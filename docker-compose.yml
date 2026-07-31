@@ -1,0 +1,19 @@
+services:
+  continuity-ledger:
+    build: .
+    image: persistence-memory:local
+    ports:
+      - "${JARVIS_PORT:-8001}:8001"
+    environment:
+      JARVIS_ENV: production
+      JARVIS_HOST: 0.0.0.0
+      JARVIS_PORT: "8001"
+      JARVIS_STORE_PATH: /data/jarvis-store.json
+      JARVIS_CORS_ORIGINS: ${JARVIS_CORS_ORIGINS:-http://localhost:3000}
+      JARVIS_API_KEY: ${JARVIS_API_KEY:-}
+    volumes:
+      - ledger-data:/data
+    restart: unless-stopped
+
+volumes:
+  ledger-data:
