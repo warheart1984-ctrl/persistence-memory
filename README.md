@@ -25,11 +25,11 @@ This is **not** a claim of full CCS (Constitutional Continuity Service) readines
 |-----------|--------|
 | Constitutional model | Moderate |
 | Governance methodology | Moderate |
-| Reference implementation | Moderate–High (local vertical slice) |
+| Reference implementation | Moderate (local vertical slice + acceptance tests) |
 | Platform engineering | Moderate (CI + Docker + optional auth; JSON file store, no HA) |
 | Commercial operations | Not started |
 
-Full table: `docs/scorecards/persistence-memory.md`.
+Full table: `docs/scorecards/persistence-memory.md`. Operator deploy: `docs/OPERATOR_DEPLOY_CHECKLIST.md`. Clause V hygiene: `docs/CLAUSE_V_HYGIENE.md` (**partial** / not API-enforced).
 
 ## Quick start
 

@@ -1,6 +1,7 @@
 services:
   continuity-ledger:
     build: .
+    image: persistence-memory:local
     ports:
       - "${JARVIS_PORT:-8001}:8001"
     environment:

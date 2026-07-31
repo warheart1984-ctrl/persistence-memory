@@ -20,3 +20,5 @@ Do not commit secrets, API keys, or production store dumps.
 4. Persist `/data` (or `JARVIS_STORE_PATH`) on durable volume; never commit store files.
 5. Prefer TLS termination at a reverse proxy; this service speaks plain HTTP.
 6. The ledger does **not** enforce multi-tenant isolation — one store per deployment.
+7. Prefer `type=decision` (+ evidence) over chat dumps — Clause V hygiene is **partial** / not API-enforced (`docs/CLAUSE_V_HYGIENE.md`).
+8. Follow `docs/OPERATOR_DEPLOY_CHECKLIST.md` before shared-network exposure.

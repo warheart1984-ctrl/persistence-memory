@@ -23,16 +23,17 @@ Write-Host "[ok] GET /api/jarvis/memory/board id=$($board.memory_board.board_id)
 $live = Invoke-RestMethod -Uri "$Base/api/jarvis/memory/retrieve?truth_scope=live&limit=5" -Method GET -Headers $Headers -TimeoutSec 5
 Write-Host "[ok] GET retrieve live_count=$($live.memories.Count) selections=$($live.selections.Count)"
 
+# Clause V hygiene (partial): prefer decision + evidence over chat/fact dumps.
 $body = @{
-  content = "Smoke test Continuity Ledger entry at $(Get-Date -Format o)"
+  content = "Smoke decision: Continuity Ledger API reachable at $(Get-Date -Format o)"
   source_agent = "smoke-test.ps1"
   session_id = "smoke-session"
-  type = "fact"
+  type = "decision"
   confidence = 0.4
   status = "draft"
   subject = "smoke-test"
   evidence = @(@{ kind = "script"; ref = "scripts/smoke-test.ps1"; note = "automated smoke" })
-  tags = @("smoke-test", "persistence-memory")
+  tags = @("smoke-test", "persistence-memory", "clause-v-hygiene")
 } | ConvertTo-Json -Depth 5
 
 $created = Invoke-RestMethod -Uri "$Base/api/jarvis/memory" -Method POST -Headers $Headers -Body $body -ContentType "application/json" -TimeoutSec 5
