@@ -10,7 +10,10 @@ services:
       JARVIS_PORT: "8001"
       JARVIS_STORE_PATH: /data/jarvis-store.json
       JARVIS_CORS_ORIGINS: ${JARVIS_CORS_ORIGINS:-http://localhost:3000}
+      # Required by default. For local compose without a key, set
+      # JARVIS_ALLOW_UNAUTHENTICATED=1 (not recommended when publishing ports).
       JARVIS_API_KEY: ${JARVIS_API_KEY:-}
+      JARVIS_ALLOW_UNAUTHENTICATED: ${JARVIS_ALLOW_UNAUTHENTICATED:-}
     volumes:
       - ledger-data:/data
     restart: unless-stopped

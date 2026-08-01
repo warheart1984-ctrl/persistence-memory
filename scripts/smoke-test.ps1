@@ -8,6 +8,8 @@ $Base = if ($env:JARVIS_MEMORYBOARD_URL) { $env:JARVIS_MEMORYBOARD_URL.TrimEnd("
 $Headers = @{}
 if ($env:JARVIS_API_KEY) {
   $Headers["Authorization"] = "Bearer $($env:JARVIS_API_KEY)"
+} elseif ($env:JARVIS_ALLOW_UNAUTHENTICATED -notin @("1", "true", "yes", "on")) {
+  Write-Warning "Neither JARVIS_API_KEY nor JARVIS_ALLOW_UNAUTHENTICATED=1 is set; protected routes will 401."
 }
 
 Write-Host "=== Continuity Ledger smoke test ==="

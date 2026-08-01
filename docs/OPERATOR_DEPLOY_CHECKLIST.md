@@ -2,7 +2,7 @@
 
 > **Status:** complete — Implementor-filled 2026-07-30 (crew2 trail)
 > Evidence required per Drive-G-1 before marking any item "complete".
-> Evidence basis: `app/` source, `tests/` suite (51 passed), `Dockerfile`, `docker-compose.yml`, `scripts/smoke-test.ps1`, `SECURITY.md`, `.env.example`.
+> Evidence basis: `app/` source, `tests/` suite, `Dockerfile`, `docker-compose.yml`, `scripts/smoke-test.ps1`, `SECURITY.md`, `.env.example`, `docs/PLATFORM_LIMITS.md`.
 
 ---
 
@@ -35,7 +35,8 @@
   | `JARVIS_STORE_PATH` | Recommended | E.g. `data/jarvis-store.json` or absolute path on durable volume |
   | `JARVIS_ENV` | **Yes** | Set to `production` — disables uvicorn `--reload` |
   | `JARVIS_CORS_ORIGINS` | **Yes** | Set to actual origin(s), comma-separated; **not `*`** in production |
-  | `JARVIS_API_KEY` | Recommended | Generate with `python -c "import secrets; print(secrets.token_hex(32))"` — store out-of-band, never commit |
+  | `JARVIS_API_KEY` | **Yes** (default) | Generate with `python -c "import secrets; print(secrets.token_hex(32))"` — store out-of-band, never commit |
+  | `JARVIS_ALLOW_UNAUTHENTICATED` | Local only | Set `1` only for trusted loopback when no key; never with published ports |
 
 ### 1c. Store path and permissions
 
@@ -52,7 +53,7 @@
 
 - [ ] Run tests once from the deploy directory to confirm environment:
   ```powershell
-  python -m pytest -q   # must return 51 passed
+  python -m pytest -q   # all tests must pass
   ```
 
 ---
@@ -232,10 +233,12 @@ Invoke-RestMethod http://127.0.0.1:8001/api/jarvis/memory/board
 | Non-claim | Detail | Where documented |
 |-----------|--------|-----------------|
 | **TLS** | Service binds HTTP only; TLS is operator-managed via reverse proxy | `SECURITY.md §5`; §2 above |
-| **HA / replication** | Single atomic-write JSON file (`os.replace`); not replicated, not HA | Scorecard "Platform engineering" |
+| **HA / replication** | Single atomic-write JSON file (`os.replace`); not replicated, not HA; **not multi-writer safe** | `docs/PLATFORM_LIMITS.md` |
+| **Per-agent write slots** | Not built; board UI `slots` ≠ partitions. Conflicts are **cross-agent by subject** on one store | `docs/PLATFORM_LIMITS.md` §0 |
 | **CCS root authority** | Clause V / Constitutional Continuity Service declared only; not enforced by this service | `docs/CONTINUITY_LEDGER_SOC.md` |
 | **Mandala constitutional runtime** | No Cursor hook infra, no CCS engine; see `docs/RELATIONSHIP_TO_MANDALA.md` | `docs/RELATIONSHIP_TO_MANDALA.md` |
 | **Multi-tenant / commercial** | Not started; no tenant isolation, billing, or signup flow | Scorecard "Commercial operations" |
+| **Vector / similarity memory** | Deliberate non-goal — ledger filters only | `docs/CONTINUITY_LEDGER_SOC.md` |
 | **JARVIS_ENV=production** | Disables uvicorn `--reload` only; does not enable HA, TLS, or Postgres | `app/__main__.py`, `Dockerfile` |
 
 **Operator checklist before exposing to a network:**

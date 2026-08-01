@@ -79,7 +79,12 @@ class JarvisStore:
             self._dirty_migration = False
 
     def _save(self):
-        """Atomic replace: write temp sibling then os.replace."""
+        """Atomic replace: write temp sibling then os.replace.
+
+        Atomicity prevents torn files; it does **not** serialize multi-writer
+        contention. Concurrent processes can still lose updates (last writer
+        wins). Single shared ledger — no per-agent write slots.
+        """
         self._path.parent.mkdir(parents=True, exist_ok=True)
         data = {
             "board": self._board.model_dump(),

@@ -23,7 +23,7 @@ Hash compare of `app/*` (PM = SoT for platform hardening):
 | `continuity.py` | IDENTICAL | Selections / conflict helpers |
 | `store.py` | DRIFT | PM uses atomic `os.replace` temp write |
 | `main.py` | DRIFT | PM: dotenv, `OptionalApiKeyMiddleware`, distribution metadata, import-at-top for `to_selection` |
-| `auth.py` | MISSING in Mandala | Optional API key — PM only |
+| `auth.py` | MISSING in Mandala | PM: API key **required by default** + `JARVIS_ALLOW_UNAUTHENTICATED` opt-out |
 | `__main__.py` | DRIFT | PM: `JARVIS_ENV=production` disables reload |
 
 **Sync policy:** Prefer fixes in **persistence-memory**. Mandala sync is an optional later operator action (port atomic store, auth, prod reload gate). Do not weaken PM to match Mandala.

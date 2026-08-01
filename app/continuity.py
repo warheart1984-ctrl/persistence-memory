@@ -110,7 +110,12 @@ def detect_conflicts(
     *,
     subject: str | None = None,
 ) -> list[ConflictSet]:
-    """Surface disagreeing active memories sharing a subject. Never merges or picks truth."""
+    """Surface disagreeing active memories sharing a subject. Never merges or picks truth.
+
+    Grouping key is ``subject`` only — ``source_agent`` / ``session_id`` are NOT
+    partition keys. Cross-agent contradictory claims on the same subject are
+    compared (Codex vs Devin, etc.). There are no per-agent write slots.
+    """
     groups: dict[str, list[MemoryRecord]] = {}
     for rec in records:
         if not rec.subject:
