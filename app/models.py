@@ -22,7 +22,8 @@ MemoryType = Literal[
 ]
 MemoryStatus = Literal["draft", "verified", "archived"]
 
-# Board UI slots (unchanged; board is workspace context, not the ledger record)
+# Board UI slots — workspace context / UX only. NOT ledger write partitions.
+# Ledger rows live in one shared store; conflicts group by subject across agents.
 SlotClass = Literal["foundation", "identity", "preference", "operational"]
 
 

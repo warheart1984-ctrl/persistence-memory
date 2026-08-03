@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.auth import OptionalApiKeyMiddleware
+from app.auth import ApiKeyMiddleware
 from app.continuity import to_selection
 from app.models import (
     BoardUpdate,
@@ -36,7 +36,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-app.add_middleware(OptionalApiKeyMiddleware)
+app.add_middleware(ApiKeyMiddleware)
 
 
 @app.get("/")
