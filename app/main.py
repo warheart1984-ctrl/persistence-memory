@@ -5,7 +5,7 @@ import os
 import secrets
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -46,6 +46,15 @@ from app.models import (
     MemoryCreate,
     MemoryUpdate,
 )
+from app.auth import (
+    deployment_label,
+    emr_recall_api_key,
+    ledger_read_protected,
+    ledger_read_protection_middleware,
+    memory_write_enabled,
+    require_emr_recall_api_key,
+    require_memory_write,
+)
 from app.store import get_store
 
 app = FastAPI(
@@ -66,6 +75,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def _ledger_read_auth(request: Request, call_next):
+    return await ledger_read_protection_middleware(request, call_next)
 
 
 @app.get("/")
@@ -148,7 +162,13 @@ def health():
         "schema": "continuity-ledger-v1",
         "memory_count": len(store.list_memories(limit=9999)),
         "board_id": board.board_id,
-        "memory_write_enabled": True,
+        "memory_write_enabled": memory_write_enabled(),
+        "deployment": deployment_label(),
+        "auth": {
+            "emr_recall_key_required": emr_recall_api_key() is not None,
+            "ledger_read_protected": ledger_read_protected(),
+        },
+        "store_path": os.getenv("JARVIS_STORE_PATH", "data/jarvis-store.json"),
     }
 
 
@@ -163,14 +183,14 @@ def get_board():
 
 
 @app.post("/api/jarvis/memory/board")
-def set_board(body: MemoryBoard):
+def set_board(body: MemoryBoard, _: None = Depends(require_memory_write)):
     store = get_store()
     board = store.set_board(body)
     return {"memory_board": board.model_dump()}
 
 
 @app.patch("/api/jarvis/memory/board")
-def patch_board(body: BoardUpdate):
+def patch_board(body: BoardUpdate, _: None = Depends(require_memory_write)):
     store = get_store()
     updates = {k: v for k, v in body.model_dump().items() if v is not None}
     board = store.patch_board(updates)
@@ -256,7 +276,7 @@ def list_memories(
 
 
 @app.post("/api/jarvis/memory")
-def create_memory(body: MemoryCreate):
+def create_memory(body: MemoryCreate, _: None = Depends(require_memory_write)):
     store = get_store()
     try:
         rec = store.create_memory(body)
@@ -268,7 +288,7 @@ def create_memory(body: MemoryCreate):
 # --- EMR / STM (LTM stays the store; STM is an activated view) ---
 
 
-@app.post("/api/jarvis/tools/emr_recall")
+@app.post("/api/jarvis/tools/emr_recall", dependencies=[Depends(require_emr_recall_api_key)])
 def tool_emr_recall(body: EmrRecallRequest):
     """Read-only EMR Recall Protocol — governed bundle for agent tool calling."""
     store = get_store()
@@ -290,7 +310,7 @@ def get_emr_status():
     return emr_status()
 
 
-@app.post("/api/jarvis/memory/emr/excite")
+@app.post("/api/jarvis/memory/emr/excite", dependencies=[Depends(require_memory_write)])
 def emr_excite(body: ExciteRequest):
     """Governed recall: score LTM → bundle → promote/evict STM under budget."""
     store = get_store()
@@ -308,7 +328,7 @@ def emr_excite(body: ExciteRequest):
     return result.model_dump()
 
 
-@app.post("/api/jarvis/memory/emr/reinforce")
+@app.post("/api/jarvis/memory/emr/reinforce", dependencies=[Depends(require_memory_write)])
 def emr_reinforce(body: ReinforceRequest):
     """Bounded reinforcement of retrievability (Q+, D−).
 
@@ -340,7 +360,7 @@ def emr_reinforce(body: ReinforceRequest):
     }
 
 
-@app.post("/api/jarvis/memory/emr/correct")
+@app.post("/api/jarvis/memory/emr/correct", dependencies=[Depends(require_memory_write)])
 def emr_correct(body: CorrectRequest):
     """Operator correction: immediately reset reinforcement overlay.
 
@@ -420,7 +440,7 @@ def read_stm_context(session_key: str = Query(default="default")):
     }
 
 
-@app.post("/api/jarvis/memory/stm/expand")
+@app.post("/api/jarvis/memory/stm/expand", dependencies=[Depends(require_memory_write)])
 def stm_expand(body: ExpandRequest):
     """Raise resolution summary→detail→evidence; payload still points at LTM."""
     store = get_store()
@@ -438,7 +458,7 @@ def stm_expand(body: ExpandRequest):
     return {"stm_entry": updated.model_dump()}
 
 
-@app.delete("/api/jarvis/memory/stm")
+@app.delete("/api/jarvis/memory/stm", dependencies=[Depends(require_memory_write)])
 def stm_clear(session_key: str | None = Query(default=None)):
     clear_stm(session_key)
     return {"status": "cleared", "session_key": session_key}
@@ -469,7 +489,7 @@ def get_memory(memory_id: str):
     return {"memory": rec.model_dump(), "selection": sel.model_dump()}
 
 
-@app.patch("/api/jarvis/memory/{memory_id}")
+@app.patch("/api/jarvis/memory/{memory_id}", dependencies=[Depends(require_memory_write)])
 def update_memory(memory_id: str, body: MemoryUpdate):
     store = get_store()
     try:
@@ -481,7 +501,7 @@ def update_memory(memory_id: str, body: MemoryUpdate):
     return {"memory": rec.model_dump()}
 
 
-@app.delete("/api/jarvis/memory/{memory_id}")
+@app.delete("/api/jarvis/memory/{memory_id}", dependencies=[Depends(require_memory_write)])
 def delete_memory(memory_id: str):
     store = get_store()
     ok = store.delete_memory(memory_id)

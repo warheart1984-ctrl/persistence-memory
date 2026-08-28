@@ -1,76 +1,115 @@
-"""API-key gate for Continuity Ledger deployments.
-
-Default (secure): JARVIS_API_KEY must be set; protected routes require
-Authorization: Bearer <key> or X-API-Key.
-
-Local-dev opt-out: set JARVIS_ALLOW_UNAUTHENTICATED=1 to serve without a key
-(open auth). Do not use the opt-out on shared or port-forwarded hosts.
-"""
+"""Deployment auth — optional API key for hosted EMR recall; write gate for public deploy."""
 
 from __future__ import annotations
 
-import hmac
 import os
+import secrets
 
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
-
-_TRUTHY = frozenset({"1", "true", "yes", "on"})
+from fastapi import Header, HTTPException, Request
+from starlette.responses import JSONResponse
 
 
-def configured_api_key() -> str | None:
-    key = (os.getenv("JARVIS_API_KEY") or "").strip()
+def emr_recall_api_key() -> str | None:
+    key = (os.getenv("EMR_RECALL_API_KEY") or "").strip()
     return key or None
 
 
-def allow_unauthenticated() -> bool:
-    raw = (os.getenv("JARVIS_ALLOW_UNAUTHENTICATED") or "").strip().lower()
-    return raw in _TRUTHY
+def memory_write_enabled() -> bool:
+    return os.getenv("JARVIS_MEMORY_WRITE_ENABLED", "true").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
 
 
-def extract_presented_key(request: Request) -> str | None:
-    auth = request.headers.get("Authorization") or ""
-    if auth.lower().startswith("bearer "):
-        return auth[7:].strip() or None
-    header_key = request.headers.get("X-API-Key")
-    if header_key:
-        return header_key.strip() or None
+def ledger_read_protected() -> bool:
+    """When true, GET /api/jarvis/memory/* requires the operator API key."""
+    if not emr_recall_api_key():
+        return False
+    return os.getenv("JARVIS_PROTECT_LEDGER_READ", "false").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def deployment_label() -> str:
+    if os.getenv("RENDER"):
+        return "render"
+    if os.getenv("JARVIS_DEPLOYMENT"):
+        return os.getenv("JARVIS_DEPLOYMENT", "").strip() or "custom"
+    return "local"
+
+
+def _extract_bearer(authorization: str | None) -> str | None:
+    if not authorization:
+        return None
+    prefix = "bearer "
+    if authorization.lower().startswith(prefix):
+        return authorization[len(prefix) :].strip()
     return None
 
 
-def path_is_public(path: str) -> bool:
-    return path in {"/", "/health", "/docs", "/openapi.json", "/redoc"}
-
-
-class ApiKeyMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next) -> Response:
-        if path_is_public(request.url.path):
-            return await call_next(request)
-
-        expected = configured_api_key()
-        if expected is not None:
-            presented = extract_presented_key(request)
-            if presented is None or not hmac.compare_digest(presented, expected):
-                return JSONResponse(
-                    status_code=401,
-                    content={"detail": "Invalid or missing API key"},
-                )
-            return await call_next(request)
-
-        if allow_unauthenticated():
-            return await call_next(request)
-
-        return JSONResponse(
+def verify_operator_api_key(
+    authorization: str | None,
+    x_emr_recall_key: str | None,
+) -> None:
+    expected = emr_recall_api_key()
+    if not expected:
+        raise HTTPException(
+            status_code=503,
+            detail="Operator API key required but EMR_RECALL_API_KEY is not configured",
+        )
+    token = _extract_bearer(authorization) or (x_emr_recall_key or "").strip()
+    if not token or not secrets.compare_digest(token, expected):
+        raise HTTPException(
             status_code=401,
-            content={
-                "detail": (
-                    "API key required. Set JARVIS_API_KEY, or for local dev only "
-                    "set JARVIS_ALLOW_UNAUTHENTICATED=1."
-                )
-            },
+            detail="Invalid or missing operator API key",
         )
 
 
-# Backward-compatible alias (middleware renamed from optional → required-by-default).
-OptionalApiKeyMiddleware = ApiKeyMiddleware
+def require_emr_recall_api_key(
+    authorization: str | None = Header(default=None),
+    x_emr_recall_key: str | None = Header(default=None, alias="X-EMR-Recall-Key"),
+) -> None:
+    """When EMR_RECALL_API_KEY is set, require Bearer or X-EMR-Recall-Key header."""
+    expected = emr_recall_api_key()
+    if not expected:
+        return
+    verify_operator_api_key(authorization, x_emr_recall_key)
+
+
+def require_ledger_read_api_key(
+    authorization: str | None = Header(default=None),
+    x_emr_recall_key: str | None = Header(default=None, alias="X-EMR-Recall-Key"),
+) -> None:
+    if not ledger_read_protected():
+        return
+    verify_operator_api_key(authorization, x_emr_recall_key)
+
+
+def require_memory_write() -> None:
+    if not memory_write_enabled():
+        raise HTTPException(
+            status_code=403,
+            detail="Memory writes are disabled on this deployment",
+        )
+
+
+LEDGER_READ_PREFIX = "/api/jarvis/memory"
+
+
+async def ledger_read_protection_middleware(request: Request, call_next):
+    """Gate GET ledger endpoints when JARVIS_PROTECT_LEDGER_READ is enabled."""
+    if request.method != "GET" or not request.url.path.startswith(LEDGER_READ_PREFIX):
+        return await call_next(request)
+    if not ledger_read_protected():
+        return await call_next(request)
+    try:
+        verify_operator_api_key(
+            request.headers.get("authorization"),
+            request.headers.get("x-emr-recall-key"),
+        )
+    except HTTPException as exc:
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+    return await call_next(request)

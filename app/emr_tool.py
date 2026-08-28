@@ -222,8 +222,7 @@ def emr_recall(
 
     try:
         # Subject-targeted tool calls: caller named the resonance band explicitly.
-        enforce_abstention = not bool(req.subjects)
-        result = excite(candidates, excite_req, enforce_abstention=enforce_abstention)
+        result = excite(candidates, excite_req, enforce_abstention=True)
     except ValueError as exc:
         raise ValueError(str(exc)) from exc
 
