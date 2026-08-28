@@ -9,17 +9,23 @@ can call the Continuity Ledger without a local MCP tunnel.
 | Render Disk persistence | **live** (operator enables via blueprint) |
 | `EMR_RECALL_API_KEY` gate on recall | **live** (`app/auth.py`) |
 | Public write endpoints | **disabled** by default (`JARVIS_MEMORY_WRITE_ENABLED=false`) |
-| HTTP MCP transport on Render | **declared** — use REST `POST /api/jarvis/tools/emr_recall` or local stdio MCP |
+| HTTP MCP transport on Render | **live** — `POST /mcp` Streamable HTTP (`emr_recall` only) |
 
 ## Architecture
 
 ```
-Remote client (ChatGPT Action, curl, hosted MCP bridge)
-    → https://jarvis-memoryboard.onrender.com/api/jarvis/tools/emr_recall
-    → EMR excite → Continuity Ledger (/var/data/jarvis-store.json)
+ChatGPT (Pro+ MCP app) ──► POST https://YOUR-SERVICE.onrender.com/mcp
+                              │
+                              ▼
+                         emr_recall (read-only MCP tool)
+                              │
+                              ▼
+                         EMR excite → Continuity Ledger (/var/data/jarvis-store.json)
+
+Cursor/OpenCode (local) ──► stdio MCP ──► loopback or Render REST/MCP
 ```
 
-Local dev unchanged: stdio MCP → loopback HTTP.
+REST fallback (OpenAI Actions, curl): `POST /api/jarvis/tools/emr_recall`
 
 ## Prerequisites
 
@@ -65,7 +71,30 @@ curl -s -X POST https://YOUR-SERVICE.onrender.com/api/jarvis/tools/emr_recall \
   -H "Authorization: Bearer $EMR_RECALL_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"intent":"code","query":"EMR release bundle","max_memories":5}'
+
+# Streamable HTTP MCP (ChatGPT remote MCP / MCP Inspector)
+curl -s -X POST https://YOUR-SERVICE.onrender.com/mcp \
+  -H "Authorization: Bearer $EMR_RECALL_API_KEY" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"curl","version":"1"}}}'
+
+curl -s -X POST https://YOUR-SERVICE.onrender.com/mcp \
+  -H "Authorization: Bearer $EMR_RECALL_API_KEY" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
 ```
+
+## ChatGPT registration (Pro+ / Business)
+
+1. Settings → Apps → Advanced → **Developer mode**
+2. Apps → **Create** → Remote MCP URL: `https://YOUR-SERVICE.onrender.com/mcp`
+3. Authentication: **Bearer token** → paste `EMR_RECALL_API_KEY`
+4. **Scan Tools** — should discover exactly **`emr_recall`** (read-only)
+5. New chat → select EMR app → “Recall my image-generation preferences”
+
+**Plus** does not support custom MCP apps per OpenAI docs — Pro minimum for read MCP.
 
 ## Security notes
 
