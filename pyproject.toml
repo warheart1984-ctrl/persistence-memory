@@ -1,13 +1,8 @@
-[build-system]
-requires = ["setuptools>=61"]
-build-backend = "setuptools.build_meta"
-
 [project]
 name = "jarvis-memoryboard"
-version = "0.2.0"
-description = "Continuity Ledger HTTP service (distributed as persistence-memory) — evidence-backed agent memory"
+version = "0.1.0"
+description = "Jarvis memory board — persistent read/write memory for MRS agents"
 requires-python = ">=3.11"
-license = { text = "MIT" }
 dependencies = [
   "fastapi==0.116.1",
   "uvicorn[standard]==0.35.0",
@@ -17,9 +12,6 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest==9.1.1", "httpx==0.28.1"]
-
-[project.urls]
-Repository = "https://github.com/warheart1984-ctrl/persistence-memory"
 
 [tool.setuptools.packages.find]
 include = ["app*"]
