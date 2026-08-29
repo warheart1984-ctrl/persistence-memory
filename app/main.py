@@ -62,6 +62,7 @@ from app.auth import (
     deployment_label,
     emr_recall_api_key,
     ledger_read_protected,
+    ApiKeyMiddleware,
     ledger_read_protection_middleware,
     mcp_write_enabled,
     memory_write_enabled,
@@ -89,6 +90,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+app.add_middleware(ApiKeyMiddleware)
 
 
 @app.middleware("http")
