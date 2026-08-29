@@ -256,6 +256,7 @@ def test_route_store_query_log_roundtrip(tmp_path, monkeypatch):
     ):
         client = TestClient(app)
         assert client.post("/api/jarvis/rag/query", json={"query": "x"}).status_code == 401
+        assert client.get("/api/jarvis/rag/status").status_code == 401
         r1 = client.post(
             "/api/jarvis/rag/documents",
             headers=headers,
