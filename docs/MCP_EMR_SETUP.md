@@ -289,6 +289,8 @@ that will create the app, or the tunnel will not appear in ChatGPT.
 
 #### B1 — Tunnel to local stdio MCP (recommended for private ledger)
 
+Example init/run script (no secrets): `config/tunnel-client.example.sh`
+
 Terminal 1 — memoryboard (loopback only):
 
 ```bash
