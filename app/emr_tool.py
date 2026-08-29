@@ -1,7 +1,8 @@
-"""EMR Recall Protocol — read-only tool boundary for agent function calling.
+"""EMR tool boundary — recall + governed write catalog for agent function calling.
 
-v1 exposes ``emr_recall`` only. Write paths (propose/commit) are reserved for
-governed endpoints — not exposed through this tool surface.
+Recall path (``emr_recall``) is unchanged in behavior.
+Write tools (``emr_remember`` / ``emr_upsert``) are implemented in ``app.emr_write``
+and gated by ``JARVIS_MCP_WRITE_ENABLED`` (default off).
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from app.emr import (
     RetrievalWeights,
     excite,
 )
+from app.emr_write import EMR_REMEMBER_TOOL_SCHEMA, EMR_UPSERT_TOOL_SCHEMA
 from app.models import MemoryRecord, MemoryStatus, MemoryType
 from app.store import JarvisStore
 
@@ -220,8 +222,9 @@ def emr_recall(
         theta_promote=0.001,
     )
 
+    # Subject-targeted calls narrow candidates via metadata filters but abstention
+    # stays fully enforced — naming a subject must not bypass the evidence gate.
     try:
-        # Subject-targeted tool calls: caller named the resonance band explicitly.
         result = excite(candidates, excite_req, enforce_abstention=True)
     except ValueError as exc:
         raise ValueError(str(exc)) from exc
@@ -280,13 +283,14 @@ def emr_recall(
             )
         recall_summary.extend(f"✓ {reason}" for reason in reasons[:2])
 
-    # Surface conflicts touching bundled subjects (read-only inspection)
+    # Surface conflicts for requested or bundled subjects (read-only inspection)
     conflict_rows: list[EmrRecallConflict] = []
     bundled_subjects = {b.subject for b in bundle if b.subject}
+    conflict_subjects = bundled_subjects | {s for s in req.subjects}
     for conflict in store.conflicts():
         if not conflict.unresolved:
             continue
-        if conflict.subject and conflict.subject in bundled_subjects:
+        if conflict.subject and conflict.subject in conflict_subjects:
             conflict_rows.append(
                 EmrRecallConflict(
                     subject=conflict.subject,
@@ -366,13 +370,22 @@ EMR_RECALL_TOOL_SCHEMA: dict[str, Any] = {
 
 
 def tool_catalog() -> dict[str, Any]:
-    """Exported tool catalog for agent hosts (read-only v1)."""
+    """Exported tool catalog for agent hosts (recall + gated writes)."""
     return {
         "schema": "emr-tool-catalog-v1",
-        "tools": [EMR_RECALL_TOOL_SCHEMA],
+        "tools": [
+            EMR_RECALL_TOOL_SCHEMA,
+            EMR_REMEMBER_TOOL_SCHEMA,
+            EMR_UPSERT_TOOL_SCHEMA,
+        ],
         "write_policy": {
             "emr_recall": "read",
-            "emr_propose_memory": "propose (not exposed v1)",
-            "emr_commit_memory": "governed (not exposed v1)",
+            "emr_remember": "write-draft (JARVIS_MCP_WRITE_ENABLED + user_requested)",
+            "emr_upsert": "write-supersede-draft (JARVIS_MCP_WRITE_ENABLED + user_requested)",
+        },
+        "gates": {
+            "JARVIS_MCP_WRITE_ENABLED": "required true for remember/upsert",
+            "user_requested": "must be true on write tools",
+            "status": "forced draft on MCP writes",
         },
     }

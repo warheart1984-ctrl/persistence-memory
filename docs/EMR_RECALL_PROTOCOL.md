@@ -9,13 +9,13 @@
 User → Assistant → emr_recall tool → Continuity Ledger → EMR excite → bundle → context
 ```
 
-## v1 surface (read-only)
+## v1 surface
 
-| Tool | Policy |
-|------|--------|
-| `emr_recall` | **READ** — governed bundle, no LTM mutation |
-| `emr_propose_memory` | PROPOSE — not exposed v1 |
-| `emr_commit_memory` | GOVERNED — not exposed v1 |
+| Tool | Policy | Status |
+|------|--------|--------|
+| `emr_recall` | **READ** — governed bundle, no LTM mutation | **enforced** |
+| `emr_remember` | **WRITE draft** — create via EMR gate | **partial** (`JARVIS_MCP_WRITE_ENABLED`) |
+| `emr_upsert` | **WRITE draft** — supersede with lineage | **partial** (`JARVIS_MCP_WRITE_ENABLED`) |
 
 ## Example call
 
@@ -83,13 +83,22 @@ Structured intent (recall wave):
 
 `GET /api/jarvis/tools` returns OpenAI-compatible function schemas for agent registration.
 
-## Write boundary (future)
+## MCP adapter (assistant hosts)
+
+Stdio MCP server proxies `emr_recall` to the HTTP API above. See
+[docs/MCP_EMR_SETUP.md](./MCP_EMR_SETUP.md) for Cursor, OpenCode, and ChatGPT
+(Secure MCP Tunnel) setup.
+
+```bash
+JARVIS_MEMORYBOARD_URL=http://127.0.0.1:8001 python -m mcp_server
+```
+
+## Write boundary
 
 ```
-READ     → emr_recall (broadly allowed)
-PROPOSE  → emr_propose_memory (governed)
-COMMIT   → emr_commit_memory (governed)
-SUPERSEDE / DELETE → operator only
+READ     → emr_recall (broadly allowed when auth permits)
+WRITE    → emr_remember / emr_upsert (JARVIS_MCP_WRITE_ENABLED + user_requested; draft-only)
+VERIFY / DELETE → operator REST only (not via MCP)
 ```
 
 Retrieval may affect activation. It must **never** silently alter LTM truth, authority, provenance, or content.
