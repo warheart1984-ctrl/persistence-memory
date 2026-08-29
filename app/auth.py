@@ -1,4 +1,10 @@
-"""Deployment auth — optional API key for hosted EMR recall; write gate for public deploy."""
+"""Auth gates.
+
+Ledger routes: JARVIS_API_KEY required by default (ApiKeyMiddleware);
+JARVIS_ALLOW_UNAUTHENTICATED=1 is the local-dev opt-out.
+EMR tool / MCP routes: EMR_RECALL_API_KEY (optional, hosted recall).
+Write gate: JARVIS_MEMORY_WRITE_ENABLED / JARVIS_MCP_WRITE_ENABLED.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +12,8 @@ import os
 import secrets
 
 from fastapi import Header, HTTPException, Request
-from starlette.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse, Response
 
 
 def emr_recall_api_key() -> str | None:
@@ -145,3 +152,81 @@ def optional_verify_operator_api_key(
     if not emr_recall_api_key():
         return
     verify_operator_api_key(authorization, x_emr_recall_key)
+
+# ---------------------------------------------------------------------------
+# Ledger operator API key (required-by-default; restored from a9b992c regression)
+# ---------------------------------------------------------------------------
+
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+
+def configured_api_key() -> str | None:
+    key = (os.getenv("JARVIS_API_KEY") or "").strip()
+    return key or None
+
+
+def allow_unauthenticated() -> bool:
+    raw = (os.getenv("JARVIS_ALLOW_UNAUTHENTICATED") or "").strip().lower()
+    return raw in _TRUTHY
+
+
+def extract_presented_key(request: Request) -> str | None:
+    auth = request.headers.get("Authorization") or ""
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip() or None
+    header_key = request.headers.get("X-API-Key")
+    if header_key:
+        return header_key.strip() or None
+    return None
+
+
+PUBLIC_PATHS = frozenset(
+    {"/", "/health", "/docs", "/openapi.json", "/redoc", "/api/jarvis/tools"}
+)
+# Routes that carry their own gate (EMR_RECALL_API_KEY for tools/MCP,
+# JARVIS_RAG_API_KEY_FILE for RAG) and are consumed by external MCP hosts;
+# the ledger key does not apply to them.
+LEDGER_KEY_EXEMPT_PREFIXES = ("/api/jarvis/tools/", "/api/jarvis/rag/", "/mcp")
+
+
+def path_is_public(path: str) -> bool:
+    return path in PUBLIC_PATHS
+
+
+def path_is_ledger_key_exempt(path: str) -> bool:
+    return path_is_public(path) or path.startswith(LEDGER_KEY_EXEMPT_PREFIXES)
+
+
+class ApiKeyMiddleware(BaseHTTPMiddleware):
+    """Gate ledger routes: JARVIS_API_KEY required unless JARVIS_ALLOW_UNAUTHENTICATED."""
+
+    async def dispatch(self, request: Request, call_next) -> Response:
+        # CORS preflights carry no credentials; let CORSMiddleware answer them.
+        if request.method == "OPTIONS" or path_is_ledger_key_exempt(request.url.path):
+            return await call_next(request)
+
+        expected = configured_api_key()
+        if expected is not None:
+            presented = extract_presented_key(request)
+            if presented is None or not secrets.compare_digest(presented, expected):
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "Invalid or missing API key"},
+                )
+            return await call_next(request)
+
+        if allow_unauthenticated():
+            return await call_next(request)
+
+        return JSONResponse(
+            status_code=401,
+            content={
+                "detail": (
+                    "API key required. Set JARVIS_API_KEY, or for local dev only "
+                    "set JARVIS_ALLOW_UNAUTHENTICATED=1."
+                )
+            },
+        )
+
+
+OptionalApiKeyMiddleware = ApiKeyMiddleware

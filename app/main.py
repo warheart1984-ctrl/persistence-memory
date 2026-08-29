@@ -62,6 +62,7 @@ from app.auth import (
     deployment_label,
     emr_recall_api_key,
     ledger_read_protected,
+    ApiKeyMiddleware,
     ledger_read_protection_middleware,
     mcp_write_enabled,
     memory_write_enabled,
@@ -89,6 +90,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+app.add_middleware(ApiKeyMiddleware)
 
 
 @app.middleware("http")
@@ -699,7 +703,7 @@ def rag_log(limit: int = Query(default=50, ge=1, le=1000)):
     return {"records": records, "count": len(records)}
 
 
-@app.get("/api/jarvis/rag/status")
+@app.get("/api/jarvis/rag/status", dependencies=[Depends(require_rag_api_key)])
 def get_rag_status():
     return amul_rag.rag_status()
 

@@ -15,6 +15,13 @@ import app.amul_llm as llm
 
 
 @pytest.fixture(autouse=True)
+def _allow_unauthenticated_for_tests(monkeypatch):
+    """Ledger tests use the local-dev opt-out; auth-required behavior is in test_auth.py."""
+    monkeypatch.delenv("JARVIS_API_KEY", raising=False)
+    monkeypatch.setenv("JARVIS_ALLOW_UNAUTHENTICATED", "1")
+
+
+@pytest.fixture(autouse=True)
 def _isolated_dynamics_sidecar(tmp_path):
     """Point EMR/AMUL/RAG/LLM storage at per-test temp files.
 

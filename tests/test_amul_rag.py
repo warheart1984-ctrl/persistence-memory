@@ -32,8 +32,22 @@ from app.main import app
 from app.store import JarvisStore
 
 
-def _doc(did: str, title: str, body: str, source: str = "repo") -> RagDocument:
-    return normalize_document({"id": did, "title": title, "body": body, "source": source})
+def _doc(
+    did: str,
+    title: str,
+    body: str,
+    source: str = "repo",
+    authority_class: str = "verified",
+) -> RagDocument:
+    """Test docs default to ``verified`` so retrieval support is not trust-attenuated.
+
+    Trust weighting is an enforced truth-boundary feature: ``untrusted`` evidence
+    (weight 0.55) cannot clear ``min_support`` on its own. That behavior is
+    locked by ``test_untrusted_only_evidence_abstains``.
+    """
+    return normalize_document(
+        {"id": did, "title": title, "body": body, "source": source, "authority_class": authority_class}
+    )
 
 
 def _index(*docs: RagDocument) -> RagIndex:
@@ -178,6 +192,21 @@ def test_supported_query_answers_extractively_with_provenance_and_logs():
     assert set(log[-1]["scores"]) == {d["id"] for d in record.docs_used}
 
 
+def test_untrusted_only_evidence_abstains():
+    """Trust membrane: a single untrusted doc cannot satisfy min_support alone."""
+    idx = _index(
+        _doc(
+            "d-untrusted",
+            "PhaseEncode",
+            "HoloRT4D debug PhaseEncode maps R/G to tanh of real over imag.",
+            authority_class="untrusted",
+        )
+    )
+    record = answer_query("what maps R/G in HoloRT4D PhaseEncode?", idx)
+    assert record.status == "insufficient_evidence"
+    assert record.docs_used == []
+
+
 def test_llm_hook_declared_off_by_default(monkeypatch):
     assert rag.RAG_LLM_URL == ""  # extractive v0 unless explicitly configured
     monkeypatch.setattr(rag, "RAG_LLM_URL", "http://127.0.0.1:9/v1")
@@ -214,14 +243,23 @@ def test_context_budget_exhaustion_abstains_without_crash(monkeypatch):
 # --- Route roundtrip -----------------------------------------------------------------
 
 
-def test_route_store_query_log_roundtrip(tmp_path):
+def test_route_store_query_log_roundtrip(tmp_path, monkeypatch):
+    # RAG routes are gated by a local secret file (JARVIS_RAG_API_KEY_FILE).
+    key_file = tmp_path / "rag.key"
+    key_file.write_text("rag-test-key", encoding="utf-8")
+    monkeypatch.setattr(rag, "RAG_API_KEY_FILE", str(key_file))
+    headers = {"X-Jarvis-Rag-Key": "rag-test-key"}
+
     store = JarvisStore(str(tmp_path / "ledger.json"))
     with patch("app.main.get_store", return_value=store), patch(
         "app.main.get_index", return_value=rag.get_index()
     ):
         client = TestClient(app)
+        assert client.post("/api/jarvis/rag/query", json={"query": "x"}).status_code == 401
+        assert client.get("/api/jarvis/rag/status").status_code == 401
         r1 = client.post(
             "/api/jarvis/rag/documents",
+            headers=headers,
             json={
                 "documents": [
                     {
@@ -239,15 +277,16 @@ def test_route_store_query_log_roundtrip(tmp_path):
         r2 = client.post(
             "/api/jarvis/rag/query",
             json={"query": "sovereign x useful-FLOPs routing"},
+            headers=headers,
         )
         assert r2.status_code == 200
         data = r2.json()
         assert data["status"] in ("answered", "insufficient_evidence")
         assert data["intent_type"] in ("fact_lookup", "code_help", "longform_explanation")
 
-        r3 = client.get("/api/jarvis/rag/log?limit=10")
+        r3 = client.get("/api/jarvis/rag/log?limit=10", headers=headers)
         assert r3.status_code == 200
         assert isinstance(r3.json()["records"], list)
 
-        r4 = client.get("/api/jarvis/rag/status")
+        r4 = client.get("/api/jarvis/rag/status", headers=headers)
         assert r4.json()["maturity"]["evidence_gate_replay"] == "enforced"
