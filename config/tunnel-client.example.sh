@@ -26,8 +26,12 @@ if [[ -z "${CONTROL_PLANE_API_KEY:-}" ]]; then
   exit 1
 fi
 
-# Terminal 1 — memoryboard (if not already running):
-#   cd "$REPO_ROOT" && uvicorn app.main:app --host 127.0.0.1 --port 8001
+# Terminal 1 — memoryboard (if not already running). MCP writes require the flag on
+# uvicorn (stdio tunnel proxies recall/write HTTP to memoryboard; gate is server-side):
+#   cd "$REPO_ROOT"
+#   export JARVIS_MCP_WRITE_ENABLED=true
+#   uvicorn app.main:app --host 127.0.0.1 --port 8001
+# or: scripts/start-memoryboard.sh   (loads .env.local when present)
 
 tunnel-client init \
   --sample sample_mcp_stdio_local \

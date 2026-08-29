@@ -26,6 +26,7 @@ services:
         value: /var/data/amul-field.jsonl
       - key: JARVIS_MEMORY_WRITE_ENABLED
         value: "false"
+      # Recall-only on public deploy. Operator may set true on a private host only.
       - key: JARVIS_MCP_WRITE_ENABLED
         value: "false"
       - key: JARVIS_PROTECT_LEDGER_READ
