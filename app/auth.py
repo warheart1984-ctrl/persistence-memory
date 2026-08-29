@@ -180,10 +180,13 @@ def extract_presented_key(request: Request) -> str | None:
     return None
 
 
-PUBLIC_PATHS = frozenset({"/", "/health", "/docs", "/openapi.json", "/redoc"})
-# Routes that carry their own operator gate (EMR_RECALL_API_KEY) and are
-# consumed by external MCP hosts; the ledger key does not apply to them.
-LEDGER_KEY_EXEMPT_PREFIXES = ("/api/jarvis/tools/", "/mcp")
+PUBLIC_PATHS = frozenset(
+    {"/", "/health", "/docs", "/openapi.json", "/redoc", "/api/jarvis/tools"}
+)
+# Routes that carry their own gate (EMR_RECALL_API_KEY for tools/MCP,
+# JARVIS_RAG_API_KEY_FILE for RAG) and are consumed by external MCP hosts;
+# the ledger key does not apply to them.
+LEDGER_KEY_EXEMPT_PREFIXES = ("/api/jarvis/tools/", "/api/jarvis/rag/", "/mcp")
 
 
 def path_is_public(path: str) -> bool:
@@ -198,7 +201,8 @@ class ApiKeyMiddleware(BaseHTTPMiddleware):
     """Gate ledger routes: JARVIS_API_KEY required unless JARVIS_ALLOW_UNAUTHENTICATED."""
 
     async def dispatch(self, request: Request, call_next) -> Response:
-        if path_is_ledger_key_exempt(request.url.path):
+        # CORS preflights carry no credentials; let CORSMiddleware answer them.
+        if request.method == "OPTIONS" or path_is_ledger_key_exempt(request.url.path):
             return await call_next(request)
 
         expected = configured_api_key()
