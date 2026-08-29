@@ -46,6 +46,12 @@ from app.emr_write import (
     emr_remember,
     emr_upsert,
 )
+from app.emr_research import (
+    EmrFetchRequest,
+    EmrSearchRequest,
+    emr_fetch,
+    emr_search,
+)
 from app.models import (
     BoardUpdate,
     MemoryBoard,
@@ -155,13 +161,23 @@ def index():
             "tools": {
                 "catalog": "GET /api/jarvis/tools",
                 "emr_recall": "POST /api/jarvis/tools/emr_recall",
+                "search": "POST /api/jarvis/tools/search",
+                "fetch": "POST /api/jarvis/tools/fetch",
                 "emr_remember": "POST /api/jarvis/tools/emr_remember",
                 "emr_upsert": "POST /api/jarvis/tools/emr_upsert",
             },
             "mcp": {
                 "streamable_http": "POST /mcp",
                 "transport": "streamable-http",
-                "tools": ["emr_recall", "emr_remember", "emr_upsert"],
+                "tools": [
+                    "emr_recall",
+                    "search",
+                    "fetch",
+                    "emr_search",
+                    "emr_fetch",
+                    "emr_remember",
+                    "emr_upsert",
+                ],
                 "mcp_write_enabled": mcp_write_enabled(),
             },
         },
@@ -187,7 +203,15 @@ def health():
         },
         "mcp": {
             "streamable_http": "/mcp",
-            "tools": ["emr_recall", "emr_remember", "emr_upsert"],
+            "tools": [
+                "emr_recall",
+                "search",
+                "fetch",
+                "emr_search",
+                "emr_fetch",
+                "emr_remember",
+                "emr_upsert",
+            ],
             "mcp_write_enabled": mcp_write_enabled(),
         },
         "store_path": os.getenv("JARVIS_STORE_PATH", "data/jarvis-store.json"),
@@ -308,6 +332,40 @@ def create_memory(body: MemoryCreate, _: None = Depends(require_memory_write)):
 
 
 # --- EMR / STM (LTM stays the store; STM is an activated view) ---
+
+
+@app.post("/api/jarvis/tools/search", dependencies=[Depends(require_emr_recall_api_key)])
+def tool_search(body: EmrSearchRequest):
+    """OpenAI company-knowledge search — read-only EMR recall → citation results."""
+    store = get_store()
+    try:
+        return emr_search(store, body)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/jarvis/tools/fetch", dependencies=[Depends(require_emr_recall_api_key)])
+def tool_fetch(body: EmrFetchRequest):
+    """OpenAI company-knowledge fetch — full LTM record by id (read-only)."""
+    store = get_store()
+    try:
+        return emr_fetch(store, body)
+    except ValueError as exc:
+        if "not found" in str(exc).lower():
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/jarvis/tools/emr_search", dependencies=[Depends(require_emr_recall_api_key)])
+def tool_emr_search(body: EmrSearchRequest):
+    """Alias of ``search`` for hosts that namespace EMR tools."""
+    return tool_search(body)
+
+
+@app.post("/api/jarvis/tools/emr_fetch", dependencies=[Depends(require_emr_recall_api_key)])
+def tool_emr_fetch(body: EmrFetchRequest):
+    """Alias of ``fetch`` for hosts that namespace EMR tools."""
+    return tool_fetch(body)
 
 
 @app.post("/api/jarvis/tools/emr_recall", dependencies=[Depends(require_emr_recall_api_key)])
@@ -725,6 +783,12 @@ def amul_field_verify():
 def _invoke_emr_tool(name: str, arguments: dict) -> dict:
     """In-process EMR tools for MCP Streamable HTTP (same path as REST tools)."""
     store = get_store()
+    if name in ("search", "emr_search"):
+        body = EmrSearchRequest.model_validate(arguments)
+        return emr_search(store, body)
+    if name in ("fetch", "emr_fetch"):
+        body = EmrFetchRequest.model_validate(arguments)
+        return emr_fetch(store, body)
     if name == "emr_recall":
         body = EmrRecallRequest.model_validate(arguments)
         return emr_recall(store, body).model_dump()

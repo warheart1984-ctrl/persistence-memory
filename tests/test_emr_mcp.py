@@ -15,7 +15,7 @@ def test_emr_recall_tool_schema():
     assert "query" in EMR_RECALL_TOOL["inputSchema"]["properties"]
 
 
-def test_tools_list_includes_three():
+def test_tools_list_includes_seven():
     captured: list[dict] = []
 
     def fake_send(msg: dict) -> None:
@@ -25,8 +25,16 @@ def test_tools_list_includes_three():
         handle_message({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
 
     names = [t["name"] for t in captured[0]["result"]["tools"]]
-    assert names == ["emr_recall", "emr_remember", "emr_upsert"]
-    assert len(MCP_TOOLS) == 3
+    assert names == [
+        "emr_recall",
+        "search",
+        "fetch",
+        "emr_search",
+        "emr_fetch",
+        "emr_remember",
+        "emr_upsert",
+    ]
+    assert len(MCP_TOOLS) == 7
 
 
 def test_tools_call_proxies_to_http():

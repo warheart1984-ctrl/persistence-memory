@@ -77,9 +77,19 @@ def _http_post(path: str, arguments: dict[str, Any]) -> dict[str, Any]:
 
 def call_emr_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     """POST the named EMR tool to the memoryboard HTTP API."""
-    if name not in {"emr_recall", "emr_remember", "emr_upsert"}:
+    route_map = {
+        "emr_recall": "emr_recall",
+        "emr_remember": "emr_remember",
+        "emr_upsert": "emr_upsert",
+        "search": "search",
+        "fetch": "fetch",
+        "emr_search": "emr_search",
+        "emr_fetch": "emr_fetch",
+    }
+    path_name = route_map.get(name)
+    if path_name is None:
         raise RuntimeError(f"unknown tool: {name}")
-    return _http_post(f"/api/jarvis/tools/{name}", arguments)
+    return _http_post(f"/api/jarvis/tools/{path_name}", arguments)
 
 
 def call_emr_recall(arguments: dict[str, Any]) -> dict[str, Any]:

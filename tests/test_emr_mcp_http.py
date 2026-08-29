@@ -72,9 +72,20 @@ def test_mcp_tools_list():
     assert resp.status_code == 200
     tools = resp.json()["result"]["tools"]
     names = [t["name"] for t in tools]
-    assert names == ["emr_recall", "emr_remember", "emr_upsert"]
+    assert names == [
+        "emr_recall",
+        "search",
+        "fetch",
+        "emr_search",
+        "emr_fetch",
+        "emr_remember",
+        "emr_upsert",
+    ]
     assert tools[0]["annotations"]["readOnlyHint"] is True
-    assert tools[1]["annotations"]["readOnlyHint"] is False
+    search_idx = names.index("search")
+    assert tools[search_idx]["annotations"]["readOnlyHint"] is True
+    remember_idx = names.index("emr_remember")
+    assert tools[remember_idx]["annotations"]["readOnlyHint"] is False
 
 
 def test_mcp_tools_call_emr_recall():

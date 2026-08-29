@@ -2,6 +2,8 @@
 
 Tools:
 - ``emr_recall`` — read-only governed recall (always available when auth allows)
+- ``search`` / ``fetch`` — OpenAI deep-research / company-knowledge (read-only)
+- ``emr_search`` / ``emr_fetch`` — aliases of search/fetch
 - ``emr_remember`` / ``emr_upsert`` — draft writes when ``JARVIS_MCP_WRITE_ENABLED``
 """
 
@@ -143,6 +145,78 @@ EMR_REMEMBER_TOOL: dict[str, Any] = {
     },
 }
 
+SEARCH_TOOL: dict[str, Any] = {
+    "name": "search",
+    "description": (
+        "Read-only company knowledge search over the Continuity Ledger (EMR recall). "
+        "Returns memory ids, titles, and citation URLs for deep-research hosts. "
+        "Does not write, reinforce, or mutate ledger truth."
+    ),
+    "annotations": {
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Natural-language search query",
+            },
+            "max_memories": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 16,
+                "default": 12,
+            },
+        },
+        "required": ["query"],
+    },
+}
+
+FETCH_TOOL: dict[str, Any] = {
+    "name": "fetch",
+    "description": (
+        "Read-only fetch of one Continuity Ledger memory by id (from search). "
+        "Returns full text, citation URL, and metadata. Does not mutate ledger truth."
+    ),
+    "annotations": {
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "id": {
+                "type": "string",
+                "description": "Memory id from a prior search result",
+            },
+        },
+        "required": ["id"],
+    },
+}
+
+EMR_SEARCH_TOOL: dict[str, Any] = {
+    **SEARCH_TOOL,
+    "name": "emr_search",
+    "description": (
+        "Alias of ``search`` — read-only EMR company-knowledge search. "
+        "Returns memory ids, titles, and citation URLs."
+    ),
+}
+
+EMR_FETCH_TOOL: dict[str, Any] = {
+    **FETCH_TOOL,
+    "name": "emr_fetch",
+    "description": (
+        "Alias of ``fetch`` — read-only EMR memory fetch by id with full text and metadata."
+    ),
+}
+
 EMR_UPSERT_TOOL: dict[str, Any] = {
     "name": "emr_upsert",
     "description": (
@@ -192,6 +266,10 @@ EMR_UPSERT_TOOL: dict[str, Any] = {
 
 MCP_TOOLS: list[dict[str, Any]] = [
     EMR_RECALL_TOOL,
+    SEARCH_TOOL,
+    FETCH_TOOL,
+    EMR_SEARCH_TOOL,
+    EMR_FETCH_TOOL,
     EMR_REMEMBER_TOOL,
     EMR_UPSERT_TOOL,
 ]
@@ -239,7 +317,9 @@ def _initialize_result(params: dict[str, Any] | None) -> dict[str, Any]:
         "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
         "instructions": (
             "EMR constitutional memory tools. "
-            "Use emr_recall for governed Continuity Ledger recall (may abstain). "
+            "Use search/fetch (or emr_search/emr_fetch) for OpenAI deep-research style "
+            "company knowledge — read-only, citation URLs on every result. "
+            "Use emr_recall for governed Continuity Ledger recall bundles (may abstain). "
             "Use emr_remember / emr_upsert only when the user explicitly asked to store "
             "or update memory (user_requested=true); writes are draft-only and may be "
             "disabled by JARVIS_MCP_WRITE_ENABLED. Never invent memories."

@@ -35,7 +35,15 @@ def store(tmp_path, monkeypatch):
 def test_tool_catalog_includes_three_tools():
     cat = tool_catalog()
     names = [t["function"]["name"] for t in cat["tools"]]
-    assert names == ["emr_recall", "emr_remember", "emr_upsert"]
+    assert names == [
+        "emr_recall",
+        "search",
+        "fetch",
+        "emr_search",
+        "emr_fetch",
+        "emr_remember",
+        "emr_upsert",
+    ]
     assert cat["write_policy"]["emr_recall"] == "read"
     assert "write-draft" in cat["write_policy"]["emr_remember"]
 

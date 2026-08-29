@@ -8,6 +8,7 @@ Expose the Jarvis **EMR Protocol** to assistant hosts
 | Capability | Tag | When it works | Evidence |
 |------------|-----|---------------|----------|
 | `POST /api/jarvis/tools/emr_recall` on loopback | **live** | Memoryboard running on `127.0.0.1:8001` | `tests/test_emr_tool.py`, `tests/test_emr_mcp.py` |
+| `search` / `fetch` (OpenAI company knowledge) | **live** | Same auth as recall (`EMR_RECALL_API_KEY` when set) | `tests/test_emr_research.py` |
 | `emr_remember` / `emr_upsert` tool endpoints | **partial** | `JARVIS_MCP_WRITE_ENABLED=true` + `user_requested=true` | `tests/test_emr_write.py`, `tests/test_emr_mcp*.py` |
 | MCP stdio adapter (`python -m mcp_server`) | **live** | Same host as memoryboard; stdio process can reach `:8001` | `tests/test_emr_mcp.py` |
 | Cursor / OpenCode local MCP wiring | **live** (operator) | Host config points `cwd` at `jarvis-memoryboard` + memoryboard up | `config/mcp-cursor.example.json` |
@@ -83,6 +84,7 @@ Environment:
 |----------|---------|---------|
 | `JARVIS_MEMORYBOARD_URL` | `http://127.0.0.1:8001` | Memoryboard base URL |
 | `EMR_RECALL_API_KEY` | — | Operator key when memoryboard requires auth (Render, protected local) |
+| `JARVIS_LEDGER_CITATION_BASE` | — | Optional HTTPS base for `search`/`fetch` citation URLs (default `ledger://{id}`) |
 | `JARVIS_MCP_WRITE_ENABLED` | `false` | Enable `emr_remember` / `emr_upsert` |
 | `JARVIS_MCP_FIXED_SOURCE_AGENT` | — | Optional fixed `source_agent` for all MCP writes |
 | `JARVIS_MEMORY_WRITE_ENABLED` | `true` (local) / `false` (Render) | REST ledger CRUD (separate from MCP tools) |
@@ -92,6 +94,10 @@ Environment:
 | MCP tool | HTTP equivalent | Policy |
 |----------|-----------------|--------|
 | `emr_recall` | `POST /api/jarvis/tools/emr_recall` | **READ** — governed bundle |
+| `search` | `POST /api/jarvis/tools/search` | **READ** — OpenAI company-knowledge search |
+| `fetch` | `POST /api/jarvis/tools/fetch` | **READ** — full memory by id |
+| `emr_search` | `POST /api/jarvis/tools/emr_search` | **READ** — alias of `search` |
+| `emr_fetch` | `POST /api/jarvis/tools/emr_fetch` | **READ** — alias of `fetch` |
 | `emr_remember` | `POST /api/jarvis/tools/emr_remember` | **WRITE draft** — create (gated) |
 | `emr_upsert` | `POST /api/jarvis/tools/emr_upsert` | **WRITE draft** — supersede lineage (gated) |
 
@@ -107,6 +113,50 @@ uvicorn app.main:app --host 127.0.0.1 --port 8001
 
 Write calls require `user_requested: true`. Hosts should set MCP `require_approval`
 (or equivalent) so the model cannot silently commit.
+
+---
+
+## OpenAI deep research / company knowledge (`search` + `fetch`)
+
+OpenAI deep-research and company-knowledge hosts expect MCP tools named **`search`**
+and **`fetch`** with citation-friendly URLs. This service implements them as a
+**read-only compatibility layer** on top of existing EMR recall and LTM resolve —
+not a rewrite of EMR.
+
+| Tool | Input | Output (structuredContent) | Backend |
+|------|-------|---------------------------|---------|
+| `search` | `{ "query": "..." }` | `{ "results": [{ "id", "title", "url" }] }` | `emr_recall` with `intent=research` |
+| `fetch` | `{ "id": "mem-..." }` | `{ "id", "title", "text", "url", "metadata" }` | `store.get_memory` + metadata |
+
+Aliases: **`emr_search`** / **`emr_fetch`** (same behavior).
+
+- **Read-only** — no writes, reinforcement, or truth mutation.
+- **Auth** — same as `emr_recall` (`EMR_RECALL_API_KEY` when configured).
+- **Citations** — every result includes a non-empty `url`:
+  - default: `ledger://{memory_id}`
+  - override: set `JARVIS_LEDGER_CITATION_BASE=https://your-host/api/jarvis/memory`
+    → `https://your-host/api/jarvis/memory/{memory_id}`
+
+MCP annotations: `readOnlyHint: true`, no approval required for search/fetch.
+
+Example REST search:
+
+```bash
+curl -sX POST http://127.0.0.1:8001/api/jarvis/tools/search \
+  -H "Content-Type: application/json" \
+  -d '{"query": "image generation preferences Halstead signature"}'
+```
+
+Example REST fetch:
+
+```bash
+curl -sX POST http://127.0.0.1:8001/api/jarvis/tools/fetch \
+  -H "Content-Type: application/json" \
+  -d '{"id": "mem-abc123"}'
+```
+
+ChatGPT remote MCP scan should list **`search`** and **`fetch`** alongside
+`emr_recall` (and write tools when enabled).
 
 ---
 

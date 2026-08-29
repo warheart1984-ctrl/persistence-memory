@@ -17,6 +17,12 @@ from app.emr import (
     RetrievalWeights,
     excite,
 )
+from app.emr_research import (
+    EMR_FETCH_ALIAS_SCHEMA,
+    EMR_FETCH_TOOL_SCHEMA,
+    EMR_SEARCH_ALIAS_SCHEMA,
+    EMR_SEARCH_TOOL_SCHEMA,
+)
 from app.emr_write import EMR_REMEMBER_TOOL_SCHEMA, EMR_UPSERT_TOOL_SCHEMA
 from app.models import MemoryRecord, MemoryStatus, MemoryType
 from app.store import JarvisStore
@@ -375,11 +381,19 @@ def tool_catalog() -> dict[str, Any]:
         "schema": "emr-tool-catalog-v1",
         "tools": [
             EMR_RECALL_TOOL_SCHEMA,
+            EMR_SEARCH_TOOL_SCHEMA,
+            EMR_FETCH_TOOL_SCHEMA,
+            EMR_SEARCH_ALIAS_SCHEMA,
+            EMR_FETCH_ALIAS_SCHEMA,
             EMR_REMEMBER_TOOL_SCHEMA,
             EMR_UPSERT_TOOL_SCHEMA,
         ],
         "write_policy": {
             "emr_recall": "read",
+            "search": "read (OpenAI company knowledge)",
+            "fetch": "read (OpenAI company knowledge)",
+            "emr_search": "read (alias of search)",
+            "emr_fetch": "read (alias of fetch)",
             "emr_remember": "write-draft (JARVIS_MCP_WRITE_ENABLED + user_requested)",
             "emr_upsert": "write-supersede-draft (JARVIS_MCP_WRITE_ENABLED + user_requested)",
         },
