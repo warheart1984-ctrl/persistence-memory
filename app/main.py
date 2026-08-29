@@ -214,6 +214,14 @@ def health():
             ],
             "mcp_write_enabled": mcp_write_enabled(),
         },
+        "emr_tools_http": {
+            "catalog": "GET /api/jarvis/tools",
+            "emr_recall": "POST /api/jarvis/tools/emr_recall",
+            "search": "POST /api/jarvis/tools/search",
+            "fetch": "POST /api/jarvis/tools/fetch",
+            "emr_remember": "POST /api/jarvis/tools/emr_remember",
+            "emr_upsert": "POST /api/jarvis/tools/emr_upsert",
+        },
         "store_path": os.getenv("JARVIS_STORE_PATH", "data/jarvis-store.json"),
     }
 
