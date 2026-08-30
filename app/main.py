@@ -52,6 +52,7 @@ from app.emr_research import (
     emr_fetch,
     emr_search,
 )
+from app.emr_pipeline import ConsolidationRequest, pipeline as memory_pipeline
 from app.models import (
     BoardUpdate,
     MemoryBoard,
@@ -568,6 +569,22 @@ def stm_expand(body: ExpandRequest):
 def stm_clear(session_key: str | None = Query(default=None)):
     clear_stm(session_key)
     return {"status": "cleared", "session_key": session_key}
+
+
+@app.post("/api/jarvis/memory/pipeline", dependencies=[Depends(require_memory_write)])
+def memory_pipeline_endpoint(body: ConsolidationRequest):
+    """EMR -> STM -> LTM governed pipeline: excite workers -> draft-consolidate to ledger.
+
+    Reads LTM, builds the STM working set, then materialises ONE governed DRAFT
+    summary record via the emr_write gateway (conflict-checked, draft-only,
+    provenance-preserving). The pipeline never auto-verifies.
+    """
+    store = get_store()
+    try:
+        trace = memory_pipeline(store, body)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return trace.model_dump()
 
 
 @app.get("/api/jarvis/memory/{memory_id}/resolve")

@@ -108,6 +108,39 @@ Continuity Ledger → EMR (read) → STM → Agent (ChatGPT)
 
 The agent never touches the ledger directly; all reads/writes flow through EMR.
 
+### EMR → STM → LTM pipeline (`POST /api/jarvis/memory/pipeline`)
+
+A single governed entry point that runs the full memory hierarchy end-to-end:
+
+```
+LTM (Continuity Ledger) --excite--> STM (active working set)
+STM  ------consolidate----->  LTM (governed DRAFT write back)
+```
+
+1. **EMR → STM**: `excite()` scores LTM candidates, promotes the active working
+   set into the session's STM view (budgeted, decay-aware, abstention-safe).
+2. **STM → LTM**: newly-promoted entries are consolidated back to the ledger as
+   ONE governed **draft** summary record via the `emr_write` gateway — never
+   verified, never bypassing the conflict membrane / transcript gate, and with
+   full `stm-provenance` evidence back to the source `memory_id`s.
+
+The pipeline **never auto-verifies** (`manifest.verified == 0`); verification
+stays operator/off-band. If a caller-supplied subject already has active claims,
+the consolidated draft falls back to an un-subjected summary to preserve the
+conflict membrane. Returns a replayable `PipelineTrace` (STM view + promoted ids
++ consolidation outcome + manifest).
+
+Example:
+
+```bash
+curl -s -X POST http://127.0.0.1:8001/api/jarvis/memory/pipeline \
+  -H "Content-Type: application/json" \
+  -d '{"query":"axiom gpu delegation","session_id":"chat-c","source_agent":"chatgpt","user_requested":true}'
+```
+
+Requires `JARVIS_MCP_WRITE_ENABLED=true` and, at the endpoint, the memory-write
+gate. See `app/emr_pipeline.py` and `tests/test_emr_pipeline.py`.
+
 See:
 
 - `docs/CONSTITUTIONAL_MEMORY_CONTRACT.md`
@@ -138,3 +171,4 @@ See:
 - `GET /api/jarvis/memory/conflicts?subject=`
 - `GET/POST/PATCH/DELETE /api/jarvis/memory[/{id}]`
 - Board: `GET/POST/PATCH /api/jarvis/memory/board`
+- `POST /api/jarvis/memory/pipeline` — EMR → STM → LTM governed consolidation (draft-only)
