@@ -15,6 +15,10 @@ from fastapi import Header, HTTPException, Request
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse, Response
 
+from app.public_security import is_public_deployment
+from app.identity import current_principal, reset_principal, set_principal
+from app.oauth import READ_SCOPE, WRITE_SCOPE, auth_mode, public_base_url, validate_access_token
+
 
 def emr_recall_api_key() -> str | None:
     key = (os.getenv("EMR_RECALL_API_KEY") or "").strip()
@@ -23,7 +27,8 @@ def emr_recall_api_key() -> str | None:
 
 def memory_write_enabled() -> bool:
     """Gate for REST ledger CRUD / EMR reinforce / board mutations."""
-    return os.getenv("JARVIS_MEMORY_WRITE_ENABLED", "true").lower() in (
+    default = "false" if is_public_deployment() else "true"
+    return os.getenv("JARVIS_MEMORY_WRITE_ENABLED", default).lower() in (
         "1",
         "true",
         "yes",
@@ -44,6 +49,10 @@ def mcp_write_enabled() -> bool:
 
 
 def require_mcp_write() -> None:
+    if oauth_enabled():
+        principal = current_principal()
+        if principal is None or WRITE_SCOPE not in principal.scopes:
+            raise HTTPException(status_code=403, detail="OAuth access token lacks required scope: memory.write")
     if not mcp_write_enabled():
         raise HTTPException(
             status_code=403,
@@ -102,7 +111,12 @@ def require_emr_recall_api_key(
     x_emr_recall_key: str | None = Header(default=None, alias="X-EMR-Recall-Key"),
 ) -> None:
     """When EMR_RECALL_API_KEY is set, require Bearer or X-EMR-Recall-Key header."""
+    if oauth_enabled():
+        # Identity middleware authenticated the OAuth token before this dependency.
+        return
     expected = emr_recall_api_key()
+    if is_public_deployment() and not expected:
+        raise HTTPException(status_code=503, detail="Public deployment requires EMR_RECALL_API_KEY")
     if not expected:
         return
     verify_operator_api_key(authorization, x_emr_recall_key)
@@ -118,6 +132,10 @@ def require_ledger_read_api_key(
 
 
 def require_memory_write() -> None:
+    if oauth_enabled():
+        principal = current_principal()
+        if principal is None or WRITE_SCOPE not in principal.scopes:
+            raise HTTPException(status_code=403, detail="OAuth access token lacks required scope: memory.write")
     if not memory_write_enabled():
         raise HTTPException(
             status_code=403,
@@ -130,6 +148,8 @@ LEDGER_READ_PREFIX = "/api/jarvis/memory"
 
 async def ledger_read_protection_middleware(request: Request, call_next):
     """Gate GET ledger endpoints when JARVIS_PROTECT_LEDGER_READ is enabled."""
+    if oauth_enabled():
+        return await call_next(request)
     if request.method != "GET" or not request.url.path.startswith(LEDGER_READ_PREFIX):
         return await call_next(request)
     if not ledger_read_protected():
@@ -149,6 +169,12 @@ def optional_verify_operator_api_key(
     x_emr_recall_key: str | None,
 ) -> None:
     """When EMR_RECALL_API_KEY is unset, allow (local dev). When set, require match."""
+    if oauth_enabled():
+        # The identity middleware already validates OAuth and binds a tenant.
+        # Never reinterpret a valid user token as the legacy operator secret.
+        return
+    if is_public_deployment() and not emr_recall_api_key():
+        raise HTTPException(status_code=503, detail="Public deployment requires EMR_RECALL_API_KEY")
     if not emr_recall_api_key():
         return
     verify_operator_api_key(authorization, x_emr_recall_key)
@@ -201,6 +227,10 @@ class ApiKeyMiddleware(BaseHTTPMiddleware):
     """Gate ledger routes: JARVIS_API_KEY required unless JARVIS_ALLOW_UNAUTHENTICATED."""
 
     async def dispatch(self, request: Request, call_next) -> Response:
+        # OAuth mode owns identity for every public API/MCP request.  Do not
+        # require the legacy operator key in addition to a valid user token.
+        if oauth_enabled():
+            return await call_next(request)
         # CORS preflights carry no credentials; let CORSMiddleware answer them.
         if request.method == "OPTIONS" or path_is_ledger_key_exempt(request.url.path):
             return await call_next(request)
@@ -230,3 +260,36 @@ class ApiKeyMiddleware(BaseHTTPMiddleware):
 
 
 OptionalApiKeyMiddleware = ApiKeyMiddleware
+
+def oauth_enabled() -> bool:
+    return auth_mode() == "oauth"
+
+
+def oauth_challenge(scope: str = READ_SCOPE) -> str:
+    base = public_base_url()
+    metadata = f'{base}/.well-known/oauth-protected-resource' if base else "/.well-known/oauth-protected-resource"
+    return f'Bearer resource_metadata="{metadata}", scope="{scope}"'
+
+
+async def identity_middleware(request: Request, call_next):
+    """Authenticate public API/MCP calls and bind their OAuth subject to storage."""
+    protected = request.url.path == "/mcp" or request.url.path.startswith("/api/jarvis/")
+    if not protected or not oauth_enabled():
+        return await call_next(request)
+    authorization = request.headers.get("authorization") or ""
+    if not authorization.lower().startswith("bearer "):
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "OAuth Bearer access token required"},
+            headers={"WWW-Authenticate": oauth_challenge()},
+        )
+    try:
+        principal = validate_access_token(authorization[7:].strip())
+    except HTTPException as exc:
+        headers = {"WWW-Authenticate": oauth_challenge()} if exc.status_code == 401 else {}
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers=headers)
+    token = set_principal(principal)
+    try:
+        return await call_next(request)
+    finally:
+        reset_principal(token)

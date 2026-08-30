@@ -6,6 +6,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+try:  # Optional locally; required by the production Docker dependency set.
+    import psycopg
+except ModuleNotFoundError:  # pragma: no cover - exercised only without extras installed
+    psycopg = None  # type: ignore[assignment]
+
 from app.continuity import (
     content_sha256,
     detect_conflicts,
@@ -21,6 +26,7 @@ from app.models import (
     SelectionProvenance,
     migrate_legacy_record,
 )
+from app.identity import current_tenant_key
 
 
 def _now_iso() -> str:
@@ -53,6 +59,9 @@ class JarvisStore:
             raw = json.loads(self._path.read_text("utf-8"))
         except (json.JSONDecodeError, OSError):
             return
+        self._hydrate(raw)
+
+    def _hydrate(self, raw: dict[str, Any]) -> None:
         board_raw = raw.get("board")
         if isinstance(board_raw, dict):
             try:
@@ -89,6 +98,7 @@ class JarvisStore:
             json.dumps(data, indent=2, default=str),
             "utf-8",
         )
+
 
     # --- Board ---
 
@@ -281,17 +291,94 @@ class JarvisStore:
         return detect_conflicts(list(self._memories.values()), subject=subject)
 
 
-_store: JarvisStore | None = None
+class PostgresJarvisStore(JarvisStore):
+    """Durable per-tenant ledger backed by managed PostgreSQL.
+
+    The validated Continuity Ledger document is stored as JSONB so the existing
+    replay/governance rules remain identical during the storage migration.  The
+    tenant key is derived exclusively from OAuth identity in ``get_store``.
+    """
+
+    def __init__(self, dsn: str, tenant_key: str):
+        super().__init__(path="")
+        self._dsn = dsn
+        self._tenant_key = tenant_key
+
+    @staticmethod
+    def _ensure_schema(conn) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS jarvis_tenant_ledgers (
+                tenant_key TEXT PRIMARY KEY,
+                payload JSONB NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+
+    def _load(self):
+        self._loaded = True
+        if psycopg is None:
+            raise RuntimeError("PostgreSQL support requires the psycopg package")
+        try:
+            with psycopg.connect(self._dsn, connect_timeout=5) as conn:
+                self._ensure_schema(conn)
+                row = conn.execute(
+                    "SELECT payload FROM jarvis_tenant_ledgers WHERE tenant_key = %s",
+                    (self._tenant_key,),
+                ).fetchone()
+        except psycopg.Error as exc:
+            raise RuntimeError("Jarvis PostgreSQL ledger is unavailable") from exc
+        if row and isinstance(row[0], dict):
+            self._hydrate(row[0])
+
+    def _save(self):
+        data = {
+            "board": self._board.model_dump(),
+            "schema": "continuity-ledger-v1",
+            "memories": [m.model_dump() for m in self._memories.values()],
+        }
+        if psycopg is None:
+            raise RuntimeError("PostgreSQL support requires the psycopg package")
+        try:
+            with psycopg.connect(self._dsn, connect_timeout=5) as conn:
+                self._ensure_schema(conn)
+                conn.execute(
+                    """
+                    INSERT INTO jarvis_tenant_ledgers (tenant_key, payload)
+                    VALUES (%s, %s::jsonb)
+                    ON CONFLICT (tenant_key) DO UPDATE SET
+                        payload = EXCLUDED.payload,
+                        updated_at = NOW()
+                    """,
+                    (self._tenant_key, json.dumps(data, default=str)),
+                )
+        except psycopg.Error as exc:
+            raise RuntimeError("Jarvis PostgreSQL ledger write failed") from exc
+
+
+_stores: dict[str, JarvisStore] = {}
 
 
 def get_store(path: str | None = None) -> JarvisStore:
-    global _store
-    if _store is None:
-        _store = JarvisStore(path or os.getenv("JARVIS_STORE_PATH", "data/jarvis-store.json"))
-    return _store
+    """Return the request tenant's isolated ledger when OAuth public mode is active."""
+    requested = path or os.getenv("JARVIS_STORE_PATH", "data/jarvis-store.json")
+    tenant = current_tenant_key()
+    database_url = (os.getenv("JARVIS_DATABASE_URL") or "").strip()
+    if database_url:
+        database_tenant = tenant or "operator"
+        cache_key = f"postgres:{database_tenant}"
+        if cache_key not in _stores:
+            _stores[cache_key] = PostgresJarvisStore(database_url, database_tenant)
+        return _stores[cache_key]
+    if tenant:
+        root = Path(os.getenv("JARVIS_TENANT_STORE_DIR", f"{Path(requested).parent}/tenants"))
+        requested = str(root / f"{tenant}.json")
+    if requested not in _stores:
+        _stores[requested] = JarvisStore(requested)
+    return _stores[requested]
 
 
 def reset_store_for_tests() -> None:
     """Test helper — clear singleton."""
-    global _store
-    _store = None
+    _stores.clear()

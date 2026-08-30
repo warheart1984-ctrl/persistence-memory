@@ -31,8 +31,31 @@ services:
         value: "false"
       - key: JARVIS_PROTECT_LEDGER_READ
         value: "true"
+      - key: JARVIS_PUBLIC_MODE
+        value: "true"
+      # Public directory mode: OAuth identity selects an isolated ledger per subject.
+      # Configure issuer, audience, JWKS URL, and support email in Render before enabling.
+      - key: JARVIS_AUTH_MODE
+        value: operator
+      - key: JARVIS_PUBLIC_BASE_URL
+        value: https://jarvis-memoryboard-teu9.onrender.com
+      - key: JARVIS_TENANT_STORE_DIR
+        value: /var/data/tenants
+      # Render PostgreSQL internal connection string; do not commit its value.
+      - key: JARVIS_DATABASE_URL
+        sync: false
+      - key: JARVIS_OIDC_ISSUER
+        sync: false
+      - key: JARVIS_OIDC_AUDIENCE
+        sync: false
+      - key: JARVIS_OIDC_JWKS_URL
+        sync: false
+      - key: JARVIS_SUPPORT_EMAIL
+        sync: false
+      - key: JARVIS_TRUSTED_HOSTS
+        value: jarvis-memoryboard-teu9.onrender.com
       - key: JARVIS_CORS_ORIGINS
-        value: "*"
+        value: "https://chatgpt.com,https://chat.openai.com"
       # Set in Render dashboard (sync: false) — required for public recall
       - key: EMR_RECALL_API_KEY
         sync: false

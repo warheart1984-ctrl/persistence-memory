@@ -69,7 +69,11 @@ from app.auth import (
     memory_write_enabled,
     require_emr_recall_api_key,
     require_memory_write,
+    identity_middleware,
+    oauth_enabled,
 )
+from app.oauth import protected_resource_metadata
+from app.public_security import cors_origins, public_security_middleware
 from app.store import get_store
 from mcp_server.mcp_http import create_mcp_router
 
@@ -83,10 +87,9 @@ app = FastAPI(
     version="0.2.0",
 )
 
-cors_origins = (os.getenv("JARVIS_CORS_ORIGINS") or "*").split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[o.strip() for o in cors_origins],
+    allow_origins=cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -99,6 +102,16 @@ app.add_middleware(ApiKeyMiddleware)
 @app.middleware("http")
 async def _ledger_read_auth(request: Request, call_next):
     return await ledger_read_protection_middleware(request, call_next)
+
+
+@app.middleware("http")
+async def _public_security(request: Request, call_next):
+    return await public_security_middleware(request, call_next)
+
+
+@app.middleware("http")
+async def _identity(request: Request, call_next):
+    return await identity_middleware(request, call_next)
 
 
 @app.get("/")
@@ -203,6 +216,7 @@ def health():
         "mcp_write_enabled": mcp_write_enabled(),
         "deployment": deployment_label(),
         "auth": {
+            "mode": "oauth" if oauth_enabled() else "operator",
             "emr_recall_key_required": emr_recall_api_key() is not None,
             "ledger_read_protected": ledger_read_protected(),
         },
@@ -228,6 +242,32 @@ def health():
             "emr_upsert": "POST /api/jarvis/tools/emr_upsert",
         },
         "store_path": os.getenv("JARVIS_STORE_PATH", "data/jarvis-store.json"),
+    }
+
+
+@app.get("/.well-known/oauth-protected-resource")
+@app.get("/.well-known/oauth-protected-resource/mcp")
+def oauth_protected_resource():
+    """RFC 9728 metadata used by ChatGPT/Codex to discover OAuth."""
+    return {key: value for key, value in protected_resource_metadata().items() if value is not None}
+
+
+@app.get("/privacy", include_in_schema=False)
+def privacy_policy():
+    return {
+        "service": "Jarvis Memoryboard",
+        "summary": "OAuth subject identifiers select isolated ledgers. The service stores only governed memory records submitted through its tools.",
+        "retention": "Records remain until the account owner requests deletion or the service retention policy changes.",
+        "contact": os.getenv("JARVIS_SUPPORT_EMAIL", "support-not-configured"),
+    }
+
+
+@app.get("/terms", include_in_schema=False)
+def terms_of_service():
+    return {
+        "service": "Jarvis Memoryboard",
+        "summary": "Read tools return only the authenticated subject's ledger. Write tools require explicit approval and the memory.write scope.",
+        "contact": os.getenv("JARVIS_SUPPORT_EMAIL", "support-not-configured"),
     }
 
 
