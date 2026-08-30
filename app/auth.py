@@ -207,7 +207,18 @@ def extract_presented_key(request: Request) -> str | None:
 
 
 PUBLIC_PATHS = frozenset(
-    {"/", "/health", "/docs", "/openapi.json", "/redoc", "/api/jarvis/tools"}
+    {
+        "/",
+        "/health",
+        "/docs",
+        "/openapi.json",
+        "/redoc",
+        "/api/jarvis/tools",
+        "/.well-known/oauth-protected-resource",
+        "/.well-known/oauth-protected-resource/mcp",
+        "/privacy",
+        "/terms",
+    }
 )
 # Routes that carry their own gate (EMR_RECALL_API_KEY for tools/MCP,
 # JARVIS_RAG_API_KEY_FILE for RAG) and are consumed by external MCP hosts;

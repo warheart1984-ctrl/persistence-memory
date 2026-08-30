@@ -32,6 +32,13 @@ def test_oauth_metadata_advertises_canonical_resource(monkeypatch):
     assert response.json()["scopes_supported"] == ["memory.read", "memory.write"]
 
 
+def test_oauth_metadata_is_public_when_legacy_ledger_key_is_enabled(monkeypatch):
+    monkeypatch.setenv("JARVIS_API_KEY", "legacy-operator-key")
+    with TestClient(app) as client:
+        response = client.get("/.well-known/oauth-protected-resource/mcp")
+    assert response.status_code == 200
+
+
 def test_oauth_middleware_challenges_missing_token(monkeypatch):
     monkeypatch.setenv("JARVIS_AUTH_MODE", "oauth")
     monkeypatch.setenv("JARVIS_PUBLIC_BASE_URL", "https://memory.example")
