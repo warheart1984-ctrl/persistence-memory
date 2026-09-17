@@ -9,7 +9,7 @@ dependencies = [
   "python-dotenv==1.2.2",
   "pydantic==2.11.7",
   "networkx>=3.0",
-  "PyJWT[crypto]==2.10.1",
+  "PyJWT[crypto]==2.13.0",
   "psycopg[binary]==3.2.9",
 ]
 
