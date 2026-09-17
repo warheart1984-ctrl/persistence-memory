@@ -7,12 +7,15 @@ from app.models import MemoryRecord
 from app.store import get_store
 
 MAX_DEPTH, MAX_NODES, MAX_K = 20, 1000, 1000
-MAX_MEMORIES, MAX_EDGES = 8000, 2_000_000
+MAX_MEMORIES_FOR_FULL_GRAPH, MAX_EDGES = 8000, 500_000
 
 def _build_graph(memories: list[MemoryRecord], *, min_confidence: float = 0.0,
                  max_age_days: float | None = None) -> nx.DiGraph:
-    if len(memories) > MAX_MEMORIES:
-        raise ValueError(f"graph memory cap exceeded: {len(memories)} > {MAX_MEMORIES}")
+    if len(memories) > MAX_MEMORIES_FOR_FULL_GRAPH:
+        raise ValueError(
+            "full graph memory cap exceeded: "
+            f"{len(memories)} > {MAX_MEMORIES_FOR_FULL_GRAPH}"
+        )
     g = nx.DiGraph(); cutoff = None
     if max_age_days is not None:
         cutoff = datetime.now(timezone.utc).timestamp() - max_age_days * 86400
