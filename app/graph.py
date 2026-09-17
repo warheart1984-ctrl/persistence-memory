@@ -7,9 +7,12 @@ from app.models import MemoryRecord
 from app.store import get_store
 
 MAX_DEPTH, MAX_NODES, MAX_K = 20, 1000, 1000
+MAX_MEMORIES, MAX_EDGES = 8000, 2_000_000
 
 def _build_graph(memories: list[MemoryRecord], *, min_confidence: float = 0.0,
                  max_age_days: float | None = None) -> nx.DiGraph:
+    if len(memories) > MAX_MEMORIES:
+        raise ValueError(f"graph memory cap exceeded: {len(memories)} > {MAX_MEMORIES}")
     g = nx.DiGraph(); cutoff = None
     if max_age_days is not None:
         cutoff = datetime.now(timezone.utc).timestamp() - max_age_days * 86400
@@ -32,9 +35,12 @@ def _build_graph(memories: list[MemoryRecord], *, min_confidence: float = 0.0,
             for i, left in enumerate(group):
                 for right in group[i + 1:]:
                     data = {"relation": relation, "subject" if relation == "shares_subject" else "tag": key}
+                    if g.number_of_edges() + 2 > MAX_EDGES:
+                        return g
                     g.add_edge(left, right, **data); g.add_edge(right, left, **data)
     for m in active:
-        if m.supersedes in ids: g.add_edge(m.id, m.supersedes, relation="supersedes")
+        if m.supersedes in ids and g.number_of_edges() < MAX_EDGES:
+            g.add_edge(m.id, m.supersedes, relation="supersedes")
     return g
 
 def _load_graph(**filters: Any) -> nx.DiGraph:
