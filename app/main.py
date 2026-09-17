@@ -78,6 +78,7 @@ from app.auth import (
 from app.oauth import protected_resource_metadata
 from app.public_security import cors_origins, public_security_middleware
 from app.store import get_store
+from app.graph import bfs_search, shortest_path, find_related, connected_components, memory_graph_stats
 from mcp_server.mcp_http import create_mcp_router
 
 app = FastAPI(
@@ -941,3 +942,30 @@ def _invoke_emr_tool(name: str, arguments: dict) -> dict:
 
 
 app.include_router(create_mcp_router(_invoke_emr_tool), prefix="/mcp", tags=["mcp"])
+
+# Relationship graph endpoints (full graph <=8k, sparse index above).
+@app.post("/api/jarvis/memory/graph/bfs")
+def graph_bfs(body: dict):
+    relations = set(body["relations"]) if body.get("relations") else None
+    results = bfs_search(body.get("start_id"), body.get("depth", 2), body.get("max_nodes", 50), relations, body.get("min_confidence", 0.0), body.get("max_age_days"))
+    return {"start_id": body.get("start_id"), "depth": body.get("depth", 2), "results": results, "count": len(results)}
+
+@app.post("/api/jarvis/memory/graph/shortest-path")
+def graph_shortest_path(body: dict):
+    path = shortest_path(body.get("source"), body.get("target"), body.get("max_nodes", 1000), body.get("min_confidence", 0.0), body.get("max_age_days"))
+    if path is None: raise HTTPException(status_code=404, detail="No path found between the given memories")
+    return {"source": body.get("source"), "target": body.get("target"), "path": path}
+
+@app.post("/api/jarvis/memory/graph/related")
+def graph_related(body: dict):
+    results = find_related(body.get("memory_id"), body.get("k", 10), body.get("min_distance", 1), body.get("max_distance", 3), body.get("min_confidence", 0.0), body.get("max_age_days"))
+    return {"memory_id": body.get("memory_id"), "k": body.get("k", 10), "results": results, "count": len(results)}
+
+@app.get("/api/jarvis/memory/graph/stats")
+def graph_stats(min_confidence: float = 0.0, max_age_days: float | None = None):
+    return memory_graph_stats(min_confidence=min_confidence, max_age_days=max_age_days)
+
+@app.post("/api/jarvis/memory/graph/components")
+def graph_components(body: dict):
+    minimum = body.get("min_size", 2)
+    return {"min_size": minimum, "components": connected_components(minimum, body.get("min_confidence", 0.0), body.get("max_age_days"))}
