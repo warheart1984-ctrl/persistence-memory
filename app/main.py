@@ -58,7 +58,10 @@ from app.models import (
     MemoryBoard,
     MemoryCreate,
     MemoryUpdate,
+    ExternalSearchRequest,
+    ExternalPromotionRequest,
 )
+from app.nx_search_client import NxSearchClient
 from app.auth import (
     deployment_label,
     emr_recall_api_key,
@@ -382,6 +385,73 @@ def create_memory(body: MemoryCreate, _: None = Depends(require_memory_write)):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"memory": rec.model_dump()}
+
+
+@app.post("/api/jarvis/memory/external-search", dependencies=[Depends(require_emr_recall_api_key)])
+def external_search(body: ExternalSearchRequest):
+    """Search nx-search; optional promotion remains bounded and auditable."""
+    client = NxSearchClient()
+    results = client.search(body.query, name_only=body.name_only, limit=body.limit)
+    if "error" in results:
+        raise HTTPException(status_code=502, detail=results["error"])
+
+    promoted = []
+    if body.auto_promote and results.get("content"):
+        store = get_store()
+        for item in results["content"][:5]:
+            data = client.promote_to_memory(item, body.source_agent, body.session_id)
+            try:
+                promoted.append(store.create_memory(MemoryCreate(**data)).model_dump())
+            except ValueError:
+                continue
+    return {"external_results": results, "promoted_memories": promoted, "promotion_count": len(promoted)}
+
+
+@app.get("/api/jarvis/memory/unified", dependencies=[Depends(require_emr_recall_api_key)])
+def unified_search(
+    query: str = Query(..., min_length=1, max_length=500),
+    limit: int = Query(default=25, ge=1, le=100),
+    session_id: str = Query(default="unified-search-session", min_length=1, max_length=128),
+):
+    """Return working-memory records alongside nx-search evidence."""
+    store = get_store()
+    memories, selections, conflicts = store.retrieve(query=query, limit=limit, session_id=session_id)
+    external = NxSearchClient().search(query, limit=limit)
+    if "error" in external:
+        raise HTTPException(status_code=502, detail=external["error"])
+    return {
+        "working_memory": {
+            "memories": [m.model_dump() for m in memories],
+            "selections": [s.model_dump() for s in selections],
+            "conflicts": [c.model_dump() for c in conflicts],
+        },
+        "long_term_memory": external,
+        "query": query,
+    }
+
+
+@app.post("/api/jarvis/memory/promote", dependencies=[Depends(require_memory_write)])
+def promote_external_result(body: ExternalPromotionRequest):
+    """Promote only an exact result returned by nx-search for the query."""
+    client = NxSearchClient()
+    results = client.search(body.query, limit=100)
+    if "error" in results:
+        raise HTTPException(status_code=502, detail=results["error"])
+    if not any(item.get("path") == body.path and item.get("snippet") == body.snippet
+               for item in results.get("content", [])):
+        raise HTTPException(status_code=422, detail="Promotion requires an exact nx-search result")
+
+    data = client.promote_to_memory(
+        {"path": body.path, "snippet": body.snippet},
+        body.source_agent,
+        body.session_id,
+        body.confidence,
+    )
+    try:
+        memory = get_store().create_memory(MemoryCreate(**data))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"memory": memory.model_dump(), "status": "promoted"}
 
 
 # --- EMR / STM (LTM stays the store; STM is an activated view) ---
