@@ -1,90 +1,174 @@
-# persistence-memory
+# Jarvis Continuity Ledger
 
-**Continuity Ledger** HTTP service for cross-session agent state.
+**Continuity infrastructure** for Mandala Rendering Software agents — isolated under
+`jarvis-memoryboard/`. The service is **stateless/replaceable**; continuity lives in
+governed ledger records — not in chat transcripts.
 
-- **Distribution name:** `persistence-memory` (this GitHub repo)
-- **Service identity:** `jarvis-memoryboard` / schema `continuity-ledger-v1`
-- **Default URL:** `http://127.0.0.1:8001`
-
-This is a **ledger of evidence records**, not associative/vector “memory.” See [docs/PLATFORM_LIMITS.md](docs/PLATFORM_LIMITS.md) and [docs/RELATIONSHIP_TO_MANDALA.md](docs/RELATIONSHIP_TO_MANDALA.md). Maturity: [docs/scorecards/persistence-memory.md](docs/scorecards/persistence-memory.md).
+The Continuity Ledger **preserves what was recorded** with provenance. It does **not**
+determine epistemic truth (see `docs/CONTINUITY_LEDGER_SOC.md`). The broader
+**Constitutional Continuity Service (CCS)** vision is largely **declared**
+(`docs/CCS_CHARTER.md`).
 
 ## Maturity (evidence-bound)
+
+### Continuity Ledger (this package)
 
 | Capability | Status | Evidence |
 |------------|--------|----------|
 | Continuity (A→B→C same restore) | **enforced** | `tests/test_acceptance.py::TestContinuityAcceptance` |
 | Replay (why/where/when/session) | **enforced** | `TestReplayAcceptance` + `/api/jarvis/memory/retrieve` |
-| Conflict (no silent merge) | **enforced** (cross-agent by `subject`) | `TestConflictAcceptance`; groups all agents — not per-agent isolation |
-| Drift (hash fidelity) | **partial** | hash check enforced; multi-day semantic protocol operator-owned |
-| API key | **enforced** (required by default) | `tests/test_auth.py`; opt-out `JARVIS_ALLOW_UNAUTHENTICATED=1` |
-| CCS / multi-product authority | **declared** | not implemented here |
-| Multi-writer / HA store | **gap** | single JSON file; atomic write ≠ concurrent-safe |
+| Conflict (no silent merge / no truth pick) | **enforced** | `TestConflictAcceptance` + `/api/jarvis/memory/conflicts` |
+| Drift (multi-day fidelity) | **partial** | hash check enforced; protocol in `docs/DRIFT_PROTOCOL.md` |
+| AMUL substrate (`app/amul.py`) | **partial** | append-only field, lineage, verify/drift **enforced** (`tests/test_amul.py`); scale/GC/index **declared** |
+| AMUL RAG (`app/amul_rag.py`) | **partial** | classifier/modes, lexical vector+BM25, evidence gate, replay log **enforced** (`tests/test_amul_rag.py`); neural embeddings **declared**, LLM generation **extractive-v0 / partial** (`JARVIS_RAG_LLM_URL` hook) |
 
-### Drive-G-2 dimensions (summary)
+### Four-layer SoC
 
-| Dimension | Rating |
-|-----------|--------|
-| Constitutional model | Moderate |
-| Governance methodology | Moderate |
-| Reference implementation | Moderate (local vertical slice + acceptance tests) |
-| Platform engineering | Moderate (CI + Docker + auth-by-default; JSON file store, no HA) |
-| Commercial operations | Not started |
+| Layer | Status | Notes |
+|-------|--------|-------|
+| Continuity Ledger / Memory | **enforced** (subset) | Store, retrieve, conflicts, provenance |
+| Evidence Engine | **declared** | Out of package — `docs/ADAPTER_CONSUMERS.md` |
+| Knowledge Engine | **declared** | Out of package |
+| Understanding Engine | **declared** | Out of package |
 
-Full table: `docs/scorecards/persistence-memory.md`. Limits: `docs/PLATFORM_LIMITS.md`. Deploy: `docs/OPERATOR_DEPLOY_CHECKLIST.md`. Clause V: `docs/CLAUSE_V_HYGIENE.md` (**partial**).
+### CCS roadmap (not claimed implemented)
 
-## Quick start (local)
+| Component | Status | Evidence |
+|-----------|--------|----------|
+| CCS as root continuity authority | **declared** | `docs/CCS_CHARTER.md` |
+| Constitutional Boundary Clause (I–VI) | **declared** | `docs/CONSTITUTIONAL_BOUNDARY_CLAUSE.md` |
+| Continuity Blocks (immutable) | **declared** | Charter §1.2; gap in `docs/LEDGER_TO_CCS_MAPPING.md` |
+| Signed Evidence Objects | **declared** / **skeleton** | CES stubs only |
+| CES.* registration | **declared** | `schemas/ces/*`, `schemas/registry.json` |
+| RC.* registration | **declared** | `schemas/rc/*` |
+| Unified provenance chain | **declared** | Charter §4 |
+| Multi-product single read/write path | **declared** | Charter §5 |
+| Clause V memory exclusion | **partial** / **transitional** | Hooks may still POST session facts; not API-enforced |
+| ESFR promotion of CCS | **declared** | Charter §6 checklist — all gaps |
+
+## Architecture docs
+
+- `docs/CONSTITUTIONAL_BOUNDARY_CLAUSE.md` — *Continuity unifies evidence, not domains* (declared)
+- `docs/CONTINUITY_LEDGER_SOC.md` — SoC boundaries & non-goals
+- `docs/CCS_CHARTER.md` — CCS charter (declared)
+- `docs/LEDGER_TO_CCS_MAPPING.md` — today → CCS gap map
+- `docs/ADAPTER_CONSUMERS.md` — read-only consumer contract (declared)
+- `docs/DRIFT_PROTOCOL.md` — drift operator protocol
+
+## Canonical record fields (`continuity-ledger-v1`)
+
+Every memory includes:
+
+| Field | Required | Notes |
+|-------|----------|-------|
+| `id` | yes | `mem-…` |
+| `created_at` / `updated_at` | yes | ISO-8601 UTC timestamps |
+| `source_agent` | yes | Who wrote it |
+| `session_id` | yes | Which session produced it |
+| `type` | yes | `decision \| fact \| task \| preference \| architecture \| research` |
+| `confidence` | yes | Caller-asserted `0.0–1.0` (not inferred by ledger) |
+| `evidence` | yes | list of `{kind, ref, note?}` (may be empty) |
+| `supersedes` | optional | Recorded replacement **claim** — never silent merge |
+| `status` | yes | Claimed lifecycle: `draft \| verified \| archived` |
+| `content` | yes | Decision/fact text (not a chat dump) |
+| `subject` | optional | Conflict grouping key |
+| `content_sha256` | yes | Normalized-content hash for drift checks |
+
+Legacy rows migrate on load to ledger fields and re-save with `"schema": "continuity-ledger-v1"`.
+
+## Quick start
 
 ```powershell
-python -m pip install -e ".[dev]"
-# Local open auth (loopback only) — or set JARVIS_API_KEY instead:
-$env:JARVIS_ALLOW_UNAUTHENTICATED = "1"
-python -m app
-# or
-uvicorn app.main:app --host 127.0.0.1 --port 8001
-python -m pytest -q
-.\scripts\smoke-test.ps1
+.\jarvis-memoryboard\scripts\start-memoryboard.ps1
+.\jarvis-memoryboard\scripts\install-cursor-hooks.ps1
+.\jarvis-memoryboard\scripts\install-autostart.ps1
+cd jarvis-memoryboard; python -m pytest -q
+.\jarvis-memoryboard\scripts\smoke-test.ps1
 ```
 
-Docker (set a key; do not rely on opt-out when publishing ports):
+Default URL: `http://127.0.0.1:8001`
+
+## EMR MCP Tools: Constitutional Memory for AI
+
+This package exposes a governed memory interface for MCP-compatible agents (ChatGPT, Cursor, OpenCode, etc.).
+EMR sits between the agent and the Continuity Ledger, enforcing provenance, abstention, conflict membranes, and STM/LTM separation.
+
+### Available Tools
+
+- `emr_remember` — create a governed durable memory (**draft**; requires `JARVIS_MCP_WRITE_ENABLED=true` + `user_requested=true`)
+- `emr_upsert` — update or supersede an existing memory (lineage preserved; same gates)
+- `emr_recall` — retrieve a governed recall bundle for the current intent
+
+### Architecture
+
+```
+Agent (ChatGPT) → EMR (write) → Continuity Ledger (LTM)
+Continuity Ledger → EMR (read) → STM → Agent (ChatGPT)
+```
+
+The agent never touches the ledger directly; all reads/writes flow through EMR.
+
+### EMR → STM → LTM pipeline (`POST /api/jarvis/memory/pipeline`)
+
+A single governed entry point that runs the full memory hierarchy end-to-end:
+
+```
+LTM (Continuity Ledger) --excite--> STM (active working set)
+STM  ------consolidate----->  LTM (governed DRAFT write back)
+```
+
+1. **EMR → STM**: `excite()` scores LTM candidates, promotes the active working
+   set into the session's STM view (budgeted, decay-aware, abstention-safe).
+2. **STM → LTM**: newly-promoted entries are consolidated back to the ledger as
+   ONE governed **draft** summary record via the `emr_write` gateway — never
+   verified, never bypassing the conflict membrane / transcript gate, and with
+   full `stm-provenance` evidence back to the source `memory_id`s.
+
+The pipeline **never auto-verifies** (`manifest.verified == 0`); verification
+stays operator/off-band. If a caller-supplied subject already has active claims,
+the consolidated draft falls back to an un-subjected summary to preserve the
+conflict membrane. Returns a replayable `PipelineTrace` (STM view + promoted ids
++ consolidation outcome + manifest).
+
+Example:
 
 ```bash
-export JARVIS_API_KEY="$(python -c 'import secrets; print(secrets.token_hex(32))')"
-docker compose up --build -d
+curl -s -X POST http://127.0.0.1:8001/api/jarvis/memory/pipeline \
+  -H "Content-Type: application/json" \
+  -d '{"query":"axiom gpu delegation","session_id":"chat-c","source_agent":"chatgpt","user_requested":true}'
 ```
 
-## API (high level)
+Requires `JARVIS_MCP_WRITE_ENABLED=true` and, at the endpoint, the memory-write
+gate. See `app/emr_pipeline.py` and `tests/test_emr_pipeline.py`.
 
-| Method | Path | Purpose |
-|--------|------|---------|
-| GET | `/health` | Liveness + schema (public) |
-| GET/POST/PATCH | `/api/jarvis/memory/board` | Board context (UI slots ≠ write partitions) |
-| GET/POST | `/api/jarvis/memory` | List / create ledger rows |
-| GET | `/api/jarvis/memory/retrieve` | Explicit filters + selections + conflicts |
-| GET | `/api/jarvis/memory/conflicts` | Conflict sets by **subject** (all `source_agent`s) |
-| GET/PATCH/DELETE | `/api/jarvis/memory/{id}` | Row CRUD |
+See:
 
-Create requires Continuity Ledger fields: `content`, `source_agent`, `session_id`, `type`, plus optional `confidence`, `evidence`, `status`, `subject`, `supersedes`, `tags`.
+- `docs/CONSTITUTIONAL_MEMORY_CONTRACT.md`
+- `docs/EMR_RECALL_PROTOCOL.md`
+- `docs/EMR_WHITEPAPER.md`
+- `docs/MCP_EMR_SETUP.md`
 
-Retrieval is **filter/query/id** — not embedding similarity.
+### Developer onboarding (short)
 
-Legacy on-disk rows (`category` / `truth_status` / …) migrate on load.
+1. Understand layers: EMR (governed activation) · Continuity Ledger (LTM SoT) · STM (view-only) · Agent (proposes via MCP).
+2. Run tests: `cd jarvis-memoryboard && pytest tests/test_emr*.py -q`
+3. Start service: `uvicorn app.main:app --host 127.0.0.1 --port 8001`
+4. Confirm catalog: `GET /api/jarvis/tools` lists all three tools.
+5. For writes locally: `export JARVIS_MCP_WRITE_ENABLED=true` and always pass `user_requested=true`.
+6. Keep public Render recall-only until you intentionally enable MCP writes on a private host.
 
-## Auth
+## Prove Continuity across chats
 
-| Env | Role |
-|-----|------|
-| `JARVIS_API_KEY` | Required by default for protected routes |
-| `JARVIS_ALLOW_UNAUTHENTICATED=1` | Explicit local-dev opt-out when no key |
+1. Chat A: POST `type=decision` with `session_id=chat-a` and stable `subject`.
+2. Chat B: `GET /api/jarvis/memory/retrieve?query=…&truth_scope=live` — same `id` + `content_sha256`.
+3. Chat C: `GET /api/jarvis/memory/{id}` — identical content + provenance.
+4. Or: `python -m pytest tests/test_acceptance.py::TestContinuityAcceptance -q`
 
-Details: [SECURITY.md](SECURITY.md).
+## API
 
-## Operator notes
-
-- Prefer `JARVIS_API_KEY` over opt-out whenever the port may leave the machine.
-- Tighten `JARVIS_CORS_ORIGINS` in shared networks.
-- `JARVIS_ENV=production` disables uvicorn reload.
-- Store path: `JARVIS_STORE_PATH` (atomic JSON writes; single-writer assumption).
-
-## License
-
-MIT — see [LICENSE](LICENSE).
+- `GET /health` — `schema: continuity-ledger-v1`
+- `GET /api/jarvis/memory/retrieve` — memories + `selections` + `conflicts` (surfaces disputes; does not pick truth)
+- `GET /api/jarvis/memory/conflicts?subject=`
+- `GET/POST/PATCH/DELETE /api/jarvis/memory[/{id}]`
+- Board: `GET/POST/PATCH /api/jarvis/memory/board`
+- `POST /api/jarvis/memory/pipeline` — EMR → STM → LTM governed consolidation (draft-only)

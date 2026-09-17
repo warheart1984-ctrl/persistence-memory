@@ -1,13 +1,58 @@
 from __future__ import annotations
 
+import json
 import os
+import secrets
+from pathlib import Path
 
-from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
-from app.auth import ApiKeyMiddleware
-from app.continuity import to_selection
+from app.amul import (
+    anchor_memory,
+    get_field,
+    verify_field,
+)
+import app.amul_rag as amul_rag
+from app.amul_rag import (
+    AuthorityClass,
+    DocumentStatus,
+    answer_query,
+    get_index,
+    ledger_docs,
+    maintain_replay_log,
+    normalize_document,
+)
+from app.emr import (
+    CorrectRequest,
+    ExpandRequest,
+    ExciteRequest,
+    ReinforceRequest,
+    clear_stm,
+    correct_memory_ids,
+    emr_status,
+    excite,
+    expand_stm_entry,
+    get_stm,
+    reinforce_ids,
+    resolve_record,
+    stm_context_block,
+)
+from app.emr_tool import EmrRecallRequest, emr_recall, tool_catalog
+from app.emr_write import (
+    EmrRememberRequest,
+    EmrUpsertRequest,
+    emr_remember,
+    emr_upsert,
+)
+from app.emr_research import (
+    EmrFetchRequest,
+    EmrSearchRequest,
+    emr_fetch,
+    emr_search,
+)
+from app.emr_pipeline import ConsolidationRequest, pipeline as memory_pipeline
 from app.models import (
     BoardUpdate,
     MemoryBoard,
@@ -17,37 +62,66 @@ from app.models import (
     ExternalPromotionRequest,
 )
 from app.nx_search_client import NxSearchClient
+from app.auth import (
+    deployment_label,
+    emr_recall_api_key,
+    ledger_read_protected,
+    ApiKeyMiddleware,
+    ledger_read_protection_middleware,
+    mcp_write_enabled,
+    memory_write_enabled,
+    require_emr_recall_api_key,
+    require_memory_write,
+    identity_middleware,
+    oauth_enabled,
+)
+from app.oauth import protected_resource_metadata
+from app.public_security import cors_origins, public_security_middleware
 from app.store import get_store
 from app.graph import bfs_search, shortest_path, find_related, connected_components, memory_graph_stats
-
-load_dotenv()
+from mcp_server.mcp_http import create_mcp_router
 
 app = FastAPI(
     title="Jarvis Continuity Ledger",
     description=(
-        "Evidence-backed Continuity Ledger (persistence-memory). "
-        "Stores decisions/facts with provenance — not conversation dumps. "
-        "Consumers read the same ledger and decide independently what to use."
+        "Jarvis Memoryboard — LTM access/API over Continuity Ledger SoT. "
+        "Stack: AMUL (LTM substrate) → Memoryboard → EMR → STM → LLM. "
+        "EMR decides active cognition; does not invent persistent LTM."
     ),
     version="0.2.0",
 )
 
-cors_origins = (os.getenv("JARVIS_CORS_ORIGINS") or "*").split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[o.strip() for o in cors_origins if o.strip()],
+    allow_origins=cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
 app.add_middleware(ApiKeyMiddleware)
+
+
+@app.middleware("http")
+async def _ledger_read_auth(request: Request, call_next):
+    return await ledger_read_protection_middleware(request, call_next)
+
+
+@app.middleware("http")
+async def _public_security(request: Request, call_next):
+    return await public_security_middleware(request, call_next)
+
+
+@app.middleware("http")
+async def _identity(request: Request, call_next):
+    return await identity_middleware(request, call_next)
 
 
 @app.get("/")
 def index():
     return {
         "service": "jarvis-memoryboard",
-        "distribution": "persistence-memory",
         "schema": "continuity-ledger-v1",
         "version": "0.2.0",
         "docs": "/docs",
@@ -56,6 +130,14 @@ def index():
             "replay": "enforced",
             "conflict": "enforced",
             "drift": "partial",
+            "emr_stm": "partial",
+        },
+        "architecture": {
+            "AMUL": "LTM substrate (persistence/structure/lineage) — declared/partial",
+            "Memoryboard": "LTM access/API — Continuity Ledger SoT (this service)",
+            "EMR": "governed activation — POST /api/jarvis/memory/emr/excite | GET /active",
+            "STM": "budgeted working set — GET /api/jarvis/memory/stm (+ context/expand)",
+            "LLM": "reasoning surface (consumer of STM)",
         },
         "endpoints": {
             "board": {
@@ -72,10 +154,53 @@ def index():
                 "update": "PATCH /api/jarvis/memory/{id}",
                 "delete": "DELETE /api/jarvis/memory/{id}",
             },
-            "unified_memory": {
-                "external_search": "POST /api/jarvis/memory/external-search",
-                "unified_search": "GET /api/jarvis/memory/unified",
-                "promote": "POST /api/jarvis/memory/promote",
+            "emr_stm": {
+                "active": "GET /api/jarvis/memory/active",
+                "excite": "POST /api/jarvis/memory/emr/excite",
+                "reinforce": "POST /api/jarvis/memory/emr/reinforce",
+                "correct": "POST /api/jarvis/memory/emr/correct",
+                "status": "GET /api/jarvis/memory/emr/status",
+                "stm": "GET /api/jarvis/memory/stm",
+                "stm_context": "GET /api/jarvis/memory/stm/context",
+                "expand": "POST /api/jarvis/memory/stm/expand",
+                "resolve": "GET /api/jarvis/memory/{id}/resolve",
+                "clear": "DELETE /api/jarvis/memory/stm",
+            },
+            "amul": {
+                "anchor": "POST /api/jarvis/memory/amul/anchor",
+                "artifact": "GET /api/jarvis/memory/amul/artifacts/{id}",
+                "lineage": "GET /api/jarvis/memory/amul/lineage/{memory_id}",
+                "field_status": "GET /api/jarvis/memory/amul/field/status",
+                "verify": "POST /api/jarvis/memory/amul/field/verify",
+            },
+            "rag": {
+                "documents": "POST /api/jarvis/rag/documents",
+                "query": "POST /api/jarvis/rag/query",
+                "log": "GET /api/jarvis/rag/log",
+                "status": "GET /api/jarvis/rag/status",
+                "maintenance": "POST /api/jarvis/rag/maintenance",
+            },
+            "tools": {
+                "catalog": "GET /api/jarvis/tools",
+                "emr_recall": "POST /api/jarvis/tools/emr_recall",
+                "search": "POST /api/jarvis/tools/search",
+                "fetch": "POST /api/jarvis/tools/fetch",
+                "emr_remember": "POST /api/jarvis/tools/emr_remember",
+                "emr_upsert": "POST /api/jarvis/tools/emr_upsert",
+            },
+            "mcp": {
+                "streamable_http": "POST /mcp",
+                "transport": "streamable-http",
+                "tools": [
+                    "emr_recall",
+                    "search",
+                    "fetch",
+                    "emr_search",
+                    "emr_fetch",
+                    "emr_remember",
+                    "emr_upsert",
+                ],
+                "mcp_write_enabled": mcp_write_enabled(),
             },
         },
     }
@@ -91,34 +216,66 @@ def health():
         "schema": "continuity-ledger-v1",
         "memory_count": len(store.list_memories(limit=9999)),
         "board_id": board.board_id,
-        "memory_write_enabled": True,
+        "memory_write_enabled": memory_write_enabled(),
+        "mcp_write_enabled": mcp_write_enabled(),
+        "deployment": deployment_label(),
+        "auth": {
+            "mode": "oauth" if oauth_enabled() else "operator",
+            "emr_recall_key_required": emr_recall_api_key() is not None,
+            "ledger_read_protected": ledger_read_protected(),
+        },
+        "mcp": {
+            "streamable_http": "/mcp",
+            "tools": [
+                "emr_recall",
+                "search",
+                "fetch",
+                "emr_search",
+                "emr_fetch",
+                "emr_remember",
+                "emr_upsert",
+            ],
+            "mcp_write_enabled": mcp_write_enabled(),
+        },
+        "emr_tools_http": {
+            "catalog": "GET /api/jarvis/tools",
+            "emr_recall": "POST /api/jarvis/tools/emr_recall",
+            "search": "POST /api/jarvis/tools/search",
+            "fetch": "POST /api/jarvis/tools/fetch",
+            "emr_remember": "POST /api/jarvis/tools/emr_remember",
+            "emr_upsert": "POST /api/jarvis/tools/emr_upsert",
+        },
+        "store_path": os.getenv("JARVIS_STORE_PATH", "data/jarvis-store.json"),
     }
 
 
-@app.post("/api/jarvis/memory/graph/bfs")
-def graph_bfs(body: dict[str, Any]):
-    relations = set(body["relations"]) if body.get("relations") else None
-    results = bfs_search(body.get("start_id"), body.get("depth", 2), body.get("max_nodes", 50), relations, body.get("min_confidence", 0.0), body.get("max_age_days"))
-    return {"start_id": body.get("start_id"), "depth": body.get("depth", 2), "results": results, "count": len(results)}
+@app.get("/.well-known/oauth-protected-resource")
+@app.get("/.well-known/oauth-protected-resource/mcp")
+def oauth_protected_resource():
+    """RFC 9728 metadata used by ChatGPT/Codex to discover OAuth."""
+    return {key: value for key, value in protected_resource_metadata().items() if value is not None}
 
-@app.post("/api/jarvis/memory/graph/shortest-path")
-def graph_shortest_path(body: dict[str, Any]):
-    path = shortest_path(body.get("source"), body.get("target"), body.get("max_nodes", 1000), body.get("min_confidence", 0.0), body.get("max_age_days"))
-    if path is None: raise HTTPException(status_code=404, detail="No path found between the given memories")
-    return {"source": body.get("source"), "target": body.get("target"), "path": path}
 
-@app.post("/api/jarvis/memory/graph/related")
-def graph_related(body: dict[str, Any]):
-    results = find_related(body.get("memory_id"), body.get("k", 10), body.get("min_distance", 1), body.get("max_distance", 3), body.get("min_confidence", 0.0), body.get("max_age_days"))
-    return {"memory_id": body.get("memory_id"), "k": body.get("k", 10), "results": results, "count": len(results)}
+@app.get("/privacy", include_in_schema=False)
+def privacy_policy():
+    return {
+        "service": "Jarvis Memoryboard",
+        "summary": "OAuth subject identifiers select isolated ledgers. The service stores only governed memory records submitted through its tools.",
+        "retention": "Records remain until the account owner requests deletion or the service retention policy changes.",
+        "contact": os.getenv("JARVIS_SUPPORT_EMAIL", "support-not-configured"),
+    }
 
-@app.post("/api/jarvis/memory/graph/components")
-def graph_components(body: dict[str, Any]):
-    return {"min_size": body.get("min_size", 2), "components": connected_components(body.get("min_size", 2), body.get("min_confidence", 0.0), body.get("max_age_days"))}
 
-@app.get("/api/jarvis/memory/graph/stats")
-def graph_stats(min_confidence: float = 0.0, max_age_days: float | None = None):
-    return memory_graph_stats(min_confidence=min_confidence, max_age_days=max_age_days)
+@app.get("/terms", include_in_schema=False)
+def terms_of_service():
+    return {
+        "service": "Jarvis Memoryboard",
+        "summary": "Read tools return only the authenticated subject's ledger. Write tools require explicit approval and the memory.write scope.",
+        "contact": os.getenv("JARVIS_SUPPORT_EMAIL", "support-not-configured"),
+    }
+
+
+# --- Board endpoints ---
 
 
 @app.get("/api/jarvis/memory/board")
@@ -129,18 +286,21 @@ def get_board():
 
 
 @app.post("/api/jarvis/memory/board")
-def set_board(body: MemoryBoard):
+def set_board(body: MemoryBoard, _: None = Depends(require_memory_write)):
     store = get_store()
     board = store.set_board(body)
     return {"memory_board": board.model_dump()}
 
 
 @app.patch("/api/jarvis/memory/board")
-def patch_board(body: BoardUpdate):
+def patch_board(body: BoardUpdate, _: None = Depends(require_memory_write)):
     store = get_store()
     updates = {k: v for k, v in body.model_dump().items() if v is not None}
     board = store.patch_board(updates)
     return {"memory_board": board.model_dump()}
+
+
+# --- Continuity Ledger (LTM) endpoints ---
 
 
 @app.get("/api/jarvis/memory/retrieve")
@@ -219,7 +379,7 @@ def list_memories(
 
 
 @app.post("/api/jarvis/memory")
-def create_memory(body: MemoryCreate):
+def create_memory(body: MemoryCreate, _: None = Depends(require_memory_write)):
     store = get_store()
     try:
         rec = store.create_memory(body)
@@ -228,17 +388,342 @@ def create_memory(body: MemoryCreate):
     return {"memory": rec.model_dump()}
 
 
+@app.post("/api/jarvis/memory/external-search", dependencies=[Depends(require_emr_recall_api_key)])
+def external_search(body: ExternalSearchRequest):
+    """Search nx-search; optional promotion remains bounded and auditable."""
+    client = NxSearchClient()
+    results = client.search(body.query, name_only=body.name_only, limit=body.limit)
+    if "error" in results:
+        raise HTTPException(status_code=502, detail=results["error"])
+
+    promoted = []
+    if body.auto_promote and results.get("content"):
+        store = get_store()
+        for item in results["content"][:5]:
+            data = client.promote_to_memory(item, body.source_agent, body.session_id)
+            try:
+                promoted.append(store.create_memory(MemoryCreate(**data)).model_dump())
+            except ValueError:
+                continue
+    return {"external_results": results, "promoted_memories": promoted, "promotion_count": len(promoted)}
+
+
+@app.get("/api/jarvis/memory/unified", dependencies=[Depends(require_emr_recall_api_key)])
+def unified_search(
+    query: str = Query(..., min_length=1, max_length=500),
+    limit: int = Query(default=25, ge=1, le=100),
+    session_id: str = Query(default="unified-search-session", min_length=1, max_length=128),
+):
+    """Return working-memory records alongside nx-search evidence."""
+    store = get_store()
+    memories, selections, conflicts = store.retrieve(query=query, limit=limit, session_id=session_id)
+    external = NxSearchClient().search(query, limit=limit)
+    if "error" in external:
+        raise HTTPException(status_code=502, detail=external["error"])
+    return {
+        "working_memory": {
+            "memories": [m.model_dump() for m in memories],
+            "selections": [s.model_dump() for s in selections],
+            "conflicts": [c.model_dump() for c in conflicts],
+        },
+        "long_term_memory": external,
+        "query": query,
+    }
+
+
+@app.post("/api/jarvis/memory/promote", dependencies=[Depends(require_memory_write)])
+def promote_external_result(body: ExternalPromotionRequest):
+    """Promote only an exact result returned by nx-search for the query."""
+    client = NxSearchClient()
+    results = client.search(body.query, limit=100)
+    if "error" in results:
+        raise HTTPException(status_code=502, detail=results["error"])
+    if not any(item.get("path") == body.path and item.get("snippet") == body.snippet
+               for item in results.get("content", [])):
+        raise HTTPException(status_code=422, detail="Promotion requires an exact nx-search result")
+
+    data = client.promote_to_memory(
+        {"path": body.path, "snippet": body.snippet},
+        body.source_agent,
+        body.session_id,
+        body.confidence,
+    )
+    try:
+        memory = get_store().create_memory(MemoryCreate(**data))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"memory": memory.model_dump(), "status": "promoted"}
+
+
+# --- EMR / STM (LTM stays the store; STM is an activated view) ---
+
+
+@app.post("/api/jarvis/tools/search", dependencies=[Depends(require_emr_recall_api_key)])
+def tool_search(body: EmrSearchRequest):
+    """OpenAI company-knowledge search — read-only EMR recall → citation results."""
+    store = get_store()
+    try:
+        return emr_search(store, body)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/jarvis/tools/fetch", dependencies=[Depends(require_emr_recall_api_key)])
+def tool_fetch(body: EmrFetchRequest):
+    """OpenAI company-knowledge fetch — full LTM record by id (read-only)."""
+    store = get_store()
+    try:
+        return emr_fetch(store, body)
+    except ValueError as exc:
+        if "not found" in str(exc).lower():
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/jarvis/tools/emr_search", dependencies=[Depends(require_emr_recall_api_key)])
+def tool_emr_search(body: EmrSearchRequest):
+    """Alias of ``search`` for hosts that namespace EMR tools."""
+    return tool_search(body)
+
+
+@app.post("/api/jarvis/tools/emr_fetch", dependencies=[Depends(require_emr_recall_api_key)])
+def tool_emr_fetch(body: EmrFetchRequest):
+    """Alias of ``fetch`` for hosts that namespace EMR tools."""
+    return tool_fetch(body)
+
+
+@app.post("/api/jarvis/tools/emr_recall", dependencies=[Depends(require_emr_recall_api_key)])
+def tool_emr_recall(body: EmrRecallRequest):
+    """Read-only EMR Recall Protocol — governed bundle for agent tool calling."""
+    store = get_store()
+    try:
+        result = emr_recall(store, body)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return result.model_dump()
+
+
+@app.post("/api/jarvis/tools/emr_remember", dependencies=[Depends(require_emr_recall_api_key)])
+def tool_emr_remember(body: EmrRememberRequest):
+    """Governed create via EMR — draft-only; gated by JARVIS_MCP_WRITE_ENABLED."""
+    store = get_store()
+    return emr_remember(store, body).model_dump()
+
+
+@app.post("/api/jarvis/tools/emr_upsert", dependencies=[Depends(require_emr_recall_api_key)])
+def tool_emr_upsert(body: EmrUpsertRequest):
+    """Governed supersede via EMR — new draft + archive prior; gated by JARVIS_MCP_WRITE_ENABLED."""
+    store = get_store()
+    return emr_upsert(store, body).model_dump()
+
+
+@app.get("/api/jarvis/tools")
+def list_tools():
+    """Tool catalog (OpenAI-compatible function schemas)."""
+    return tool_catalog()
+
+
+@app.get("/api/jarvis/memory/emr/status")
+def get_emr_status():
+    return emr_status()
+
+
+@app.post("/api/jarvis/memory/emr/excite", dependencies=[Depends(require_memory_write)])
+def emr_excite(body: ExciteRequest):
+    """Governed recall: score LTM → bundle → promote/evict STM under budget."""
+    store = get_store()
+    candidates = store.list_memories(
+        truth_scope=body.truth_scope,
+        # Filters must see the whole local ledger cohort before candidate_limit
+        # is applied; otherwise older exact metadata matches can be hidden by
+        # the store's recency ordering and graph traversal becomes incomplete.
+        limit=9999,
+    )
+    try:
+        result = excite(candidates, body)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return result.model_dump()
+
+
+@app.post("/api/jarvis/memory/emr/reinforce", dependencies=[Depends(require_memory_write)])
+def emr_reinforce(body: ReinforceRequest):
+    """Bounded reinforcement of retrievability (Q+, D−).
+
+    Constitutional guard: mutates only the EMR dynamics overlay. LTM fields
+    carrying truth/authority (status, confidence, content, content_sha256)
+    are never written by this endpoint.
+    """
+    store = get_store()
+    known: set[str] = set()
+    for mid in body.memory_ids:
+        if store.get_memory(mid) is not None:
+            known.add(mid)
+    reinforced, unknown, replayed = reinforce_ids(
+        known,
+        body.memory_ids,
+        outcome=body.outcome,
+    )
+    return {
+        "reinforced": [r.model_dump() for r in reinforced],
+        "unknown_ids": unknown,
+        "replayed_memory_ids": replayed,
+        "ltm_mutations": 0,
+        "rule": (
+            "Reinforcement requires an explicit positive outcome signal and "
+            "strengthens retrievability within separate and combined hard caps; "
+            "truth/authority remain independently certified by the Continuity "
+            "Ledger and are never mutated."
+        ),
+    }
+
+
+@app.post("/api/jarvis/memory/emr/correct", dependencies=[Depends(require_memory_write)])
+def emr_correct(body: CorrectRequest):
+    """Operator correction: immediately reset reinforcement overlay.
+
+    Clears salience and decay damping on corrected memories so wrong recall
+    cannot slowly outcompete a replacement. Never mutates LTM truth fields.
+    """
+    store = get_store()
+    known: set[str] = set()
+    for mid in body.memory_ids:
+        if store.get_memory(mid) is not None:
+            known.add(mid)
+    corrected, unknown, replayed = correct_memory_ids(
+        known,
+        body.memory_ids,
+        correction=body.correction,
+    )
+    return {
+        "corrected": [r.model_dump() for r in corrected],
+        "unknown_ids": unknown,
+        "replayed_correction_ids": replayed,
+        "ltm_mutations": 0,
+        "rule": (
+            "Operator correction resets reinforcement overlay immediately; "
+            "LTM truth/authority remain independently certified."
+        ),
+    }
+
+
+@app.get("/api/jarvis/memory/active")
+def active_stm(
+    query: str = Query(..., min_length=1, max_length=2000),
+    session_key: str = Query(default="default"),
+    token_budget: int = Query(default=512, ge=32, le=8000),
+    theta_promote: float = Query(default=0.12, ge=0.0, le=1.0),
+    theta_evict: float = Query(default=0.04, ge=0.0, le=1.0),
+    truth_scope: str = Query(default="live"),
+    candidate_limit: int = Query(default=200, ge=1, le=2000),
+    trajectory: list[str] | None = Query(default=None),
+):
+    """Contract surface: EMR excite → budgeted STM view in one GET."""
+    store = get_store()
+    body = ExciteRequest(
+        query=query,
+        trajectory=trajectory or [],
+        token_budget=token_budget,
+        theta_promote=theta_promote,
+        theta_evict=theta_evict,
+        truth_scope=truth_scope,
+        candidate_limit=candidate_limit,
+        session_key=session_key,
+    )
+    candidates = store.list_memories(
+        truth_scope=body.truth_scope,
+        limit=9999,
+    )
+    result = excite(candidates, body)
+    return result.model_dump()
+
+
+@app.get("/api/jarvis/memory/stm")
+def read_stm(session_key: str = Query(default="default")):
+    entries = get_stm(session_key)
+    return {
+        "session_key": session_key,
+        "stm": [e.model_dump() for e in entries],
+        "budget_used": sum(e.token_cost for e in entries),
+        "count": len(entries),
+    }
+
+
+@app.get("/api/jarvis/memory/stm/context")
+def read_stm_context(session_key: str = Query(default="default")):
+    """LLM-ready STM block (summaries + LTM provenance ids)."""
+    return {
+        "session_key": session_key,
+        "context": stm_context_block(session_key),
+    }
+
+
+@app.post("/api/jarvis/memory/stm/expand", dependencies=[Depends(require_memory_write)])
+def stm_expand(body: ExpandRequest):
+    """Raise resolution summary→detail→evidence; payload still points at LTM."""
+    store = get_store()
+    rec = store.get_memory(body.memory_id)
+    if not rec:
+        raise HTTPException(status_code=404, detail="LTM memory not found")
+    if body.memory_id not in {e.memory_id for e in get_stm(body.session_key)}:
+        raise HTTPException(
+            status_code=400,
+            detail="Memory not in STM; POST /emr/excite first to promote",
+        )
+    updated = expand_stm_entry({body.memory_id: rec}, body)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="STM entry not found")
+    return {"stm_entry": updated.model_dump()}
+
+
+@app.delete("/api/jarvis/memory/stm", dependencies=[Depends(require_memory_write)])
+def stm_clear(session_key: str | None = Query(default=None)):
+    clear_stm(session_key)
+    return {"status": "cleared", "session_key": session_key}
+
+
+@app.post("/api/jarvis/memory/pipeline", dependencies=[Depends(require_memory_write)])
+def memory_pipeline_endpoint(body: ConsolidationRequest):
+    """EMR -> STM -> LTM governed pipeline: excite workers -> draft-consolidate to ledger.
+
+    Reads LTM, builds the STM working set, then materialises ONE governed DRAFT
+    summary record via the emr_write gateway (conflict-checked, draft-only,
+    provenance-preserving). The pipeline never auto-verifies.
+    """
+    store = get_store()
+    try:
+        trace = memory_pipeline(store, body)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return trace.model_dump()
+
+
+@app.get("/api/jarvis/memory/{memory_id}/resolve")
+def resolve_memory(
+    memory_id: str,
+    resolution: str = Query(default="summary", pattern="^(summary|detail|evidence)$"),
+):
+    """Expand one LTM particle to summary|detail|evidence with provenance."""
+    store = get_store()
+    rec = store.get_memory(memory_id)
+    if not rec:
+        raise HTTPException(status_code=404, detail="LTM memory not found")
+    return resolve_record(rec, resolution)  # type: ignore[arg-type]
+
+
 @app.get("/api/jarvis/memory/{memory_id}")
 def get_memory(memory_id: str):
     store = get_store()
     rec = store.get_memory(memory_id)
     if not rec:
         raise HTTPException(status_code=404, detail="Memory not found")
+    from app.continuity import to_selection
+
     sel = to_selection(rec)
     return {"memory": rec.model_dump(), "selection": sel.model_dump()}
 
 
-@app.patch("/api/jarvis/memory/{memory_id}")
+@app.patch("/api/jarvis/memory/{memory_id}", dependencies=[Depends(require_memory_write)])
 def update_memory(memory_id: str, body: MemoryUpdate):
     store = get_store()
     try:
@@ -250,7 +735,7 @@ def update_memory(memory_id: str, body: MemoryUpdate):
     return {"memory": rec.model_dump()}
 
 
-@app.delete("/api/jarvis/memory/{memory_id}")
+@app.delete("/api/jarvis/memory/{memory_id}", dependencies=[Depends(require_memory_write)])
 def delete_memory(memory_id: str):
     store = get_store()
     ok = store.delete_memory(memory_id)
@@ -259,114 +744,228 @@ def delete_memory(memory_id: str):
     return {"status": "deleted", "id": memory_id}
 
 
-# --- Unified Memory System endpoints (nx-search integration) ---
-
-@app.post("/api/jarvis/memory/external-search")
-def external_search(
-    body: ExternalSearchRequest,
-):
-    """Search nx-search external memory and optionally promote results to working memory."""
-    query = body.query
-    name_only = body.name_only
-    limit = body.limit
-    auto_promote = body.auto_promote
-    source_agent = body.source_agent
-    session_id = body.session_id
-    
-    nx_client = NxSearchClient()
-    search_results = nx_client.search(query, name_only=name_only, limit=limit)
-    
-    if "error" in search_results:
-        raise HTTPException(status_code=500, detail=search_results["error"])
-    
-    promoted_memories = []
-    if auto_promote and search_results.get("content"):
-        store = get_store()
-        for result in search_results["content"][:5]:  # Promote top 5 results
-            memory_data = nx_client.promote_to_memory(
-                result, source_agent, session_id, confidence=0.7
-            )
-            try:
-                memory = store.create_memory(MemoryCreate(**memory_data))
-                promoted_memories.append(memory.model_dump())
-            except ValueError:
-                pass  # Skip invalid promotions
-    
-    return {
-        "external_results": search_results,
-        "promoted_memories": promoted_memories,
-        "promotion_count": len(promoted_memories),
-    }
+# --- AMUL RAG (adaptive retrieval + evidence gate + replay) ---
 
 
-@app.get("/api/jarvis/memory/unified")
-def unified_search(
-    query: str = Query(..., min_length=1),
-    limit: int = Query(default=25, ge=1, le=100),
-    source_agent: str = Query(default="unified-memory-system"),
-    session_id: str = Query(default="unified-search-session"),
-    use_nx_fallback: bool = Query(default=True),
-):
-    """Search the truth ledger first; optionally augment it with untrusted NX evidence."""
-    store = get_store()
-    working_memories, selections, conflicts = store.retrieve(
-        query=query,
-        limit=limit,
-        session_id=session_id,
-    )
-    
-    external_results = {"content": [], "filenames": [], "skipped": True}
-    if use_nx_fallback and not working_memories:
-        external_results = NxSearchClient().search(query, limit=limit)
-    
-    return {
-        "working_memory": {
-            "memories": [m.model_dump() for m in working_memories],
-            "selections": [s.model_dump() for s in selections],
-            "conflicts": [c.model_dump() for c in conflicts],
-        },
-        "long_term_memory": external_results,
-        "query": query,
-        "source_agent": source_agent,
-        "nx_fallback_used": use_nx_fallback and not working_memories,
-    }
+class RagDocumentInput(BaseModel):
+    id: str | None = Field(default=None, min_length=1, max_length=256)
+    title: str = Field(default="", max_length=512)
+    body: str = Field(..., min_length=1, max_length=200_000)
+    source: str = Field(default="unknown", min_length=1, max_length=128)
+    tags: list[str] = Field(default_factory=list, max_length=64)
+    authority_class: AuthorityClass = "untrusted"
+    status: DocumentStatus = "draft"
+    subject: str | None = Field(default=None, max_length=256)
+    supersedes: str | None = Field(default=None, max_length=256)
+    conflict_ids: list[str] = Field(default_factory=list, max_length=64)
 
 
-@app.post("/api/jarvis/memory/promote")
-def promote_external_result(
-    body: ExternalPromotionRequest,
-):
-    """Promote a specific nx-search result to structured working memory."""
-    path = body.path
-    snippet = body.snippet
-    source_agent = body.source_agent
-    session_id = body.session_id
-    confidence = body.confidence
-    
-    store = get_store()
-    nx_client = NxSearchClient()
-    
-    # Require the promoted record to be an actual result from the indexed
-    # search, rather than accepting caller-invented filesystem evidence.
-    verified_results = nx_client.search(body.query, limit=100)
-    if "error" in verified_results:
-        raise HTTPException(status_code=502, detail=verified_results["error"])
-    if not any(
-        item.get("path") == path and item.get("snippet") == snippet
-        for item in verified_results.get("content", [])
-    ):
-        raise HTTPException(
-            status_code=422,
-            detail="Promotion requires an exact result returned by nx-search for the supplied query",
-        )
+class RagDocumentsBody(BaseModel):
+    documents: list[RagDocumentInput] = Field(..., min_length=1, max_length=256)
 
-    search_result = {"path": path, "snippet": snippet}
-    memory_data = nx_client.promote_to_memory(
-        search_result, source_agent, session_id, confidence
-    )
-    
+
+class RagQueryBody(BaseModel):
+    query: str = Field(..., min_length=1, max_length=4000)
+
+
+class RagMaintenanceBody(BaseModel):
+    apply: bool = False
+
+
+def require_rag_api_key(x_jarvis_rag_key: str | None = Header(default=None)) -> None:
+    """Protect RAG content, queries, and replay data with a local secret file."""
+    key_path = Path(amul_rag.RAG_API_KEY_FILE) if amul_rag.RAG_API_KEY_FILE else None
     try:
-        memory = store.create_memory(MemoryCreate(**memory_data))
-        return {"memory": memory.model_dump(), "status": "promoted"}
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        expected = key_path.read_text(encoding="utf-8").strip() if key_path else ""
+    except OSError as exc:
+        raise HTTPException(status_code=503, detail="RAG access key is unavailable") from exc
+    if not expected:
+        raise HTTPException(status_code=503, detail="RAG access control is not configured")
+    if not x_jarvis_rag_key or not secrets.compare_digest(x_jarvis_rag_key, expected):
+        raise HTTPException(status_code=401, detail="Invalid RAG access key")
+
+
+@app.post("/api/jarvis/rag/documents", dependencies=[Depends(require_rag_api_key)])
+def rag_documents(body: RagDocumentsBody):
+    index = get_index()
+    documents = []
+    for item in body.documents:
+        raw = item.model_dump(exclude_none=True)
+        requested_id = str(raw.get("id") or "")
+        existing = index.docs.get(requested_id) if requested_id else None
+        document = normalize_document(
+            raw,
+            existing_version=existing.version if existing else 0,
+        )
+        try:
+            index.add(document, persist=True)
+        except OSError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        documents.append(document.model_dump())
+    return {"documents": documents, "count": len(documents)}
+
+
+@app.post("/api/jarvis/rag/query", dependencies=[Depends(require_rag_api_key)])
+def rag_query(body: RagQueryBody):
+    try:
+        record = answer_query(
+            body.query,
+            get_index(),
+            extra_docs=ledger_docs(get_store()),
+        )
+    except OSError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return record.model_dump()
+
+
+@app.get("/api/jarvis/rag/log", dependencies=[Depends(require_rag_api_key)])
+def rag_log(limit: int = Query(default=50, ge=1, le=1000)):
+    records: list[dict] = []
+    path = Path(amul_rag.RAG_LOG_PATH)
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines()[-limit:]:
+            try:
+                records.append(json.loads(line))
+            except (json.JSONDecodeError, TypeError):
+                continue
+    return {"records": records, "count": len(records)}
+
+
+@app.get("/api/jarvis/rag/status", dependencies=[Depends(require_rag_api_key)])
+def get_rag_status():
+    return amul_rag.rag_status()
+
+
+@app.post("/api/jarvis/rag/maintenance", dependencies=[Depends(require_rag_api_key)])
+def rag_maintenance(body: RagMaintenanceBody):
+    return maintain_replay_log(apply=body.apply)
+
+
+# --- AMUL Architect (LTM substrate: append-only field, lineage, drift) ---
+
+
+class AnchorBody(BaseModel):
+    memory_id: str | None = None
+    anchor_all: bool = False
+    actor: str = Field(default="amul", max_length=64)
+
+
+@app.post("/api/jarvis/memory/amul/anchor")
+def amul_anchor(body: AnchorBody):
+    """Anchor ledger truth into immutable AMUL artifacts (idempotent)."""
+    store = get_store()
+    field = get_field()
+    if body.anchor_all:
+        records = store.list_memories(limit=9999)
+        reports = [anchor_memory(r, field, body.actor) for r in records]
+        return {
+            "anchored": len(reports),
+            "created_artifacts": sum(len(r.created) for r in reports),
+            "unchanged_resolutions": sum(len(r.unchanged) for r in reports),
+            "field_count": field.count,
+        }
+    if not body.memory_id:
+        raise HTTPException(status_code=400, detail="memory_id or anchor_all required")
+    rec = store.get_memory(body.memory_id)
+    if not rec:
+        raise HTTPException(status_code=404, detail="LTM memory not found")
+    report = anchor_memory(rec, field, body.actor)
+    return report.model_dump()
+
+
+@app.get("/api/jarvis/memory/amul/artifacts/{artifact_id}")
+def amul_artifact(artifact_id: str):
+    art = get_field().get(artifact_id)
+    if not art:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    return {"artifact": art.model_dump()}
+
+
+@app.get("/api/jarvis/memory/amul/lineage/{memory_id}")
+def amul_lineage(memory_id: str):
+    lineage = get_field().lineage(memory_id)
+    if lineage["depth"] == 0:
+        raise HTTPException(status_code=404, detail="No artifacts anchored for this memory")
+    return lineage
+
+
+@app.get("/api/jarvis/memory/amul/field/status")
+def amul_field_status():
+    field = get_field()
+    by_res: dict[str, int] = {}
+    for a in field.all():
+        by_res[a.resolution] = by_res.get(a.resolution, 0) + 1
+    return {
+        "schema": "amul-artifact-v1",
+        "path": field.path,
+        "artifact_count": field.count,
+        "by_resolution": by_res,
+        "append_only": True,
+        "role": "AMUL LTM substrate beneath the Continuity Ledger (ledger = truth SoT)",
+        "maturity": {
+            "persistence": "enforced",
+            "resolution_artifacts": "enforced",
+            "lineage_provenance": "enforced",
+            "verify_drift": "enforced",
+            "scale_gc_index": "declared",
+        },
+    }
+
+
+@app.post("/api/jarvis/memory/amul/field/verify")
+def amul_field_verify():
+    """Rehash the whole field + detect ledger drift since last anchors."""
+    store = get_store()
+    report = verify_field(get_field(), store.list_memories(limit=9999))
+    return report.model_dump()
+
+
+def _invoke_emr_tool(name: str, arguments: dict) -> dict:
+    """In-process EMR tools for MCP Streamable HTTP (same path as REST tools)."""
+    store = get_store()
+    if name in ("search", "emr_search"):
+        body = EmrSearchRequest.model_validate(arguments)
+        return emr_search(store, body)
+    if name in ("fetch", "emr_fetch"):
+        body = EmrFetchRequest.model_validate(arguments)
+        return emr_fetch(store, body)
+    if name == "emr_recall":
+        body = EmrRecallRequest.model_validate(arguments)
+        return emr_recall(store, body).model_dump()
+    if name == "emr_remember":
+        body = EmrRememberRequest.model_validate(arguments)
+        return emr_remember(store, body).model_dump()
+    if name == "emr_upsert":
+        body = EmrUpsertRequest.model_validate(arguments)
+        return emr_upsert(store, body).model_dump()
+    raise RuntimeError(f"unknown tool: {name}")
+
+
+app.include_router(create_mcp_router(_invoke_emr_tool), prefix="/mcp", tags=["mcp"])
+
+# Relationship graph endpoints (full graph <=8k, sparse index above).
+@app.post("/api/jarvis/memory/graph/bfs")
+def graph_bfs(body: dict):
+    relations = set(body["relations"]) if body.get("relations") else None
+    results = bfs_search(body.get("start_id"), body.get("depth", 2), body.get("max_nodes", 50), relations, body.get("min_confidence", 0.0), body.get("max_age_days"))
+    return {"start_id": body.get("start_id"), "depth": body.get("depth", 2), "results": results, "count": len(results)}
+
+@app.post("/api/jarvis/memory/graph/shortest-path")
+def graph_shortest_path(body: dict):
+    path = shortest_path(body.get("source"), body.get("target"), body.get("max_nodes", 1000), body.get("min_confidence", 0.0), body.get("max_age_days"))
+    if path is None: raise HTTPException(status_code=404, detail="No path found between the given memories")
+    return {"source": body.get("source"), "target": body.get("target"), "path": path}
+
+@app.post("/api/jarvis/memory/graph/related")
+def graph_related(body: dict):
+    results = find_related(body.get("memory_id"), body.get("k", 10), body.get("min_distance", 1), body.get("max_distance", 3), body.get("min_confidence", 0.0), body.get("max_age_days"))
+    return {"memory_id": body.get("memory_id"), "k": body.get("k", 10), "results": results, "count": len(results)}
+
+@app.get("/api/jarvis/memory/graph/stats")
+def graph_stats(min_confidence: float = 0.0, max_age_days: float | None = None):
+    return memory_graph_stats(min_confidence=min_confidence, max_age_days=max_age_days)
+
+@app.post("/api/jarvis/memory/graph/components")
+def graph_components(body: dict):
+    minimum = body.get("min_size", 2)
+    return {"min_size": minimum, "components": connected_components(minimum, body.get("min_confidence", 0.0), body.get("max_age_days"))}

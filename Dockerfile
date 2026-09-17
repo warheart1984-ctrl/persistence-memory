@@ -4,21 +4,20 @@ WORKDIR /app
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    JARVIS_ENV=production \
     JARVIS_HOST=0.0.0.0 \
-    JARVIS_PORT=8001 \
-    JARVIS_STORE_PATH=/data/jarvis-store.json
+    JARVIS_STORE_PATH=/var/data/jarvis-store.json \
+    JARVIS_EMR_DYNAMICS_PATH=/var/data/emr-dynamics.json \
+    JARVIS_AMUL_PATH=/var/data/amul-field.jsonl \
+    JARVIS_MEMORY_WRITE_ENABLED=false
+
+ENV JARVIS_PROTECT_LEDGER_READ=false
 
 COPY pyproject.toml ./
 COPY app ./app
+COPY mcp_server ./mcp_server
 
-RUN pip install --no-cache-dir -e .
-
-RUN mkdir -p /data
+RUN pip install --no-cache-dir .
 
 EXPOSE 8001
 
-HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
-  CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health')"
-
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8001"]
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8001}"]

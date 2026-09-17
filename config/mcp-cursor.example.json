@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "jarvis-emr": {
+      "command": "python",
+      "args": ["-m", "mcp_server"],
+      "cwd": "/absolute/path/to/persistence-memory",
+      "env": {
+        "JARVIS_MEMORYBOARD_URL": "http://127.0.0.1:8001"
+      }
+    }
+  }
+}
