@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query, Body
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.auth import ApiKeyMiddleware
@@ -13,6 +13,8 @@ from app.models import (
     MemoryBoard,
     MemoryCreate,
     MemoryUpdate,
+    ExternalSearchRequest,
+    ExternalPromotionRequest,
 )
 from app.nx_search_client import NxSearchClient
 from app.store import get_store
@@ -234,15 +236,15 @@ def delete_memory(memory_id: str):
 
 @app.post("/api/jarvis/memory/external-search")
 def external_search(
-    body: dict = Body(...),
+    body: ExternalSearchRequest,
 ):
     """Search nx-search external memory and optionally promote results to working memory."""
-    query = body.get("query", "")
-    name_only = body.get("name_only", False)
-    limit = body.get("limit", 25)
-    auto_promote = body.get("auto_promote", False)
-    source_agent = body.get("source_agent", "unified-memory-system")
-    session_id = body.get("session_id", "external-search-session")
+    query = body.query
+    name_only = body.name_only
+    limit = body.limit
+    auto_promote = body.auto_promote
+    source_agent = body.source_agent
+    session_id = body.session_id
     
     nx_client = NxSearchClient()
     search_results = nx_client.search(query, name_only=name_only, limit=limit)
@@ -304,18 +306,32 @@ def unified_search(
 
 @app.post("/api/jarvis/memory/promote")
 def promote_external_result(
-    body: dict = Body(...),
+    body: ExternalPromotionRequest,
 ):
     """Promote a specific nx-search result to structured working memory."""
-    path = body.get("path", "")
-    snippet = body.get("snippet", "")
-    source_agent = body.get("source_agent", "unified-memory-system")
-    session_id = body.get("session_id", "promotion-session")
-    confidence = body.get("confidence", 0.7)
+    path = body.path
+    snippet = body.snippet
+    source_agent = body.source_agent
+    session_id = body.session_id
+    confidence = body.confidence
     
     store = get_store()
     nx_client = NxSearchClient()
     
+    # Require the promoted record to be an actual result from the indexed
+    # search, rather than accepting caller-invented filesystem evidence.
+    verified_results = nx_client.search(body.query, limit=100)
+    if "error" in verified_results:
+        raise HTTPException(status_code=502, detail=verified_results["error"])
+    if not any(
+        item.get("path") == path and item.get("snippet") == snippet
+        for item in verified_results.get("content", [])
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Promotion requires an exact result returned by nx-search for the supplied query",
+        )
+
     search_result = {"path": path, "snippet": snippet}
     memory_data = nx_client.promote_to_memory(
         search_result, source_agent, session_id, confidence

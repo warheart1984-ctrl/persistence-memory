@@ -154,6 +154,24 @@ class MemoryUpdate(BaseModel):
     tags: list[str] | None = None
 
 
+class ExternalSearchRequest(BaseModel):
+    query: str = Field(..., min_length=1, max_length=500)
+    name_only: bool = False
+    limit: int = Field(default=25, ge=1, le=100)
+    auto_promote: bool = False
+    source_agent: str = Field(default="unified-memory-system", min_length=1, max_length=128)
+    session_id: str = Field(default="external-search-session", min_length=1, max_length=128)
+
+
+class ExternalPromotionRequest(BaseModel):
+    query: str = Field(..., min_length=1, max_length=500)
+    path: str = Field(..., min_length=1, max_length=1000)
+    snippet: str = Field(..., min_length=1, max_length=2000)
+    source_agent: str = Field(default="unified-memory-system", min_length=1, max_length=128)
+    session_id: str = Field(default="promotion-session", min_length=1, max_length=128)
+    confidence: float = Field(default=0.7, ge=0.0, le=1.0)
+
+
 class MemoryRecord(BaseModel):
     """Canonical Continuity Ledger record — all fields required on the wire."""
 
