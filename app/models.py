@@ -9,7 +9,16 @@ Status tags in docs/tests:
 from __future__ import annotations
 
 from typing import Any, Literal
-from pydantic import BaseModel, Field, field_validator
+
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 
 MemoryType = Literal[
@@ -19,12 +28,14 @@ MemoryType = Literal[
     "preference",
     "architecture",
     "research",
+    "external_context",
 ]
 MemoryStatus = Literal["draft", "verified", "archived"]
 
-# Board UI slots — workspace context / UX only. NOT ledger write partitions.
-# Ledger rows live in one shared store; conflicts group by subject across agents.
-SlotClass = Literal["foundation", "identity", "preference", "operational"]
+# Board workspace contexts (wire alias: slots) — UI/workspace UX only.
+# NOT ledger write partitions. Conflicts group by subject across agents on one store.
+ContextClass = Literal["foundation", "identity", "preference", "operational"]
+SlotClass = ContextClass  # backward-compatible alias
 
 
 class ModuleSlot(BaseModel):
@@ -33,11 +44,32 @@ class ModuleSlot(BaseModel):
     linked_subsystem: str = "jarvis"
 
 
-class BoardSlot(BaseModel):
-    slot_id: str | None = None
-    slot_name: str
-    accepted_class: SlotClass
+class BoardContext(BaseModel):
+    """UI/workspace context entry — never used as a write partition key."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    context_id: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("context_id", "slot_id"),
+    )
+    context_name: str = Field(
+        validation_alias=AliasChoices("context_name", "slot_name"),
+    )
+    accepted_class: ContextClass
     module: ModuleSlot | None = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        # Emit legacy slot_* keys for board UI compatibility.
+        data["slot_id"] = data.get("context_id")
+        data["slot_name"] = data.get("context_name")
+        return data
+
+
+# Backward-compatible name
+BoardSlot = BoardContext
 
 
 class GovernanceItem(BaseModel):
@@ -46,11 +78,38 @@ class GovernanceItem(BaseModel):
 
 
 class MemoryBoard(BaseModel):
+    """Board UI workspace context. ``slots`` is a deprecated wire alias."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
     board_id: str = "default_board"
     summary: str = ""
     linked_subsystems: list[str] = Field(default_factory=lambda: ["jarvis"])
-    slots: list[BoardSlot] = Field(default_factory=list)
+    workspace_contexts: list[BoardContext] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("workspace_contexts", "slots"),
+    )
     governance: list[GovernanceItem] = Field(default_factory=list)
+
+    @property
+    def slots(self) -> list[BoardContext]:
+        """Deprecated alias for ``workspace_contexts`` (not write partitions)."""
+        return self.workspace_contexts
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_slots_alias(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "workspace_contexts" not in data and "slots" in data:
+            data = dict(data)
+            data["workspace_contexts"] = data.get("slots") or []
+        return data
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        # Keep ``slots`` on the wire so existing board UI keeps working.
+        data["slots"] = data.get("workspace_contexts", [])
+        return data
 
 
 class EvidenceLink(BaseModel):
@@ -150,10 +209,26 @@ class ConflictSet(BaseModel):
 
 
 class BoardUpdate(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     summary: str | None = None
     linked_subsystems: list[str] | None = None
-    slots: list[BoardSlot] | None = None
+    workspace_contexts: list[BoardContext] | None = Field(
+        default=None,
+        validation_alias=AliasChoices("workspace_contexts", "slots"),
+    )
     governance: list[GovernanceItem] | None = None
+
+    @property
+    def slots(self) -> list[BoardContext] | None:
+        return self.workspace_contexts
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if "workspace_contexts" in data:
+            data["slots"] = data.get("workspace_contexts")
+        return data
 
 
 def migrate_legacy_record(raw: dict[str, Any]) -> dict[str, Any]:

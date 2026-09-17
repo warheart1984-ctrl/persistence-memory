@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.auth import ApiKeyMiddleware
@@ -14,6 +14,7 @@ from app.models import (
     MemoryCreate,
     MemoryUpdate,
 )
+from app.nx_search_client import NxSearchClient
 from app.store import get_store
 
 load_dotenv()
@@ -67,6 +68,11 @@ def index():
                 "read": "GET /api/jarvis/memory/{id}",
                 "update": "PATCH /api/jarvis/memory/{id}",
                 "delete": "DELETE /api/jarvis/memory/{id}",
+            },
+            "unified_memory": {
+                "external_search": "POST /api/jarvis/memory/external-search",
+                "unified_search": "GET /api/jarvis/memory/unified",
+                "promote": "POST /api/jarvis/memory/promote",
             },
         },
     }
@@ -222,3 +228,101 @@ def delete_memory(memory_id: str):
     if not ok:
         raise HTTPException(status_code=404, detail="Memory not found")
     return {"status": "deleted", "id": memory_id}
+
+
+# --- Unified Memory System endpoints (nx-search integration) ---
+
+@app.post("/api/jarvis/memory/external-search")
+def external_search(
+    body: dict = Body(...),
+):
+    """Search nx-search external memory and optionally promote results to working memory."""
+    query = body.get("query", "")
+    name_only = body.get("name_only", False)
+    limit = body.get("limit", 25)
+    auto_promote = body.get("auto_promote", False)
+    source_agent = body.get("source_agent", "unified-memory-system")
+    session_id = body.get("session_id", "external-search-session")
+    
+    nx_client = NxSearchClient()
+    search_results = nx_client.search(query, name_only=name_only, limit=limit)
+    
+    if "error" in search_results:
+        raise HTTPException(status_code=500, detail=search_results["error"])
+    
+    promoted_memories = []
+    if auto_promote and search_results.get("content"):
+        store = get_store()
+        for result in search_results["content"][:5]:  # Promote top 5 results
+            memory_data = nx_client.promote_to_memory(
+                result, source_agent, session_id, confidence=0.7
+            )
+            try:
+                memory = store.create_memory(MemoryCreate(**memory_data))
+                promoted_memories.append(memory.model_dump())
+            except ValueError:
+                pass  # Skip invalid promotions
+    
+    return {
+        "external_results": search_results,
+        "promoted_memories": promoted_memories,
+        "promotion_count": len(promoted_memories),
+    }
+
+
+@app.get("/api/jarvis/memory/unified")
+def unified_search(
+    query: str = Query(..., min_length=1),
+    limit: int = Query(default=25, ge=1, le=100),
+    source_agent: str = Query(default="unified-memory-system"),
+    session_id: str = Query(default="unified-search-session"),
+):
+    """Search both working memory (Jarvis) and long-term memory (nx-search) simultaneously."""
+    # Search working memory
+    store = get_store()
+    working_memories, selections, conflicts = store.retrieve(
+        query=query,
+        limit=limit,
+        session_id=session_id,
+    )
+    
+    # Search long-term memory (nx-search)
+    nx_client = NxSearchClient()
+    external_results = nx_client.search(query, limit=limit)
+    
+    return {
+        "working_memory": {
+            "memories": [m.model_dump() for m in working_memories],
+            "selections": [s.model_dump() for s in selections],
+            "conflicts": [c.model_dump() for c in conflicts],
+        },
+        "long_term_memory": external_results,
+        "query": query,
+        "source_agent": source_agent,
+    }
+
+
+@app.post("/api/jarvis/memory/promote")
+def promote_external_result(
+    body: dict = Body(...),
+):
+    """Promote a specific nx-search result to structured working memory."""
+    path = body.get("path", "")
+    snippet = body.get("snippet", "")
+    source_agent = body.get("source_agent", "unified-memory-system")
+    session_id = body.get("session_id", "promotion-session")
+    confidence = body.get("confidence", 0.7)
+    
+    store = get_store()
+    nx_client = NxSearchClient()
+    
+    search_result = {"path": path, "snippet": snippet}
+    memory_data = nx_client.promote_to_memory(
+        search_result, source_agent, session_id, confidence
+    )
+    
+    try:
+        memory = store.create_memory(MemoryCreate(**memory_data))
+        return {"memory": memory.model_dump(), "status": "promoted"}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
