@@ -305,9 +305,9 @@ def unified_search(
     limit: int = Query(default=25, ge=1, le=100),
     source_agent: str = Query(default="unified-memory-system"),
     session_id: str = Query(default="unified-search-session"),
+    use_nx_fallback: bool = Query(default=True),
 ):
-    """Search both working memory (Jarvis) and long-term memory (nx-search) simultaneously."""
-    # Search working memory
+    """Search the truth ledger first; optionally augment it with untrusted NX evidence."""
     store = get_store()
     working_memories, selections, conflicts = store.retrieve(
         query=query,
@@ -315,9 +315,9 @@ def unified_search(
         session_id=session_id,
     )
     
-    # Search long-term memory (nx-search)
-    nx_client = NxSearchClient()
-    external_results = nx_client.search(query, limit=limit)
+    external_results = {"content": [], "filenames": [], "skipped": True}
+    if use_nx_fallback and not working_memories:
+        external_results = NxSearchClient().search(query, limit=limit)
     
     return {
         "working_memory": {
@@ -328,6 +328,7 @@ def unified_search(
         "long_term_memory": external_results,
         "query": query,
         "source_agent": source_agent,
+        "nx_fallback_used": use_nx_fallback and not working_memories,
     }
 
 
