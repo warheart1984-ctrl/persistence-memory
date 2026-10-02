@@ -239,7 +239,10 @@ def emr_recall(
     provenance: list[EmrRecallProvenance] = []
     recall_summary: list[str] = []
 
-    for entry in result.stm[: req.max_memories]:
+    # STM is filled by activation per token; the bundle is a ranking, so order
+    # it by activation itself.
+    ranked = sorted(result.stm, key=lambda e: (-e.activation, e.memory_id))
+    for entry in ranked[: req.max_memories]:
         rec = records_by_id.get(entry.memory_id)
         if rec is None:
             continue
