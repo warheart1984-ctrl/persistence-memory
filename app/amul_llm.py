@@ -176,6 +176,10 @@ class GenerationResult(BaseModel):
     tokens_used: int
 
 
+# Backends where a model actually answered (not the echo stub or the logical layer).
+MODEL_BACKENDS = ("openai-compat", "llm-gateway")
+
+
 _discovered_model: str | None = None
 
 
@@ -344,10 +348,13 @@ def policy_check(answer_text: str, contract: dict[str, Any]) -> list[str]:
     return flags
 
 
-def generate(contract: PromptContract) -> dict[str, Any]:
+def generate(contract: PromptContract, recall: dict[str, Any] | None = None) -> dict[str, Any]:
     """Full AMUL-LLM loop. Rules R-A/R-B are structural, not aspirational:
     the function cannot return without running policy_check, and it cannot
-    return without writing the replay record."""
+    return without writing the replay record.
+
+    `recall` describes memories the caller recalled into `contract.context`;
+    it is kept on the replay record so the generation stays replayable."""
     steps: list[str] = []
     started = time.time()
 
@@ -388,9 +395,10 @@ def generate(contract: PromptContract) -> dict[str, Any]:
         steps.append("output post-processing")
         flags = policy_check(result.text, rc)
 
-    grounded = bool(contract.context) and result.backend == "openai-compat"
+    real_model = result.backend in MODEL_BACKENDS
+    grounded = bool(contract.context) and real_model
     confidence = round(min(0.95, 0.45 + (0.25 if grounded else 0.0) +
-                           (0.15 if result.backend == "openai-compat" else 0.0)), 2)
+                           (0.15 if real_model else 0.0)), 2)
     record = {
         "schema_version": REPLAY_SCHEMA,
         "query": contract.user[:500],
@@ -411,6 +419,8 @@ def generate(contract: PromptContract) -> dict[str, Any]:
         },
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+    if recall is not None:
+        record["recall"] = recall
     append_jsonl(LLM_LOG_PATH, record)  # Rule R-B: replay ALWAYS written
     return record
 
