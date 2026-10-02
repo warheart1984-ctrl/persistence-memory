@@ -146,3 +146,99 @@ def test_replay_record_is_replayable_shape(tmp_path):
     needed = {"query", "final_answer", "tokens_used", "policy_flags",
               "steps", "intent", "mode", "metadata", "timestamp"}
     assert needed <= set(r.keys())
+
+
+# --- Backend adapters (httpx patched; no network) --------------------------------
+
+
+class _FakeResponse:
+    def __init__(self, payload: dict, status: int = 200):
+        self._payload, self.status_code = payload, status
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+    def json(self):
+        return self._payload
+
+
+def _patch_post(monkeypatch, payload: dict, status: int = 200) -> list[dict]:
+    import httpx
+
+    calls: list[dict] = []
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        calls.append({"url": url, "headers": headers or {}, "json": json})
+        return _FakeResponse(payload, status)
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    return calls
+
+
+def test_llm_gateway_adapter_request_and_answer(monkeypatch):
+    monkeypatch.setattr(llm, "LLM_URL", "http://gw.test/v1/")
+    monkeypatch.setattr(llm, "LLM_API", "llm-gateway")
+    monkeypatch.setattr(llm, "LLM_MODEL", "groq/gpt-oss-20b")
+    monkeypatch.setattr(llm, "LLM_API_KEY", "gwk_test")
+    calls = _patch_post(monkeypatch, {
+        "model": "groq/gpt-oss-20b", "content": "pong", "reasoning": "thinking",
+        "usage": {"total_tokens": 42},
+    })
+    result = llm.core_model_generate([{"role": "user", "content": "ping"}], 0.3, 64)
+    assert (result.text, result.backend, result.model, result.tokens_used) == (
+        "pong", "llm-gateway", "groq/gpt-oss-20b", 42)
+    (call,) = calls
+    assert call["url"] == "http://gw.test/v1/chat/complete"
+    assert call["headers"] == {"Authorization": "Bearer gwk_test"}
+    # The gateway takes generation params nested, and needs max_tokens to reserve cost.
+    assert call["json"] == {
+        "model": "groq/gpt-oss-20b",
+        "messages": [{"role": "user", "content": "ping"}],
+        "params": {"temperature": 0.3, "max_tokens": 64},
+    }
+
+
+def test_llm_gateway_adapter_uses_reasoning_only_without_content(monkeypatch):
+    monkeypatch.setattr(llm, "LLM_URL", "http://gw.test/v1")
+    monkeypatch.setattr(llm, "LLM_API", "llm-gateway")
+    monkeypatch.setattr(llm, "LLM_MODEL", "groq/gpt-oss-20b")
+    _patch_post(monkeypatch, {"content": "", "reasoning": "only this", "usage": {}})
+    assert llm.core_model_generate([{"role": "user", "content": "x"}], 0.2, 8).text == "only this"
+
+
+def test_llm_gateway_refusal_degrades_to_echo_stub(monkeypatch):
+    monkeypatch.setattr(llm, "LLM_URL", "http://gw.test/v1")
+    monkeypatch.setattr(llm, "LLM_API", "llm-gateway")
+    monkeypatch.setattr(llm, "LLM_MODEL", "groq/gpt-oss-20b")
+    _patch_post(monkeypatch, {"error": {"code": "budget_exhausted"}}, status=402)
+    result = llm.core_model_generate([{"role": "user", "content": "x"}], 0.2, 8)
+    assert result.backend == "echo-stub"
+
+
+def test_openai_adapter_sends_bearer_only_when_keyed(monkeypatch):
+    monkeypatch.setattr(llm, "LLM_URL", "http://oai.test/v1")
+    monkeypatch.setattr(llm, "LLM_API", "openai")
+    monkeypatch.setattr(llm, "LLM_MODEL", "m")
+    answer = {"model": "m", "choices": [{"message": {"content": "hi"}}], "usage": {"total_tokens": 3}}
+    calls = _patch_post(monkeypatch, answer)
+    monkeypatch.setattr(llm, "LLM_API_KEY", "")
+    assert llm.core_model_generate([{"role": "user", "content": "x"}], 0.2, 8).backend == "openai-compat"
+    monkeypatch.setattr(llm, "LLM_API_KEY", "sk_test")
+    llm.core_model_generate([{"role": "user", "content": "x"}], 0.2, 8)
+    assert [c["url"] for c in calls] == ["http://oai.test/v1/chat/completions"] * 2
+    assert calls[0]["headers"] == {}
+    assert calls[1]["headers"] == {"Authorization": "Bearer sk_test"}
+
+
+def test_api_key_read_from_file_when_env_unset(monkeypatch, tmp_path):
+    key_file = tmp_path / "key"
+    key_file.write_text("gwk_from_file\n", encoding="utf-8")
+    monkeypatch.delenv("JARVIS_LLM_API_KEY", raising=False)
+    monkeypatch.setenv("JARVIS_LLM_API_KEY_FILE", str(key_file))
+    assert llm._read_api_key() == "gwk_from_file"
+    monkeypatch.setenv("JARVIS_LLM_API_KEY", "gwk_env")
+    assert llm._read_api_key() == "gwk_env"
+    monkeypatch.delenv("JARVIS_LLM_API_KEY")
+    monkeypatch.setenv("JARVIS_LLM_API_KEY_FILE", str(tmp_path / "missing"))
+    assert llm._read_api_key() == ""

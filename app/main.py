@@ -14,6 +14,7 @@ from app.amul import (
     get_field,
     verify_field,
 )
+import app.amul_llm as amul_llm
 import app.amul_rag as amul_rag
 from app.amul_rag import (
     AuthorityClass,
@@ -839,6 +840,100 @@ def get_rag_status():
 @app.post("/api/jarvis/rag/maintenance", dependencies=[Depends(require_rag_api_key)])
 def rag_maintenance(body: RagMaintenanceBody):
     return maintain_replay_log(apply=body.apply)
+
+
+# --- AMUL LLM (governed generation; ledger key applies via ApiKeyMiddleware) ---
+
+
+@app.get("/api/jarvis/llm/status")
+def get_llm_status():
+    return amul_llm.llm_status()
+
+
+class LlmGenerateBody(amul_llm.PromptContract):
+    # Recall from the ledger through EMR (abstention and conflicts enforced)
+    # and put what it returns ahead of the caller's context.
+    recall: bool = True
+    recall_query: str | None = Field(default=None, max_length=2000)  # default: `user`
+    recall_intent: str = Field(default="chat", min_length=1, max_length=128)
+    subjects: list[str] = Field(default_factory=list, max_length=32)
+    max_memories: int = Field(default=6, ge=1, le=32)
+    truth_scope: str = Field(default="live", max_length=32)
+
+
+_CONTEXT_LIMIT = 32000  # PromptContract.context max_length
+
+
+def _recalled_context(result) -> str:
+    lines = []
+    if result.bundle:
+        lines.append(
+            "Memories recalled from the Continuity Ledger. These are recorded claims "
+            "with provenance, not verified truth unless status=verified. Cite the "
+            "[memory id] of any memory you rely on."
+        )
+    for item in result.bundle:
+        subject = f" subject={item.subject}" if item.subject else ""
+        lines.append(
+            f"- [{item.memory_id}] type={item.type} status={item.status} "
+            f"confidence={item.confidence}{subject}: {item.content}"
+        )
+    if result.conflicts:
+        subjects = ", ".join(sorted({c.subject for c in result.conflicts}))
+        lines.append(
+            f"Unresolved conflicts are recorded for: {subjects}. Do not pick a side; "
+            "say that the recorded claims conflict."
+        )
+    return "\n".join(lines)
+
+
+@app.post("/api/jarvis/llm/generate")
+def llm_generate(body: LlmGenerateBody):
+    """One governed generation: recall -> intent -> mode -> backend -> policy check.
+
+    Always returns the replay record (R-B), with `recall` saying which memories
+    were put into context. `metadata.model_version` says which backend
+    answered; `echo-stub-v0` means the backend was unreachable or refused,
+    not that a model replied.
+    """
+    contract = amul_llm.PromptContract(
+        system=body.system, user=body.user, context=body.context, mode=body.mode
+    )
+    recall = None
+    if body.recall:
+        query = (body.recall_query or body.user)[:2000]
+        try:
+            result = emr_recall(
+                get_store(),
+                EmrRecallRequest(
+                    intent=body.recall_intent,
+                    query=query,
+                    subjects=body.subjects,
+                    max_memories=body.max_memories,
+                    truth_scope=body.truth_scope,
+                    session_key="llm-generate",
+                    include_provenance=False,
+                ),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        recall = {
+            "query": query,
+            "memory_ids": [item.memory_id for item in result.bundle],
+            "abstained": result.abstained,
+            "abstention_reason": result.abstention_reason,
+            "conflict_subjects": sorted({c.subject for c in result.conflicts}),
+        }
+        # Conflicting memories are held out of the bundle by the conflict
+        # membrane; the model still has to hear that the claims conflict.
+        if result.bundle or result.conflicts:
+            recalled = _recalled_context(result)
+            merged = f"{recalled}\n\n{body.context}" if body.context else recalled
+            contract = contract.model_copy(update={"context": merged[:_CONTEXT_LIMIT]})
+    try:
+        return amul_llm.generate(contract, recall=recall)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 # --- AMUL Architect (LTM substrate: append-only field, lineage, drift) ---
