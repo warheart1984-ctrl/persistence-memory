@@ -1,0 +1,130 @@
+{"case_id":"kw-01","query":"llm-gateway systemd service","relevant_ids":["bm-001"]}
+{"case_id":"kw-02","query":"ops listener metrics","relevant_ids":["bm-002"]}
+{"case_id":"kw-03","query":"Groq time to first token","relevant_ids":["bm-003","bm-041"]}
+{"case_id":"kw-04","query":"canary timer","relevant_ids":["bm-004"]}
+{"case_id":"kw-05","query":"canary budget","relevant_ids":["bm-005"]}
+{"case_id":"kw-06","query":"Prometheus Grafana","relevant_ids":["bm-006"]}
+{"case_id":"kw-07","query":"Grafana admin password","relevant_ids":["bm-009"]}
+{"case_id":"kw-08","query":"Jarvis tenant budget","relevant_ids":["bm-010"]}
+{"case_id":"kw-09","query":"nano-USD","relevant_ids":["bm-024"]}
+{"case_id":"kw-10","query":"DHCP reservation","relevant_ids":["bm-014"]}
+{"case_id":"kw-11","query":"uv virtual environments","relevant_ids":["bm-017"]}
+{"case_id":"kw-12","query":"rustup Rust 1.88","relevant_ids":["bm-018"]}
+{"case_id":"kw-13","query":"SQLite ledger Postgres replicas","relevant_ids":["bm-020"]}
+{"case_id":"kw-14","query":"merge commit squash","relevant_ids":["bm-021"]}
+{"case_id":"kw-15","query":"warheart1984-ctrl","relevant_ids":["bm-022"]}
+{"case_id":"kw-16","query":"normalized framing passthrough","relevant_ids":["bm-023"]}
+{"case_id":"kw-17","query":"reverse proxy TLS","relevant_ids":["bm-026"]}
+{"case_id":"kw-18","query":"Wolf CoG OS","relevant_ids":["bm-028"]}
+{"case_id":"kw-19","query":"nightly backups USB drive","relevant_ids":["bm-031"]}
+{"case_id":"kw-20","query":"brother birthday","relevant_ids":["bm-033"]}
+{"case_id":"kw-21","query":"EliteDesk RAM SSD","relevant_ids":["bm-035"]}
+{"case_id":"kw-22","query":"Ubuntu 24.04","relevant_ids":["bm-036"]}
+{"case_id":"kw-23","query":"memory tenant","relevant_ids":["bm-037"]}
+{"case_id":"kw-24","query":"gpt-oss-120b gpt-oss-20b","relevant_ids":["bm-040"]}
+{"case_id":"kw-25","query":"hot-reload YAML","relevant_ids":["bm-042"]}
+{"case_id":"kw-26","query":"gateway.env Groq API key","relevant_ids":["bm-043"]}
+{"case_id":"kw-27","query":"dog","relevant_ids":["bm-058"]}
+{"case_id":"kw-28","query":"Netgear Nighthawk","relevant_ids":["bm-062"]}
+{"case_id":"kw-29","query":"printer","relevant_ids":["bm-066"]}
+{"case_id":"kw-30","query":"sqlite-vec embeddings","relevant_ids":["bm-064"]}
+{"case_id":"nq-01","query":"Where does llm-gateway run, and on which port?","relevant_ids":["bm-001"]}
+{"case_id":"nq-02","query":"Which port serves the gateway's metrics?","relevant_ids":["bm-002"]}
+{"case_id":"nq-03","query":"Why did we pick Groq as the first provider?","relevant_ids":["bm-003"]}
+{"case_id":"nq-04","query":"How often does the canary send a request?","relevant_ids":["bm-004"]}
+{"case_id":"nq-05","query":"How much does the canary cost per day?","relevant_ids":["bm-005"]}
+{"case_id":"nq-06","query":"How long does Prometheus keep its history?","relevant_ids":["bm-006"]}
+{"case_id":"nq-07","query":"Should conversation memory live inside the gateway?","relevant_ids":["bm-007"]}
+{"case_id":"nq-08","query":"What is Groq's rate limit on the free tier?","relevant_ids":["bm-008"]}
+{"case_id":"nq-09","query":"What do I need to do before opening Grafana to the LAN?","relevant_ids":["bm-009"]}
+{"case_id":"nq-10","query":"How should answers be written for Jon?","relevant_ids":["bm-011"]}
+{"case_id":"nq-11","query":"Which text editor does Jon use?","relevant_ids":["bm-012"]}
+{"case_id":"nq-12","query":"What IP address does the EliteDesk have?","relevant_ids":["bm-013"]}
+{"case_id":"nq-13","query":"Where is the continuity ledger stored on disk?","relevant_ids":["bm-016"]}
+{"case_id":"nq-14","query":"Why do we use uv instead of python -m venv?","relevant_ids":["bm-017"]}
+{"case_id":"nq-15","query":"Why do some SQLite tests fail on the first run?","relevant_ids":["bm-019"]}
+{"case_id":"nq-16","query":"Do we need Postgres for the gateway ledger?","relevant_ids":["bm-020"]}
+{"case_id":"nq-17","query":"How does Jon like pull requests merged?","relevant_ids":["bm-021"]}
+{"case_id":"nq-18","query":"How many nano-USD are in one dollar?","relevant_ids":["bm-024"]}
+{"case_id":"nq-19","query":"Can the EliteDesk run Llama 3.1 8B locally?","relevant_ids":["bm-025"]}
+{"case_id":"nq-20","query":"Does the gateway support HTTPS by itself?","relevant_ids":["bm-026"]}
+{"case_id":"nq-21","query":"What kind of alerts does Jon want?","relevant_ids":["bm-027"]}
+{"case_id":"nq-22","query":"What is jarvis-render?","relevant_ids":["bm-029"]}
+{"case_id":"nq-23","query":"Where do the nightly backups go?","relevant_ids":["bm-031"]}
+{"case_id":"nq-24","query":"How does Jon take his coffee?","relevant_ids":["bm-032"]}
+{"case_id":"nq-25","query":"When is Jon's brother's birthday?","relevant_ids":["bm-033"]}
+{"case_id":"nq-26","query":"How much RAM does the EliteDesk have?","relevant_ids":["bm-035"]}
+{"case_id":"nq-27","query":"Which Ubuntu version is the EliteDesk running?","relevant_ids":["bm-036"]}
+{"case_id":"nq-28","query":"Why does EMR sometimes recall nothing for long questions?","relevant_ids":["bm-038"]}
+{"case_id":"nq-29","query":"What do I need to change so LAN devices can reach the gateway?","relevant_ids":["bm-039"]}
+{"case_id":"nq-30","query":"Which models does the gateway serve?","relevant_ids":["bm-040"]}
+{"case_id":"nq-31","query":"How fast is the first token through the gateway?","relevant_ids":["bm-041"]}
+{"case_id":"nq-32","query":"Do I need to restart the gateway after editing tenants?","relevant_ids":["bm-042"]}
+{"case_id":"nq-33","query":"Where is the Groq API key kept?","relevant_ids":["bm-043"]}
+{"case_id":"nq-34","query":"Is Ollama installed on this machine?","relevant_ids":["bm-046"]}
+{"case_id":"nq-35","query":"What time zone is Jon in?","relevant_ids":["bm-048"]}
+{"case_id":"nq-36","query":"When are pull requests allowed to merge?","relevant_ids":["bm-049"]}
+{"case_id":"nq-37","query":"How do I restart the gateway and read its logs?","relevant_ids":["bm-056"]}
+{"case_id":"nq-38","query":"How do I roll back to the previous gateway binary?","relevant_ids":["bm-057"]}
+{"case_id":"nq-39","query":"What is the name of Jon's dog?","relevant_ids":["bm-058"]}
+{"case_id":"nq-40","query":"Should I forward router ports to the gateway?","relevant_ids":["bm-063"]}
+{"case_id":"nq-41","query":"Which programming language does Jon prefer for services?","relevant_ids":["bm-053"]}
+{"case_id":"nq-42","query":"Where does Jon's sister live?","relevant_ids":["bm-068"]}
+{"case_id":"nq-43","query":"What IP address is the office printer on?","relevant_ids":["bm-066"]}
+{"case_id":"nq-44","query":"Who reviews pull requests now that Greptile stopped?","relevant_ids":["bm-044"]}
+{"case_id":"nq-45","query":"How much disk space is free on the EliteDesk?","relevant_ids":["bm-054"]}
+{"case_id":"morph-01","query":"gateway running service","relevant_ids":["bm-001"]}
+{"case_id":"morph-02","query":"decision routing Groq","relevant_ids":["bm-003"]}
+{"case_id":"morph-03","query":"canary sending requests","relevant_ids":["bm-004"]}
+{"case_id":"morph-04","query":"Prometheus scraping","relevant_ids":["bm-006"]}
+{"case_id":"morph-05","query":"changing the Grafana password","relevant_ids":["bm-009"]}
+{"case_id":"morph-06","query":"reserving the address in the router","relevant_ids":["bm-014"]}
+{"case_id":"morph-07","query":"creating Python environments","relevant_ids":["bm-017"]}
+{"case_id":"morph-08","query":"failing ledger test","relevant_ids":["bm-019"]}
+{"case_id":"morph-09","query":"merging pull request","relevant_ids":["bm-021"]}
+{"case_id":"morph-10","query":"backing up the home directory","relevant_ids":["bm-031"]}
+{"case_id":"morph-11","query":"reloading tenant files","relevant_ids":["bm-042"]}
+{"case_id":"morph-12","query":"restarting gateway","relevant_ids":["bm-056"]}
+{"case_id":"morph-13","query":"forwarding ports","relevant_ids":["bm-063"]}
+{"case_id":"morph-14","query":"abstaining recall","relevant_ids":["bm-038"]}
+{"case_id":"morph-15","query":"excited memories consolidated","relevant_ids":["bm-030"]}
+{"case_id":"para-01","query":"what address and port is the LLM proxy bound to","relevant_ids":["bm-001"]}
+{"case_id":"para-02","query":"health check robot that pings the models","relevant_ids":["bm-004"]}
+{"case_id":"para-03","query":"how long is monitoring data retained","relevant_ids":["bm-006"]}
+{"case_id":"para-04","query":"why not store chat history in the proxy","relevant_ids":["bm-007"]}
+{"case_id":"para-05","query":"how verbose should replies be","relevant_ids":["bm-011"]}
+{"case_id":"para-06","query":"local IP of the desktop computer","relevant_ids":["bm-013"]}
+{"case_id":"para-07","query":"stop the machine's IP from changing","relevant_ids":["bm-014"]}
+{"case_id":"para-08","query":"semantic search models that run without a GPU","relevant_ids":["bm-015"]}
+{"case_id":"para-09","query":"encryption for remote access to the API","relevant_ids":["bm-026","bm-063"]}
+{"case_id":"para-10","query":"what does Jon put in his morning drink","relevant_ids":["bm-032"]}
+{"case_id":"para-11","query":"sibling's date of birth","relevant_ids":["bm-033"]}
+{"case_id":"para-12","query":"how much memory does the box have","relevant_ids":["bm-035"]}
+{"case_id":"para-13","query":"which pickup truck does Jon own","relevant_ids":["bm-059"]}
+{"case_id":"para-14","query":"what is the pet called","relevant_ids":["bm-058"]}
+{"case_id":"para-15","query":"how quickly does the model start answering","relevant_ids":["bm-041"]}
+{"case_id":"para-16","query":"where is the vendor credential stored","relevant_ids":["bm-043"]}
+{"case_id":"para-17","query":"undo a bad upgrade of the proxy","relevant_ids":["bm-057"]}
+{"case_id":"para-18","query":"vehicle maintenance due","relevant_ids":["bm-061"]}
+{"case_id":"para-19","query":"what genre of music during programming","relevant_ids":["bm-060"]}
+{"case_id":"para-20","query":"earliest time Jon will take a meeting","relevant_ids":["bm-067"]}
+{"case_id":"neg-01","query":"What is the capital of France?","expected_empty":true}
+{"case_id":"neg-02","query":"recipe for banana bread","expected_empty":true}
+{"case_id":"neg-03","query":"Who won the 1998 World Cup?","expected_empty":true}
+{"case_id":"neg-04","query":"how to tune a guitar","expected_empty":true}
+{"case_id":"neg-05","query":"photosynthesis in plants","expected_empty":true}
+{"case_id":"neg-06","query":"What is Jon's favourite movie?","expected_empty":true}
+{"case_id":"neg-07","query":"Kubernetes cluster autoscaling","expected_empty":true}
+{"case_id":"neg-08","query":"stock price of Apple today","expected_empty":true}
+{"case_id":"neg-09","query":"translate hello into Japanese","expected_empty":true}
+{"case_id":"neg-10","query":"weather forecast for tomorrow","expected_empty":true}
+{"case_id":"near-01","query":"When is Jon's sister's birthday?","expected_empty":true,"notes":"only the brother's birthday and the sister's city are stored"}
+{"case_id":"near-02","query":"What is the name of Jon's cat?","expected_empty":true,"notes":"only a dog is stored"}
+{"case_id":"near-03","query":"What OpenRouter models does the gateway serve?","expected_empty":true,"notes":"only Groq models are configured"}
+{"case_id":"near-04","query":"How much does the Jarvis tenant spend per hour on OpenAI?","expected_empty":true}
+{"case_id":"near-05","query":"What GPU is in the EliteDesk?","expected_empty":true,"notes":"bm-025 says it has none, but the question asks for a model"}
+{"case_id":"near-06","query":"Which Docker containers are running on the EliteDesk?","expected_empty":true}
+{"case_id":"near-07","query":"What is the Wi-Fi password?","expected_empty":true}
+{"case_id":"near-08","query":"How much does the mandala-render domain renewal cost?","expected_empty":true,"notes":"only the renewal task is stored, not a price"}
+{"case_id":"near-09","query":"What port does Ollama listen on?","expected_empty":true}
+{"case_id":"near-10","query":"What is Jon's mother's name?","expected_empty":true}
