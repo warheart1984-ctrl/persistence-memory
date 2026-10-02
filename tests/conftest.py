@@ -12,6 +12,17 @@ import app.amul as amul
 import app.amul_gc as amul_gc
 import app.amul_rag as rag
 import app.amul_llm as llm
+import app.emr_embed as emr_embed
+
+
+@pytest.fixture(autouse=True)
+def _embeddings_off_and_isolated(monkeypatch, tmp_path):
+    """EMR scores lexically unless a test opts in; vectors never reach data/."""
+    monkeypatch.delenv("JARVIS_EMR_EMBEDDINGS", raising=False)
+    monkeypatch.setenv("JARVIS_EMR_EMBED_CACHE", str(tmp_path / "emr-embeddings.json"))
+    emr_embed.reset_for_tests()
+    yield
+    emr_embed.reset_for_tests()
 
 
 @pytest.fixture(autouse=True)

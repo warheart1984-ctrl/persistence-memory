@@ -43,3 +43,30 @@ def test_keyword_and_word_form_queries(bench):
     assert cats["kw"]["hit_at_k"] >= 0.95
     assert cats["morph"]["hit_at_k"] >= 0.9
     assert cats["nq"]["hit_at_k"] >= 0.9
+
+
+# --- With local embeddings (skipped unless the `embed` extra is installed) --------
+
+
+@pytest.fixture(scope="module")
+def bench_embed():
+    pytest.importorskip("fastembed")
+    try:
+        return run_bench(embeddings=True)
+    except RuntimeError as exc:  # model could not be loaded (e.g. offline first run)
+        pytest.skip(str(exc))
+
+
+def test_embeddings_recall_paraphrases(bench_embed):
+    cats = bench_embed["summary"]["by_category"]
+    assert cats["para"]["hit_at_k"] >= 0.65
+    assert cats["nq"]["hit_at_k"] >= 0.95
+
+
+def test_embeddings_keep_lexical_gains(bench_embed):
+    overall = bench_embed["summary"]["overall"]
+    assert overall["hit_at_k"] >= 0.92
+    assert overall["top1"] >= 0.70
+    assert bench_embed["summary"]["by_age"][">1mo"]["hit_at_k"] >= 0.9
+    assert bench_embed["summary"]["by_category"]["neg"]["false_positive"] == 0.0
+    assert bench_embed["safety_status"] == "pass"
