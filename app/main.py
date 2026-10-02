@@ -14,6 +14,7 @@ from app.amul import (
     get_field,
     verify_field,
 )
+import app.amul_llm as amul_llm
 import app.amul_rag as amul_rag
 from app.amul_rag import (
     AuthorityClass,
@@ -839,6 +840,28 @@ def get_rag_status():
 @app.post("/api/jarvis/rag/maintenance", dependencies=[Depends(require_rag_api_key)])
 def rag_maintenance(body: RagMaintenanceBody):
     return maintain_replay_log(apply=body.apply)
+
+
+# --- AMUL LLM (governed generation; ledger key applies via ApiKeyMiddleware) ---
+
+
+@app.get("/api/jarvis/llm/status")
+def get_llm_status():
+    return amul_llm.llm_status()
+
+
+@app.post("/api/jarvis/llm/generate")
+def llm_generate(body: amul_llm.PromptContract):
+    """One governed generation: intent -> mode -> backend -> policy check.
+
+    Always returns the replay record (R-B). `metadata.model_version` says which
+    backend answered; `echo-stub-v0` means the backend was unreachable or
+    refused, not that a model replied.
+    """
+    try:
+        return amul_llm.generate(body)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 # --- AMUL Architect (LTM substrate: append-only field, lineage, drift) ---
