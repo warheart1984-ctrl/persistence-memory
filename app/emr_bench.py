@@ -12,7 +12,11 @@ and the case_id prefix names the category:
     neg    unrelated (must abstain)       near   adjacent but unstored (must abstain)
 
 Run:
-    python -m app.emr_bench [--json-out bench.json] [--show-failures]
+    python -m app.emr_bench [--json-out bench.json] [--show-failures] [--embeddings]
+
+--embeddings scores with emr_embed switched on (needs the `embed` extra). The
+model is cached in JARVIS_EMR_EMBED_MODEL_DIR (default ~/.cache/emr-embed-model)
+and memory vectors in a scratch file per run.
 """
 
 from __future__ import annotations
@@ -26,7 +30,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+import os
+
 import app.emr as emr
+import app.emr_embed as emr_embed
 from app.emr_eval import run_evaluation
 from app.emr_tool import EmrRecallRequest, emr_recall
 from app.store import JarvisStore
@@ -137,7 +144,9 @@ def _recall_rows(store: JarvisStore, labels: dict[str, dict], k: int) -> list[di
     return rows
 
 
-def run_bench(bench_dir: Path = BENCH_DIR, k: int = 5, safety: bool = True) -> dict[str, Any]:
+def run_bench(
+    bench_dir: Path = BENCH_DIR, k: int = 5, safety: bool = True, embeddings: bool = False
+) -> dict[str, Any]:
     cases_path = bench_dir / "cases.jsonl"
     labels = {
         row["case_id"]: row
@@ -150,6 +159,12 @@ def run_bench(bench_dir: Path = BENCH_DIR, k: int = 5, safety: bool = True) -> d
         # real dynamics sidecar.
         original = emr.DYNAMICS_PATH
         emr.DYNAMICS_PATH, emr._dynamics_loaded = str(dynamics), False
+        saved_env = {k: os.environ.get(k) for k in (
+            "JARVIS_EMR_EMBEDDINGS", "JARVIS_EMR_EMBED_CACHE", "JARVIS_EMR_EMBED_MODEL_DIR")}
+        os.environ["JARVIS_EMR_EMBEDDINGS"] = "1" if embeddings else "0"
+        os.environ["JARVIS_EMR_EMBED_CACHE"] = str(Path(tmp) / "vectors.json")
+        os.environ.setdefault(
+            "JARVIS_EMR_EMBED_MODEL_DIR", str(Path.home() / ".cache" / "emr-embed-model"))
         try:
             ages = materialize_ledger(bench_dir / "memories.jsonl", ledger, datetime.now(timezone.utc))
             per_case = _recall_rows(JarvisStore(str(ledger)), labels, k)
@@ -159,8 +174,16 @@ def run_bench(bench_dir: Path = BENCH_DIR, k: int = 5, safety: bool = True) -> d
             ) if safety else None
         finally:
             emr.DYNAMICS_PATH, emr._dynamics_loaded = original, False
+            for key, value in saved_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+    if embeddings and emr_embed._model is None:
+        raise RuntimeError("--embeddings: the embedding model did not load (pip install '.[embed]')")
     return {
         "k": k,
+        "embeddings": embeddings,
         "summary": summarize(per_case, labels, ages),
         # emr_eval's contradiction, reinforcement and graph safety gates.
         "safety_status": report["safety_status"] if report else "skipped",
@@ -171,7 +194,8 @@ def run_bench(bench_dir: Path = BENCH_DIR, k: int = 5, safety: bool = True) -> d
 
 def _print_table(result: dict[str, Any]) -> None:
     o = result["summary"]["overall"]
-    print(f"EMR benchmark (k={result['k']}, safety={result['safety_status']})")
+    mode = "lexical + embeddings" if result["embeddings"] else "lexical"
+    print(f"EMR benchmark ({mode}, k={result['k']}, safety={result['safety_status']})")
     print(f"  answerable: {o['positive_cases']} cases  hit@k {o['hit_at_k']}  top1 {o['top1']}  "
           f"mrr {o['mrr']}  wrongly abstained {o['wrongly_abstained']}")
     print(f"  must abstain: {o['negative_cases']} cases  false positives {o['negative_false_positive']}")
@@ -191,8 +215,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--k", type=int, default=5)
     parser.add_argument("--json-out")
     parser.add_argument("--show-failures", action="store_true")
+    parser.add_argument("--embeddings", action="store_true")
     args = parser.parse_args(argv)
-    result = run_bench(k=args.k)
+    result = run_bench(k=args.k, embeddings=args.embeddings)
     _print_table(result)
     if args.show_failures:
         print("  failures:")

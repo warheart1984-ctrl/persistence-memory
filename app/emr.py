@@ -32,6 +32,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from app import emr_embed
 from app.models import MemoryRecord, MemoryStatus, MemoryType
 
 Resolution = Literal["summary", "detail", "evidence"]
@@ -151,6 +152,9 @@ class AbstentionConfig(BaseModel):
 
 class ActivationBreakdown(BaseModel):
     Q: float
+    # Q's parts: lexical alignment, and the semantic one when embeddings ran.
+    Q_lex: float | None = None
+    Q_sem: float | None = None
     R: float
     P: float
     decay: float
@@ -951,9 +955,14 @@ def activate(
     rf_kappa: float = 0.0,
     weights: RetrievalWeights | None = None,
     idf: dict[str, float] | None = None,
+    semantic: float | None = None,
 ) -> ActivationBreakdown:
     weights = weights or RetrievalWeights()
-    Q = query_alignment(rec, query, idf)
+    Q_lex = query_alignment(rec, query, idf)
+    # `semantic` is the query/memory cosine from emr_embed. A paraphrase that
+    # shares no words can still align; the stronger signal wins.
+    Q_sem = emr_embed.semantic_alignment(semantic) if semantic is not None else None
+    Q = max(Q_lex, Q_sem) if Q_sem is not None else Q_lex
     R = resonance(rec, trajectory or [], prior_stm_ids or [])
     P = provenance_authority(rec)
     _, age_hours, D = decay_factor(rec, now=now)
@@ -988,6 +997,8 @@ def activate(
     A = evidence_A * reinforcement_multiplier
     return ActivationBreakdown(
         Q=round(Q, 4),
+        Q_lex=round(Q_lex, 4),
+        Q_sem=round(Q_sem, 4) if Q_sem is not None else None,
         R=round(R, 4),
         P=round(P, 4),
         decay=round(decay, 6),
@@ -1376,6 +1387,8 @@ def excite(
     # Term rarity over the whole ledger, not the filtered slice, so a filter
     # cannot make a common term look rare.
     idf = term_idf(records)
+    # None unless embeddings are switched on and the model loads.
+    cosines = emr_embed.similarities(req.query, candidates) or {}
     scored: list[tuple[MemoryRecord, ActivationBreakdown]] = []
     for rec in candidates:
         br = activate(
@@ -1388,6 +1401,7 @@ def excite(
             rf_kappa=req.rf_kappa,
             weights=req.weights,
             idf=idf,
+            semantic=cosines.get(rec.id),
         )
         scored.append((rec, br))
 
