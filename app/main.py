@@ -7,6 +7,7 @@ from pathlib import Path
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from app.amul import (
@@ -78,7 +79,7 @@ from app.auth import (
 )
 from app.oauth import protected_resource_metadata
 from app.public_security import cors_origins, public_security_middleware
-from app.store import get_store
+from app.store import StoreUnavailableError, get_store
 from app.graph import bfs_search, shortest_path, find_related, connected_components, memory_graph_stats
 from mcp_server.mcp_http import create_mcp_router
 
@@ -207,15 +208,27 @@ def index():
     }
 
 
+@app.exception_handler(StoreUnavailableError)
+async def _store_unavailable(request: Request, exc: StoreUnavailableError):
+    return JSONResponse(status_code=503, content={"detail": "Ledger store unavailable"})
+
+
 @app.get("/health")
 def health():
-    store = get_store()
-    board = store.get_board()
+    try:
+        store = get_store()
+        board = store.get_board()
+        memory_count = len(store.list_memories(limit=9999))
+    except StoreUnavailableError:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "unavailable", "service": "jarvis-memoryboard", "detail": "Ledger store unavailable"},
+        )
     return {
         "status": "ok",
         "service": "jarvis-memoryboard",
         "schema": "continuity-ledger-v1",
-        "memory_count": len(store.list_memories(limit=9999)),
+        "memory_count": memory_count,
         "board_id": board.board_id,
         "memory_write_enabled": memory_write_enabled(),
         "mcp_write_enabled": mcp_write_enabled(),
