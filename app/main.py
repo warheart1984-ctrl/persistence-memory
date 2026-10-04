@@ -71,6 +71,7 @@ from app.auth import (
     mcp_write_enabled,
     memory_write_enabled,
     require_emr_recall_api_key,
+    require_mcp_write_scope,
     require_memory_write,
     identity_middleware,
     oauth_enabled,
@@ -391,6 +392,8 @@ def create_memory(body: MemoryCreate, _: None = Depends(require_memory_write)):
 @app.post("/api/jarvis/memory/external-search", dependencies=[Depends(require_emr_recall_api_key)])
 def external_search(body: ExternalSearchRequest):
     """Search nx-search; optional promotion remains bounded and auditable."""
+    if body.auto_promote:
+        require_memory_write()  # promotion writes to the ledger; search alone stays read-only
     client = NxSearchClient()
     results = client.search(body.query, name_only=body.name_only, limit=body.limit)
     if "error" in results:
@@ -503,14 +506,20 @@ def tool_emr_recall(body: EmrRecallRequest):
     return result.model_dump()
 
 
-@app.post("/api/jarvis/tools/emr_remember", dependencies=[Depends(require_emr_recall_api_key)])
+@app.post(
+    "/api/jarvis/tools/emr_remember",
+    dependencies=[Depends(require_emr_recall_api_key), Depends(require_mcp_write_scope)],
+)
 def tool_emr_remember(body: EmrRememberRequest):
     """Governed create via EMR — draft-only; gated by JARVIS_MCP_WRITE_ENABLED."""
     store = get_store()
     return emr_remember(store, body).model_dump()
 
 
-@app.post("/api/jarvis/tools/emr_upsert", dependencies=[Depends(require_emr_recall_api_key)])
+@app.post(
+    "/api/jarvis/tools/emr_upsert",
+    dependencies=[Depends(require_emr_recall_api_key), Depends(require_mcp_write_scope)],
+)
 def tool_emr_upsert(body: EmrUpsertRequest):
     """Governed supersede via EMR — new draft + archive prior; gated by JARVIS_MCP_WRITE_ENABLED."""
     store = get_store()
@@ -607,7 +616,7 @@ def emr_correct(body: CorrectRequest):
     }
 
 
-@app.get("/api/jarvis/memory/active")
+@app.get("/api/jarvis/memory/active", dependencies=[Depends(require_memory_write)])
 def active_stm(
     query: str = Query(..., min_length=1, max_length=2000),
     session_key: str = Query(default="default"),
@@ -850,7 +859,7 @@ class AnchorBody(BaseModel):
     actor: str = Field(default="amul", max_length=64)
 
 
-@app.post("/api/jarvis/memory/amul/anchor")
+@app.post("/api/jarvis/memory/amul/anchor", dependencies=[Depends(require_memory_write)])
 def amul_anchor(body: AnchorBody):
     """Anchor ledger truth into immutable AMUL artifacts (idempotent)."""
     store = get_store()
@@ -932,6 +941,8 @@ def _invoke_emr_tool(name: str, arguments: dict) -> dict:
     if name == "emr_recall":
         body = EmrRecallRequest.model_validate(arguments)
         return emr_recall(store, body).model_dump()
+    if name in ("emr_remember", "emr_upsert"):
+        require_mcp_write_scope()
     if name == "emr_remember":
         body = EmrRememberRequest.model_validate(arguments)
         return emr_remember(store, body).model_dump()

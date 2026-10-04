@@ -48,11 +48,16 @@ def mcp_write_enabled() -> bool:
     )
 
 
-def require_mcp_write() -> None:
+def require_mcp_write_scope() -> None:
+    """OAuth scope half of the MCP write gate (flag handled by the write tools)."""
     if oauth_enabled():
         principal = current_principal()
         if principal is None or WRITE_SCOPE not in principal.scopes:
             raise HTTPException(status_code=403, detail="OAuth access token lacks required scope: memory.write")
+
+
+def require_mcp_write() -> None:
+    require_mcp_write_scope()
     if not mcp_write_enabled():
         raise HTTPException(
             status_code=403,
