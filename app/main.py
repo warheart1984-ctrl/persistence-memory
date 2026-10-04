@@ -732,6 +732,25 @@ def memory_pipeline_endpoint(body: ConsolidationRequest):
     return trace.model_dump()
 
 
+@app.get("/api/jarvis/memory/history/verify")
+def verify_history():
+    """Recompute the record-history hash chain (PostgreSQL row store only)."""
+    try:
+        problems = get_store().verify_history()
+    except NotImplementedError as exc:
+        raise HTTPException(status_code=501, detail=str(exc)) from exc
+    return {"ok": not problems, "problems": problems}
+
+
+@app.get("/api/jarvis/memory/{memory_id}/history")
+def memory_history(memory_id: str, limit: int = Query(default=200, ge=1, le=1000)):
+    """Append-only change log for one record, including after deletion (row store only)."""
+    try:
+        return {"memory_id": memory_id, "history": get_store().history(memory_id, limit)}
+    except NotImplementedError as exc:
+        raise HTTPException(status_code=501, detail=str(exc)) from exc
+
+
 @app.get("/api/jarvis/memory/{memory_id}/resolve")
 def resolve_memory(
     memory_id: str,

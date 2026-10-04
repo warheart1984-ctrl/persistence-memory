@@ -400,6 +400,12 @@ class JarvisStore:
             self._save_or_restore(lambda: self._memories.__setitem__(memory_id, removed))
             return True
 
+    def history(self, memory_id: str, limit: int = 200) -> list[dict[str, Any]]:
+        raise NotImplementedError("record history requires the PostgreSQL row store")
+
+    def verify_history(self, memory_id: str | None = None) -> list[dict[str, Any]]:
+        raise NotImplementedError("record history requires the PostgreSQL row store")
+
     def conflicts(self, subject: str | None = None) -> list[ConflictSet]:
         self._ensure_loaded()
         return detect_conflicts(list(self._memories.values()), subject=subject)

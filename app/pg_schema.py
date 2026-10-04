@@ -87,7 +87,136 @@ CREATE POLICY tenant_isolation ON boards
     WITH CHECK (tenant_key = current_setting('jarvis.tenant_key', true));
 """
 
-MIGRATIONS: list[tuple[int, str]] = [(1, _V1)]
+_V2 = """
+-- Deterministic JSON snapshot of a record: timestamps rendered in UTC, independent of
+-- the session TimeZone, so hashes recompute identically anywhere.
+CREATE FUNCTION jarvis_memory_json(m memories) RETURNS jsonb LANGUAGE sql STABLE AS $fn$
+    SELECT to_jsonb(m) || jsonb_build_object(
+        'created_at', to_char(m.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"+00:00"'),
+        'updated_at', to_char(m.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"+00:00"'))
+$fn$;
+
+CREATE FUNCTION jarvis_history_hash(prev text, op text, version bigint, before jsonb, after jsonb)
+RETURNS text LANGUAGE sql IMMUTABLE AS $fn$
+    SELECT encode(sha256(convert_to(
+        prev || '|' || op || '|' || version::text || '|' ||
+        coalesce(before::text, '') || '|' || coalesce(after::text, ''), 'UTF8')), 'hex')
+$fn$;
+
+CREATE TABLE record_history (
+    history_id bigserial PRIMARY KEY,
+    tenant_key text   NOT NULL CHECK (tenant_key <> ''),
+    memory_id  text   NOT NULL,
+    version    bigint NOT NULL,
+    op         text   NOT NULL CHECK (op IN ('create', 'update', 'delete', 'backfill')),
+    actor      text   NOT NULL,
+    changed_at timestamptz NOT NULL DEFAULT now(),
+    before     jsonb,
+    after      jsonb,
+    prev_hash  text   NOT NULL CHECK (prev_hash ~ '^[0-9a-f]{64}$'),
+    row_hash   text   NOT NULL CHECK (row_hash ~ '^[0-9a-f]{64}$'),
+    CHECK ((op IN ('create', 'backfill') AND before IS NULL AND after IS NOT NULL)
+        OR (op = 'update' AND before IS NOT NULL AND after IS NOT NULL)
+        OR (op = 'delete' AND before IS NOT NULL AND after IS NULL))
+);
+CREATE INDEX record_history_record_idx ON record_history (tenant_key, memory_id, history_id);
+
+-- Backfill: rows that exist before history capture get a genesis entry with op='backfill'
+-- and actor='migration:backfill'.  It records the row's state at upgrade time (its real
+-- created_at is inside 'after'); it is NOT a claim that a create happened at that moment.
+-- (NO FORCE lets the owner see every tenant for this one statement.)
+ALTER TABLE memories NO FORCE ROW LEVEL SECURITY;
+INSERT INTO record_history (tenant_key, memory_id, version, op, actor, before, after, prev_hash, row_hash)
+SELECT m.tenant_key, m.id, m.version, 'backfill', 'migration:backfill', NULL, jarvis_memory_json(m),
+       repeat('0', 64),
+       jarvis_history_hash(repeat('0', 64), 'backfill', m.version, NULL, jarvis_memory_json(m))
+FROM memories m ORDER BY m.tenant_key, m.id;
+ALTER TABLE memories FORCE ROW LEVEL SECURITY;
+
+CREATE FUNCTION jarvis_history_immutable() RETURNS trigger LANGUAGE plpgsql AS $fn$
+BEGIN
+    RAISE EXCEPTION 'record_history is append-only';
+END
+$fn$;
+CREATE TRIGGER record_history_no_update BEFORE UPDATE ON record_history
+    FOR EACH ROW EXECUTE FUNCTION jarvis_history_immutable();
+CREATE TRIGGER record_history_no_delete BEFORE DELETE ON record_history
+    FOR EACH ROW EXECUTE FUNCTION jarvis_history_immutable();
+CREATE TRIGGER record_history_no_truncate BEFORE TRUNCATE ON record_history
+    FOR EACH STATEMENT EXECUTE FUNCTION jarvis_history_immutable();
+
+ALTER TABLE record_history ENABLE ROW LEVEL SECURITY;
+ALTER TABLE record_history FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON record_history
+    USING (tenant_key = current_setting('jarvis.tenant_key', true))
+    WITH CHECK (tenant_key = current_setting('jarvis.tenant_key', true));
+
+-- Capture every create/update/delete in the same transaction as the change, chained per record.
+CREATE FUNCTION jarvis_record_history() RETURNS trigger LANGUAGE plpgsql AS $fn$
+DECLARE
+    t text; mid text; opn text; b jsonb; a jsonb; v bigint; prev text; act text;
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        t := OLD.tenant_key; mid := OLD.id; opn := 'delete'; b := jarvis_memory_json(OLD); a := NULL; v := OLD.version;
+    ELSIF TG_OP = 'UPDATE' THEN
+        t := NEW.tenant_key; mid := NEW.id; opn := 'update'; b := jarvis_memory_json(OLD); a := jarvis_memory_json(NEW); v := NEW.version;
+    ELSE
+        t := NEW.tenant_key; mid := NEW.id; opn := 'create'; b := NULL; a := jarvis_memory_json(NEW); v := NEW.version;
+    END IF;
+    PERFORM pg_advisory_xact_lock(hashtextextended(t || '/' || mid, 0));
+    SELECT h.row_hash INTO prev FROM record_history h
+        WHERE h.tenant_key = t AND h.memory_id = mid ORDER BY h.history_id DESC LIMIT 1;
+    prev := coalesce(prev, repeat('0', 64));
+    act := coalesce(nullif(current_setting('jarvis.actor', true), ''), 'unknown');
+    INSERT INTO record_history (tenant_key, memory_id, version, op, actor, before, after, prev_hash, row_hash)
+    VALUES (t, mid, v, opn, act, b, a, prev, jarvis_history_hash(prev, opn, v, b, a));
+    RETURN NULL;
+END
+$fn$;
+CREATE TRIGGER memories_history AFTER INSERT OR UPDATE OR DELETE ON memories
+    FOR EACH ROW EXECUTE FUNCTION jarvis_record_history();
+
+-- Verifier: per-record chain integrity, plus every live row must equal its last history entry
+-- (catches truncated tails and writes that bypassed the triggers).
+CREATE FUNCTION jarvis_verify_history(p_tenant text, p_memory_id text DEFAULT NULL)
+RETURNS TABLE (history_id bigint, memory_id text, problem text) LANGUAGE plpgsql AS $fn$
+DECLARE
+    r record; cur_mem text := NULL; last_hash text := NULL; calc text;
+BEGIN
+    FOR r IN
+        SELECT * FROM record_history h
+        WHERE h.tenant_key = p_tenant AND (p_memory_id IS NULL OR h.memory_id = p_memory_id)
+        ORDER BY h.memory_id COLLATE "C", h.history_id
+    LOOP
+        IF cur_mem IS DISTINCT FROM r.memory_id THEN
+            cur_mem := r.memory_id; last_hash := repeat('0', 64);
+        END IF;
+        IF r.prev_hash <> last_hash THEN
+            RETURN QUERY SELECT r.history_id, r.memory_id,
+                'prev_hash does not match the previous entry (an entry was removed or reordered)'::text;
+        END IF;
+        calc := jarvis_history_hash(r.prev_hash, r.op, r.version, r.before, r.after);
+        IF calc <> r.row_hash THEN
+            RETURN QUERY SELECT r.history_id, r.memory_id, 'row_hash mismatch (entry was altered)'::text;
+        END IF;
+        last_hash := r.row_hash;
+    END LOOP;
+
+    -- Head consistency: live rows vs. the latest entry of their chain.
+    RETURN QUERY
+    SELECT lh.history_id, m.id, 'live record differs from its latest history entry (or has none)'::text
+    FROM memories m
+    LEFT JOIN LATERAL (
+        SELECT h.history_id, h.op, h.after FROM record_history h
+        WHERE h.tenant_key = m.tenant_key AND h.memory_id = m.id ORDER BY h.history_id DESC LIMIT 1
+    ) lh ON true
+    WHERE m.tenant_key = p_tenant AND (p_memory_id IS NULL OR m.id = p_memory_id)
+      AND (lh.history_id IS NULL OR lh.op = 'delete' OR lh.after IS DISTINCT FROM jarvis_memory_json(m));
+END
+$fn$;
+"""
+
+MIGRATIONS: list[tuple[int, str]] = [(1, _V1), (2, _V2)]
 EXPECTED_SCHEMA_VERSION = MIGRATIONS[-1][0]
 
 
@@ -102,6 +231,10 @@ def _grant(conn: psycopg.Connection, schema: str, role: str) -> None:
     conn.execute(sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(s, r))
     conn.execute(sql.SQL("GRANT SELECT, INSERT, UPDATE, DELETE ON memories, boards TO {}").format(r))
     conn.execute(sql.SQL("GRANT SELECT ON schema_version TO {}").format(r))
+    if conn.execute("SELECT to_regclass('record_history') IS NOT NULL").fetchone()[0]:
+        # append-only for the app: no UPDATE/DELETE/TRUNCATE is ever granted
+        conn.execute(sql.SQL("GRANT SELECT, INSERT ON record_history TO {}").format(r))
+        conn.execute(sql.SQL("GRANT USAGE, SELECT ON SEQUENCE record_history_history_id_seq TO {}").format(r))
 
 
 def migrate(
@@ -109,6 +242,7 @@ def migrate(
     *,
     schema: str | None = None,
     app_role: str | None = None,
+    up_to: int | None = None,
 ) -> int:
     """Apply pending migrations atomically and return the resulting schema version.
 
@@ -133,7 +267,7 @@ def migrate(
                 f"database schema version {current} is newer than this code ({EXPECTED_SCHEMA_VERSION})"
             )
         for version, ddl in MIGRATIONS:
-            if version > current:
+            if version > current and (up_to is None or version <= up_to):
                 conn.execute(ddl)
                 conn.execute("INSERT INTO schema_version (version) VALUES (%s)", (version,))
                 current = version

@@ -272,6 +272,29 @@ class PostgresRowStore:
     def conflicts(self, subject: str | None = None) -> list[ConflictSet]:
         return detect_conflicts(self.list_memories(limit=10**9), subject=subject)
 
+    # -- history ----------------------------------------------------------------
+
+    def history(self, memory_id: str, limit: int = 200) -> list[dict[str, Any]]:
+        """Append-only change log for one record (survives deletion), oldest first."""
+        with self._tx() as conn:
+            rows = conn.execute(
+                "SELECT history_id, memory_id, version, op, actor, changed_at, before, after, "
+                "prev_hash, row_hash FROM record_history "
+                "WHERE tenant_key = %s AND memory_id = %s ORDER BY history_id LIMIT %s",
+                (self._tenant_key, memory_id, max(1, min(int(limit), 1000))),
+            ).fetchall()
+        for row in rows:
+            row["changed_at"] = _iso(row["changed_at"])
+        return rows
+
+    def verify_history(self, memory_id: str | None = None) -> list[dict[str, Any]]:
+        """Recompute the hash chain and compare live rows to it; [] means intact."""
+        with self._tx() as conn:
+            return conn.execute(
+                "SELECT history_id, memory_id, problem FROM jarvis_verify_history(%s, %s)",
+                (self._tenant_key, memory_id),
+            ).fetchall()
+
     # -- writes -----------------------------------------------------------------
 
     def _supersedes_exists(self, conn: psycopg.Connection, target: str) -> bool:
@@ -368,7 +391,7 @@ class PostgresRowStore:
                 return _record(changed)
             if data.expected_version is not None:
                 raise StoreVersionConflict("version conflict: record changed during update")
-            time.sleep(random.uniform(0.005, 0.02) * (attempt + 1))
+            time.sleep(random.uniform(0, min(0.25, 0.005 * 2**attempt)))  # jittered exponential backoff
         raise StoreVersionConflict("version conflict: too much concurrent modification, retry")
 
     def delete_memory(self, memory_id: str) -> bool:

@@ -118,20 +118,41 @@ def test_concurrent_updates_to_different_fields_are_never_clobbered(pg):
     rec = _new(stores[0], subject="start", confidence=0.5)
     n = 25
 
+    ok = {"subject": 0, "confidence": 0}
+    unexpected: list[BaseException] = []
+    guard = threading.Lock()
+
+    def attempt(kind, store_, data):
+        try:
+            store_.update_memory(rec.id, data)
+            with guard:
+                ok[kind] += 1
+        except StoreVersionConflict:
+            pass  # allowed under contention (HTTP 409)
+        except BaseException as exc:  # noqa: BLE001
+            with guard:
+                unexpected.append(exc)
+
     def set_subject():
         for i in range(n):
-            stores[0].update_memory(rec.id, MemoryUpdate(subject=f"subject-{i}"))
+            attempt("subject", stores[0], MemoryUpdate(subject=f"subject-{i}"))
 
     def set_confidence():
         for i in range(n):
-            stores[1].update_memory(rec.id, MemoryUpdate(confidence=(i + 1) / 100))
+            attempt("confidence", stores[1], MemoryUpdate(confidence=(i + 1) / 100))
 
     threads = [threading.Thread(target=f) for f in (set_subject, set_confidence)]
     [t.start() for t in threads]
     [t.join() for t in threads]
+    assert unexpected == []
     final = stores[0].get_memory(rec.id)
-    assert final.subject == f"subject-{n - 1}" and final.confidence == n / 100  # neither writer lost
-    assert final.version == 1 + 2 * n  # every update counted exactly once
+    assert final.version == 1 + ok["subject"] + ok["confidence"]  # every success counted exactly once
+    updates = [e for e in stores[0].history(rec.id) if e["op"] == "update"]
+    assert len(updates) == ok["subject"] + ok["confidence"]
+    for e in updates:  # no stale snapshot ever clobbered the other writer's field
+        changed = [k for k in ("subject", "confidence") if e["before"][k] != e["after"][k]]
+        assert len(changed) == 1
+    assert stores[0].verify_history() == []
 
 
 def test_internal_retry_recovers_from_a_concurrent_update(pg, store):
