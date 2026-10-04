@@ -284,7 +284,8 @@ def oauth_challenge(scope: str = READ_SCOPE) -> str:
 
 async def identity_middleware(request: Request, call_next):
     """Authenticate public API/MCP calls and bind their OAuth subject to storage."""
-    protected = request.url.path == "/mcp" or request.url.path.startswith("/api/jarvis/")
+    path = request.url.path
+    protected = path == "/mcp" or path.startswith(("/mcp/", "/api/jarvis/"))
     if not protected or not oauth_enabled():
         return await call_next(request)
     authorization = request.headers.get("authorization") or ""
