@@ -51,7 +51,11 @@ def _http_post(path: str, arguments: dict[str, Any]) -> dict[str, Any]:
     url = f"{base_url()}{path}"
     payload = json.dumps(arguments).encode("utf-8")
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
-    api_key = (os.environ.get("EMR_RECALL_API_KEY") or "").strip()
+    # Server accepts EMR_RECALL_API_KEY when set, else JARVIS_API_KEY.
+    api_key = (
+        (os.environ.get("EMR_RECALL_API_KEY") or "").strip()
+        or (os.environ.get("JARVIS_API_KEY") or "").strip()
+    )
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     req = urllib.request.Request(

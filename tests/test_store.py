@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import tempfile
+
+import pytest
 from pathlib import Path
 
 from app.models import MemoryBoard, MemoryCreate, MemoryUpdate, migrate_legacy_record
-from app.store import JarvisStore
+from app.store import JarvisStore, StoreUnavailableError
 from app.continuity import content_sha256
 
 
@@ -195,8 +197,9 @@ def test_load_corrupted_store():
     tmp = Path(tempfile.mktemp(suffix=".json"))
     tmp.write_text("{bad json", "utf-8")
     s = JarvisStore(str(tmp))
-    board = s.get_board()
-    assert board.board_id == "default_board"
+    with pytest.raises(StoreUnavailableError):
+        s.get_board()
+    assert tmp.read_text("utf-8") == "{bad json"  # never overwritten with an empty ledger
     tmp.unlink(missing_ok=True)
 
 

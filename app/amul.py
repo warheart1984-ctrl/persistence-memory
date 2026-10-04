@@ -34,6 +34,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 from app.emr import make_summary, render_resolution
+from app.identity import current_tenant_key
 from app.models import MemoryRecord
 
 ArtifactResolution = Literal["summary", "detail", "evidence"]
@@ -42,7 +43,7 @@ SCHEMA = "amul-artifact-v1"
 
 FIELD_PATH = os.getenv("JARVIS_AMUL_PATH") or os.path.join("data", "amul-field.jsonl")
 
-_field: "AmulField | None" = None
+_fields: "dict[str, AmulField]" = {}
 
 
 def sha256_text(text: str) -> str:
@@ -183,16 +184,22 @@ class AmulField:
         return [self._artifacts[i] for i in self._order]
 
 
+def _tenant_field_path(tenant: str) -> str:
+    return str(Path(FIELD_PATH).parent / "tenants" / f"{tenant}-field.jsonl")
+
+
 def get_field(path: str | None = None) -> AmulField:
-    global _field
-    if _field is None or (path and path != _field.path):
-        _field = AmulField(path or FIELD_PATH)
-    return _field
+    """Field for the explicit path, else the current OAuth tenant's, else the operator's."""
+    if path is None:
+        tenant = current_tenant_key()
+        path = _tenant_field_path(tenant) if tenant else FIELD_PATH
+    if path not in _fields:
+        _fields[path] = AmulField(path)
+    return _fields[path]
 
 
 def reset_field_for_tests() -> None:
-    global _field
-    _field = None
+    _fields.clear()
 
 
 # --- Anchoring: Ledger truth -> immutable AMUL artifacts -------------------

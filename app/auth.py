@@ -48,11 +48,16 @@ def mcp_write_enabled() -> bool:
     )
 
 
-def require_mcp_write() -> None:
+def require_mcp_write_scope() -> None:
+    """OAuth scope half of the MCP write gate (flag handled by the write tools)."""
     if oauth_enabled():
         principal = current_principal()
         if principal is None or WRITE_SCOPE not in principal.scopes:
             raise HTTPException(status_code=403, detail="OAuth access token lacks required scope: memory.write")
+
+
+def require_mcp_write() -> None:
+    require_mcp_write_scope()
     if not mcp_write_enabled():
         raise HTTPException(
             status_code=403,
@@ -109,8 +114,9 @@ def verify_operator_api_key(
 def require_emr_recall_api_key(
     authorization: str | None = Header(default=None),
     x_emr_recall_key: str | None = Header(default=None, alias="X-EMR-Recall-Key"),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> None:
-    """When EMR_RECALL_API_KEY is set, require Bearer or X-EMR-Recall-Key header."""
+    """Require EMR_RECALL_API_KEY when set; else JARVIS_API_KEY unless JARVIS_ALLOW_UNAUTHENTICATED."""
     if oauth_enabled():
         # Identity middleware authenticated the OAuth token before this dependency.
         return
@@ -118,6 +124,7 @@ def require_emr_recall_api_key(
     if is_public_deployment() and not expected:
         raise HTTPException(status_code=503, detail="Public deployment requires EMR_RECALL_API_KEY")
     if not expected:
+        verify_ledger_key_fallback(authorization, x_api_key)
         return
     verify_operator_api_key(authorization, x_emr_recall_key)
 
@@ -164,11 +171,30 @@ async def ledger_read_protection_middleware(request: Request, call_next):
     return await call_next(request)
 
 
+def verify_ledger_key_fallback(authorization: str | None, x_api_key: str | None) -> None:
+    """No recall key configured: require JARVIS_API_KEY unless the local-dev opt-out is set."""
+    expected = configured_api_key()
+    if expected is None:
+        if allow_unauthenticated():
+            return
+        raise HTTPException(
+            status_code=401,
+            detail=(
+                "API key required. Set EMR_RECALL_API_KEY or JARVIS_API_KEY, or for "
+                "local dev only set JARVIS_ALLOW_UNAUTHENTICATED=1."
+            ),
+        )
+    presented = _extract_bearer(authorization) or (x_api_key or "").strip()
+    if not presented or not secrets.compare_digest(presented, expected):
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+
 def optional_verify_operator_api_key(
     authorization: str | None,
     x_emr_recall_key: str | None,
+    x_api_key: str | None = None,
 ) -> None:
-    """When EMR_RECALL_API_KEY is unset, allow (local dev). When set, require match."""
+    """EMR_RECALL_API_KEY when set; otherwise JARVIS_API_KEY / explicit local-dev opt-out."""
     if oauth_enabled():
         # The identity middleware already validates OAuth and binds a tenant.
         # Never reinterpret a valid user token as the legacy operator secret.
@@ -176,6 +202,7 @@ def optional_verify_operator_api_key(
     if is_public_deployment() and not emr_recall_api_key():
         raise HTTPException(status_code=503, detail="Public deployment requires EMR_RECALL_API_KEY")
     if not emr_recall_api_key():
+        verify_ledger_key_fallback(authorization, x_api_key)
         return
     verify_operator_api_key(authorization, x_emr_recall_key)
 
@@ -284,7 +311,8 @@ def oauth_challenge(scope: str = READ_SCOPE) -> str:
 
 async def identity_middleware(request: Request, call_next):
     """Authenticate public API/MCP calls and bind their OAuth subject to storage."""
-    protected = request.url.path == "/mcp" or request.url.path.startswith("/api/jarvis/")
+    path = request.url.path
+    protected = path == "/mcp" or path.startswith(("/mcp/", "/api/jarvis/"))
     if not protected or not oauth_enabled():
         return await call_next(request)
     authorization = request.headers.get("authorization") or ""

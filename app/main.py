@@ -7,6 +7,7 @@ from pathlib import Path
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from app.amul import (
@@ -72,14 +73,25 @@ from app.auth import (
     mcp_write_enabled,
     memory_write_enabled,
     require_emr_recall_api_key,
+    require_mcp_write_scope,
     require_memory_write,
     identity_middleware,
     oauth_enabled,
 )
 from app.oauth import protected_resource_metadata
 from app.public_security import cors_origins, public_security_middleware
-from app.store import get_store
-from app.graph import bfs_search, shortest_path, find_related, connected_components, memory_graph_stats
+from app.store import StoreUnavailableError, get_store
+from app.graph import (
+    BfsBody,
+    ComponentsBody,
+    RelatedBody,
+    ShortestPathBody,
+    bfs_search,
+    connected_components,
+    find_related,
+    memory_graph_stats,
+    shortest_path,
+)
 from mcp_server.mcp_http import create_mcp_router
 
 app = FastAPI(
@@ -207,15 +219,27 @@ def index():
     }
 
 
+@app.exception_handler(StoreUnavailableError)
+async def _store_unavailable(request: Request, exc: StoreUnavailableError):
+    return JSONResponse(status_code=503, content={"detail": "Ledger store unavailable"})
+
+
 @app.get("/health")
 def health():
-    store = get_store()
-    board = store.get_board()
+    try:
+        store = get_store()
+        board = store.get_board()
+        memory_count = len(store.list_memories(limit=9999))
+    except StoreUnavailableError:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "unavailable", "service": "jarvis-memoryboard", "detail": "Ledger store unavailable"},
+        )
     return {
         "status": "ok",
         "service": "jarvis-memoryboard",
         "schema": "continuity-ledger-v1",
-        "memory_count": len(store.list_memories(limit=9999)),
+        "memory_count": memory_count,
         "board_id": board.board_id,
         "memory_write_enabled": memory_write_enabled(),
         "mcp_write_enabled": mcp_write_enabled(),
@@ -392,6 +416,8 @@ def create_memory(body: MemoryCreate, _: None = Depends(require_memory_write)):
 @app.post("/api/jarvis/memory/external-search", dependencies=[Depends(require_emr_recall_api_key)])
 def external_search(body: ExternalSearchRequest):
     """Search nx-search; optional promotion remains bounded and auditable."""
+    if body.auto_promote:
+        require_memory_write()  # promotion writes to the ledger; search alone stays read-only
     client = NxSearchClient()
     results = client.search(body.query, name_only=body.name_only, limit=body.limit)
     if "error" in results:
@@ -504,14 +530,20 @@ def tool_emr_recall(body: EmrRecallRequest):
     return result.model_dump()
 
 
-@app.post("/api/jarvis/tools/emr_remember", dependencies=[Depends(require_emr_recall_api_key)])
+@app.post(
+    "/api/jarvis/tools/emr_remember",
+    dependencies=[Depends(require_emr_recall_api_key), Depends(require_mcp_write_scope)],
+)
 def tool_emr_remember(body: EmrRememberRequest):
     """Governed create via EMR — draft-only; gated by JARVIS_MCP_WRITE_ENABLED."""
     store = get_store()
     return emr_remember(store, body).model_dump()
 
 
-@app.post("/api/jarvis/tools/emr_upsert", dependencies=[Depends(require_emr_recall_api_key)])
+@app.post(
+    "/api/jarvis/tools/emr_upsert",
+    dependencies=[Depends(require_emr_recall_api_key), Depends(require_mcp_write_scope)],
+)
 def tool_emr_upsert(body: EmrUpsertRequest):
     """Governed supersede via EMR — new draft + archive prior; gated by JARVIS_MCP_WRITE_ENABLED."""
     store = get_store()
@@ -608,7 +640,7 @@ def emr_correct(body: CorrectRequest):
     }
 
 
-@app.get("/api/jarvis/memory/active")
+@app.get("/api/jarvis/memory/active", dependencies=[Depends(require_memory_write)])
 def active_stm(
     query: str = Query(..., min_length=1, max_length=2000),
     session_key: str = Query(default="default"),
@@ -945,7 +977,7 @@ class AnchorBody(BaseModel):
     actor: str = Field(default="amul", max_length=64)
 
 
-@app.post("/api/jarvis/memory/amul/anchor")
+@app.post("/api/jarvis/memory/amul/anchor", dependencies=[Depends(require_memory_write)])
 def amul_anchor(body: AnchorBody):
     """Anchor ledger truth into immutable AMUL artifacts (idempotent)."""
     store = get_store()
@@ -1027,6 +1059,8 @@ def _invoke_emr_tool(name: str, arguments: dict) -> dict:
     if name == "emr_recall":
         body = EmrRecallRequest.model_validate(arguments)
         return emr_recall(store, body).model_dump()
+    if name in ("emr_remember", "emr_upsert"):
+        require_mcp_write_scope()
     if name == "emr_remember":
         body = EmrRememberRequest.model_validate(arguments)
         return emr_remember(store, body).model_dump()
@@ -1040,27 +1074,32 @@ app.include_router(create_mcp_router(_invoke_emr_tool), prefix="/mcp", tags=["mc
 
 # Relationship graph endpoints (full graph <=8k, sparse index above).
 @app.post("/api/jarvis/memory/graph/bfs")
-def graph_bfs(body: dict):
-    relations = set(body["relations"]) if body.get("relations") else None
-    results = bfs_search(body.get("start_id"), body.get("depth", 2), body.get("max_nodes", 50), relations, body.get("min_confidence", 0.0), body.get("max_age_days"))
-    return {"start_id": body.get("start_id"), "depth": body.get("depth", 2), "results": results, "count": len(results)}
+def graph_bfs(body: BfsBody):
+    relations = set(body.relations) if body.relations else None
+    results = bfs_search(body.start_id, body.depth, body.max_nodes, relations, body.min_confidence, body.max_age_days)
+    return {"start_id": body.start_id, "depth": body.depth, "results": results, "count": len(results)}
 
 @app.post("/api/jarvis/memory/graph/shortest-path")
-def graph_shortest_path(body: dict):
-    path = shortest_path(body.get("source"), body.get("target"), body.get("max_nodes", 1000), body.get("min_confidence", 0.0), body.get("max_age_days"))
+def graph_shortest_path(body: ShortestPathBody):
+    path = shortest_path(body.source, body.target, body.max_nodes, body.min_confidence, body.max_age_days)
     if path is None: raise HTTPException(status_code=404, detail="No path found between the given memories")
-    return {"source": body.get("source"), "target": body.get("target"), "path": path}
+    return {"source": body.source, "target": body.target, "path": path}
 
 @app.post("/api/jarvis/memory/graph/related")
-def graph_related(body: dict):
-    results = find_related(body.get("memory_id"), body.get("k", 10), body.get("min_distance", 1), body.get("max_distance", 3), body.get("min_confidence", 0.0), body.get("max_age_days"))
-    return {"memory_id": body.get("memory_id"), "k": body.get("k", 10), "results": results, "count": len(results)}
+def graph_related(body: RelatedBody):
+    results = find_related(body.memory_id, body.k, body.min_distance, body.max_distance, body.min_confidence, body.max_age_days)
+    return {"memory_id": body.memory_id, "k": body.k, "results": results, "count": len(results)}
 
 @app.get("/api/jarvis/memory/graph/stats")
 def graph_stats(min_confidence: float = 0.0, max_age_days: float | None = None):
     return memory_graph_stats(min_confidence=min_confidence, max_age_days=max_age_days)
 
 @app.post("/api/jarvis/memory/graph/components")
-def graph_components(body: dict):
-    minimum = body.get("min_size", 2)
-    return {"min_size": minimum, "components": connected_components(minimum, body.get("min_confidence", 0.0), body.get("max_age_days"))}
+def graph_components(body: ComponentsBody):
+    found = connected_components(body.min_size, body.min_confidence, body.max_age_days)
+    return {
+        "min_size": body.min_size,
+        "components": found[: body.limit],
+        "total_components": len(found),
+        "truncated": len(found) > body.limit,
+    }

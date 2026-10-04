@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -39,6 +41,10 @@ def _make_id(prefix: str = "mem") -> str:
     return f"{prefix}-{uuid.uuid4().hex[:12]}"
 
 
+class StoreUnavailableError(RuntimeError):
+    """The ledger cannot be read or written safely; callers must fail closed."""
+
+
 class JarvisStore:
     def __init__(self, path: str = "data/jarvis-store.json"):
         self._path = Path(path)
@@ -46,58 +52,114 @@ class JarvisStore:
         self._memories: dict[str, MemoryRecord] = {}
         self._loaded = False
         self._dirty_migration = False
+        # Serialises load and every mutate+save; re-entrant because load may save a migration.
+        self._lock = threading.RLock()
 
     def _ensure_loaded(self):
-        if not self._loaded:
-            self._load()
+        if self._loaded:
+            return
+        with self._lock:
+            if not self._loaded:
+                self._load()
 
     def _load(self):
-        self._loaded = True
+        """Load the ledger.  A file that exists but cannot be parsed is never "empty"."""
         if not self._path.exists():
+            self._loaded = True
             return
         try:
             raw = json.loads(self._path.read_text("utf-8"))
-        except (json.JSONDecodeError, OSError):
-            return
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
+            raise StoreUnavailableError(
+                f"Ledger file exists but cannot be read ({type(exc).__name__}); refusing to start empty"
+            ) from exc
+        if not isinstance(raw, dict):
+            raise StoreUnavailableError("Ledger file is not a JSON object; refusing to start empty")
+        self._board = MemoryBoard()
+        self._memories = {}
         self._hydrate(raw)
+        self._loaded = True
 
     def _hydrate(self, raw: dict[str, Any]) -> None:
+        """Parse the whole document or raise; never keep a partial ledger.
+
+        Anything skipped here would be deleted from disk by the next _save, so every
+        anomaly is fatal.  The bad record's id and error go in the exception message
+        (for logs); the HTTP response stays generic.
+        """
+        board = MemoryBoard()
         board_raw = raw.get("board")
-        if isinstance(board_raw, dict):
+        if board_raw is not None:
             try:
-                self._board = MemoryBoard(**board_raw)
-            except Exception:
-                self._board = MemoryBoard()
-        for item in raw.get("memories", []):
-            if not isinstance(item, dict) or not item.get("id"):
-                continue
+                if not isinstance(board_raw, dict):
+                    raise TypeError(f"board is {type(board_raw).__name__}, not an object")
+                board = MemoryBoard(**board_raw)
+            except Exception as exc:
+                raise StoreUnavailableError(f"Ledger board is invalid: {exc}") from exc
+        items = raw.get("memories", [])
+        if not isinstance(items, list):
+            raise StoreUnavailableError(f"Ledger 'memories' is {type(items).__name__}, not a list")
+        memories: dict[str, MemoryRecord] = {}
+        dirty_migration = False
+        for index, item in enumerate(items):
+            label = item.get("id") if isinstance(item, dict) and item.get("id") else f"#{index}"
             try:
+                if not isinstance(item, dict) or not item.get("id"):
+                    raise ValueError("record is not an object with an id")
+                if item["id"] in memories:
+                    raise ValueError("duplicate record id")
                 migrated = migrate_legacy_record(item)
-                rec = MemoryRecord(**migrated)
-                rec = ensure_content_hash(rec)
-                self._memories[rec.id] = rec
-                # Persist migration if legacy fields were present
-                if any(k in item for k in ("category", "state_class", "truth_status", "scope")):
-                    self._dirty_migration = True
-                if not item.get("content_sha256"):
-                    self._dirty_migration = True
-            except Exception:
-                continue
-        if self._dirty_migration:
+                rec = ensure_content_hash(MemoryRecord(**migrated))
+            except Exception as exc:
+                raise StoreUnavailableError(f"Ledger record {label} failed validation: {exc}") from exc
+            memories[rec.id] = rec
+            # Persist migration if legacy fields were present
+            if any(k in item for k in ("category", "state_class", "truth_status", "scope")):
+                dirty_migration = True
+            if not item.get("content_sha256"):
+                dirty_migration = True
+        self._board = board
+        self._memories = memories
+        if dirty_migration:
+            # Only reached after a fully clean parse, so nothing can be dropped by this save.
             self._save()
-            self._dirty_migration = False
 
     def _save(self):
-        self._path.parent.mkdir(parents=True, exist_ok=True)
+        """Atomically replace the ledger file: temp file, fsync, os.replace."""
         data = {
             "board": self._board.model_dump(),
             "schema": "continuity-ledger-v1",
             "memories": [m.model_dump() for m in self._memories.values()],
         }
-        self._path.write_text(
-            json.dumps(data, indent=2, default=str),
-            "utf-8",
-        )
+        payload = json.dumps(data, indent=2, default=str).encode("utf-8")
+        tmp_name: str | None = None
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_name = tempfile.mkstemp(
+                dir=str(self._path.parent), prefix=f"{self._path.name}.", suffix=".tmp"
+            )
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_name, self._path)
+            tmp_name = None
+        except OSError as exc:
+            raise StoreUnavailableError(f"Ledger write failed ({type(exc).__name__})") from exc
+        finally:
+            if tmp_name is not None:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+
+    def _save_or_restore(self, restore) -> None:
+        """Persist; if that fails, undo the in-memory change so memory never leads disk."""
+        try:
+            self._save()
+        except BaseException:
+            restore()
+            raise
 
 
     # --- Board ---
@@ -106,21 +168,29 @@ class JarvisStore:
         self._ensure_loaded()
         return self._board
 
-    def set_board(self, board: MemoryBoard) -> MemoryBoard:
-        self._ensure_loaded()
+    def _swap_board(self, board: MemoryBoard) -> MemoryBoard:
+        previous = self._board
         self._board = board
-        self._save()
+
+        def restore() -> None:
+            self._board = previous
+
+        self._save_or_restore(restore)
         return self._board
 
+    def set_board(self, board: MemoryBoard) -> MemoryBoard:
+        with self._lock:
+            self._ensure_loaded()
+            return self._swap_board(board)
+
     def patch_board(self, updates: dict[str, Any]) -> MemoryBoard:
-        self._ensure_loaded()
-        current = self._board.model_dump()
-        for key, value in updates.items():
-            if value is not None:
-                current[key] = value
-        self._board = MemoryBoard(**current)
-        self._save()
-        return self._board
+        with self._lock:
+            self._ensure_loaded()
+            current = self._board.model_dump()
+            for key, value in updates.items():
+                if value is not None:
+                    current[key] = value
+            return self._swap_board(MemoryBoard(**current))
 
     # --- Memories ---
 
@@ -218,6 +288,10 @@ class JarvisStore:
         return self._memories.get(memory_id)
 
     def create_memory(self, data: MemoryCreate) -> MemoryRecord:
+        with self._lock:
+            return self._create_memory(data)
+
+    def _create_memory(self, data: MemoryCreate) -> MemoryRecord:
         self._ensure_loaded()
         now = _now_iso()
         if data.supersedes and data.supersedes not in self._memories:
@@ -240,10 +314,14 @@ class JarvisStore:
             content_sha256=content_sha256(data.content),
         )
         self._memories[rec.id] = rec
-        self._save()
+        self._save_or_restore(lambda: self._memories.pop(rec.id, None))
         return rec
 
     def update_memory(self, memory_id: str, data: MemoryUpdate) -> MemoryRecord | None:
+        with self._lock:
+            return self._update_memory(memory_id, data)
+
+    def _update_memory(self, memory_id: str, data: MemoryUpdate) -> MemoryRecord | None:
         self._ensure_loaded()
         existing = self._memories.get(memory_id)
         if not existing:
@@ -275,16 +353,17 @@ class JarvisStore:
             updates["content_sha256"] = content_sha256(data.content)
         updated = MemoryRecord(**updates)
         self._memories[memory_id] = updated
-        self._save()
+        self._save_or_restore(lambda: self._memories.__setitem__(memory_id, existing))
         return updated
 
     def delete_memory(self, memory_id: str) -> bool:
-        self._ensure_loaded()
-        if memory_id in self._memories:
-            del self._memories[memory_id]
-            self._save()
+        with self._lock:
+            self._ensure_loaded()
+            removed = self._memories.pop(memory_id, None)
+            if removed is None:
+                return False
+            self._save_or_restore(lambda: self._memories.__setitem__(memory_id, removed))
             return True
-        return False
 
     def conflicts(self, subject: str | None = None) -> list[ConflictSet]:
         self._ensure_loaded()
@@ -317,9 +396,8 @@ class PostgresJarvisStore(JarvisStore):
         )
 
     def _load(self):
-        self._loaded = True
         if psycopg is None:
-            raise RuntimeError("PostgreSQL support requires the psycopg package")
+            raise StoreUnavailableError("PostgreSQL support requires the psycopg package")
         try:
             with psycopg.connect(self._dsn, connect_timeout=5) as conn:
                 self._ensure_schema(conn)
@@ -328,9 +406,10 @@ class PostgresJarvisStore(JarvisStore):
                     (self._tenant_key,),
                 ).fetchone()
         except psycopg.Error as exc:
-            raise RuntimeError("Jarvis PostgreSQL ledger is unavailable") from exc
+            raise StoreUnavailableError("Jarvis PostgreSQL ledger is unavailable") from exc
         if row and isinstance(row[0], dict):
             self._hydrate(row[0])
+        self._loaded = True
 
     def _save(self):
         data = {
@@ -339,7 +418,7 @@ class PostgresJarvisStore(JarvisStore):
             "memories": [m.model_dump() for m in self._memories.values()],
         }
         if psycopg is None:
-            raise RuntimeError("PostgreSQL support requires the psycopg package")
+            raise StoreUnavailableError("PostgreSQL support requires the psycopg package")
         try:
             with psycopg.connect(self._dsn, connect_timeout=5) as conn:
                 self._ensure_schema(conn)
@@ -354,7 +433,7 @@ class PostgresJarvisStore(JarvisStore):
                     (self._tenant_key, json.dumps(data, default=str)),
                 )
         except psycopg.Error as exc:
-            raise RuntimeError("Jarvis PostgreSQL ledger write failed") from exc
+            raise StoreUnavailableError("Jarvis PostgreSQL ledger write failed") from exc
 
 
 _stores: dict[str, JarvisStore] = {}

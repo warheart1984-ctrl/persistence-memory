@@ -395,6 +395,11 @@ def emr_upsert(
     target = store.get_memory(req.id)
     if target is None:
         return _refuse("target-not-found", f"Memory id not found: {req.id}")
+    if target.status == "verified":
+        return _refuse(
+            "authority-protected",
+            "Verified records cannot be superseded or archived through a draft MCP write",
+        )
 
     if req.supersedes is not None and req.supersedes.strip() and req.supersedes.strip() != req.id:
         return _refuse(

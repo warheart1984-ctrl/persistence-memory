@@ -5,7 +5,8 @@
       "args": ["-m", "mcp_server"],
       "cwd": "/absolute/path/to/persistence-memory",
       "env": {
-        "JARVIS_MEMORYBOARD_URL": "http://127.0.0.1:8001"
+        "JARVIS_MEMORYBOARD_URL": "http://127.0.0.1:8001",
+        "JARVIS_API_KEY": "<same value as the server's JARVIS_API_KEY; use EMR_RECALL_API_KEY instead if the server sets it>"
       }
     }
   }

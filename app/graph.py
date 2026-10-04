@@ -1,8 +1,9 @@
 """Bounded relationship graph over continuity-ledger memories."""
 from __future__ import annotations
 from datetime import datetime, timezone
-from typing import Any
+from typing import Annotated, Any
 import networkx as nx
+from pydantic import BaseModel, ConfigDict, Field
 from app.models import MemoryRecord
 from app.store import get_store
 
@@ -131,9 +132,73 @@ def find_related(memory_id: str, k: int = 10, min_distance: int = 1, max_distanc
         if node != memory_id and distance >= min_distance: out.append({"id": node, "distance": distance, "relation": g[memory_id][node].get("relation", "connected") if g.has_edge(memory_id, node) else "connected"})
     return sorted(out, key=lambda x: (x["distance"], x["id"]))[:k]
 
+def _sparse_components(index: SparseMemoryIndex) -> list[set[str]]:
+    """Linear-time union-find over the index's subject/tag/supersedes groups."""
+    parent = {node: node for node in index.memories}
+
+    def find(node: str) -> str:
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    def union(left: str, right: str) -> None:
+        root_left, root_right = find(left), find(right)
+        if root_left != root_right:
+            parent[root_right] = root_left
+
+    for groups in (index.subjects, index.tags):
+        for members in groups.values():
+            ordered = list(members)
+            for other in ordered[1:]:
+                union(ordered[0], other)
+    for child, parent_id in index.supersedes.items():
+        union(child, parent_id)
+    grouped: dict[str, set[str]] = {}
+    for node in parent:
+        grouped.setdefault(find(node), set()).add(node)
+    return list(grouped.values())
+
+
 def connected_components(min_size: int = 2, min_confidence: float = 0.0, max_age_days: float | None = None):
     g = _load_graph(min_confidence=min_confidence, max_age_days=max_age_days)
-    return [sorted(c) for c in nx.connected_components(g.to_undirected()) if len(c) >= min_size]
+    if isinstance(g, SparseMemoryIndex):
+        groups = _sparse_components(g)
+    else:
+        groups = nx.connected_components(g.to_undirected())
+    found = [sorted(c) for c in groups if len(c) >= min_size]
+    return sorted(found, key=lambda c: (-len(c), c[0]))
+
+
+class _GraphBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    min_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    max_age_days: float | None = Field(default=None, gt=0, le=36500)
+
+
+class BfsBody(_GraphBody):
+    start_id: str = Field(min_length=1, max_length=64)
+    depth: int = Field(default=2, ge=0, le=MAX_DEPTH)
+    max_nodes: int = Field(default=50, ge=1, le=MAX_NODES)
+    relations: list[Annotated[str, Field(min_length=1, max_length=64)]] | None = Field(default=None, max_length=16)
+
+
+class ShortestPathBody(_GraphBody):
+    source: str = Field(min_length=1, max_length=64)
+    target: str = Field(min_length=1, max_length=64)
+    max_nodes: int = Field(default=MAX_NODES, ge=1, le=MAX_NODES)
+
+
+class RelatedBody(_GraphBody):
+    memory_id: str = Field(min_length=1, max_length=64)
+    k: int = Field(default=10, ge=1, le=MAX_K)
+    min_distance: int = Field(default=1, ge=0, le=MAX_DEPTH)
+    max_distance: int = Field(default=3, ge=0, le=MAX_DEPTH)
+
+
+class ComponentsBody(_GraphBody):
+    min_size: int = Field(default=2, ge=1, le=100_000)
+    limit: int = Field(default=100, ge=1, le=1000)
 
 def memory_graph_stats(*, min_confidence: float = 0.0, max_age_days: float | None = None):
     g = _load_graph(min_confidence=min_confidence, max_age_days=max_age_days)
