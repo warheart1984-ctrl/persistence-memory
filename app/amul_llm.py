@@ -40,6 +40,26 @@ from app.amul_rag import append_jsonl, embed
 
 LLM_URL = os.getenv("JARVIS_LLM_URL") or "http://localhost:13305/api/v1"
 LLM_MODEL = os.getenv("JARVIS_LLM_MODEL") or ""
+# Wire protocol of the backend at LLM_URL:
+#   openai       POST {url}/chat/completions, answer in choices[0].message
+#   llm-gateway  POST {url}/chat/complete (warheart1984-ctrl/llm-gateway),
+#                answer in content/reasoning; params nested under `params`
+LLM_API = (os.getenv("JARVIS_LLM_API") or "openai").strip().lower()
+
+
+def _read_api_key() -> str:
+    """Backend credential: JARVIS_LLM_API_KEY, else the file JARVIS_LLM_API_KEY_FILE."""
+    key = os.getenv("JARVIS_LLM_API_KEY") or ""
+    path = os.getenv("JARVIS_LLM_API_KEY_FILE") or ""
+    if not key and path:
+        try:
+            key = Path(path).read_text(encoding="utf-8")
+        except OSError:
+            key = ""
+    return key.strip()
+
+
+LLM_API_KEY = _read_api_key()
 LLM_LOG_PATH = os.getenv("JARVIS_LLM_LOG_PATH") or os.path.join("data", "amul-llm-log.jsonl")
 
 REPLAY_SCHEMA = "amul-llm-replay-v1"
@@ -152,11 +172,20 @@ def decode(tokens: list[str]) -> str:
 class GenerationResult(BaseModel):
     text: str
     model: str
-    backend: str  # openai-compat | echo-stub
+    backend: str  # openai-compat | llm-gateway | echo-stub
     tokens_used: int
 
 
+# Backends where a model actually answered (not the echo stub or the logical layer).
+MODEL_BACKENDS = ("openai-compat", "llm-gateway")
+
+
 _discovered_model: str | None = None
+
+
+def _auth_headers() -> dict[str, str]:
+    # Bearer works for OpenAI-compatible servers and for llm-gateway alike.
+    return {"Authorization": f"Bearer {LLM_API_KEY}"} if LLM_API_KEY else {}
 
 
 def _resolve_model() -> str:
@@ -170,7 +199,7 @@ def _resolve_model() -> str:
     try:
         import httpx
 
-        r = httpx.get(LLM_URL.rstrip("/") + "/models", timeout=10)
+        r = httpx.get(LLM_URL.rstrip("/") + "/models", headers=_auth_headers(), timeout=10)
         models = r.json().get("data", [])
         for m in models:
             if "chat" in (m.get("labels") or []):
@@ -188,16 +217,43 @@ def core_model_generate(
 ) -> GenerationResult:
     """Core Model Module — swappable adapter.
 
-    Primary: OpenAI-compatible backend (e.g., Lemonade). Fallback: Echo stub
-    so the governed pipeline is always exercisable; the stub NEVER pretends
-    to be a real model (backend='echo-stub' in metadata).
+    Primary: OpenAI-compatible backend (e.g., Lemonade), or llm-gateway when
+    JARVIS_LLM_API=llm-gateway. Fallback: Echo stub so the governed pipeline
+    is always exercisable; the stub NEVER pretends to be a real model
+    (backend='echo-stub' in metadata).
     """
-    if LLM_URL:
+    if LLM_URL and LLM_API == "llm-gateway":
+        try:
+            import httpx
+
+            resp = httpx.post(
+                LLM_URL.rstrip("/") + "/chat/complete",
+                headers=_auth_headers(),
+                json={
+                    "model": _resolve_model(),
+                    "messages": messages,
+                    "params": {"temperature": temperature, "max_tokens": max_tokens},
+                },
+                timeout=120,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            # Reasoning stays out of `content`; use it only when there is no answer.
+            text = data.get("content") or data.get("reasoning") or ""
+            used = (data.get("usage") or {}).get("total_tokens") or len(encode(text))
+            return GenerationResult(
+                text=text, model=data.get("model") or LLM_MODEL or "unknown",
+                backend="llm-gateway", tokens_used=int(used),
+            )
+        except Exception:
+            pass  # graceful degradation to stub below
+    elif LLM_URL:
         try:
             import httpx
 
             resp = httpx.post(
                 LLM_URL.rstrip("/") + "/chat/completions",
+                headers=_auth_headers(),
                 json={
                     "model": _resolve_model(),
                     "messages": messages,
@@ -292,10 +348,13 @@ def policy_check(answer_text: str, contract: dict[str, Any]) -> list[str]:
     return flags
 
 
-def generate(contract: PromptContract) -> dict[str, Any]:
+def generate(contract: PromptContract, recall: dict[str, Any] | None = None) -> dict[str, Any]:
     """Full AMUL-LLM loop. Rules R-A/R-B are structural, not aspirational:
     the function cannot return without running policy_check, and it cannot
-    return without writing the replay record."""
+    return without writing the replay record.
+
+    `recall` describes memories the caller recalled into `contract.context`;
+    it is kept on the replay record so the generation stays replayable."""
     steps: list[str] = []
     started = time.time()
 
@@ -336,9 +395,10 @@ def generate(contract: PromptContract) -> dict[str, Any]:
         steps.append("output post-processing")
         flags = policy_check(result.text, rc)
 
-    grounded = bool(contract.context) and result.backend == "openai-compat"
+    real_model = result.backend in MODEL_BACKENDS
+    grounded = bool(contract.context) and real_model
     confidence = round(min(0.95, 0.45 + (0.25 if grounded else 0.0) +
-                           (0.15 if result.backend == "openai-compat" else 0.0)), 2)
+                           (0.15 if real_model else 0.0)), 2)
     record = {
         "schema_version": REPLAY_SCHEMA,
         "query": contract.user[:500],
@@ -359,6 +419,8 @@ def generate(contract: PromptContract) -> dict[str, Any]:
         },
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+    if recall is not None:
+        record["recall"] = recall
     append_jsonl(LLM_LOG_PATH, record)  # Rule R-B: replay ALWAYS written
     return record
 
@@ -385,6 +447,8 @@ def llm_status() -> dict[str, Any]:
         "replay_schema": REPLAY_SCHEMA,
         "backend": {
             "url": LLM_URL or "(unset)",
+            "api": LLM_API,
+            "authenticated": bool(LLM_API_KEY),
             "model_env": LLM_MODEL or "(backend default)",
             "fallback": "echo-stub-v0",
         },

@@ -873,15 +873,20 @@ def _reinforcement_metrics(
                     ),
                     None,
                 )
-                distractor = next(
-                    (
-                        memory_id
-                        for memory_id in baseline.ids
-                        if memory_id != target
+                def _irrelevant(memory_id: str) -> bool:
+                    return (
+                        memory_id != target
                         and by_id[memory_id].content_sha256 not in case.relevant_hashes
-                    ),
+                    )
+
+                # Prefer an irrelevant memory the query already ranks. Retrieval
+                # that keeps unrelated memories out entirely leaves none, so
+                # fall back to any irrelevant one: it must stay out however
+                # often it is "used".
+                distractor = next(
+                    (memory_id for memory_id in baseline.ids if _irrelevant(memory_id)),
                     None,
-                )
+                ) or next((rec.id for rec in records if _irrelevant(rec.id)), None)
                 if target is None or distractor is None:
                     continue
                 probes += 1
@@ -892,9 +897,12 @@ def _reinforcement_metrics(
                 base_target_rank = _rank_of(baseline.ids, target)
                 base_distractor_rank = _rank_of(baseline.ids, distractor)
                 base_activation = next(
-                    entry.activation
-                    for entry in baseline.entries
-                    if entry.memory_id == distractor
+                    (
+                        entry.activation
+                        for entry in baseline.entries
+                        if entry.memory_id == distractor
+                    ),
+                    0.0,
                 )
 
                 for use_index in range(uses):
@@ -970,9 +978,12 @@ def _reinforcement_metrics(
                     base_distractor_rank > DEFAULT_K and biased_rank <= DEFAULT_K
                 )
                 biased_activation = next(
-                    entry.activation
-                    for entry in biased.entries
-                    if entry.memory_id == distractor
+                    (
+                        entry.activation
+                        for entry in biased.entries
+                        if entry.memory_id == distractor
+                    ),
+                    0.0,
                 )
                 if base_activation > 0:
                     activation_multipliers.append(biased_activation / base_activation)

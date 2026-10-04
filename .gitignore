@@ -12,3 +12,5 @@ data/*.tmp
 *.egg-info/
 dist/
 build/
+data/emr-embeddings.json
+data/emr-embed-model/

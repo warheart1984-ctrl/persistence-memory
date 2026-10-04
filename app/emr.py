@@ -32,6 +32,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from app import emr_embed
 from app.identity import current_tenant_key
 from app.models import MemoryRecord, MemoryStatus, MemoryType
 
@@ -141,7 +142,10 @@ class AbstentionConfig(BaseModel):
     """
 
     enabled: Literal[True] = True
-    min_top_score: float = Field(default=0.05, ge=0.05, le=1.0)
+    # gate_A is Q × P × (1 + κ·sim) with κ ≤ 0.5. A memory sharing no term
+    # with the query has Q = Q_NO_OVERLAP (0.05), so it scores at most 0.075:
+    # the floor sits above that, and no-overlap evidence can never pass.
+    min_top_score: float = Field(default=0.08, ge=0.05, le=1.0)
     min_top_query_alignment: float = Field(default=0.2, ge=0.2, le=1.0)
     min_score_margin: float = Field(default=0.0005, ge=0.0005, le=1.0)
     min_relative_margin: float = Field(default=0.005, ge=0.005, le=1.0)
@@ -149,6 +153,9 @@ class AbstentionConfig(BaseModel):
 
 class ActivationBreakdown(BaseModel):
     Q: float
+    # Q's parts: lexical alignment, and the semantic one when embeddings ran.
+    Q_lex: float | None = None
+    Q_sem: float | None = None
     R: float
     P: float
     decay: float
@@ -213,6 +220,11 @@ SALIENCE_CAP = 0.5
 DAMP_GAIN = 0.03
 DAMP_CAP = 0.5
 TOTAL_REINFORCEMENT_CAP = 1.25
+# Decay ranks recent memories first but never erases one: without a floor a
+# month-old fact scored ~1e-4 of a fresh one and lost to unrelated memories.
+RECENCY_FLOOR = 0.25
+# query_alignment's value when a memory shares no term with the query.
+Q_NO_OVERLAP = 0.05
 
 REINFORCEMENT_RULE = (
     "Reinforcement requires an explicit positive outcome signal and strengthens "
@@ -809,17 +821,97 @@ def make_summary(content: str, max_chars: int = 140) -> str:
     return (cut or text[: max_chars - 1]).rstrip(",;:") + "…"
 
 
-def query_alignment(rec: MemoryRecord, query: str) -> float:
-    """Q_i ∈ (0, 1] — lexical overlap of query with content/subject/tags."""
-    q_tokens = _tokenize(query)
-    if not q_tokens:
+# Function words carry no evidence: counted, they dilute real questions and let
+# unrelated ones match on "what"/"is"/"the".
+_STOPWORDS = frozenset("""
+a about above after again against all am an and any are as at be been before
+being below between both but by can could did do does doing done down during
+each few for from further had has have having he her here hers herself him
+himself his how i if in into is it its itself just me more most my myself no
+nor not now of off on once only or other our ours ourselves out over own same
+she should so some such than that the their theirs them themselves then there
+these they this those through to too under until up very was we were what when
+where which while who whom why will with would you your yours yourself
+yourselves get got let lets please tell know need want like use used using one
+also still ever much many way thing things anything something
+""".split())
+
+
+def _stem(word: str) -> str:
+    """Light, deterministic suffix stripping so word forms meet.
+
+    restarting/restarts/restart, merged/merging/merge and services/service
+    each reduce to one stem. Not a full Porter stemmer: it only has to make
+    the same word's forms agree, never to produce a real word.
+    """
+    w = word
+    if len(w) <= 3 or w.isdigit():
+        return w
+    if w.endswith("ies") and len(w) > 4:
+        w = w[:-3] + "y"
+    elif w.endswith("sses"):
+        w = w[:-2]
+    elif w.endswith("s") and not w.endswith(("ss", "us", "is")):
+        w = w[:-1]
+    if w.endswith("ing") and len(w) >= 6:
+        w = w[:-3]
+    elif w.endswith("ed") and len(w) >= 5:
+        w = w[:-2]
+    if len(w) >= 4 and w[-1] == w[-2] and w[-1] not in "lsz" and not w[-1].isdigit():
+        w = w[:-1]  # running -> runn -> run
+    if w.endswith("e") and len(w) >= 4:
+        w = w[:-1]  # merge/merged -> merg
+    return w
+
+
+def _terms(text: str) -> set[str]:
+    """Stemmed content terms: tokens minus function words."""
+    return {_stem(t) for t in _tokenize(text) if t not in _STOPWORDS}
+
+
+def _record_terms(rec: MemoryRecord) -> set[str]:
+    return _terms(" ".join([rec.content, rec.subject or "", " ".join(rec.tags), rec.type]))
+
+
+def term_idf(records: list[MemoryRecord]) -> dict[str, float]:
+    """BM25 inverse document frequency of every term in `records`.
+
+    Rare terms ("nighthawk", "8080") then count for more than ones every
+    memory shares ("gateway", "jon"). A query term no memory contains weighs
+    as much as the rarest real term, so an unrelated question cannot score
+    well; in a ledger of one or two memories every weight is equal and this
+    is plain overlap, rather than unseen terms swamping the ones that match.
+    """
+    n = len(records)
+    df: dict[str, int] = {}
+    for rec in records:
+        for term in _record_terms(rec):
+            df[term] = df.get(term, 0) + 1
+    idf = {t: math.log(1.0 + (n - d + 0.5) / (d + 0.5)) for t, d in df.items()}
+    idf[""] = math.log(1.0 + (n - 0.5) / 1.5)  # unseen term: weight of df=1
+    return idf
+
+
+def query_alignment(
+    rec: MemoryRecord, query: str, idf: dict[str, float] | None = None
+) -> float:
+    """Q_i ∈ (0, 1] — share of the query's evidence weight the memory covers.
+
+    Terms are stemmed content words. With `idf` (from `term_idf` over the
+    candidate set) each term weighs its rarity; without it, all weigh 1.
+    """
+    q_terms = _terms(query)
+    if not q_terms:
         return 0.15
-    blob = _tokenize(
-        " ".join([rec.content, rec.subject or "", " ".join(rec.tags), rec.type])
-    )
+    blob = _record_terms(rec)
     if not blob:
         return 0.05
-    overlap = len(q_tokens & blob) / len(q_tokens)
+    if idf is None:
+        overlap = len(q_terms & blob) / len(q_terms)
+    else:
+        unseen = idf.get("", 1.0)
+        weight = {t: idf.get(t, unseen) for t in q_terms}
+        overlap = sum(weight[t] for t in q_terms & blob) / sum(weight.values())
     q_lower = query.lower().strip()
     if q_lower and q_lower in rec.content.lower():
         overlap = min(1.0, overlap + 0.35)
@@ -882,9 +974,15 @@ def activate(
     intent_f: dict[str, float] | None = None,
     rf_kappa: float = 0.0,
     weights: RetrievalWeights | None = None,
+    idf: dict[str, float] | None = None,
+    semantic: float | None = None,
 ) -> ActivationBreakdown:
     weights = weights or RetrievalWeights()
-    Q = query_alignment(rec, query)
+    Q_lex = query_alignment(rec, query, idf)
+    # `semantic` is the query/memory cosine from emr_embed. A paraphrase that
+    # shares no words can still align; the stronger signal wins.
+    Q_sem = emr_embed.semantic_alignment(semantic) if semantic is not None else None
+    Q = max(Q_lex, Q_sem) if Q_sem is not None else Q_lex
     R = resonance(rec, trajectory or [], prior_stm_ids or [])
     P = provenance_authority(rec)
     _, age_hours, D = decay_factor(rec, now=now)
@@ -892,8 +990,8 @@ def activate(
     salience = dyn.salience if dyn else 0.0
     damp = dyn.decay_damp if dyn else 0.0
     D_eff = D * (1.0 - damp)
-    unreinforced_decay = math.exp(-D * age_hours)
-    decay = math.exp(-D_eff * age_hours)
+    unreinforced_decay = max(RECENCY_FLOOR, math.exp(-D * age_hours))
+    decay = max(RECENCY_FLOOR, math.exp(-D_eff * age_hours))
     F = resonance_vector(rec, now=now) if intent_f is not None else {}
     sim = sim_rf(F, intent_f) if intent_f is not None else 0.0
     evidence_A = (
@@ -903,13 +1001,11 @@ def activate(
         * (unreinforced_decay ** weights.decay)
         * ((1.0 + rf_kappa * sim) ** weights.resonance)
     )
-    gate_A = (
-        Q
-        * R
-        * P
-        * unreinforced_decay
-        * (1.0 + min(rf_kappa, DEFAULT_RF_KAPPA) * sim)
-    )
+    # The abstention gate asks "does this memory answer the query, on whose
+    # authority?": relevance × provenance. Age and trajectory are not evidence
+    # (a year-old verified fact is no less true), so they order results via
+    # evidence_A but cannot keep a matching memory from being recalled.
+    gate_A = Q * P * (1.0 + min(rf_kappa, DEFAULT_RF_KAPPA) * sim)
     reinforcement_log = (
         weights.reinforcement * math.log1p(salience)
         + weights.decay * (D - D_eff) * age_hours
@@ -921,6 +1017,8 @@ def activate(
     A = evidence_A * reinforcement_multiplier
     return ActivationBreakdown(
         Q=round(Q, 4),
+        Q_lex=round(Q_lex, 4),
+        Q_sem=round(Q_sem, 4) if Q_sem is not None else None,
         R=round(R, 4),
         P=round(P, 4),
         decay=round(decay, 6),
@@ -1236,7 +1334,15 @@ def select_stm(
     surfaced via /conflicts, never silently co-admitted (policy='exclude').
     """
     prior_res = {e.memory_id: e.resolution for e in (prior or [])}
-    eligible = [(rec, br) for rec, br in scored if br.A >= theta_promote and br.P > 0]
+    # A memory sharing no term with the query only enters as graph expansion
+    # or as sticky STM from the previous turn, never on activation alone.
+    eligible = [
+        (rec, br)
+        for rec, br in scored
+        if br.A >= theta_promote
+        and br.P > 0
+        and (br.Q > Q_NO_OVERLAP or br.graph_boost > 0 or rec.id in prior_res)
+    ]
 
     selected: list[STMEntry] = []
     sel_recs: list[MemoryRecord] = []
@@ -1298,6 +1404,11 @@ def excite(
     candidates = filtered[: req.candidate_limit]
 
     intent_f = intent_vector(req.query, req.trigger)
+    # Term rarity over the whole ledger, not the filtered slice, so a filter
+    # cannot make a common term look rare.
+    idf = term_idf(records)
+    # None unless embeddings are switched on and the model loads.
+    cosines = emr_embed.similarities(req.query, candidates) or {}
     scored: list[tuple[MemoryRecord, ActivationBreakdown]] = []
     for rec in candidates:
         br = activate(
@@ -1309,6 +1420,8 @@ def excite(
             intent_f=intent_f,
             rf_kappa=req.rf_kappa,
             weights=req.weights,
+            idf=idf,
+            semantic=cosines.get(rec.id),
         )
         scored.append((rec, br))
 
