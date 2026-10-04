@@ -87,6 +87,12 @@ class JarvisStore:
         anomaly is fatal.  The bad record's id and error go in the exception message
         (for logs); the HTTP response stays generic.
         """
+        if "memories" not in raw:
+            stray = sorted(k for k, v in raw.items() if k not in ("board", "schema") and v)
+            if stray:
+                raise StoreUnavailableError(
+                    f"Ledger has no 'memories' key but has other data under {stray}; refusing to load as empty"
+                )
         board = MemoryBoard()
         board_raw = raw.get("board")
         if board_raw is not None:

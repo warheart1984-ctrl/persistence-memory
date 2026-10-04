@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import secrets
 from pathlib import Path
@@ -1047,8 +1048,23 @@ def amul_field_verify():
     return report.model_dump()
 
 
+_log = logging.getLogger("jarvis.store")
+
+
 def _invoke_emr_tool(name: str, arguments: dict) -> dict:
-    """In-process EMR tools for MCP Streamable HTTP (same path as REST tools)."""
+    """In-process EMR tools for MCP Streamable HTTP (same path as REST tools).
+
+    Store failures are logged in full but reported to the MCP client generically,
+    matching the HTTP 503 handler (the detail can name record ids).
+    """
+    try:
+        return _invoke_emr_tool_unguarded(name, arguments)
+    except StoreUnavailableError as exc:
+        _log.error("MCP tool %s failed: %s", name, exc)
+        raise RuntimeError("Ledger store unavailable") from None
+
+
+def _invoke_emr_tool_unguarded(name: str, arguments: dict) -> dict:
     store = get_store()
     if name in ("search", "emr_search"):
         body = EmrSearchRequest.model_validate(arguments)

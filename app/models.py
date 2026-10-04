@@ -124,7 +124,7 @@ class MemoryRecord(BaseModel):
     source_agent: str
     session_id: str
     type: MemoryType
-    confidence: float
+    confidence: float = Field(ge=0.0, le=1.0)
     evidence: list[EvidenceLink] = Field(default_factory=list)
     supersedes: str | None = None
     status: MemoryStatus
