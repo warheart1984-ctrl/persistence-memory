@@ -148,3 +148,44 @@ def pg_schema(pg_server):
     yield PgSchema(schema=name, admin_dsn=admin_dsn, app_dsn=app_dsn)
     with psycopg.connect(admin_dsn, autocommit=True) as conn:
         conn.execute(f'DROP SCHEMA "{name}" CASCADE')
+
+
+# --- Run the whole suite against the Postgres row store -------------------------------------
+# JARVIS_TEST_BACKEND=postgres (plus JARVIS_TEST_PG_DSN) points every test that goes through
+# get_store() / the HTTP API at a fresh, migrated schema on a throwaway server.  Tests that are
+# about the JSON file itself carry @pytest.mark.json_store_only and are skipped in that mode;
+# the Postgres counterparts (fail-closed, CHECK constraints, RLS, history) are tests/test_pg_*.py.
+
+_PG_MODE = os.environ.get("JARVIS_TEST_BACKEND", "").strip().lower() == "postgres"
+
+
+def pytest_configure(config):
+    if _PG_MODE and not os.environ.get("JARVIS_TEST_PG_DSN", "").strip():
+        raise pytest.UsageError("JARVIS_TEST_BACKEND=postgres requires JARVIS_TEST_PG_DSN (a throwaway server)")
+
+
+def pytest_collection_modifyitems(config, items):
+    if not _PG_MODE:
+        return
+    skip = pytest.mark.skip(reason="specific to the JSON file store; see tests/test_pg_*.py for Postgres")
+    for item in items:
+        if "json_store_only" in item.keywords:
+            item.add_marker(skip)
+
+
+@pytest.fixture(autouse=True)
+def _postgres_backend(request, monkeypatch):
+    if not _PG_MODE or request.node.get_closest_marker("postgres") is not None:
+        yield  # tests marked postgres build (and sometimes deliberately break) their own schemas
+        return
+    from app import pg_store
+    from app.pg_schema import migrate
+
+    schema = request.getfixturevalue("pg_schema")
+    migrate(schema.admin_dsn, schema=schema.schema, app_role="jarvis_app_test")
+    monkeypatch.setenv("JARVIS_DATABASE_URL", schema.app_dsn)
+    monkeypatch.setenv("JARVIS_DATABASE_SCHEMA", schema.schema)
+    monkeypatch.setenv("JARVIS_PG_STORE", "rows")
+    monkeypatch.setenv("JARVIS_DATABASE_CONNECT_TIMEOUT", "2")
+    yield
+    pg_store.close_pools()

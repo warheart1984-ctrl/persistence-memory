@@ -330,3 +330,52 @@ def test_default_pg_mode_is_still_the_legacy_blob_store(pg, monkeypatch):
     reset_store_for_tests()
     with pytest.raises(StoreUnavailableError):
         get_store()
+
+
+# --- the red-team properties, restated for the database ---------------------------------------
+
+
+def test_mcp_tool_error_is_generic_when_the_database_is_down(monkeypatch, caplog):
+    """MCP clients see a fixed message; the host, port and driver detail stay in the server log."""
+    import logging
+
+    monkeypatch.setenv("JARVIS_DATABASE_URL", "postgresql://secretuser:secretpw@127.0.0.1:9/none")
+    monkeypatch.setenv("JARVIS_PG_STORE", "rows")
+    monkeypatch.setenv("JARVIS_DATABASE_CONNECT_TIMEOUT", "1")
+    rpc = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+           "params": {"name": "emr_fetch", "arguments": {"id": "mem-1"}}}
+    try:
+        with caplog.at_level(logging.ERROR), TestClient(app, raise_server_exceptions=False) as client:
+            response = client.post("/mcp", json=rpc)
+        result = response.json()["result"]
+        assert result["isError"] is True and result["content"][0]["text"] == "Ledger store unavailable"
+        for secret in ("secretuser", "secretpw", "127.0.0.1", ":9/", "postgresql://"):
+            assert secret not in response.text
+        assert "Ledger database error" in caplog.text or "ledger database error" in caplog.text
+    finally:
+        pg_store.close_pools()
+
+
+def test_a_write_that_fails_midway_leaves_the_original_and_its_history_intact(pg):
+    """A database error inside the transaction rolls everything back: row, history, sequence."""
+    s = PostgresRowStore(pg.app_dsn, "alice", schema=pg.schema)
+    rec = _new(s, "original content text", subject="before")
+    before_history = s.history(rec.id)
+    with pg.admin_conn() as conn:
+        conn.execute(
+            "CREATE FUNCTION boom() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected failure'; END $$"
+        )
+        # fires after the history trigger ran, so the rollback has real work to undo
+        conn.execute(
+            "CREATE TRIGGER zz_boom AFTER UPDATE ON memories FOR EACH ROW WHEN (NEW.content = 'boom boom boom') EXECUTE FUNCTION boom()"
+        )
+    with pytest.raises(StoreUnavailableError):
+        s.update_memory(rec.id, MemoryUpdate(content="boom boom boom", subject="after"))
+    current = s.get_memory(rec.id)
+    assert current.content == "original content text" and current.subject == "before" and current.version == 1
+    assert s.history(rec.id) == before_history
+    with pg.admin_conn() as conn:
+        conn.execute("DROP TRIGGER zz_boom ON memories")
+    s.update_memory(rec.id, MemoryUpdate(subject="later"))  # the store is still healthy
+    assert [e["seq"] for e in s.history(rec.id)] == [1, 2]  # the failed attempt consumed no sequence number
+    assert s.verify_history() == []

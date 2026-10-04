@@ -97,3 +97,10 @@ def test_legacy_rows_still_migrate_and_persist(tmp_path):
     assert rec is not None and rec.type == "decision" and rec.session_id == "sess-9"
     on_disk = json.loads(path.read_text("utf-8"))["memories"][0]
     assert on_disk["content_sha256"] and "category" not in on_disk
+
+
+# The Postgres counterparts of these properties live in tests/test_pg_*.py (CHECK constraints,
+# fail-closed on a database outage, generic MCP errors, history verification).
+import pytest as _pytest_marker  # noqa: E402
+
+pytestmark = _pytest_marker.mark.json_store_only

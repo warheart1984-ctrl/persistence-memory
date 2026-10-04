@@ -14,3 +14,10 @@ def test_database_url_selects_postgres_tenant_store(monkeypatch):
         reset_principal(token)
     assert isinstance(first, PostgresJarvisStore)
     assert first._tenant_key != "user-a"
+
+
+# The Postgres counterparts of these properties live in tests/test_pg_*.py (CHECK constraints,
+# fail-closed on a database outage, generic MCP errors, history verification).
+import pytest as _pytest_marker  # noqa: E402
+
+pytestmark = _pytest_marker.mark.json_store_only

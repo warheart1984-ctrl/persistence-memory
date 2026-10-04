@@ -58,3 +58,10 @@ def test_brand_new_file_still_starts_empty(tmp_path):
     assert store.list_memories() == []
     store.create_memory(MemoryCreate(content="first record", source_agent="t", session_id="s", type="fact"))
     assert len(JarvisStore(str(tmp_path / "fresh.json")).list_memories()) == 1
+
+
+# The Postgres counterparts of these properties live in tests/test_pg_*.py (CHECK constraints,
+# fail-closed on a database outage, generic MCP errors, history verification).
+import pytest as _pytest_marker  # noqa: E402
+
+pytestmark = _pytest_marker.mark.json_store_only

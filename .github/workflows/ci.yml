@@ -25,3 +25,36 @@ jobs:
       - name: Docker build
         if: matrix.python-version == '3.12'
         run: docker build -t persistence-memory:ci .
+
+  test-postgres:
+    # Postgres-specific tests, plus the whole HTTP-level suite (red-team tests included) run on the
+    # row-level store.  The service container is throwaway; its password protects nothing real.
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: ci-throwaway
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      JARVIS_TEST_PG_DSN: postgresql://postgres:ci-throwaway@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: pip install -e ".[dev]"
+      - name: JSON backend and Postgres-specific tests
+        run: python -m pytest -q
+      - name: Whole suite on the Postgres row store
+        run: python -m pytest -q
+        env:
+          JARVIS_TEST_BACKEND: postgres

@@ -25,5 +25,8 @@ include = ["app*", "mcp_server*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["postgres: needs JARVIS_TEST_PG_DSN (a throwaway Postgres server); skipped otherwise"]
+markers = [
+  "postgres: needs JARVIS_TEST_PG_DSN (a throwaway Postgres server); skipped otherwise",
+  "json_store_only: about the JSON file store itself; skipped when JARVIS_TEST_BACKEND=postgres",
+]
 pythonpath = ["."]
