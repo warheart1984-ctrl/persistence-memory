@@ -22,6 +22,18 @@ def _allow_unauthenticated_for_tests(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolated_store_paths(tmp_path, monkeypatch):
+    """Ledger stores (operator + per-tenant) must never touch repo data/."""
+    from app.store import reset_store_for_tests
+
+    monkeypatch.setenv("JARVIS_STORE_PATH", str(tmp_path / "jarvis-store.json"))
+    monkeypatch.setenv("JARVIS_TENANT_STORE_DIR", str(tmp_path / "tenants"))
+    reset_store_for_tests()
+    yield
+    reset_store_for_tests()
+
+
+@pytest.fixture(autouse=True)
 def _isolated_dynamics_sidecar(tmp_path):
     """Point EMR/AMUL/RAG/LLM storage at per-test temp files.
 
