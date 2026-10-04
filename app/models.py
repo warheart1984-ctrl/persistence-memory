@@ -111,6 +111,8 @@ class MemoryUpdate(BaseModel):
     status: MemoryStatus | None = None
     subject: str | None = Field(default=None, max_length=256)
     tags: list[str] | None = None
+    # optional optimistic lock: reject with 409 unless the record is still at this version
+    expected_version: int | None = Field(default=None, ge=1)
 
 
 class MemoryRecord(BaseModel):
@@ -130,6 +132,8 @@ class MemoryRecord(BaseModel):
     status: MemoryStatus
     subject: str | None = None
     tags: list[str] = Field(default_factory=list)
+    # optimistic-locking counter: starts at 1, +1 on every update
+    version: int = Field(default=1, ge=1)
     # content hash for drift checks (sha256 hex of normalized content)
     content_sha256: str = ""
 

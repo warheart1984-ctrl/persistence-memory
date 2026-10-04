@@ -1,0 +1,391 @@
+"""Row-level PostgreSQL ledger store (one row per record, optimistic locking, RLS).
+
+Selected with ``JARVIS_PG_STORE=rows`` together with ``JARVIS_DATABASE_URL``.  The
+application role must be an ordinary (non-superuser, non-BYPASSRLS) role; every
+transaction sets ``jarvis.tenant_key`` so row-level security is a second tenant fence
+behind the explicit ``tenant_key`` filters in each query.
+
+Fail-closed: any database error becomes ``StoreUnavailableError`` (HTTP 503); there is
+never a fallback to another store.  Details are logged on ``jarvis.store`` only.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import logging
+import os
+import random
+import re
+import threading
+import time
+from datetime import datetime, timezone
+from typing import Any, Callable, Iterator
+
+import psycopg
+from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
+from psycopg_pool import ConnectionPool
+
+from app.continuity import detect_conflicts, content_sha256
+from app.models import (
+    ConflictSet,
+    MemoryBoard,
+    MemoryCreate,
+    MemoryRecord,
+    MemoryUpdate,
+    SelectionProvenance,
+)
+from app.pg_schema import check_schema_version, validate_schema_name
+from app.store import _make_id, ledger_retrieve, memory_matches_query
+from app.store_errors import StoreUnavailableError, StoreVersionConflict
+
+_log = logging.getLogger("jarvis.store")
+
+MAX_UPDATE_ATTEMPTS = 5
+
+_COLUMNS = (
+    "id, version, content, content_sha256, created_at, updated_at, source_agent, session_id, "
+    "type, status, confidence, subject, supersedes, tags, evidence"
+)
+
+_pools: dict[tuple[str, str], ConnectionPool] = {}
+_ready: set[tuple[str, str]] = set()
+_pools_lock = threading.Lock()
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.getenv(name, "") or default))
+    except ValueError:
+        return default
+
+
+def _connect_timeout() -> float:
+    return float(_env_int("JARVIS_DATABASE_CONNECT_TIMEOUT", 5))
+
+
+def _pool_for(dsn: str, schema: str | None) -> tuple[ConnectionPool, tuple[str, str]]:
+    key = (dsn, schema or "")
+    with _pools_lock:
+        pool = _pools.get(key)
+        if pool is None:
+            options = [
+                "-c timezone=UTC",
+                f"-c statement_timeout={_env_int('JARVIS_DATABASE_STATEMENT_TIMEOUT_MS', 10_000)}",
+                f"-c lock_timeout={_env_int('JARVIS_DATABASE_LOCK_TIMEOUT_MS', 5_000)}",
+            ]
+            if schema:
+                options.append(f"-c search_path={validate_schema_name(schema)}")
+            pool = ConnectionPool(
+                dsn,
+                min_size=1,
+                max_size=_env_int("JARVIS_DATABASE_POOL_MAX", 10),
+                timeout=_connect_timeout(),
+                kwargs={"options": " ".join(options), "connect_timeout": int(_connect_timeout())},
+                check=ConnectionPool.check_connection,
+                open=False,
+            )
+            pool.open(wait=False)
+            _pools[key] = pool
+        return pool, key
+
+
+def close_pools() -> None:
+    """Close every pooled connection (tests, shutdown)."""
+    with _pools_lock:
+        pools = list(_pools.values())
+        _pools.clear()
+        _ready.clear()
+    for pool in pools:
+        with contextlib.suppress(Exception):
+            pool.close(timeout=2)
+
+
+def _iso(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat()
+
+
+def _record(row: dict[str, Any]) -> MemoryRecord:
+    return MemoryRecord(
+        id=row["id"],
+        version=row["version"],
+        content=row["content"],
+        content_sha256=row["content_sha256"],
+        created_at=_iso(row["created_at"]),
+        updated_at=_iso(row["updated_at"]),
+        source_agent=row["source_agent"],
+        session_id=row["session_id"],
+        type=row["type"],
+        status=row["status"],
+        confidence=row["confidence"],
+        subject=row["subject"],
+        supersedes=row["supersedes"],
+        tags=list(row["tags"] or []),
+        evidence=row["evidence"] or [],
+    )
+
+
+class PostgresRowStore:
+    """Per-tenant ledger over the row-level schema in ``app.pg_schema``."""
+
+    def __init__(self, dsn: str, tenant_key: str, *, schema: str | None = None):
+        if not tenant_key:
+            raise ValueError("tenant_key is required")
+        self._dsn = dsn
+        self._tenant_key = tenant_key
+        self._schema = schema
+        # Test seam: called after update_memory reads the row and before it writes.
+        self._after_read_hook: Callable[[], None] | None = None
+
+    # -- plumbing ---------------------------------------------------------------
+
+    @contextlib.contextmanager
+    def _tx(self) -> Iterator[psycopg.Connection]:
+        """One transaction as the tenant; every database failure fails closed."""
+        pool, key = _pool_for(self._dsn, self._schema)
+        try:
+            with pool.connection() as conn:
+                conn.row_factory = dict_row
+                conn.execute("SELECT set_config('jarvis.tenant_key', %s, true)", (self._tenant_key,))
+                conn.execute("SELECT set_config('jarvis.actor', %s, true)", (self._tenant_key,))
+                if key not in _ready:
+                    check_schema_version(conn)
+                    _warn_if_rls_bypassed(conn)
+                    _ready.add(key)
+                yield conn
+        except StoreUnavailableError:
+            raise
+        except psycopg.Error as exc:
+            _log.error("ledger database error (%s): %s", type(exc).__name__, exc)
+            raise StoreUnavailableError("Ledger database error") from exc
+
+    # -- board ------------------------------------------------------------------
+
+    def get_board(self) -> MemoryBoard:
+        with self._tx() as conn:
+            row = conn.execute(
+                "SELECT board FROM boards WHERE tenant_key = %s", (self._tenant_key,)
+            ).fetchone()
+        return MemoryBoard(**row["board"]) if row else MemoryBoard()
+
+    def set_board(self, board: MemoryBoard) -> MemoryBoard:
+        with self._tx() as conn:
+            conn.execute(
+                "INSERT INTO boards (tenant_key, board) VALUES (%s, %s) "
+                "ON CONFLICT (tenant_key) DO UPDATE SET board = EXCLUDED.board",
+                (self._tenant_key, Jsonb(board.model_dump())),
+            )
+        return board
+
+    def patch_board(self, updates: dict[str, Any]) -> MemoryBoard:
+        with self._tx() as conn:
+            conn.execute(
+                "INSERT INTO boards (tenant_key, board) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+                (self._tenant_key, Jsonb(MemoryBoard().model_dump())),
+            )
+            row = conn.execute(
+                "SELECT board FROM boards WHERE tenant_key = %s FOR UPDATE", (self._tenant_key,)
+            ).fetchone()
+            current = dict(row["board"])
+            for key, value in updates.items():
+                if value is not None:
+                    current[key] = value
+            board = MemoryBoard(**current)
+            conn.execute(
+                "UPDATE boards SET board = %s WHERE tenant_key = %s",
+                (Jsonb(board.model_dump()), self._tenant_key),
+            )
+        return board
+
+    # -- reads ------------------------------------------------------------------
+
+    def list_memories(
+        self,
+        truth_scope: str | None = None,
+        query: str | None = None,
+        limit: int = 50,
+        memory_type: str | None = None,
+        status: str | None = None,
+        session_id: str | None = None,
+        subject: str | None = None,
+    ) -> list[MemoryRecord]:
+        where = ["tenant_key = %s"]
+        params: list[Any] = [self._tenant_key]
+        if truth_scope:
+            lower = truth_scope.lower()
+            if lower == "live":
+                where.append("status <> 'archived'")
+            else:
+                where.append("(status = %s OR source_agent = %s)")
+                params += [lower, lower]
+        for column, value in (
+            ("type", memory_type), ("status", status), ("session_id", session_id), ("subject", subject)
+        ):
+            if value:
+                where.append(f"{column} = %s")
+                params.append(value)
+        sql_text = (
+            f"SELECT {_COLUMNS} FROM memories WHERE {' AND '.join(where)} "
+            'ORDER BY created_at DESC, id COLLATE "C" DESC'
+        )
+        if not query:
+            sql_text += " LIMIT %s"
+            params.append(max(0, int(limit)))
+        with self._tx() as conn:
+            rows = conn.execute(sql_text, params).fetchall()
+        records = [_record(r) for r in rows]
+        if query:
+            q = query.lower()
+            records = [m for m in records if memory_matches_query(m, q)][: max(0, int(limit))]
+        return records
+
+    def retrieve(
+        self,
+        *,
+        truth_scope: str | None = None,
+        query: str | None = None,
+        limit: int = 50,
+        memory_type: str | None = None,
+        status: str | None = None,
+        session_id: str | None = None,
+        subject: str | None = None,
+    ) -> tuple[list[MemoryRecord], list[SelectionProvenance], list[ConflictSet]]:
+        return ledger_retrieve(
+            self,
+            truth_scope=truth_scope,
+            query=query,
+            limit=limit,
+            memory_type=memory_type,
+            status=status,
+            session_id=session_id,
+            subject=subject,
+        )
+
+    def get_memory(self, memory_id: str) -> MemoryRecord | None:
+        with self._tx() as conn:
+            row = conn.execute(
+                f"SELECT {_COLUMNS} FROM memories WHERE tenant_key = %s AND id = %s",
+                (self._tenant_key, memory_id),
+            ).fetchone()
+        return _record(row) if row else None
+
+    def conflicts(self, subject: str | None = None) -> list[ConflictSet]:
+        return detect_conflicts(self.list_memories(limit=10**9), subject=subject)
+
+    # -- writes -----------------------------------------------------------------
+
+    def _supersedes_exists(self, conn: psycopg.Connection, target: str) -> bool:
+        return (
+            conn.execute(
+                "SELECT 1 FROM memories WHERE tenant_key = %s AND id = %s", (self._tenant_key, target)
+            ).fetchone()
+            is not None
+        )
+
+    def create_memory(self, data: MemoryCreate) -> MemoryRecord:
+        now = datetime.now(timezone.utc)
+        for _ in range(3):
+            rec_id = _make_id("mem")
+            try:
+                with self._tx() as conn:
+                    if data.supersedes and not self._supersedes_exists(conn, data.supersedes):
+                        raise ValueError(f"supersedes target not found: {data.supersedes}")
+                    try:
+                        row = conn.execute(
+                            "INSERT INTO memories (tenant_key, id, content, content_sha256, created_at, "
+                            "updated_at, source_agent, session_id, type, status, confidence, subject, "
+                            "supersedes, tags, evidence) "
+                            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::text[],%s) "
+                            f"RETURNING {_COLUMNS}",
+                            (
+                                self._tenant_key, rec_id, data.content, content_sha256(data.content),
+                                now, now, data.source_agent, data.session_id, data.type, data.status,
+                                data.confidence, data.subject, data.supersedes or None, list(data.tags),
+                                Jsonb([e.model_dump() for e in data.evidence]),
+                            ),
+                        ).fetchone()
+                    except psycopg.errors.ForeignKeyViolation as exc:  # target deleted mid-flight
+                        raise ValueError(f"supersedes target not found: {data.supersedes}") from exc
+                return _record(row)
+            except psycopg.errors.UniqueViolation:  # pragma: no cover - 48-bit id collision
+                continue
+        raise StoreUnavailableError("Could not allocate a unique memory id")  # pragma: no cover
+
+    def update_memory(self, memory_id: str, data: MemoryUpdate) -> MemoryRecord | None:
+        """Read-modify-write guarded by the row version; retried on concurrent change."""
+        for attempt in range(MAX_UPDATE_ATTEMPTS):
+            with self._tx() as conn:
+                row = conn.execute(
+                    f"SELECT {_COLUMNS} FROM memories WHERE tenant_key = %s AND id = %s",
+                    (self._tenant_key, memory_id),
+                ).fetchone()
+                if row is None:
+                    return None
+                existing = _record(row)
+                if data.expected_version is not None and data.expected_version != existing.version:
+                    raise StoreVersionConflict(
+                        f"version conflict: expected {data.expected_version}, current {existing.version}"
+                    )
+                if self._after_read_hook is not None:
+                    self._after_read_hook()
+                updates = existing.model_dump()
+                for key in (
+                    "content", "source_agent", "session_id", "type", "confidence", "evidence",
+                    "supersedes", "status", "subject", "tags",
+                ):
+                    value = getattr(data, key, None)
+                    if value is not None:
+                        updates[key] = (
+                            [e.model_dump() if hasattr(e, "model_dump") else e for e in value]
+                            if key == "evidence"
+                            else value
+                        )
+                if updates["supersedes"] == "":
+                    updates["supersedes"] = None
+                if updates["supersedes"] and not self._supersedes_exists(conn, updates["supersedes"]):
+                    raise ValueError(f"supersedes target not found: {updates['supersedes']}")
+                if data.content is not None:
+                    updates["content_sha256"] = content_sha256(data.content)
+                now = datetime.now(timezone.utc)
+                new = MemoryRecord(**{**updates, "updated_at": _iso(now)})
+                try:
+                    changed = conn.execute(
+                        "UPDATE memories SET content=%s, content_sha256=%s, updated_at=%s, source_agent=%s, "
+                        "session_id=%s, type=%s, status=%s, confidence=%s, subject=%s, supersedes=%s, "
+                        "tags=%s::text[], evidence=%s "
+                        "WHERE tenant_key=%s AND id=%s AND version=%s "
+                        f"RETURNING {_COLUMNS}",
+                        (
+                            new.content, new.content_sha256, now, new.source_agent, new.session_id,
+                            new.type, new.status, new.confidence, new.subject, new.supersedes,
+                            list(new.tags), Jsonb([e.model_dump() for e in new.evidence]),
+                            self._tenant_key, memory_id, existing.version,
+                        ),
+                    ).fetchone()
+                except psycopg.errors.ForeignKeyViolation as exc:
+                    raise ValueError(f"supersedes target not found: {new.supersedes}") from exc
+            if changed is not None:
+                return _record(changed)
+            if data.expected_version is not None:
+                raise StoreVersionConflict("version conflict: record changed during update")
+            time.sleep(random.uniform(0.005, 0.02) * (attempt + 1))
+        raise StoreVersionConflict("version conflict: too much concurrent modification, retry")
+
+    def delete_memory(self, memory_id: str) -> bool:
+        with self._tx() as conn:
+            row = conn.execute(
+                "DELETE FROM memories WHERE tenant_key = %s AND id = %s RETURNING id",
+                (self._tenant_key, memory_id),
+            ).fetchone()
+        return row is not None
+
+
+def _warn_if_rls_bypassed(conn: psycopg.Connection) -> None:
+    row = conn.execute(
+        "SELECT rolsuper OR rolbypassrls AS bypass FROM pg_roles WHERE rolname = current_user"
+    ).fetchone()
+    if row and row["bypass"]:
+        _log.warning(
+            "ledger database role bypasses row-level security (superuser/BYPASSRLS); "
+            "tenant isolation then relies on query filters alone — use an ordinary app role"
+        )

@@ -81,7 +81,7 @@ from app.auth import (
 )
 from app.oauth import protected_resource_metadata
 from app.public_security import cors_origins, public_security_middleware
-from app.store import StoreUnavailableError, get_store
+from app.store import StoreUnavailableError, StoreVersionConflict, get_store
 from app.graph import (
     BfsBody,
     ComponentsBody,
@@ -762,6 +762,8 @@ def update_memory(memory_id: str, body: MemoryUpdate):
     store = get_store()
     try:
         rec = store.update_memory(memory_id, body)
+    except StoreVersionConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not rec:

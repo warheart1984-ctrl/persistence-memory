@@ -149,7 +149,7 @@ def check_schema_version(conn: psycopg.Connection) -> None:
         row = conn.execute("SELECT max(version) FROM schema_version").fetchone()
     except psycopg.Error as exc:
         raise StoreUnavailableError("Ledger schema is missing; run the migration") from exc
-    found = row[0] if row else None
+    found = (next(iter(row.values())) if isinstance(row, dict) else row[0]) if row else None
     if found != EXPECTED_SCHEMA_VERSION:
         raise StoreUnavailableError(
             f"Ledger schema version {found} does not match expected {EXPECTED_SCHEMA_VERSION}"

@@ -29,7 +29,7 @@ from app.models import (
     migrate_legacy_record,
 )
 from app.identity import current_tenant_key
-from app.store_errors import StoreUnavailableError
+from app.store_errors import StoreUnavailableError, StoreVersionConflict
 
 
 def _now_iso() -> str:
@@ -40,6 +40,63 @@ def _make_id(prefix: str = "mem") -> str:
     import uuid
 
     return f"{prefix}-{uuid.uuid4().hex[:12]}"
+
+
+def memory_matches_query(m: MemoryRecord, q: str) -> bool:
+    """Case-insensitive substring match used by every ledger backend (``q`` lower-cased)."""
+    return bool(
+        q in m.content.lower()
+        or any(q in tag.lower() for tag in m.tags)
+        or (m.subject and q in m.subject.lower())
+        or q in m.type.lower()
+        or q in m.source_agent.lower()
+        or q in m.session_id.lower()
+    )
+
+
+def ledger_retrieve(
+    store: Any,
+    *,
+    truth_scope: str | None = None,
+    query: str | None = None,
+    limit: int = 50,
+    memory_type: str | None = None,
+    status: str | None = None,
+    session_id: str | None = None,
+    subject: str | None = None,
+) -> tuple[list[MemoryRecord], list[SelectionProvenance], list[ConflictSet]]:
+    """List with selection provenance + any subject conflicts among results."""
+    memories = store.list_memories(
+        truth_scope=truth_scope,
+        query=query,
+        limit=limit,
+        memory_type=memory_type,
+        status=status,
+        session_id=session_id,
+        subject=subject,
+    )
+    selections = [
+        to_selection(
+            m,
+            query=query,
+            truth_scope=truth_scope,
+            memory_type=memory_type,
+            status=status,
+        )
+        for m in memories
+    ]
+    # Conflict scan uses full subject cohort from store (not just page)
+    all_for_conflict = store.list_memories(limit=9999, truth_scope="live")
+    conflicts = detect_conflicts(all_for_conflict, subject=subject)
+    # If subject filter unset, only include conflicts that touch returned ids
+    if subject is None:
+        returned_ids = {m.id for m in memories}
+        conflicts = [
+            c
+            for c in conflicts
+            if any(m.id in returned_ids for m in c.memories)
+        ]
+    return memories, selections, conflicts
 
 
 class JarvisStore:
@@ -229,16 +286,7 @@ class JarvisStore:
             results = [m for m in results if m.subject == subject]
         if query:
             q = query.lower()
-            results = [
-                m
-                for m in results
-                if q in m.content.lower()
-                or any(q in tag.lower() for tag in m.tags)
-                or (m.subject and q in m.subject.lower())
-                or q in m.type.lower()
-                or q in m.source_agent.lower()
-                or q in m.session_id.lower()
-            ]
+            results = [m for m in results if memory_matches_query(m, q)]
         results.sort(key=lambda m: (m.created_at, m.id), reverse=True)
         return results[:limit]
 
@@ -254,7 +302,8 @@ class JarvisStore:
         subject: str | None = None,
     ) -> tuple[list[MemoryRecord], list[SelectionProvenance], list[ConflictSet]]:
         """List with selection provenance + any subject conflicts among results."""
-        memories = self.list_memories(
+        return ledger_retrieve(
+            self,
             truth_scope=truth_scope,
             query=query,
             limit=limit,
@@ -263,28 +312,6 @@ class JarvisStore:
             session_id=session_id,
             subject=subject,
         )
-        selections = [
-            to_selection(
-                m,
-                query=query,
-                truth_scope=truth_scope,
-                memory_type=memory_type,
-                status=status,
-            )
-            for m in memories
-        ]
-        # Conflict scan uses full subject cohort from store (not just page)
-        all_for_conflict = self.list_memories(limit=9999, truth_scope="live")
-        conflicts = detect_conflicts(all_for_conflict, subject=subject)
-        # If subject filter unset, only include conflicts that touch returned ids
-        if subject is None:
-            returned_ids = {m.id for m in memories}
-            conflicts = [
-                c
-                for c in conflicts
-                if any(m.id in returned_ids for m in c.memories)
-            ]
-        return memories, selections, conflicts
 
     def get_memory(self, memory_id: str) -> MemoryRecord | None:
         self._ensure_loaded()
@@ -329,6 +356,10 @@ class JarvisStore:
         existing = self._memories.get(memory_id)
         if not existing:
             return None
+        if data.expected_version is not None and data.expected_version != existing.version:
+            raise StoreVersionConflict(
+                f"version conflict: expected {data.expected_version}, current {existing.version}"
+            )
         updates = existing.model_dump()
         for key in (
             "content",
@@ -352,6 +383,7 @@ class JarvisStore:
             raise ValueError(f"supersedes target not found: {data.supersedes}")
         # Explicit clear of supersedes via empty string not supported; use null through model
         updates["updated_at"] = _now_iso()
+        updates["version"] = existing.version + 1
         if data.content is not None:
             updates["content_sha256"] = content_sha256(data.content)
         updated = MemoryRecord(**updates)
@@ -449,6 +481,17 @@ def get_store(path: str | None = None) -> JarvisStore:
     database_url = (os.getenv("JARVIS_DATABASE_URL") or "").strip()
     if database_url:
         database_tenant = tenant or "operator"
+        mode = (os.getenv("JARVIS_PG_STORE") or "blob").strip().lower()
+        if mode == "rows":
+            schema = (os.getenv("JARVIS_DATABASE_SCHEMA") or "").strip() or None
+            cache_key = f"postgres-rows:{schema or ''}:{database_tenant}"
+            if cache_key not in _stores:
+                from app.pg_store import PostgresRowStore
+
+                _stores[cache_key] = PostgresRowStore(database_url, database_tenant, schema=schema)  # type: ignore[assignment]
+            return _stores[cache_key]
+        if mode != "blob":
+            raise StoreUnavailableError("JARVIS_PG_STORE must be 'rows' or 'blob'")
         cache_key = f"postgres:{database_tenant}"
         if cache_key not in _stores:
             _stores[cache_key] = PostgresJarvisStore(database_url, database_tenant)
@@ -464,3 +507,7 @@ def get_store(path: str | None = None) -> JarvisStore:
 def reset_store_for_tests() -> None:
     """Test helper — clear singleton."""
     _stores.clear()
+    import sys
+
+    if "app.pg_store" in sys.modules:
+        sys.modules["app.pg_store"].close_pools()
