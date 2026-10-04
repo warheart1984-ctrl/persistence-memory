@@ -32,6 +32,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from app.identity import current_tenant_key
 from app.models import MemoryRecord, MemoryStatus, MemoryType
 
 Resolution = Literal["summary", "detail", "evidence"]
@@ -557,21 +558,40 @@ class CorrectResponse(BaseModel):
 
 
 _STM: dict[str, list[STMEntry]] = {}
+_TENANT_SEP = "\x1f"
+
+
+def _stm_key(session_key: str) -> str:
+    """Namespace a session by the current OAuth tenant (operator mode: unchanged)."""
+    tenant = current_tenant_key()
+    return f"{tenant}{_TENANT_SEP}{session_key}" if tenant else session_key
+
+
+def _visible_stm_keys() -> dict[str, str]:
+    """Internal key -> caller-facing session_key, for the current tenant only."""
+    tenant = current_tenant_key()
+    if tenant:
+        prefix = f"{tenant}{_TENANT_SEP}"
+        return {k: k[len(prefix):] for k in _STM if k.startswith(prefix)}
+    return {k: k for k in _STM if _TENANT_SEP not in k}
 
 
 def get_stm(session_key: str = "default") -> list[STMEntry]:
-    return list(_STM.get(session_key, []))
+    return list(_STM.get(_stm_key(session_key), []))
 
 
 def set_stm(session_key: str, entries: list[STMEntry]) -> None:
-    _STM[session_key] = list(entries)
+    _STM[_stm_key(session_key)] = list(entries)
 
 
 def clear_stm(session_key: str | None = None) -> None:
-    if session_key is None:
-        _STM.clear()
+    if session_key is not None:
+        _STM.pop(_stm_key(session_key), None)
+    elif current_tenant_key():
+        for key in _visible_stm_keys():
+            _STM.pop(key, None)
     else:
-        _STM.pop(session_key, None)
+        _STM.clear()
 
 
 def reset_stm_for_tests() -> None:
@@ -1441,8 +1461,8 @@ def emr_status() -> dict[str, Any]:
     _ensure_dynamics()  # report true persisted state, not pre-load zeros
     reinforced = sorted(_REINFORCEMENT.values(), key=lambda s: -s.use_count)
     return {
-        "sessions": sorted(_STM.keys()),
-        "counts": {k: len(v) for k, v in _STM.items()},
+        "sessions": sorted(_visible_stm_keys().values()),
+        "counts": {name: len(_STM[key]) for key, name in _visible_stm_keys().items()},
         "stack": {
             "AMUL": "LTM substrate (declared/partial)",
             "Memoryboard": "LTM access/API / Continuity Ledger SoT",
