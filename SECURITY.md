@@ -42,4 +42,5 @@ python -c "import secrets; print(secrets.token_hex(32))"
 6. The ledger does **not** enforce multi-tenant isolation — one store per deployment.
 7. Prefer `type=decision` (+ evidence) over chat dumps — Clause V hygiene is **partial** / not API-enforced (`docs/CLAUSE_V_HYGIENE.md`).
 8. Follow `docs/OPERATOR_DEPLOY_CHECKLIST.md` before shared-network exposure.
-9. Treat the JSON store as **single-writer** — atomic writes ≠ multi-writer safety (`docs/PLATFORM_LIMITS.md`).
+9. The JSON store is atomic (temp file, fsync, replace) and locked **within one process**. Multi-worker and multi-instance deployments are **last-writer-wins**: run a single worker and a single instance per store file (`docs/PLATFORM_LIMITS.md`). The same applies to the PostgreSQL store, which replaces the whole ledger document on each write.
+10. A ledger file that cannot be parsed, or that contains an invalid record, makes the service fail closed (HTTP 503, `/health` reports `unavailable`) instead of starting empty; repair or restore the file rather than deleting it.
