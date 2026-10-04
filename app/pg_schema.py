@@ -382,7 +382,44 @@ END
 $fn$;
 """
 
-MIGRATIONS: list[tuple[int, str]] = [(1, _V1), (2, _V2), (3, _V3)]
+_V4 = """
+-- Imports label their history entries as backfills: the importer sets the transaction-local
+-- jarvis.history_op = 'backfill', honoured for INSERTs only.  Ordinary creates stay 'create'.
+CREATE OR REPLACE FUNCTION jarvis_record_history() RETURNS trigger LANGUAGE plpgsql
+SECURITY DEFINER SET search_path FROM CURRENT AS $fn$
+DECLARE
+    t text; mid text; opn text; b jsonb; a jsonb; v bigint; prev text; act text; s bigint; rh text;
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        t := OLD.tenant_key; mid := OLD.id; opn := 'delete'; b := jarvis_memory_json(OLD); a := NULL; v := OLD.version;
+    ELSIF TG_OP = 'UPDATE' THEN
+        t := NEW.tenant_key; mid := NEW.id; opn := 'update'; b := jarvis_memory_json(OLD); a := jarvis_memory_json(NEW); v := NEW.version;
+    ELSE
+        t := NEW.tenant_key; mid := NEW.id; opn := 'create'; b := NULL; a := jarvis_memory_json(NEW); v := NEW.version;
+        IF current_setting('jarvis.history_op', true) = 'backfill' THEN
+            opn := 'backfill';
+        END IF;
+    END IF;
+    PERFORM pg_advisory_xact_lock(hashtextextended(t || '/' || mid, 0));
+    SELECT h.row_hash INTO prev FROM record_history h
+        WHERE h.tenant_key = t AND h.memory_id = mid ORDER BY h.seq DESC LIMIT 1;
+    prev := coalesce(prev, repeat('0', 64));
+    act := coalesce(nullif(current_setting('jarvis.actor', true), ''), 'unknown');
+    INSERT INTO history_counters (tenant_key, last_seq) VALUES (t, 1)
+        ON CONFLICT (tenant_key) DO UPDATE SET last_seq = history_counters.last_seq + 1
+        RETURNING last_seq INTO s;
+    rh := jarvis_history_hash(prev, opn, v, b, a);
+    INSERT INTO record_history (tenant_key, memory_id, version, op, actor, before, after, prev_hash, row_hash, seq)
+        VALUES (t, mid, v, opn, act, b, a, prev, rh, s);
+    INSERT INTO chain_heads (tenant_key, id, last_seq, last_hash, deleted) VALUES (t, mid, s, rh, opn = 'delete')
+        ON CONFLICT (tenant_key, id) DO UPDATE
+        SET last_seq = EXCLUDED.last_seq, last_hash = EXCLUDED.last_hash, deleted = EXCLUDED.deleted;
+    RETURN NULL;
+END
+$fn$;
+"""
+
+MIGRATIONS: list[tuple[int, str]] = [(1, _V1), (2, _V2), (3, _V3), (4, _V4)]
 EXPECTED_SCHEMA_VERSION = MIGRATIONS[-1][0]
 
 

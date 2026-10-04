@@ -99,6 +99,54 @@ def ledger_retrieve(
     return memories, selections, conflicts
 
 
+def parse_ledger_document(raw: dict[str, Any]) -> tuple[MemoryBoard, dict[str, MemoryRecord], bool]:
+    """Parse a whole ledger document or raise; never returns a partial ledger.
+
+    Anything skipped here would be deleted from disk by the next save, so every anomaly is
+    fatal.  The bad record's id and error go in the exception message (for logs); the HTTP
+    response stays generic.  Pure: no file or database is touched.  The third value says
+    whether legacy rows were migrated in memory (a file-backed store then re-saves).
+    """
+    if "memories" not in raw:
+        stray = sorted(k for k, v in raw.items() if k not in ("board", "schema") and v)
+        if stray:
+            raise StoreUnavailableError(
+                f"Ledger has no 'memories' key but has other data under {stray}; refusing to load as empty"
+            )
+    board = MemoryBoard()
+    board_raw = raw.get("board")
+    if board_raw is not None:
+        try:
+            if not isinstance(board_raw, dict):
+                raise TypeError(f"board is {type(board_raw).__name__}, not an object")
+            board = MemoryBoard(**board_raw)
+        except Exception as exc:
+            raise StoreUnavailableError(f"Ledger board is invalid: {exc}") from exc
+    items = raw.get("memories", [])
+    if not isinstance(items, list):
+        raise StoreUnavailableError(f"Ledger 'memories' is {type(items).__name__}, not a list")
+    memories: dict[str, MemoryRecord] = {}
+    dirty_migration = False
+    for index, item in enumerate(items):
+        label = item.get("id") if isinstance(item, dict) and item.get("id") else f"#{index}"
+        try:
+            if not isinstance(item, dict) or not item.get("id"):
+                raise ValueError("record is not an object with an id")
+            if item["id"] in memories:
+                raise ValueError("duplicate record id")
+            migrated = migrate_legacy_record(item)
+            rec = ensure_content_hash(MemoryRecord(**migrated))
+        except Exception as exc:
+            raise StoreUnavailableError(f"Ledger record {label} failed validation: {exc}") from exc
+        memories[rec.id] = rec
+        # Persist migration if legacy fields were present
+        if any(k in item for k in ("category", "state_class", "truth_status", "scope")):
+            dirty_migration = True
+        if not item.get("content_sha256"):
+            dirty_migration = True
+    return board, memories, dirty_migration
+
+
 class JarvisStore:
     def __init__(self, path: str = "data/jarvis-store.json"):
         self._path = Path(path)
@@ -135,49 +183,8 @@ class JarvisStore:
         self._loaded = True
 
     def _hydrate(self, raw: dict[str, Any]) -> None:
-        """Parse the whole document or raise; never keep a partial ledger.
-
-        Anything skipped here would be deleted from disk by the next _save, so every
-        anomaly is fatal.  The bad record's id and error go in the exception message
-        (for logs); the HTTP response stays generic.
-        """
-        if "memories" not in raw:
-            stray = sorted(k for k, v in raw.items() if k not in ("board", "schema") and v)
-            if stray:
-                raise StoreUnavailableError(
-                    f"Ledger has no 'memories' key but has other data under {stray}; refusing to load as empty"
-                )
-        board = MemoryBoard()
-        board_raw = raw.get("board")
-        if board_raw is not None:
-            try:
-                if not isinstance(board_raw, dict):
-                    raise TypeError(f"board is {type(board_raw).__name__}, not an object")
-                board = MemoryBoard(**board_raw)
-            except Exception as exc:
-                raise StoreUnavailableError(f"Ledger board is invalid: {exc}") from exc
-        items = raw.get("memories", [])
-        if not isinstance(items, list):
-            raise StoreUnavailableError(f"Ledger 'memories' is {type(items).__name__}, not a list")
-        memories: dict[str, MemoryRecord] = {}
-        dirty_migration = False
-        for index, item in enumerate(items):
-            label = item.get("id") if isinstance(item, dict) and item.get("id") else f"#{index}"
-            try:
-                if not isinstance(item, dict) or not item.get("id"):
-                    raise ValueError("record is not an object with an id")
-                if item["id"] in memories:
-                    raise ValueError("duplicate record id")
-                migrated = migrate_legacy_record(item)
-                rec = ensure_content_hash(MemoryRecord(**migrated))
-            except Exception as exc:
-                raise StoreUnavailableError(f"Ledger record {label} failed validation: {exc}") from exc
-            memories[rec.id] = rec
-            # Persist migration if legacy fields were present
-            if any(k in item for k in ("category", "state_class", "truth_status", "scope")):
-                dirty_migration = True
-            if not item.get("content_sha256"):
-                dirty_migration = True
+        """Parse the whole document or raise; never keep a partial ledger."""
+        board, memories, dirty_migration = parse_ledger_document(raw)
         self._board = board
         self._memories = memories
         if dirty_migration:
