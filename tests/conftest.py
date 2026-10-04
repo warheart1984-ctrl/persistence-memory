@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import tempfile
 from pathlib import Path
 
@@ -85,3 +86,65 @@ def _isolated_dynamics_sidecar(tmp_path):
     rag.reset_index_for_tests()
     llm.LLM_LOG_PATH, llm.LLM_URL = original_llm_paths
     emr.reset_stm_for_tests()
+
+
+# --- Postgres (throwaway server only) -------------------------------------------------
+# Tests marked ``postgres`` need JARVIS_TEST_PG_DSN pointing at a disposable superuser
+# connection (e.g. a local ``postgres:16`` container).  They skip when it is unset.
+
+import contextlib
+import secrets
+import uuid
+from dataclasses import dataclass
+
+
+@dataclass
+class PgSchema:
+    schema: str
+    admin_dsn: str
+    app_dsn: str
+
+    @contextlib.contextmanager
+    def app_conn(self, tenant: str | None):
+        """Connection as the non-superuser app role, one transaction, tenant set (or not)."""
+        import psycopg
+
+        with psycopg.connect(self.app_dsn, options=f"-c search_path={self.schema}") as conn:
+            if tenant is not None:
+                conn.execute("SELECT set_config('jarvis.tenant_key', %s, true)", (tenant,))
+            yield conn
+
+    def admin_conn(self):
+        import psycopg
+
+        return psycopg.connect(self.admin_dsn, options=f"-c search_path={self.schema}", autocommit=True)
+
+
+@pytest.fixture(scope="session")
+def pg_server():
+    dsn = os.environ.get("JARVIS_TEST_PG_DSN", "").strip()
+    if not dsn:
+        pytest.skip("JARVIS_TEST_PG_DSN not set (throwaway Postgres required)")
+    import psycopg
+    from psycopg.conninfo import make_conninfo
+
+    password = secrets.token_hex(12)
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        conn.execute("DROP ROLE IF EXISTS jarvis_app_test")
+        conn.execute(f"CREATE ROLE jarvis_app_test LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD '{password}'")
+    app_dsn = make_conninfo(dsn, user="jarvis_app_test", password=password)
+    yield dsn, app_dsn
+
+
+@pytest.fixture
+def pg_schema(pg_server):
+    """A fresh, empty schema (not yet migrated) plus DSNs for the admin and app roles."""
+    import psycopg
+
+    admin_dsn, app_dsn = pg_server
+    name = f"t_{uuid.uuid4().hex[:12]}"
+    with psycopg.connect(admin_dsn, autocommit=True) as conn:
+        conn.execute(f'CREATE SCHEMA "{name}"')
+    yield PgSchema(schema=name, admin_dsn=admin_dsn, app_dsn=app_dsn)
+    with psycopg.connect(admin_dsn, autocommit=True) as conn:
+        conn.execute(f'DROP SCHEMA "{name}" CASCADE')

@@ -29,6 +29,7 @@ from app.models import (
     migrate_legacy_record,
 )
 from app.identity import current_tenant_key
+from app.store_errors import StoreUnavailableError
 
 
 def _now_iso() -> str:
@@ -39,10 +40,6 @@ def _make_id(prefix: str = "mem") -> str:
     import uuid
 
     return f"{prefix}-{uuid.uuid4().hex[:12]}"
-
-
-class StoreUnavailableError(RuntimeError):
-    """The ledger cannot be read or written safely; callers must fail closed."""
 
 
 class JarvisStore:
