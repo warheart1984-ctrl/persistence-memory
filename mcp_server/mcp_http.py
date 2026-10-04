@@ -30,6 +30,7 @@ def _require_mcp_auth(request: Request) -> None:
         optional_verify_operator_api_key(
             request.headers.get("authorization"),
             request.headers.get("x-emr-recall-key"),
+            request.headers.get("x-api-key"),
         )
     except HTTPException as exc:
         raise exc
