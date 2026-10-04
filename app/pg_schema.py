@@ -216,7 +216,173 @@ END
 $fn$;
 """
 
-MIGRATIONS: list[tuple[int, str]] = [(1, _V1), (2, _V2)]
+_V3 = """
+-- Gapless per-tenant history sequence + one chain head per record (also for deleted records).
+CREATE TABLE history_counters (
+    tenant_key text PRIMARY KEY CHECK (tenant_key <> ''),
+    last_seq   bigint NOT NULL CHECK (last_seq >= 0)
+);
+CREATE TABLE chain_heads (
+    tenant_key text    NOT NULL CHECK (tenant_key <> ''),
+    id         text    NOT NULL,
+    last_seq   bigint  NOT NULL,
+    last_hash  text    NOT NULL CHECK (last_hash ~ '^[0-9a-f]{64}$'),
+    deleted    boolean NOT NULL,
+    PRIMARY KEY (tenant_key, id)
+);
+ALTER TABLE record_history ADD COLUMN seq bigint;
+
+-- Backfill existing history in history_id order (NO FORCE: the owner sees every tenant here;
+-- the append-only trigger is lifted for this one statement and restored right after).
+ALTER TABLE record_history NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE record_history DISABLE TRIGGER record_history_no_update;
+UPDATE record_history h SET seq = n.rn
+FROM (SELECT x.history_id, row_number() OVER (PARTITION BY x.tenant_key ORDER BY x.history_id) AS rn
+      FROM record_history x) n
+WHERE n.history_id = h.history_id;
+ALTER TABLE record_history ENABLE TRIGGER record_history_no_update;
+ALTER TABLE record_history ALTER COLUMN seq SET NOT NULL;
+CREATE UNIQUE INDEX record_history_seq_idx ON record_history (tenant_key, seq);
+INSERT INTO history_counters (tenant_key, last_seq)
+    SELECT tenant_key, max(seq) FROM record_history GROUP BY tenant_key;
+INSERT INTO chain_heads (tenant_key, id, last_seq, last_hash, deleted)
+    SELECT DISTINCT ON (tenant_key, memory_id) tenant_key, memory_id, seq, row_hash, (op = 'delete')
+    FROM record_history ORDER BY tenant_key, memory_id, history_id DESC;
+ALTER TABLE record_history FORCE ROW LEVEL SECURITY;
+
+ALTER TABLE history_counters ENABLE ROW LEVEL SECURITY;
+ALTER TABLE history_counters FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON history_counters
+    USING (tenant_key = current_setting('jarvis.tenant_key', true))
+    WITH CHECK (tenant_key = current_setting('jarvis.tenant_key', true));
+ALTER TABLE chain_heads ENABLE ROW LEVEL SECURITY;
+ALTER TABLE chain_heads FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON chain_heads
+    USING (tenant_key = current_setting('jarvis.tenant_key', true))
+    WITH CHECK (tenant_key = current_setting('jarvis.tenant_key', true));
+
+-- The capture trigger now runs as the table owner (SECURITY DEFINER), so the application role
+-- needs no write access to the history tables and cannot forge or alter entries, heads or counters.
+CREATE OR REPLACE FUNCTION jarvis_record_history() RETURNS trigger LANGUAGE plpgsql
+SECURITY DEFINER SET search_path FROM CURRENT AS $fn$
+DECLARE
+    t text; mid text; opn text; b jsonb; a jsonb; v bigint; prev text; act text; s bigint; rh text;
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        t := OLD.tenant_key; mid := OLD.id; opn := 'delete'; b := jarvis_memory_json(OLD); a := NULL; v := OLD.version;
+    ELSIF TG_OP = 'UPDATE' THEN
+        t := NEW.tenant_key; mid := NEW.id; opn := 'update'; b := jarvis_memory_json(OLD); a := jarvis_memory_json(NEW); v := NEW.version;
+    ELSE
+        t := NEW.tenant_key; mid := NEW.id; opn := 'create'; b := NULL; a := jarvis_memory_json(NEW); v := NEW.version;
+    END IF;
+    PERFORM pg_advisory_xact_lock(hashtextextended(t || '/' || mid, 0));
+    SELECT h.row_hash INTO prev FROM record_history h
+        WHERE h.tenant_key = t AND h.memory_id = mid ORDER BY h.seq DESC LIMIT 1;
+    prev := coalesce(prev, repeat('0', 64));
+    act := coalesce(nullif(current_setting('jarvis.actor', true), ''), 'unknown');
+    INSERT INTO history_counters (tenant_key, last_seq) VALUES (t, 1)
+        ON CONFLICT (tenant_key) DO UPDATE SET last_seq = history_counters.last_seq + 1
+        RETURNING last_seq INTO s;
+    rh := jarvis_history_hash(prev, opn, v, b, a);
+    INSERT INTO record_history (tenant_key, memory_id, version, op, actor, before, after, prev_hash, row_hash, seq)
+        VALUES (t, mid, v, opn, act, b, a, prev, rh, s);
+    INSERT INTO chain_heads (tenant_key, id, last_seq, last_hash, deleted) VALUES (t, mid, s, rh, opn = 'delete')
+        ON CONFLICT (tenant_key, id) DO UPDATE
+        SET last_seq = EXCLUDED.last_seq, last_hash = EXCLUDED.last_hash, deleted = EXCLUDED.deleted;
+    RETURN NULL;
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION jarvis_verify_history(p_tenant text, p_memory_id text DEFAULT NULL)
+RETURNS TABLE (history_id bigint, memory_id text, problem text) LANGUAGE plpgsql AS $fn$
+DECLARE
+    r record; hd record; e record; gap record;
+    cur_mem text := NULL; last_hash text := NULL; calc text; ctr bigint; maxseq bigint;
+BEGIN
+    -- 1. per-record hash chain
+    FOR r IN
+        SELECT * FROM record_history h
+        WHERE h.tenant_key = p_tenant AND (p_memory_id IS NULL OR h.memory_id = p_memory_id)
+        ORDER BY h.memory_id COLLATE "C", h.seq
+    LOOP
+        IF cur_mem IS DISTINCT FROM r.memory_id THEN
+            cur_mem := r.memory_id; last_hash := repeat('0', 64);
+        END IF;
+        IF r.prev_hash <> last_hash THEN
+            RETURN QUERY SELECT r.history_id, r.memory_id,
+                'prev_hash does not match the previous entry (an entry was removed or reordered)'::text;
+        END IF;
+        calc := jarvis_history_hash(r.prev_hash, r.op, r.version, r.before, r.after);
+        IF calc <> r.row_hash THEN
+            RETURN QUERY SELECT r.history_id, r.memory_id, 'row_hash mismatch (entry was altered)'::text;
+        END IF;
+        last_hash := r.row_hash;
+    END LOOP;
+
+    -- 2. gapless tenant sequence (whole-tenant verification only)
+    IF p_memory_id IS NULL THEN
+        SELECT c.last_seq INTO ctr FROM history_counters c WHERE c.tenant_key = p_tenant;
+        SELECT max(h.seq) INTO maxseq FROM record_history h WHERE h.tenant_key = p_tenant;
+        IF maxseq IS NOT NULL AND (ctr IS NULL OR ctr < maxseq) THEN
+            RETURN QUERY SELECT NULL::bigint, NULL::text,
+                'history counter is behind the history (counter altered or missing)'::text;
+        END IF;
+        IF ctr IS NOT NULL THEN
+            FOR gap IN
+                SELECT g AS n FROM generate_series(1::bigint, ctr) g
+                WHERE NOT EXISTS (SELECT 1 FROM record_history h WHERE h.tenant_key = p_tenant AND h.seq = g)
+                LIMIT 100
+            LOOP
+                RETURN QUERY SELECT NULL::bigint, NULL::text,
+                    format('missing history sequence number %s (an entry was removed)', gap.n)::text;
+            END LOOP;
+        END IF;
+    END IF;
+
+    -- 3. every chain head must still point at its record's latest entry (deleted records included)
+    FOR hd IN
+        SELECT ch.id, ch.last_seq, ch.last_hash, ch.deleted FROM chain_heads ch
+        WHERE ch.tenant_key = p_tenant AND (p_memory_id IS NULL OR ch.id = p_memory_id)
+    LOOP
+        SELECT h.* INTO e FROM record_history h WHERE h.tenant_key = p_tenant AND h.seq = hd.last_seq;
+        IF NOT FOUND OR e.memory_id <> hd.id THEN
+            RETURN QUERY SELECT NULL::bigint, hd.id,
+                format('chain head points at a missing history entry (seq %s)', hd.last_seq)::text;
+            CONTINUE;
+        END IF;
+        IF e.row_hash <> hd.last_hash THEN
+            RETURN QUERY SELECT e.history_id, hd.id, 'chain head hash does not match its last entry'::text;
+        END IF;
+        IF (e.op = 'delete') <> hd.deleted THEN
+            RETURN QUERY SELECT e.history_id, hd.id, 'chain head deleted flag disagrees with its last entry'::text;
+        END IF;
+        IF EXISTS (SELECT 1 FROM record_history h
+                   WHERE h.tenant_key = p_tenant AND h.memory_id = hd.id AND h.seq > hd.last_seq) THEN
+            RETURN QUERY SELECT e.history_id, hd.id, 'record has history newer than its chain head'::text;
+        END IF;
+    END LOOP;
+
+    -- 4. records with history must have a head
+    RETURN QUERY
+    SELECT NULL::bigint, d.mid, 'record has history but no chain head'::text
+    FROM (SELECT DISTINCT h.memory_id AS mid FROM record_history h
+          WHERE h.tenant_key = p_tenant AND (p_memory_id IS NULL OR h.memory_id = p_memory_id)) d
+    WHERE NOT EXISTS (SELECT 1 FROM chain_heads ch WHERE ch.tenant_key = p_tenant AND ch.id = d.mid);
+
+    -- 5. every live row must equal the state recorded by its head's entry
+    RETURN QUERY
+    SELECT lh.history_id, m.id, 'live record differs from its latest history entry (or has none)'::text
+    FROM memories m
+    LEFT JOIN chain_heads ch ON ch.tenant_key = m.tenant_key AND ch.id = m.id
+    LEFT JOIN record_history lh ON lh.tenant_key = m.tenant_key AND lh.seq = ch.last_seq
+    WHERE m.tenant_key = p_tenant AND (p_memory_id IS NULL OR m.id = p_memory_id)
+      AND (ch.id IS NULL OR ch.deleted OR lh.history_id IS NULL
+           OR lh.after IS DISTINCT FROM jarvis_memory_json(m));
+END
+$fn$;
+"""
+
+MIGRATIONS: list[tuple[int, str]] = [(1, _V1), (2, _V2), (3, _V3)]
 EXPECTED_SCHEMA_VERSION = MIGRATIONS[-1][0]
 
 
@@ -231,8 +397,15 @@ def _grant(conn: psycopg.Connection, schema: str, role: str) -> None:
     conn.execute(sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(s, r))
     conn.execute(sql.SQL("GRANT SELECT, INSERT, UPDATE, DELETE ON memories, boards TO {}").format(r))
     conn.execute(sql.SQL("GRANT SELECT ON schema_version TO {}").format(r))
-    if conn.execute("SELECT to_regclass('record_history') IS NOT NULL").fetchone()[0]:
-        # append-only for the app: no UPDATE/DELETE/TRUNCATE is ever granted
+    exists = lambda name: conn.execute("SELECT to_regclass(%s) IS NOT NULL", (name,)).fetchone()[0]  # noqa: E731
+    if exists("chain_heads"):
+        # v3+: read-only for the app; the SECURITY DEFINER capture trigger is the only writer
+        for table in ("record_history", "chain_heads", "history_counters"):
+            conn.execute(sql.SQL("REVOKE ALL ON {} FROM {}").format(sql.Identifier(table), r))
+            conn.execute(sql.SQL("GRANT SELECT ON {} TO {}").format(sql.Identifier(table), r))
+        conn.execute(sql.SQL("REVOKE ALL ON SEQUENCE record_history_history_id_seq FROM {}").format(r))
+    elif exists("record_history"):
+        # v2 only (transitional): the invoker-rights trigger inserts as the app role
         conn.execute(sql.SQL("GRANT SELECT, INSERT ON record_history TO {}").format(r))
         conn.execute(sql.SQL("GRANT USAGE, SELECT ON SEQUENCE record_history_history_id_seq TO {}").format(r))
 

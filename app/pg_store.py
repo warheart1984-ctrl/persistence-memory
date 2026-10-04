@@ -150,7 +150,7 @@ class PostgresRowStore:
                 conn.execute("SELECT set_config('jarvis.actor', %s, true)", (self._tenant_key,))
                 if key not in _ready:
                     check_schema_version(conn)
-                    _warn_if_rls_bypassed(conn)
+                    _require_rls_enforced(conn)
                     _ready.add(key)
                 yield conn
         except StoreUnavailableError:
@@ -278,7 +278,7 @@ class PostgresRowStore:
         """Append-only change log for one record (survives deletion), oldest first."""
         with self._tx() as conn:
             rows = conn.execute(
-                "SELECT history_id, memory_id, version, op, actor, changed_at, before, after, "
+                "SELECT history_id, seq, memory_id, version, op, actor, changed_at, before, after, "
                 "prev_hash, row_hash FROM record_history "
                 "WHERE tenant_key = %s AND memory_id = %s ORDER BY history_id LIMIT %s",
                 (self._tenant_key, memory_id, max(1, min(int(limit), 1000))),
@@ -403,12 +403,14 @@ class PostgresRowStore:
         return row is not None
 
 
-def _warn_if_rls_bypassed(conn: psycopg.Connection) -> None:
+def _require_rls_enforced(conn: psycopg.Connection) -> None:
+    """Refuse to serve as a role that bypasses row-level security (fail closed, 503)."""
     row = conn.execute(
         "SELECT rolsuper OR rolbypassrls AS bypass FROM pg_roles WHERE rolname = current_user"
     ).fetchone()
-    if row and row["bypass"]:
-        _log.warning(
-            "ledger database role bypasses row-level security (superuser/BYPASSRLS); "
-            "tenant isolation then relies on query filters alone — use an ordinary app role"
+    if row is None or row["bypass"]:
+        _log.error(
+            "ledger database role is a superuser or has BYPASSRLS; refusing to serve. "
+            "Connect as an ordinary role (JARVIS_DATABASE_URL); use JARVIS_DATABASE_MIGRATE_URL for DDL."
         )
+        raise StoreUnavailableError("Ledger database role must not bypass row-level security")
