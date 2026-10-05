@@ -10,9 +10,10 @@ Requires **PostgreSQL 15+** (the `supersedes` foreign key uses `ON DELETE SET NU
 
 | Setting | Meaning |
 |---|---|
-| `JARVIS_DATABASE_URL` | Connection string **for the application**. Must be an ordinary role (see *Roles*). Unset = JSON file store. |
+| `JARVIS_DATABASE_URL` | Connection string **for the application**. Must be an ordinary role (see *Roles*). Unset = **no ledger** (503) unless `JARVIS_STORE_BOOTSTRAP` opts in to the JSON file store. |
 | `JARVIS_PG_STORE` | `rows` (default) = row-level tables. `blob` = the legacy store (one JSONB document per tenant, last-writer-wins). Anything else fails closed. |
 | `JARVIS_DATABASE_SCHEMA` | Optional schema (becomes the `search_path`). |
+| `JARVIS_STORE_BOOTSTRAP` | `1`/`true`/`yes`/`on` allows the local JSON file store when no database URL is set (first run, local development, tests). Off by default: with no database and no opt-in every ledger route and `/ready` answer 503 `ledger_unavailable`, and no `data/` folder or JSON file is ever created. |
 | `JARVIS_DATABASE_MIGRATE_URL` | Role allowed to run DDL, used by `python -m app.pg_migrate`, `app.pg_import`, `app.pg_verify`. Falls back to `JARVIS_DATABASE_URL`. |
 | `JARVIS_DATABASE_APP_ROLE` | Role that `pg_migrate` grants DML to (optional; see *Roles*). |
 | `JARVIS_DATABASE_POOL_MAX` | Fixed pool size (10). The pool never grows. |
@@ -152,7 +153,7 @@ row store is empty, the store refuses to serve (503) instead of quietly starting
 Import the data, keep the old store with `JARVIS_PG_STORE=blob`, or override with
 `JARVIS_PG_IGNORE_LEGACY_BLOB=1`.
 
-**Render.** While `JARVIS_DATABASE_URL` is unset the service uses the JSON file store on its disk, and
+**Render.** While `JARVIS_DATABASE_URL` is unset the service answers 503 unless `JARVIS_STORE_BOOTSTRAP=1` is set (then it uses the JSON file store on its disk), and
 `JARVIS_PG_STORE` has no effect (setting `rows` without a URL silently keeps the JSON store). With a URL,
 `render.yaml` pins `JARVIS_PG_STORE=blob` so that merging this code cannot switch a running deployment's
 store by itself (`autoDeployTrigger: commit`). Migrate and import first, then change it to `rows`.

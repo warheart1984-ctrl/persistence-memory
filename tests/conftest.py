@@ -39,6 +39,7 @@ def _isolated_store_paths(tmp_path, monkeypatch):
     from app.store import reset_store_for_tests
 
     monkeypatch.setenv("JARVIS_STORE_PATH", str(tmp_path / "jarvis-store.json"))
+    monkeypatch.setenv("JARVIS_STORE_BOOTSTRAP", "1")  # the tests use the JSON store on purpose
     monkeypatch.setenv("JARVIS_TENANT_STORE_DIR", str(tmp_path / "tenants"))
     reset_store_for_tests()
     yield
