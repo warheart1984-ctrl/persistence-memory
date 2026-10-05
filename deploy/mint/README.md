@@ -156,6 +156,12 @@ unpacks the files and the `anchors/` log; then run restore as above.
 * **RPO is one hour** (hourly dumps). Point-in-time recovery is a later option.
 * A compromised **database owner** can rewrite history, heads and counters consistently; the anchors outside the
   database are what would expose it, as long as the PC's copies are intact.
+* **No LLM adapter on port 8011 yet.** The old service on 8001 called llm-gateway (tenant `memory`, `JARVIS_LLM_*`
+  in `~/.config/persistence-memory/memory.env`) for the AMUL LLM adapter. The 8011 stack sets no `JARVIS_LLM_*`
+  variables, so that adapter is off. Recall, writes, history, backups and the rest do not use it. To get it back,
+  the app container needs `JARVIS_LLM_URL`, `JARVIS_LLM_API`, `JARVIS_LLM_MODEL` and a key reachable from inside
+  Docker, which means llm-gateway listening beyond `127.0.0.1` or a host-gateway route. That is a deliberate
+  decision, so it is not done by default. (2026-10-05: the owner does not use the adapter.)
 * Docker's `docker` group is root-equivalent; the secrets are in env files readable by that group and by
   `docker inspect`.
 * `emr_upsert` is still not atomic, and AMUL/STM/overlay/RAG state is per-instance (see `docs/POSTGRES.md`).
