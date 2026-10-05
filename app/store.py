@@ -492,8 +492,18 @@ class PostgresJarvisStore(JarvisStore):
 _stores: dict[str, JarvisStore] = {}
 
 
+def store_bootstrap_enabled() -> bool:
+    """The local JSON file store is used only when JARVIS_STORE_BOOTSTRAP is explicitly on (1/true/yes/on)."""
+    return (os.getenv("JARVIS_STORE_BOOTSTRAP") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def get_store(path: str | None = None) -> JarvisStore:
-    """Return the request tenant's isolated ledger when OAuth public mode is active."""
+    """Return the request tenant's isolated ledger when OAuth public mode is active.
+
+    With JARVIS_DATABASE_URL set this is the PostgreSQL store. Without it the call raises StoreUnavailableError
+    (HTTP 503) unless JARVIS_STORE_BOOTSTRAP is on, so a missing database setting can never silently turn into a
+    local JSON ledger.
+    """
     requested = path or os.getenv("JARVIS_STORE_PATH", "data/jarvis-store.json")
     tenant = current_tenant_key()
     database_url = (os.getenv("JARVIS_DATABASE_URL") or "").strip()
@@ -514,6 +524,12 @@ def get_store(path: str | None = None) -> JarvisStore:
         if cache_key not in _stores:
             _stores[cache_key] = PostgresJarvisStore(database_url, database_tenant)
         return _stores[cache_key]
+    if not store_bootstrap_enabled():
+        # Fail closed: never fall back to a local JSON file (and never create a data/ folder) unless asked to.
+        raise StoreUnavailableError(
+            "No database is configured (JARVIS_DATABASE_URL) and the JSON file store is not enabled. "
+            "Set JARVIS_STORE_BOOTSTRAP=1 to use the local JSON file store (first run or local development only)."
+        )
     if tenant:
         root = Path(os.getenv("JARVIS_TENANT_STORE_DIR", f"{Path(requested).parent}/tenants"))
         requested = str(root / f"{tenant}.json")

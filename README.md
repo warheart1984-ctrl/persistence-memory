@@ -153,7 +153,9 @@ See:
 
 1. Understand layers: EMR (governed activation) · Continuity Ledger (LTM SoT) · STM (view-only) · Agent (proposes via MCP).
 2. Run tests: `cd jarvis-memoryboard && pytest tests/test_emr*.py -q`
-3. Start service: `uvicorn app.main:app --host 127.0.0.1 --port 8001`
+3. Start service: `JARVIS_STORE_BOOTSTRAP=1 uvicorn app.main:app --host 127.0.0.1 --port 8001`
+   (`JARVIS_STORE_BOOTSTRAP=1` opts in to the local JSON file store. Without it, and without `JARVIS_DATABASE_URL`, the
+   service refuses with 503 instead of quietly creating a local ledger.)
 4. Confirm catalog: `GET /api/jarvis/tools` lists all three tools.
 5. For writes locally: `export JARVIS_MCP_WRITE_ENABLED=true` and always pass `user_requested=true`.
 6. Keep public Render recall-only until you intentionally enable MCP writes on a private host.
