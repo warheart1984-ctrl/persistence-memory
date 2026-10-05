@@ -15,9 +15,9 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
-from pathlib import Path
 from typing import Any
 
+from mcp_server.jarvis_keyfile import KeyFileError, read_key_file
 from mcp_server.protocol import (
     EMR_RECALL_TOOL,
     EMR_REMEMBER_TOOL,
@@ -68,14 +68,9 @@ def api_key() -> str:
     from_file = ""
     if path:
         try:
-            lines = Path(path).read_text(encoding="utf-8").strip().splitlines()
-        except OSError:
-            lines = []
-        from_file = lines[0].strip() if lines else ""
-        if not from_file:
-            raise RuntimeError(
-                f"JARVIS_API_KEY_FILE names {path!r}, which is missing, unreadable or empty. Nothing was sent."
-            )
+            from_file = read_key_file(path)  # UTF-8, UTF-8 with BOM and UTF-16 (what Windows tools write) all work
+        except KeyFileError as exc:
+            raise RuntimeError(f"JARVIS_API_KEY_FILE names {path!r}, which {exc}. Nothing was sent.") from None
     return (
         (os.environ.get("EMR_RECALL_API_KEY") or "").strip()
         or (os.environ.get("JARVIS_API_KEY") or "").strip()

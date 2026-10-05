@@ -47,6 +47,36 @@ def base_url() -> str:
     return url
 
 
+def _read_key_file(path: str) -> str | None:
+    """First line of a key file saved as UTF-8, UTF-8 with BOM or UTF-16 (what Windows tools write), or None.
+
+    The same logic as mcp_server/jarvis_keyfile.py (a test keeps them in step). Anything unusable gives None: the
+    hook then sends no key rather than a wrong one, and never crashes on the file's encoding.
+    """
+    try:
+        raw = Path(path).read_bytes()
+        if raw.startswith(b"\xef\xbb\xbf"):
+            text = raw.decode("utf-8-sig")
+        elif raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+            text = raw.decode("utf-16")
+        elif b"\x00" in raw:
+            if len(raw) >= 2 and raw[0] != 0 and raw[1] == 0:
+                text = raw.decode("utf-16-le")
+            elif len(raw) >= 2 and raw[0] == 0 and raw[1] != 0:
+                text = raw.decode("utf-16-be")
+            else:
+                return None
+        else:
+            text = raw.decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    lines = text.lstrip("\ufeff").strip().splitlines()
+    key = lines[0].strip() if lines else ""
+    if not key or not key.isascii() or not key.isprintable() or any(ch.isspace() for ch in key):
+        return None
+    return key
+
+
 def api_key() -> str | None:
     """The ledger API key, if configured: JARVIS_API_KEY, else the first line of JARVIS_API_KEY_FILE."""
     key = (os.environ.get("JARVIS_API_KEY") or "").strip()
@@ -54,10 +84,7 @@ def api_key() -> str | None:
         return key
     path = (os.environ.get("JARVIS_API_KEY_FILE") or "").strip()
     if path:
-        try:
-            return Path(path).read_text(encoding="utf-8").strip() or None
-        except OSError:
-            return None
+        return _read_key_file(path)
     return None
 
 

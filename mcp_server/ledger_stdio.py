@@ -32,6 +32,12 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+try:
+    from mcp_server.jarvis_keyfile import KeyFileError, read_key_file
+except ImportError:  # run as a script (python mcp_server/ledger_stdio.py): load the sibling module
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from jarvis_keyfile import KeyFileError, read_key_file  # type: ignore[no-redef]
+
 PROTOCOL_VERSION = "2025-03-26"
 PROTOCOL_VERSION_LEGACY = "2024-11-05"
 SERVER_NAME = "jarvis-ledger"
@@ -77,9 +83,9 @@ def _api_key() -> str:
         path = (os.environ.get("JARVIS_API_KEY_FILE") or "").strip()
         if path:
             try:
-                key = Path(path).read_text(encoding="utf-8").strip().splitlines()[0].strip()
-            except (OSError, IndexError):
-                key = ""
+                key = read_key_file(path)
+            except KeyFileError as exc:
+                raise Refusal("no_key", f"JARVIS_API_KEY_FILE names {path!r}, which {exc}. Nothing was sent.") from None
     if not key:
         raise Refusal("no_key", NO_KEY_MESSAGE)
     return key
