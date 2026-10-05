@@ -83,6 +83,8 @@ from app.auth import (
 from app.oauth import protected_resource_metadata
 from app.public_security import cors_origins, public_security_middleware
 from app.refusal import DENIED, LEDGER_UNAVAILABLE, VERSION_CONFLICT, json_response, retry_after_seconds
+from app import clause_v
+from app.clause_v import ClauseVViolation
 from app.store import StoreUnavailableError, StoreVersionConflict, get_store
 from app.graph import (
     BfsBody,
@@ -227,6 +229,12 @@ def index():
 async def _store_unavailable(request: Request, exc: StoreUnavailableError):
     logging.getLogger("jarvis.store").error("ledger unavailable: %s", exc)
     return json_response(503, "Ledger store unavailable", code=LEDGER_UNAVAILABLE)
+
+
+@app.exception_handler(ClauseVViolation)
+async def _clause_v_violation(request: Request, exc: ClauseVViolation):
+    # 422, no Retry-After: retrying the same write cannot succeed. The body names every reason.
+    return JSONResponse(status_code=422, content=exc.body())
 
 
 @app.exception_handler(StoreVersionConflict)
@@ -428,6 +436,14 @@ def list_memories(
     return {"memories": [m.model_dump() for m in memories]}
 
 
+def _with_clause_v_warnings(payload: dict) -> dict:
+    """Add the gate's soft (warn-only) findings for this write, if any, so the caller sees them."""
+    warnings = clause_v.take_warnings()
+    if warnings:
+        payload["clause_v_warnings"] = warnings
+    return payload
+
+
 @app.post("/api/jarvis/memory")
 def create_memory(body: MemoryCreate, _: None = Depends(require_memory_write)):
     store = get_store()
@@ -435,7 +451,7 @@ def create_memory(body: MemoryCreate, _: None = Depends(require_memory_write)):
         rec = store.create_memory(body)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"memory": rec.model_dump()}
+    return _with_clause_v_warnings({"memory": rec.model_dump()})
 
 
 @app.post("/api/jarvis/memory/external-search", dependencies=[Depends(require_emr_recall_api_key)])
@@ -809,7 +825,7 @@ def update_memory(memory_id: str, body: MemoryUpdate):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not rec:
         raise HTTPException(status_code=404, detail="Memory not found")
-    return {"memory": rec.model_dump()}
+    return _with_clause_v_warnings({"memory": rec.model_dump()})
 
 
 @app.delete("/api/jarvis/memory/{memory_id}", dependencies=[Depends(require_memory_write)])
