@@ -90,7 +90,7 @@ Stdio MCP server proxies `emr_recall` to the HTTP API above. See
 (Secure MCP Tunnel) setup.
 
 ```bash
-JARVIS_MEMORYBOARD_URL=http://127.0.0.1:8001 python -m mcp_server
+JARVIS_MEMORYBOARD_URL=http://127.0.0.1:8011 python -m mcp_server
 ```
 
 ## Write boundary

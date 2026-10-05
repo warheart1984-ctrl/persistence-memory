@@ -86,7 +86,8 @@ cd jarvis-memoryboard; python -m pytest -q
 .\jarvis-memoryboard\scripts\smoke-test.ps1
 ```
 
-Default URL: `http://127.0.0.1:8001`
+URL: set `JARVIS_MEMORYBOARD_URL` explicitly, for example `http://127.0.0.1:8011` (the Mint stack, through an SSH tunnel).
+The hooks and the MCP stdio proxy have **no default address**: without it they refuse, and never send the API key.
 
 ## EMR MCP Tools: Constitutional Memory for AI
 
@@ -133,7 +134,7 @@ conflict membrane. Returns a replayable `PipelineTrace` (STM view + promoted ids
 Example:
 
 ```bash
-curl -s -X POST http://127.0.0.1:8001/api/jarvis/memory/pipeline \
+curl -s -X POST http://127.0.0.1:8011/api/jarvis/memory/pipeline \
   -H "Content-Type: application/json" \
   -d '{"query":"axiom gpu delegation","session_id":"chat-c","source_agent":"chatgpt","user_requested":true}'
 ```

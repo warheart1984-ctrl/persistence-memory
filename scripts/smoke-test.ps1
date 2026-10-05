@@ -4,12 +4,24 @@
 #>
 
 $ErrorActionPreference = "Stop"
-$Base = if ($env:JARVIS_MEMORYBOARD_URL) { $env:JARVIS_MEMORYBOARD_URL.TrimEnd("/") } else { "http://127.0.0.1:8001" }
+if (-not $env:JARVIS_MEMORYBOARD_URL) {
+  throw "JARVIS_MEMORYBOARD_URL is not set. Set it to the ledger you mean, for example http://127.0.0.1:8011 through an SSH tunnel. There is no default address, so nothing is sent (and the API key is never sent) until you choose one."
+}
+$Base = $env:JARVIS_MEMORYBOARD_URL.TrimEnd("/")
 $Headers = @{}
-if ($env:JARVIS_API_KEY) {
-  $Headers["Authorization"] = "Bearer $($env:JARVIS_API_KEY)"
+$ApiKey = $env:JARVIS_API_KEY
+if (-not $ApiKey -and $env:JARVIS_API_KEY_FILE -and (Test-Path $env:JARVIS_API_KEY_FILE)) {
+  $ApiKey = (Get-Content $env:JARVIS_API_KEY_FILE -TotalCount 1).Trim()
+}
+if ($ApiKey) {
+  # Only ever to https or to this machine (e.g. an SSH tunnel to 127.0.0.1).
+  $u = [Uri]$Base
+  if ($u.Scheme -ne "https" -and $u.Host -notin @("127.0.0.1", "localhost", "[::1]", "::1")) {
+    throw "Refusing to send the API key over plain http to a non-loopback host; use https or an SSH tunnel to 127.0.0.1."
+  }
+  $Headers["X-API-Key"] = $ApiKey
 } elseif ($env:JARVIS_ALLOW_UNAUTHENTICATED -notin @("1", "true", "yes", "on")) {
-  Write-Warning "Neither JARVIS_API_KEY nor JARVIS_ALLOW_UNAUTHENTICATED=1 is set; protected routes will 401."
+  Write-Warning "Neither JARVIS_API_KEY, JARVIS_API_KEY_FILE nor JARVIS_ALLOW_UNAUTHENTICATED=1 is set; protected routes will 401."
 }
 
 Write-Host "=== Continuity Ledger smoke test ==="

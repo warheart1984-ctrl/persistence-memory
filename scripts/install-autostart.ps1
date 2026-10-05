@@ -6,14 +6,15 @@
 .DESCRIPTION
   Creates a task named "JarvisMemoryBoard" in Task Scheduler.
   Log output goes to $(PROJECT_ROOT)\data\jarvis.log.
-  The service runs on port 8001 (set JARVIS_PORT to change).
+  The service runs on the port in JARVIS_PORT. There is no default port.
 #>
 
 $ErrorActionPreference = "Stop"
 
 $ProjectRoot = Resolve-Path "$PSScriptRoot\.."
 $LogFile = "$ProjectRoot\data\jarvis.log"
-$Port = if ($env:JARVIS_PORT) { $env:JARVIS_PORT } else { "8001" }
+if (-not $env:JARVIS_PORT) { throw "JARVIS_PORT is not set. Choose the port for this local ledger (it must not clash with another service)." }
+$Port = $env:JARVIS_PORT
 
 # Resolve the python from the hermes venv if it exists, else fallback to PATH
 $VenvPython = "$env:USERPROFILE\AppData\Local\hermes\hermes-agent\venv\Scripts\python.exe"
