@@ -1,0 +1,3 @@
+#!/bin/sh
+# Stand-in for notify-send used by the rehearsal: records what would have popped up on the desktop.
+printf '%s\n' "$*" >> "${NOTIFY_CALLS:-/tmp/notify-send.calls}"
