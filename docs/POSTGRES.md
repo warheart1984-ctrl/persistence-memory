@@ -102,9 +102,31 @@ Recommended, two roles:
    `chain_heads`, `history_counters`. It has no DDL, and the history tables can only be written by the
    `SECURITY DEFINER` capture trigger, so the application cannot forge or edit history.
 
-**Single-role deployments** (for example Render's managed Postgres, where the one database user owns
-everything) work, but the application is then the owner: it could disable RLS or alter the history tables.
-The checks above still catch accidents and partial tampering, not a compromised application.
+**Two roles are required in practice: a single-role deployment does not work as shipped.** If the
+application connects as the role that owns the tables, that role holds write privileges on the history
+tables, so the `/ready` check `history_write_denied` fails permanently. Reads and writes themselves still
+succeed, but readiness never goes green, and any platform that gates traffic or deploys on `/ready` will
+treat the service as down. There is no waiver switch. (An earlier version of this document said
+single-role deployments "work"; that was wrong.)
+
+Before planning around a second role, check that you can create one:
+`select rolcreaterole from pg_roles where rolname = current_user;`. A managed provider's default user may
+not be allowed to (Render's documentation does not say what its default user can do). If you cannot
+create roles, the only route would be a deliberate, explicit opt-in that waives the
+`history_write_denied` check. **That does not exist yet**; it would have to be built, tested and accepted
+knowing what it gives up:
+
+* **RLS stops being a barrier against a compromised application.** The owner can run
+  `ALTER TABLE ... DISABLE ROW LEVEL SECURITY` or drop the policies. It would still protect against
+  accidental cross-tenant queries.
+* **History tamper-evidence only covers accidents.** Whoever holds the application credentials can disable
+  the append-only triggers and rewrite history, chain heads and counters consistently; the verifier would
+  then report clean.
+* **The application could run DDL**, including altering or dropping the ledger tables.
+
+What would still hold: the CHECK constraints, optimistic locking, fail-closed 503s and the per-tenant
+query filters. Exporting chain-head hashes outside the database (see *Not addressed*) would matter more in
+that mode.
 
 ## Cutover from the JSON file (or the JSONB-blob store)
 
@@ -130,9 +152,20 @@ row store is empty, the store refuses to serve (503) instead of quietly starting
 Import the data, keep the old store with `JARVIS_PG_STORE=blob`, or override with
 `JARVIS_PG_IGNORE_LEGACY_BLOB=1`.
 
-**Render.** `render.yaml` pins `JARVIS_PG_STORE=blob` so that merging this code cannot switch a running
-deployment's store by itself (`autoDeployTrigger: commit`). Migrate and import first, then change it to
-`rows`.
+**Render.** While `JARVIS_DATABASE_URL` is unset the service uses the JSON file store on its disk, and
+`JARVIS_PG_STORE` has no effect (setting `rows` without a URL silently keeps the JSON store). With a URL,
+`render.yaml` pins `JARVIS_PG_STORE=blob` so that merging this code cannot switch a running deployment's
+store by itself (`autoDeployTrigger: commit`). Migrate and import first, then change it to `rows`.
+
+**Hosting the database.** The row store needs PostgreSQL 15 or newer (tested on 16). Render's *Free*
+Postgres is not suitable: it expires 30 days after creation, is deleted after a further 14-day grace
+period, holds 1 GB, has no backups of any kind, and only one is allowed per workspace. Render's paid
+databases include point-in-time recovery (past 3 days on a Hobby workspace, 7 days on Pro or higher).
+Whatever the host, plan backups before putting a ledger on it. Back up with `pg_dump` as a superuser or a
+`BYPASSRLS` role, never as the application role: with forced row-level security an ordinary role either
+fails (`query would be affected by row-level security policy`) or, if you add `--enable-row-security`,
+**exits successfully with zero rows** - a silently empty backup. After every dump, check that it contains
+rows.
 
 **Rollback.** Point back at the JSON file (unset `JARVIS_DATABASE_URL`). Anything written to Postgres after
 the cutover is not in the JSON file; export it first if you need it.
