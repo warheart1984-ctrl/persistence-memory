@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,26 @@ def base_url() -> str:
         or os.environ.get("DIRECTOR_MEMORYBOARD_BASE_URL")
         or DEFAULT_BASE
     ).rstrip("/")
+
+
+def api_key() -> str | None:
+    """The ledger API key, if configured: JARVIS_API_KEY, else the first line of JARVIS_API_KEY_FILE."""
+    key = (os.environ.get("JARVIS_API_KEY") or "").strip()
+    if key:
+        return key
+    path = (os.environ.get("JARVIS_API_KEY_FILE") or "").strip()
+    if path:
+        try:
+            return Path(path).read_text(encoding="utf-8").strip() or None
+        except OSError:
+            return None
+    return None
+
+
+def _key_may_travel(url: str) -> bool:
+    """A secret only goes over https, or to this machine (e.g. through an SSH tunnel)."""
+    parsed = urllib.parse.urlparse(url)
+    return parsed.scheme == "https" or (parsed.hostname or "") in ("127.0.0.1", "localhost", "::1")
 
 
 def repo_root() -> Path:
@@ -65,6 +86,14 @@ def http_json(method: str, path: str, body: dict[str, Any] | None = None) -> dic
     if body is not None:
         data = json.dumps(body).encode("utf-8")
         headers["Content-Type"] = "application/json"
+    key = api_key()
+    if key:
+        if not _key_may_travel(url):
+            raise RuntimeError(
+                "refusing to send the API key over plain http to a non-loopback host; "
+                "use https or an SSH tunnel to 127.0.0.1"
+            )
+        headers["X-API-Key"] = key
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     with urllib.request.urlopen(req, timeout=TIMEOUT_SEC) as resp:
         payload = json.loads(resp.read().decode("utf-8"))

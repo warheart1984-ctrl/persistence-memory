@@ -1,0 +1,7 @@
+# Copy to deploy/mint/secrets/offsite.conf and edit. (This file is sourced by bash.)
+OFFSITE_HOST=192.168.1.50                 # your Windows PC
+OFFSITE_USER=your-windows-user
+OFFSITE_PATH=G:/jarvis-backups            # must already exist; forward slashes, also for Windows
+OFFSITE_KEY=$HOME/.ssh/jarvis_offsite_ed25519   # a dedicated key for this one job (no passphrase: it runs unattended)
+OFFSITE_PORT=22
+OFFSITE_OS=windows                        # windows | linux  (decides how the upload is hash-checked)

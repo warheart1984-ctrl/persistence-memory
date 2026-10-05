@@ -1,0 +1,8 @@
+# Never commit secrets, backups or logs.
+secrets/
+*.env
+.env
+!*.env.example
+backups/
+logs/
+state/

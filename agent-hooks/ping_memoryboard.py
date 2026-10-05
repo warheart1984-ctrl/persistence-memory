@@ -1,24 +1,27 @@
-import http.client, json
+"""Diagnostic: is the ledger up, ready, and what does it hold?  Honors JARVIS_MEMORYBOARD_URL and JARVIS_API_KEY."""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from jarvis_common import http_json  # noqa: E402
+
 
 def main():
-    c = http.client.HTTPConnection("127.0.0.1", 8001, timeout=5)
+    health = http_json("GET", "/health")
+    print(f"Health: {health['status']}")
+    ready = http_json("GET", "/ready")  # 503 (an error here) if the ledger cannot be served
+    print(f"Ready: {ready['status']} {ready.get('checks', {})}")
 
-    c.request("GET", "/health")
-    h = json.loads(c.getresponse().read())
-    print(f"Health: {h['status']}")
-    print(f"Memories stored: {h['memory_count']}")
-
-    c.request("GET", "/api/jarvis/memory")
-    m = json.loads(c.getresponse().read())
-    print(f"All memories: {len(m['memories'])}")
-    for mem in m['memories']:
+    memories = http_json("GET", "/api/jarvis/memory")["memories"]
+    print(f"Memories stored: {len(memories)}")
+    for mem in memories:
         print(f"  [{mem['id']}] {mem['content'][:100]}")
 
-    c.request("GET", "/api/jarvis/memory/board")
-    b = json.loads(c.getresponse().read())
-    print(f"Board: {b['memory_board']['summary']}")
+    board = http_json("GET", "/api/jarvis/memory/board")
+    print(f"Board: {board['memory_board']['summary']}")
 
     print("OK: service is live")
+
 
 if __name__ == "__main__":
     main()

@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# One entry point for everything. Run from anywhere:  deploy/mint/bin/jarvisctl help
+set -Eeuo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export LOG_NAME=ctl
+# shellcheck source=lib.sh
+source "$here/lib.sh"
+
+usage() {
+  cat <<'EOF'
+jarvisctl <command>
+
+  secrets              create secrets/*.env and api-key (first time only; never prints a value)
+  up                   build and start: db -> migrate -> app
+  down                 stop the stack (volumes and backups are kept)
+  restart [service]    restart the app (or one service)
+  status               containers, health, last backup/offsite/drill ages
+  logs [service]       follow logs (db | app | migrate)
+  psql                 an admin psql session inside the database container (as postgres)
+  verify [tenant]      verify the history hash chain (default tenant: operator)
+  smoke [--no-write]   acceptance checks
+  backup               take a backup set now
+  prune [--dry-run]    apply the retention policy
+  restore --yes-destroy-current-data [--backup SET] [--no-start]
+  drill [--prove-detection]
+  offsite              encrypt and send the newest set to your Windows PC
+  watchdog             run the health/staleness checks once
+  rotate app|migrator|api-key
+EOF
+}
+
+cmd="${1:-help}"; [ $# -eq 0 ] || shift
+case "$cmd" in
+  secrets)  exec "$here/gen-secrets.sh" "$@" ;;
+  up)
+    [ -f "$SECRETS_DIR/app.env" ] || { echo "no secrets yet: run  jarvisctl secrets  first" >&2; exit 1; }
+    "${COMPOSE[@]}" up -d --build "$@"
+    wait_healthy "$APP_CONTAINER" 240 && echo "stack is up: http://127.0.0.1:$APP_PORT (health: ok)" \
+      || { echo "app did not become healthy; try: jarvisctl logs app" >&2; exit 1; } ;;
+  down)     "${COMPOSE[@]}" down "$@" ;;
+  restart)  "${COMPOSE[@]}" restart "${@:-app}" ;;
+  status)
+    "${COMPOSE[@]}" ps
+    for f in backup offsite drill; do
+      if [ -f "$STATE_DIR/$f.last_ok" ]; then printf '%-8s last ok %s min ago\n' "$f" $(( ($(date +%s) - $(cat "$STATE_DIR/$f.last_ok")) / 60 ))
+      else printf '%-8s never\n' "$f"; fi
+    done
+    ls -1 "$BACKUP_DIR"/jarvis-*.sha256 2>/dev/null | wc -l | xargs printf 'backup sets on disk: %s\n' ;;
+  logs)     "${COMPOSE[@]}" logs -f --tail=100 "$@" ;;
+  psql)     exec docker exec -it -u postgres "$DB_CONTAINER" psql -d jarvis "$@" ;;
+  verify)
+    t="${1:-operator}"
+    "${COMPOSE[@]}" run --rm --no-deps -T migrate python -m app.pg_verify --tenant "$t" ;;
+  smoke)    exec "$here/smoke.sh" "$@" ;;
+  backup)   exec "$here/backup.sh" "$@" ;;
+  prune)    exec "$here/prune.sh" "$@" ;;
+  restore)  exec "$here/restore.sh" "$@" ;;
+  drill)    exec "$here/drill.sh" "$@" ;;
+  offsite)  exec "$here/offsite.sh" "$@" ;;
+  watchdog) exec "$here/watchdog.sh" "$@" ;;
+  rotate)   exec "$here/rotate-password.sh" "$@" ;;
+  help|-h|--help) usage ;;
+  *) echo "unknown command: $cmd" >&2; usage >&2; exit 2 ;;
+esac

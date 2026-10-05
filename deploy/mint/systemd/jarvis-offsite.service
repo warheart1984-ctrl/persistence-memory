@@ -1,0 +1,14 @@
+[Unit]
+Description=Jarvis ledger: encrypted offsite copy to the Windows PC
+Documentation=file://@DEPLOY_DIR@/README.md
+
+[Service]
+Type=oneshot
+Environment=JARVIS_HOME=@JARVIS_HOME@
+# optional tuning (JARVIS_APP_PORT, BACKUP_MAX_AGE, NOTIFY_EVERY_SECONDS, ...); the dash makes the file optional
+EnvironmentFile=-@DEPLOY_DIR@/.env
+EnvironmentFile=-@JARVIS_HOME@/systemd.env
+ExecStart=@DEPLOY_DIR@/bin/offsite.sh
+TimeoutStartSec=30min
+NoNewPrivileges=true
+PrivateTmp=true

@@ -1,0 +1,11 @@
+[Unit]
+Description=Jarvis ledger: watchdog every 15 minutes
+
+[Timer]
+OnCalendar=*:0/15
+# first check shortly after login/boot, giving the stack time to come up
+OnBootSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
