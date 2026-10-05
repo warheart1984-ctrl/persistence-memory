@@ -12,7 +12,7 @@ over https or to this machine (loopback), is never printed, and never appears in
 Tools (namespaced by the host with the server name, e.g. ``jarvis-ledger__recall``):
 
     health   liveness and readiness
-    recall   list live memories (default 50, up to 200)
+    recall   list memories (default 50, up to 200); live ones only unless truth_scope says otherwise
     get      one memory by id
     write    store ONE draft fact or decision. Only offered when JARVIS_LEDGER_MCP_WRITE=1; needs the user's own
              wording in ``user_requested``; refuses anything that looks like a credential; source_agent is
@@ -46,6 +46,7 @@ SERVER_VERSION = "1.0.0"
 TIMEOUT_SEC = 20.0
 MAX_LIMIT = 200
 DEFAULT_LIMIT = 50
+TRUTH_SCOPES = ("live", "all", "archived")  # live = everything except archived records (the default)
 MAX_CONTENT = 1900  # the API limit is 2000
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
@@ -167,7 +168,12 @@ def tool_recall(args: dict[str, Any]) -> dict[str, Any]:
     limit = args.get("limit", DEFAULT_LIMIT)
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_LIMIT:
         raise Refusal("bad_argument", f"limit must be an integer from 1 to {MAX_LIMIT}")
+    scope = args.get("truth_scope", "live")
+    if scope not in TRUTH_SCOPES:
+        raise Refusal("bad_argument", f"truth_scope must be one of {', '.join(TRUTH_SCOPES)}")
     params: dict[str, str] = {"limit": str(limit), "with_provenance": "false"}
+    if scope != "all":  # live (the default) leaves archived records out; archived returns only those
+        params["truth_scope"] = scope
     for name in ("query", "type", "status", "subject"):
         value = args.get(name)
         if value is not None:
@@ -186,7 +192,7 @@ def tool_recall(args: dict[str, Any]) -> dict[str, Any]:
         record["content"] = _truncate(content, chars)
         record["truncated"] = bool(chars) and len(content) > chars
         records.append(record)
-    return {"count": len(records), "limit": limit, "capped": len(records) >= limit, "memories": records}
+    return {"count": len(records), "limit": limit, "capped": len(records) >= limit, "truth_scope": scope, "memories": records}
 
 
 def tool_get(args: dict[str, Any]) -> dict[str, Any]:
@@ -257,9 +263,10 @@ TOOLS: dict[str, dict[str, Any]] = {
     },
     "recall": {
         "description": (
-            "List live memories from the Jarvis Continuity Ledger, newest first. Default 50, at most 200. Optional "
-            "filters: query, type, status, subject. Content is shortened to content_chars (default 400; 0 = full "
-            "text). Read-only. Say so when the result is capped."
+            "List live memories from the Jarvis Continuity Ledger, newest first. Archived records are left out unless "
+            "you ask for truth_scope 'all' or 'archived'. Default 50, at most 200. Optional filters: query, type, "
+            "status, subject. Content is shortened to content_chars (default 400; 0 = full text). Read-only. Say so "
+            "when the result is capped."
         ),
         "annotations": _READ_ONLY,
         "inputSchema": {
@@ -271,6 +278,7 @@ TOOLS: dict[str, dict[str, Any]] = {
                 "status": {"type": "string", "description": "Optional status, e.g. draft, verified"},
                 "subject": {"type": "string"},
                 "content_chars": {"type": "integer", "minimum": 0, "default": 400},
+                "truth_scope": {"type": "string", "enum": list(TRUTH_SCOPES), "default": "live"},
             },
         },
         "run": tool_recall,
