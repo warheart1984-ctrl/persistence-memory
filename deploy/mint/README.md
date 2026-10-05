@@ -85,7 +85,7 @@ reports the hash verified before trusting the timer.
 ```bash
 bin/jarvisctl up                  # db -> migrate -> app; builds the images the first time
 bin/jarvisctl smoke               # the acceptance checklist; every line must say PASS
-bin/install-units.sh              # hourly backup, daily offsite, weekly drill, 15-minute watchdog (systemd user timers)
+bin/install-units.sh              # hourly backup, daily offsite, weekly drill, 15-minute watchdog, 1-minute self-heal (systemd user timers)
 bin/jarvisctl backup && bin/jarvisctl drill --prove-detection
 bin/jarvisctl offsite
 ```
@@ -164,6 +164,12 @@ unpacks the files and the `anchors/` log; then run restore as above.
 The old service keeps running on 8001 with its own JSON file. When you are ready: stop writing to it, do a
 `pg_import` **dry run first** against its `data/jarvis-store.json` (`docs/POSTGRES.md`), apply, verify, point your
 hooks at 8011, and only then retire the old unit. Its data file is never modified by any of this.
+
+## If the database stops
+`restart: unless-stopped` makes Docker restart the database after a crash, an out-of-memory kill or a reboot. Docker
+never restarts a container that was stopped or killed through its API (`docker kill`, `docker stop`), so a one-minute
+timer (`jarvis-heal.timer`, `bin/heal.sh`) starts the database or app again if it finds it stopped, and raises a
+notification. `jarvisctl down` leaves a marker so a stop on purpose is respected until the next `jarvisctl up`.
 
 ## Rehearsal
 `rehearse/rehearse-wsl.sh` (Git Bash on the Windows PC) runs all of the above in a WSL Ubuntu 24.04 with its own

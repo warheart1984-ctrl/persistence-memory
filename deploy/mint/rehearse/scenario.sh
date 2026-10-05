@@ -243,8 +243,8 @@ EOF
   t "the user manager is reachable" systemctl --user show -p Version
   t "user services can run docker (the manager has the docker group)" systemd-run --user --wait --collect --quiet --pipe docker ps -q
   "$BIN/install-units.sh" > "$R/iu.out" 2>&1; eq "install-units enables the timers" "$?" "0"
-  for tm in backup offsite drill watchdog; do t "timer jarvis-$tm.timer is active" systemctl --user is-active "jarvis-$tm.timer"; done
-  eq "all four timers have a next run scheduled" "$(systemctl --user list-timers 'jarvis-*' --no-legend 2>/dev/null | grep -c jarvis)" "4"
+  for tm in backup offsite drill watchdog heal; do t "timer jarvis-$tm.timer is active" systemctl --user is-active "jarvis-$tm.timer"; done
+  eq "all five timers have a next run scheduled" "$(systemctl --user list-timers 'jarvis-*' --no-legend 2>/dev/null | grep -c jarvis)" "5"
   sets_before=$(ls "$BK"/*.sha256 | wc -l); sleep 1
   systemctl --user start jarvis-backup.service; rc=$?
   eq "the backup unit runs to success under systemd" "$rc/$(systemctl --user show -p Result --value jarvis-backup.service)" "0/success"
@@ -270,7 +270,7 @@ EOF
   eq "the live database is unchanged by the drill" "$(psql_pg -c 'select count(*) from jarvis.memories')" "$before_live"
   "$BIN/watchdog.sh" > "$R/w3.out" 2>&1; eq "watchdog is now fully quiet" "$?" "0"
 
-  section "A12. outage: database killed hard (SIGKILL)"
+  section "A12. outage: database killed with docker kill, then a real crash"
   n_before="$(api GET '/api/jarvis/memory?limit=200' | jget "len(d['memories'])")"
   docker kill jarvis-db >/dev/null
   sleep 2
@@ -282,12 +282,23 @@ EOF
   eq "a write during the outage is a 503" "$(code -X POST -H "X-API-Key: $KEY" -H 'Content-Type: application/json' -d '{"content":"written during an outage","source_agent":"t","session_id":"s","type":"fact"}' "http://127.0.0.1:$JARVIS_APP_PORT/api/jarvis/memory")" "503"
   eq "/ready is 503 during the outage" "$(ready_code)" "503"
   eq "/health (liveness) stays 200 during the outage" "$(code "http://127.0.0.1:$JARVIS_APP_PORT/health")" "200"
-  if wait_for '[ "$(docker inspect -f "{{.State.Running}}" jarvis-db)" = true ]' 30; then ok "docker restarted the killed database by itself (restart policy)"; else echo "        note: docker did not auto-restart an explicitly killed container; the operator would run: jarvisctl up"; docker start jarvis-db >/dev/null; fi
+  # Docker never auto-restarts a container that was killed through the API, so the 1-minute self-heal timer must.
+  if wait_for '[ "$(docker inspect -f "{{.State.Running}}" jarvis-db)" = true ]' 150; then ok "the killed database came back by itself (self-heal timer, nothing started by hand)"; else bad "the killed database did NOT come back by itself within 150 s"; docker start jarvis-db >/dev/null; fi
   t "database is healthy again" wait_for '[ "$(docker inspect -f "{{.State.Health.Status}}" jarvis-db)" = healthy ]' 120
   t "the app's /ready recovers on its own" wait_for '[ "$(ready_code)" = 200 ]' 120
   has "postgres replayed its WAL after the SIGKILL (crash recovery ran)" "automatic recovery in progress" <(docker logs jarvis-db 2>&1)
   eq "no partial write: the record count is exactly what it was" "$(api GET '/api/jarvis/memory?limit=200' | jget "len(d['memories'])")" "$n_before"
   t "history still verifies after the crash" "$BIN/jarvisctl" verify operator
+
+  # Docker's own policy (restart: unless-stopped) covers a real crash: the database process dies by itself.
+  # The heal timer is paused so only Docker can bring it back.
+  systemctl --user stop jarvis-heal.timer
+  started_before="$(docker inspect -f '{{.State.StartedAt}}' jarvis-db)"
+  docker exec -u postgres jarvis-db pg_ctl -D /var/lib/postgresql/data stop -m immediate >/dev/null 2>&1
+  if wait_for '[ "$(docker inspect -f "{{.State.StartedAt}}" jarvis-db)" != "$started_before" ] && [ "$(docker inspect -f "{{.State.Running}}" jarvis-db)" = true ]' 60; then ok "docker's restart policy brought back a database that crashed (heal timer paused)"; else bad "the crashed database was not restarted by docker's restart policy"; docker start jarvis-db >/dev/null; fi
+  systemctl --user start jarvis-heal.timer
+  t "database is healthy after the crash restart" wait_for '[ "$(docker inspect -f "{{.State.Health.Status}}" jarvis-db)" = healthy ]' 120
+  t "the app's /ready recovers after the crash restart" wait_for '[ "$(ready_code)" = 200 ]' 120
 
   section "A13. stop and start"
   before="$(snapshot)"
@@ -411,8 +422,8 @@ phase_b() {
 # =================================================================================================================
 teardown() {
   cd "$SRC/deploy/mint" 2>/dev/null || true
-  systemctl --user disable --now jarvis-backup.timer jarvis-offsite.timer jarvis-drill.timer jarvis-watchdog.timer >/dev/null 2>&1
-  systemctl --user stop jarvis-backup.service jarvis-offsite.service jarvis-drill.service jarvis-watchdog.service >/dev/null 2>&1
+  systemctl --user disable --now jarvis-backup.timer jarvis-offsite.timer jarvis-drill.timer jarvis-watchdog.timer jarvis-heal.timer >/dev/null 2>&1
+  systemctl --user stop jarvis-backup.service jarvis-offsite.service jarvis-drill.service jarvis-watchdog.service jarvis-heal.service >/dev/null 2>&1
   rm -f "$HOME"/.config/systemd/user/jarvis-*.service "$HOME"/.config/systemd/user/jarvis-*.timer
   systemctl --user daemon-reload >/dev/null 2>&1
   docker compose -f "$SRC/deploy/mint/docker-compose.yml" down -v >/dev/null 2>&1
