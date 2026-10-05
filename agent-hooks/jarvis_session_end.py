@@ -20,7 +20,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from jarvis_common import (  # noqa: E402
     MAX_MEMORY_CONTENT,
     emit,
+    find_secrets,
     last_response_path,
+    log_refusal,
     read_stdin_json,
     session_meta_path,
     truncate,
@@ -117,6 +119,22 @@ def main() -> int:
         ],
         "tags": ["cursor-session", "auto-sessionEnd", mem_type],
     }
+    # Refuse, don't redact: if anything that looks like a credential is in what we would send (or in the cached
+    # response it came from), post nothing. The notice names the patterns, never the text. Fail closed on errors.
+    try:
+        scan_text = "\n".join(
+            [last, content, subject, *body["tags"]]
+            + [f"{e['kind']} {e['ref']} {e['note']}" for e in body["evidence"]]
+        )
+        matched = find_secrets(scan_text)
+    except Exception:  # noqa: BLE001 - the filter must never be the reason a secret is sent
+        matched = ["filter-error"]
+    if matched:
+        notice = log_refusal("sessionEnd", str(session_id), matched)
+        print(f"jarvis hook: {notice}", file=sys.stderr)
+        emit({})
+        return 0
+
     try_http_json("POST", "/api/jarvis/memory", body)
     emit({})
     return 0

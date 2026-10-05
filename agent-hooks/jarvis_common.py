@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import math
 import os
+import re
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -62,6 +65,97 @@ def _key_may_travel(url: str) -> bool:
     """A secret only goes over https, or to this machine (e.g. through an SSH tunnel)."""
     parsed = urllib.parse.urlparse(url)
     return parsed.scheme == "https" or (parsed.hostname or "") in ("127.0.0.1", "localhost", "::1")
+
+
+# --- secret filter for what the hooks send to the ledger ----------------------------------------------------
+# A tripwire, not a guarantee: it recognises the common shapes of credentials (and this ledger's own API key,
+# exactly). It returns the NAMES of the patterns that matched, never the matched text, so a refusal notice
+# cannot leak the thing it refused. The sessionEnd hook refuses to post anything that matches.
+
+_SECRET_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    ("private-key-block", re.compile(r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----")),
+    ("age-secret-key", re.compile(r"AGE-SECRET-KEY-1[A-Z0-9]{20,}")),
+    ("openai-style-key", re.compile(r"\bsk-(?:ant-|proj-)?[A-Za-z0-9_-]{20,}")),
+    ("github-token", re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,})")),
+    ("gitlab-token", re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}")),
+    ("slack-token", re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}")),
+    ("aws-access-key-id", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
+    ("google-api-key", re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b")),
+    ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}")),
+    ("bearer-token", re.compile(r"\bbearer\s+[A-Za-z0-9._~+/=-]{20,}", re.IGNORECASE)),
+    ("authorization-header", re.compile(r"\bauthorization\s*:\s*(?:basic|bearer|token)\s+\S{8,}", re.IGNORECASE)),
+    (
+        "secret-assignment",
+        re.compile(
+            r"""\b(?:api[_-]?key|secret(?:[_-]?key)?|access[_-]?token|auth[_-]?token|token|passw(?:or)?d|passwd|pwd|"""
+            r"""client[_-]?secret|private[_-]?key)\b["']?\s*[:=]\s*["']?[^\s"',;]{6,}""",
+            re.IGNORECASE,
+        ),
+    ),
+    ("url-credentials", re.compile(r"\b[a-z][a-z0-9+.-]*://[^/\s:@]+:[^/\s@]{3,}@", re.IGNORECASE)),
+]
+
+_ENTROPY_CANDIDATE = re.compile(r"[A-Za-z0-9+/_-]{40,}")
+
+
+def _shannon_entropy(text: str) -> float:
+    counts: dict[str, int] = {}
+    for ch in text:
+        counts[ch] = counts.get(ch, 0) + 1
+    return -sum((n / len(text)) * math.log2(n / len(text)) for n in counts.values())
+
+
+def _own_secrets() -> list[str]:
+    """This ledger's own credentials, so they are caught even in a shape no pattern knows."""
+    values = [
+        os.environ.get("JARVIS_API_KEY"),
+        os.environ.get("EMR_RECALL_API_KEY"),
+        api_key(),
+    ]
+    return sorted({v.strip() for v in values if v and len(v.strip()) >= 8})
+
+
+def find_secrets(text: str, *, entropy: bool | None = None) -> list[str]:
+    """Names of the secret patterns found in ``text`` (empty list: nothing matched). Never returns the matches.
+
+    The high-entropy rule is off unless ``entropy=True`` or JARVIS_HOOK_SECRET_ENTROPY=1: long random-looking
+    strings are legitimate in a ledger (hashes, ids), so it is opt-in. Pure hex is never flagged by it.
+    """
+    found: set[str] = set()
+    for name, pattern in _SECRET_PATTERNS:
+        if pattern.search(text):
+            found.add(name)
+    if any(secret in text for secret in _own_secrets()):
+        found.add("ledger-api-key")
+    if entropy is None:
+        entropy = os.environ.get("JARVIS_HOOK_SECRET_ENTROPY", "").strip().lower() in ("1", "true", "yes", "on")
+    if entropy:
+        for candidate in _ENTROPY_CANDIDATE.findall(text):
+            if re.fullmatch(r"[0-9a-fA-F]+", candidate):
+                continue
+            if _shannon_entropy(candidate) >= 4.3 and any(c.isdigit() for c in candidate) and any(c.isalpha() for c in candidate):
+                found.add("high-entropy-string")
+                break
+    return sorted(found)
+
+
+def refusal_log_path() -> Path:
+    return state_dir() / "jarvis-hook-refusals.log"
+
+
+def log_refusal(hook: str, session_id: str, names: list[str]) -> str:
+    """Record that a hook refused to send something. Writes pattern names only, never the matched text."""
+    safe_session = re.sub(r"[^A-Za-z0-9_.-]", "_", str(session_id))[:64]
+    if find_secrets(str(session_id)) or find_secrets(safe_session):
+        safe_session = "<redacted>"  # the id is caller-supplied text: it must not carry a secret into the log
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    line = f"{stamp} {hook} session={safe_session} not sent; matched: {', '.join(names)}"
+    try:
+        with refusal_log_path().open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+    except OSError:
+        pass
+    return line
 
 
 def repo_root() -> Path:
