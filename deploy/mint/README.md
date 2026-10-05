@@ -13,93 +13,45 @@ Windows PC ──ssh -L──►  127.0.0.1:8011  ─►  app (non-root, read-on
    backups (hourly, verified) ──► ~/jarvis-ledger/backups ──► age-encrypted daily ──► Windows PC (G:)
 ```
 
-## What is already on the box (found by a read-only check on 2026-10-05)
+## Where things stand (2026-10-05)
 
-* **Linux Mint 22.3** (Ubuntu 24.04 base), 4 CPUs, 15 GiB RAM, root filesystem `/dev/sda2` ext4, 168 GB free.
-  Connected by **Wi-Fi** only. `ufw` is installed but **not enabled**. The disk is **not encrypted**.
-  SSH listens on all interfaces (key-only).
-* **Docker is not installed.** `age` is not installed. `notify-send` is (Cinnamon desktop session).
-* **An older `persistence-memory` service already runs** (user unit `persistence-memory.service`, uvicorn on
-  `127.0.0.1:8001`, from `~/persistence-memory`, JSON store, code from before the red-team fixes). It also runs
-  Grafana (3000), `llm-gateway` (8080/9090) and Prometheus (9091). **None of that is touched.** This stack uses
-  port **8011** and its own directories so both can run side by side until you decide to switch.
-
-## One-time setup
-
-Steps that need `sudo` are yours to run; nothing here asks for or stores a sudo password.
-
-### 1. Install Docker Engine, compose and age (from Ubuntu's own archive, no extra repository)
-```bash
-sudo apt-get update
-sudo apt-get install -y docker.io docker-compose-v2 age
-sudo usermod -aG docker "$USER"      # the docker group is root-equivalent: keep it to your own user
-```
-Log out and back in (or reboot) so the group applies to your session *and* to your systemd user manager.
-Check: `docker run --rm hello-world` and `docker compose version`.
-
-### 2. Firewall and updates (recommended, not required by the stack)
-`ufw` is installed but disabled, so nothing filters the box. The stack itself exposes only `127.0.0.1`, but SSH is
-open to the whole network. Before enabling, make sure the SSH rule is in place or you will lock yourself out:
-```bash
-sudo ufw default deny incoming
-sudo ufw default allow outgoing
-sudo ufw allow from 192.168.1.0/24 to any port 22 proto tcp
-sudo ufw enable
-sudo ufw status verbose
-```
-Note that a Docker **published** port bypasses ufw (Docker edits iptables itself). That is why this stack binds
-`127.0.0.1` explicitly and publishes nothing for the database. Security updates:
-`sudo apt-get install -y unattended-upgrades && sudo dpkg-reconfigure -plow unattended-upgrades`.
-
-### 3. Get the code (a separate checkout; the old service's `~/persistence-memory` is left alone)
-```bash
-git clone https://github.com/warheart1984-ctrl/persistence-memory.git ~/jarvis-ledger-src
-cd ~/jarvis-ledger-src/deploy/mint
-cp .env.example .env            # port 8011, local tuning, no secrets
-bin/jarvisctl secrets           # random passwords + API key, mode 600, never printed
-```
-
-### 4. The offsite copy to your Windows PC (the part the rehearsal could not test against real Windows)
-The rehearsal used a Linux SSH server as the PC. `OFFSITE_OS=windows` changes only how the upload is hash-checked
-(PowerShell `Get-FileHash`); **that path is untested**. Run `bin/jarvisctl offsite` once by hand and confirm it
-reports the hash verified before trusting the timer.
-
-1. **age keypair, on the Windows PC (not on the Mint box):** `winget install FiloSottile.age`, then
-   `age-keygen -o jarvis-age-key.txt`. Put the file on your USB stick, print a copy, and **remove it from the PC**.
-   Copy only the line starting `age1…` (the public key) to the Mint box as `deploy/mint/secrets/age_recipient.txt`.
-   Without the private key nobody - including this box - can read the backups, and **you cannot restore from an
-   offsite copy without it.**
-2. **SSH server on Windows:** Settings → Optional features → OpenSSH Server, then start the `sshd` service and set it
-   to Automatic. Create the folder `G:\jarvis-backups`.
-3. **A dedicated key for this one job**, on the Mint box: `ssh-keygen -t ed25519 -N '' -f ~/.ssh/jarvis_offsite_ed25519`
-   (no passphrase because it runs unattended). Put the **public** half in the Windows account's
-   `authorized_keys` (for an administrator account that is `C:\ProgramData\ssh\administrators_authorized_keys`).
-   A key that can write to the PC is a risk, so use a normal, non-admin Windows user that owns only the backup folder.
-4. **Pin the PC's host key** (this is what stops someone impersonating the PC): on the Mint box
-   `ssh-keyscan -t ed25519 <PC address> > deploy/mint/secrets/offsite_known_hosts`, then compare the fingerprint
-   (`ssh-keygen -lf deploy/mint/secrets/offsite_known_hosts`) with the one on the PC
-   (`ssh-keygen -lf C:\ProgramData\ssh\ssh_host_ed25519_key.pub`) before trusting it.
-5. `cp offsite.conf.example secrets/offsite.conf` and fill it in (`OFFSITE_OS=windows`, `OFFSITE_PATH=G:/jarvis-backups`).
-
-### 5. Start it, check it, schedule it
-```bash
-bin/jarvisctl up                  # db -> migrate -> app; builds the images the first time
-bin/jarvisctl smoke               # the acceptance checklist; every line must say PASS
-bin/install-units.sh              # hourly backup, daily offsite, weekly drill, 15-minute watchdog, 1-minute self-heal (systemd user timers)
-bin/jarvisctl backup && bin/jarvisctl drill --prove-detection
-bin/jarvisctl offsite
-```
-`loginctl show-user $USER -p Linger` already says `yes` on this box, so the timers run while you are logged out.
+* **Running:** the stack on `127.0.0.1:8011`, on Linux Mint 22.3 (4 CPUs, 15 GiB RAM, Wi-Fi only, disk not
+  encrypted). Docker 29.1.3, compose 2.40.3 and age 1.1.1 come from Ubuntu's own archive.
+* **Data:** 59 records imported from the PC's `jarvis-store.json` with `pg_import` (manifest in
+  `~/jarvis-ledger/state/import-manifest.json`), plus one record migrated from the old service
+  (`mem-da3ddefda22a`, copied from `mem-79f9aa7e7e44`). 60 live records.
+* **The old service on 8001 is retired:** `persistence-memory.service` is stopped and disabled. Its data
+  (`~/.local/share/persistence-memory/`) and `~/.config/persistence-memory/memory.env` are untouched, and
+  `~/persistence-memory` is pinned at `d5157ba`. To bring it back:
+  `systemctl --user enable --now persistence-memory.service`.
+* **Firewall:** `ufw` is on and allows SSH only from `192.168.1.0/24`. Grafana, `llm-gateway` and Prometheus are
+  on the box and untouched.
+* **Timers (systemd user units, linger on):** hourly backup, daily offsite copy, weekly restore drill, 15-minute
+  watchdog, 1-minute self-heal.
+* **Checked on this hardware:** `jarvisctl smoke` passes every check; a `docker kill` of the database was back in
+  48 s with `/ready` 200 and no lost record; a crash (`pg_ctl stop -m immediate`) was restarted by Docker itself in
+  3 s; the restore drill passes; the offsite copy was verified by hash on the Windows side and decrypts.
 
 ## Using it from your Windows PC
+
+The hooks and the MCP stdio proxy have **no default address**. Without `JARVIS_MEMORYBOARD_URL` they refuse with a
+clear error, send nothing and never use the API key. (On the PC, port 8001 belongs to another program.) They send the
+key only over `https` or to `127.0.0.1`, so it cannot leak onto the LAN. You need current code in
+`G:\persistence-memory` for that.
+
 ```powershell
-ssh -N -L 8011:127.0.0.1:8011 jon@192.168.1.102          # keep this open (or use autossh / a scheduled task)
+ssh -N -L 127.0.0.1:8011:127.0.0.1:8011 jon@192.168.1.102   # the tunnel; keep it open
 scp jon@192.168.1.102:jarvis-ledger-src/deploy/mint/secrets/api-key $HOME\.jarvis-api-key
+icacls $HOME\.jarvis-api-key /inheritance:r /grant:r "${env:USERNAME}:R"
 $env:JARVIS_MEMORYBOARD_URL = "http://127.0.0.1:8011"
 $env:JARVIS_API_KEY_FILE    = "$HOME\.jarvis-api-key"
-python agent-hooks\ping_memoryboard.py                   # Health / Ready / memory count / "OK: service is live"
+python agent-hooks\ping_memoryboard.py    # Health / Ready / memory count / "OK: service is live"
 ```
-The hooks send the key as `X-API-Key`, and only over `https` or to `127.0.0.1`, so it cannot leak onto the LAN.
+
+The key file is read-only on purpose, so after `jarvisctl rotate api-key` delete it before copying the new one.
+`ping_memoryboard.py` asks for up to 200 records and says when the list is capped; the API pages at 50 by default.
+The variables above last for one PowerShell session. Making them permanent (user environment variables, a key file
+only you can read, a tunnel that starts at login) is **not done yet**.
 
 ## Day to day
 
@@ -112,12 +64,19 @@ The hooks send the key as `X-API-Key`, and only over `https` or to `127.0.0.1`, 
 | `jarvisctl restore --yes-destroy-current-data [--backup SET]` | **destructive**: see below |
 | `jarvisctl offsite` | encrypt and send the newest set to the PC |
 | `jarvisctl verify [tenant]` | recompute the history hash chain |
+| `jarvisctl watchdog` / `heal` | run the health checks / the self-heal once |
 | `jarvisctl psql` | admin session inside the database container |
 | `jarvisctl rotate app\|migrator\|api-key` | new random credential, never shown; api-key then needs copying to the PC |
-| `jarvisctl logs [db\|app]`, `down`, `restart` | the obvious |
+| `jarvisctl logs [db\|app]`, `up`, `down`, `restart` | the obvious |
 
 Alerts go to `~/jarvis-ledger/logs/alerts.log` and, when you are logged in to the desktop, a notification
 (the same alert at most once every 6 hours). `~/jarvis-ledger/logs/` has one log per job.
+
+### If the database stops
+`restart: unless-stopped` makes Docker restart the database after a crash, an out-of-memory kill or a reboot. Docker
+never restarts a container that was stopped or killed through its API (`docker kill`, `docker stop`), so a one-minute
+timer (`jarvis-heal.timer`, `bin/heal.sh`) starts the database or app again if it finds it stopped, and raises a
+notification. `jarvisctl down` leaves a marker so a stop on purpose is respected until the next `jarvisctl up`.
 
 ## Backups, precisely
 
@@ -131,10 +90,28 @@ Alerts go to `~/jarvis-ledger/logs/alerts.log` and, when you are logged in to th
   "good". This is the interim form of the "export chain-head hashes outside the database" follow-up.
 * **Retention:** newest 48, one per day for 14 days, one per week for 12 weeks. Anchors, `quarantine/` and
   `pre-restore-*` dumps are never pruned.
-* **Offsite:** daily, age-encrypted, to the PC; only the public key is on this box.
 * **`/data` (AMUL field, STM overlay, RAG files)** is archived in every set; those files are not in Postgres.
 * **Restore drill** weekly, with `--prove-detection`: restores into a scratch database, verifies counts, anchors and
   the hash chain, then tampers with the copy and requires the verifier to fail.
+
+### The offsite copy
+Daily, the newest complete set is packed, encrypted with age and sent by `scp` to `G:\jarvis-backups` on the PC,
+then hashed again on the PC (PowerShell `Get-FileHash`) and compared. Only the age **public** key is on this box
+(`secrets/age_recipient.txt`), so a stolen backup directory is unreadable. The PC's host key is pinned in
+`secrets/offsite_known_hosts`; settings are in `secrets/offsite.conf`.
+
+* **G: must be plugged in and the PC on.** If not, the copy fails and the watchdog alerts after 48 h.
+* **The age private key lives only on a USB stick** (`E:\jarvis-keys\`), off the backup drive. It was generated on
+  this box, copied to the stick, checked by hash and then deleted from the box. It is the only way to read an
+  offsite copy, and there is **one** copy of it: make a second (a printout works; it is 189 bytes of text).
+* **Setting up again:** on the PC, enable OpenSSH Server and create `G:\jarvis-backups`; make a dedicated key on the
+  box (`ssh-keygen -t ed25519 -N '' -f ~/.ssh/jarvis_offsite_ed25519`) and put its public half in the Windows
+  account's `authorized_keys` (for an administrator that is `C:\ProgramData\ssh\administrators_authorized_keys`);
+  pin the host key with `ssh-keyscan -t ed25519 <PC> > secrets/offsite_known_hosts` and compare
+  `ssh-keygen -lf` with `ssh-keygen -lf C:\ProgramData\ssh\ssh_host_ed25519_key.pub` on the PC; then
+  `cp offsite.conf.example secrets/offsite.conf`, fill it in, and run `jarvisctl offsite` once by hand.
+* **The offsite SSH user is currently an administrator** on the PC, so that key can run commands there. A normal
+  Windows user that owns only `G:\jarvis-backups` would be safer. Not done yet.
 
 ### Restoring (destructive)
 ```bash
@@ -143,20 +120,59 @@ bin/jarvisctl restore --yes-destroy-current-data            # newest set; or --b
 It verifies the set's checksums, takes a safety dump (`pre-restore-*.dump`), recreates both volumes empty,
 restores in one transaction, and **leaves the app stopped** unless restored row counts, anchors and the history
 chain (every tenant) all match; only then does it start the app and wait for `/ready`. From an offsite bundle:
-`age -d -i jarvis-age-key.txt jarvis-<UTC>.bundle.tar.age | tar -x -C ~/jarvis-ledger/backups` first. That
+`age -d -i <private-key-file> jarvis-<UTC>.bundle.tar.age | tar -x -C ~/jarvis-ledger/backups` first. That
 unpacks the files and the `anchors/` log; then run restore as above.
+
+## Setting it up from scratch
+
+Steps that need `sudo` are yours to run; nothing here asks for or stores a sudo password.
+
+1. **Docker, compose and age** (from Ubuntu's archive), then reboot so the docker group reaches your systemd user
+   manager:
+   ```bash
+   sudo apt-get update && sudo apt-get install -y docker.io docker-compose-v2 age
+   sudo usermod -aG docker "$USER"      # the docker group is root-equivalent: keep it to your own user
+   ```
+2. **Firewall.** Put the SSH rule in before enabling, or you will lock yourself out:
+   ```bash
+   sudo ufw default deny incoming && sudo ufw default allow outgoing
+   sudo ufw allow from 192.168.1.0/24 to any port 22 proto tcp
+   sudo ufw show added && sudo ufw enable
+   ```
+   A Docker **published** port bypasses ufw, which is why this stack binds `127.0.0.1` explicitly and publishes
+   nothing for the database.
+3. **The code and secrets:**
+   ```bash
+   git clone https://github.com/warheart1984-ctrl/persistence-memory.git ~/jarvis-ledger-src
+   cd ~/jarvis-ledger-src/deploy/mint
+   cp .env.example .env            # port 8011, local tuning, no secrets
+   bin/jarvisctl secrets           # random passwords + API key, mode 600, never printed
+   ```
+4. **The offsite copy**, as described above (age public key in `secrets/age_recipient.txt`).
+5. **Start, check, schedule:**
+   ```bash
+   bin/jarvisctl up                  # db -> migrate -> app; builds the images the first time
+   bin/jarvisctl smoke               # every line must say PASS
+   bin/install-units.sh              # the five timers; the offsite timer needs secrets/offsite.conf first
+   bin/jarvisctl backup && bin/jarvisctl drill --prove-detection
+   bin/jarvisctl offsite
+   ```
+6. **Importing an existing JSON ledger** (`docs/POSTGRES.md`): the target tenant must be empty. Dry run first
+   (the default; it rolls back), then `--apply --manifest <path not next to the source>`, then `--verify` and
+   `bin/jarvisctl verify`. The source file is only read and its hash is re-checked.
 
 ## Honest limits
 
 * **One box, one disk.** The hourly sets live on the same disk as the database. The offsite copy is what survives
-  the box. The PC being off for more than 48 h raises an alert.
+  the box.
 * **Not encrypted at rest.** The root filesystem is plain ext4: the database volume and the local backups
   (mode 600, but plaintext) are readable by anyone who takes the disk. Offsite copies are encrypted.
 * **Wi-Fi** is the box's only network interface; an unreliable link delays the offsite copy, not the local backups.
 * **RPO is one hour** (hourly dumps). Point-in-time recovery is a later option.
+* **Automatic security updates are not set up** (`unattended-upgrades` is not installed).
 * A compromised **database owner** can rewrite history, heads and counters consistently; the anchors outside the
   database are what would expose it, as long as the PC's copies are intact.
-* **No LLM adapter on port 8011 yet.** The old service on 8001 called llm-gateway (tenant `memory`, `JARVIS_LLM_*`
+* **No LLM adapter on port 8011.** The old service on 8001 called llm-gateway (tenant `memory`, `JARVIS_LLM_*`
   in `~/.config/persistence-memory/memory.env`) for the AMUL LLM adapter. The 8011 stack sets no `JARVIS_LLM_*`
   variables, so that adapter is off. Recall, writes, history, backups and the rest do not use it. To get it back,
   the app container needs `JARVIS_LLM_URL`, `JARVIS_LLM_API`, `JARVIS_LLM_MODEL` and a key reachable from inside
@@ -166,19 +182,10 @@ unpacks the files and the `anchors/` log; then run restore as above.
   `docker inspect`.
 * `emr_upsert` is still not atomic, and AMUL/STM/overlay/RAG state is per-instance (see `docs/POSTGRES.md`).
 
-## Switching from the old instance later
-The old service keeps running on 8001 with its own JSON file. When you are ready: stop writing to it, do a
-`pg_import` **dry run first** against its `data/jarvis-store.json` (`docs/POSTGRES.md`), apply, verify, point your
-hooks at 8011, and only then retire the old unit. Its data file is never modified by any of this.
-
-## If the database stops
-`restart: unless-stopped` makes Docker restart the database after a crash, an out-of-memory kill or a reboot. Docker
-never restarts a container that was stopped or killed through its API (`docker kill`, `docker stop`), so a one-minute
-timer (`jarvis-heal.timer`, `bin/heal.sh`) starts the database or app again if it finds it stopped, and raises a
-notification. `jarvisctl down` leaves a marker so a stop on purpose is respected until the next `jarvisctl up`.
-
 ## Rehearsal
-`rehearse/rehearse-wsl.sh` (Git Bash on the Windows PC) runs all of the above in a WSL Ubuntu 24.04 with its own
+`rehearse/rehearse-wsl.sh` (Git Bash on the Windows PC) runs the whole thing in a WSL Ubuntu 24.04 with its own
 Docker Engine and real systemd: hardening, hooks, backups, the anchor-regression alarm, offsite copy (PC off, wrong
-host key), real systemd timers, a SIGKILL of the database, a `wsl --terminate` reboot, credential rotation, a
-deliberate destruction of every volume, and a restore that must reproduce every record, hash, anchor and file.
+host key), real systemd timers, a `docker kill` of the database and the self-heal, a crash restarted by Docker's own
+policy, a `wsl --terminate` reboot, credential rotation, a deliberate destruction of every volume, and a restore
+that must reproduce every record, hash, anchor and file. The self-heal and crash checks were added after the last
+full rehearsal run; they were run on the real box, not re-run in WSL.
