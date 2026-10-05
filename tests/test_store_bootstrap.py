@@ -95,6 +95,8 @@ def test_with_a_database_url_no_opt_in_is_needed(fresh, monkeypatch):
     fake.close_pools = lambda: None
     monkeypatch.setitem(sys.modules, "app.pg_store", fake)
     monkeypatch.setenv("JARVIS_DATABASE_URL", "postgresql://u:p@db/jarvis")
+    monkeypatch.setenv("JARVIS_PG_STORE", "rows")
+    monkeypatch.delenv("JARVIS_DATABASE_SCHEMA", raising=False)  # CI's Postgres job sets one for the real-database tests
     store = get_store()
     assert isinstance(store, FakeRowStore) and built == [("postgresql://u:p@db/jarvis", "operator", None)]
     assert _noise_free(fresh)
