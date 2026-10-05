@@ -1,0 +1,14 @@
+[Unit]
+Description=Jarvis ledger: backup set (dump, globals, appdata, anchors)
+Documentation=file://@DEPLOY_DIR@/README.md
+
+[Service]
+Type=oneshot
+Environment=JARVIS_HOME=@JARVIS_HOME@
+# optional tuning (JARVIS_APP_PORT, BACKUP_MAX_AGE, NOTIFY_EVERY_SECONDS, ...); the dash makes the file optional
+EnvironmentFile=-@DEPLOY_DIR@/.env
+EnvironmentFile=-@JARVIS_HOME@/systemd.env
+ExecStart=@DEPLOY_DIR@/bin/backup.sh
+TimeoutStartSec=20min
+NoNewPrivileges=true
+PrivateTmp=true
