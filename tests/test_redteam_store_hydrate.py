@@ -61,7 +61,7 @@ def test_damaged_ledger_gives_503_and_file_is_byte_identical(tmp_path, mutate):
         assert client.get("/api/jarvis/memory").status_code == 503
         assert client.post("/api/jarvis/memory", json=_MEMORY).status_code == 503
         assert client.post("/api/jarvis/memory", json=_MEMORY).status_code == 503  # retry must not heal
-        health = client.get("/health")
+        health = client.get("/ready")
     assert health.status_code == 503 and health.json()["status"] == "unavailable"
     assert path.read_bytes() == damaged
 

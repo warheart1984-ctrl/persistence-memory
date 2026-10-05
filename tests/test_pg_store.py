@@ -301,17 +301,17 @@ def test_http_crud_with_expected_version(api):
     assert api.patch(f"/api/jarvis/memory/{mem['id']}", json={"subject": "c"}).json()["memory"]["version"] == 3
     assert api.delete(f"/api/jarvis/memory/{mem['id']}").status_code == 200
     assert api.get(f"/api/jarvis/memory/{mem['id']}").status_code == 404
-    assert api.get("/health").json()["status"] == "ok"
+    assert api.get("/ready").json()["status"] == "ready"
 
 
-def test_http_database_outage_is_503_and_health_unavailable(pg, monkeypatch):
+def test_http_database_outage_is_503_and_not_ready(pg, monkeypatch):
     monkeypatch.setenv("JARVIS_DATABASE_URL", "postgresql://u:p@127.0.0.1:9/none")
     monkeypatch.setenv("JARVIS_PG_STORE", "rows")
     monkeypatch.setenv("JARVIS_DATABASE_CONNECT_TIMEOUT", "1")
     with TestClient(app, raise_server_exceptions=False) as client:
         assert client.get("/api/jarvis/memory").status_code == 503
         assert client.post("/api/jarvis/memory", json=_BODY).status_code == 503
-        health = client.get("/health")
+        health = client.get("/ready")
     assert health.status_code == 503 and health.json()["status"] == "unavailable"
     assert "127.0.0.1" not in health.text and "postgresql://" not in health.text
 

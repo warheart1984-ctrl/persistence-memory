@@ -52,7 +52,7 @@ def test_health_is_not_ok_when_store_is_damaged(tmp_path):
     _seed(path)
     _truncate(path)
     with TestClient(app) as client:
-        response = client.get("/health")
+        response = client.get("/ready")
     assert response.status_code == 503
     assert response.json()["status"] != "ok"
 

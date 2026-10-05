@@ -287,12 +287,12 @@ def test_store_refuses_a_bypassrls_role(pg):
             conn.execute("DROP ROLE jarvis_bypass_test")
 
 
-def test_health_is_503_when_the_app_connects_as_superuser(pg, monkeypatch):
+def test_ready_is_503_when_the_app_connects_as_superuser(pg, monkeypatch):
     monkeypatch.setenv("JARVIS_DATABASE_URL", pg.admin_dsn)
     monkeypatch.setenv("JARVIS_DATABASE_SCHEMA", pg.schema)
     monkeypatch.setenv("JARVIS_PG_STORE", "rows")
     with TestClient(app, raise_server_exceptions=False) as client:
-        health = client.get("/health")
+        health = client.get("/ready")
         assert health.status_code == 503 and health.json()["status"] == "unavailable"
         assert client.get("/api/jarvis/memory").status_code == 503
     assert pg.admin_dsn.split("@")[0] not in health.text
@@ -303,4 +303,4 @@ def test_an_ordinary_role_is_accepted(pg, monkeypatch):
     monkeypatch.setenv("JARVIS_DATABASE_SCHEMA", pg.schema)
     monkeypatch.setenv("JARVIS_PG_STORE", "rows")
     with TestClient(app, raise_server_exceptions=False) as client:
-        assert client.get("/health").status_code == 200
+        assert client.get("/ready").status_code == 200

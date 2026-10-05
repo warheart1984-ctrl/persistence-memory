@@ -78,11 +78,16 @@ def _pool_for(dsn: str, schema: str | None) -> tuple[ConnectionPool, tuple[str, 
             ]
             if schema:
                 options.append(f"-c search_path={validate_schema_name(schema)}")
+            pool_max = _env_int("JARVIS_DATABASE_POOL_MAX", 10)
             pool = ConnectionPool(
                 dsn,
                 min_size=1,
-                max_size=_env_int("JARVIS_DATABASE_POOL_MAX", 10),
-                timeout=_connect_timeout(),
+                max_size=pool_max,  # fixed: the pool never grows beyond this
+                # A request that finds every connection busy waits at most this long (default 1 s) and
+                # then fails with 503; at most max_waiting requests may wait at all, the rest fail at
+                # once (TooManyRequests).  Saturation is shed, never queued behind a slow database.
+                timeout=_env_int("JARVIS_DATABASE_POOL_TIMEOUT_MS", 1000) / 1000.0,
+                max_waiting=_env_int("JARVIS_DATABASE_POOL_MAX_WAITING", pool_max),
                 kwargs={"options": " ".join(options), "connect_timeout": int(_connect_timeout())},
                 check=ConnectionPool.check_connection,
                 open=False,
@@ -164,6 +169,40 @@ class PostgresRowStore:
         except psycopg.Error as exc:
             _log.error("ledger database error (%s): %s", type(exc).__name__, exc)
             raise StoreUnavailableError("Ledger database error") from exc
+
+    # -- readiness --------------------------------------------------------------
+
+    def readiness(self) -> dict[str, str]:
+        """Live readiness checks for /ready (never cached): name -> "ok" | "failed".
+
+        Uses the same bounded pool checkout as requests.  Each check runs in its own savepoint so one
+        failure cannot hide the others; details go to the log, never into the result.
+        """
+        names = ("database", "schema_version", "role", "history_write_denied", "legacy_data")
+        checks = {name: "failed" for name in names}
+        try:
+            pool, _ = _pool_for(self._dsn, self._schema)
+            with pool.connection() as conn:
+                conn.row_factory = dict_row
+                conn.execute("SELECT set_config('jarvis.tenant_key', %s, true)", (self._tenant_key,))
+
+                def run(name: str, check: Callable[[], bool | None]) -> None:
+                    try:
+                        with conn.transaction():
+                            ok = check()
+                        checks[name] = "ok" if ok is not False else "failed"
+                    except (StoreUnavailableError, psycopg.Error) as exc:
+                        _log.error("readiness check %s failed (%s): %s", name, type(exc).__name__, exc)
+
+                run("database", lambda: conn.execute("SELECT 1").fetchone() is not None)
+                run("schema_version", lambda: check_schema_version(conn))
+                run("role", lambda: _require_rls_enforced(conn))
+                run("history_write_denied", lambda: _history_is_unwritable(conn))
+                run("legacy_data", lambda: _refuse_if_legacy_data_unimported(conn, self._tenant_key))
+                conn.rollback()  # nothing above may leave anything behind
+        except (psycopg.Error, ValueError) as exc:
+            _log.error("readiness: cannot use the database (%s): %s", type(exc).__name__, exc)
+        return checks
 
     # -- board ------------------------------------------------------------------
 
@@ -464,3 +503,66 @@ def _refuse_if_legacy_data_unimported(conn: psycopg.Connection, tenant: str) -> 
         row["n"],
     )
     raise StoreUnavailableError("Legacy blob ledger exists but the row store is empty; import it first")
+
+_HISTORY_TABLES = ("record_history", "chain_heads", "history_counters")
+_PROBE_INSERTS = {
+    "record_history": (
+        "INSERT INTO record_history (tenant_key, memory_id, version, op, actor, after, prev_hash, row_hash, seq) "
+        "VALUES (current_setting('jarvis.tenant_key'), 'readiness-probe', 1, 'backfill', 'probe', '{}'::jsonb, "
+        "repeat('0', 64), repeat('0', 64), 1)"
+    ),
+    "chain_heads": (
+        "INSERT INTO chain_heads (tenant_key, id, last_seq, last_hash, deleted) "
+        "VALUES (current_setting('jarvis.tenant_key'), 'readiness-probe', 1, repeat('0', 64), false)"
+    ),
+    "history_counters": (
+        "INSERT INTO history_counters (tenant_key, last_seq) VALUES (current_setting('jarvis.tenant_key'), 1)"
+    ),
+}
+
+
+class _ProbeSucceeded(Exception):
+    """A write that must have been refused went through; raised only to roll its savepoint back."""
+
+
+def _history_is_unwritable(conn: psycopg.Connection) -> bool:
+    """Prove the connected role cannot write the history tables (True only when proven).
+
+    Two independent proofs per table: the catalog says the role holds none of INSERT/UPDATE/DELETE/
+    TRUNCATE, and an actual attempt at each of INSERT/UPDATE/DELETE is refused with *permission
+    denied* (inside a savepoint that is rolled back even if the attempt unexpectedly succeeds, so the
+    probe never leaves a row behind).  TRUNCATE is checked in the catalog only: attempting it would
+    take an ACCESS EXCLUSIVE lock and could stall live traffic.  Any other outcome (success, a different
+    error) means "cannot prove" and fails closed.
+    """
+    for table in _HISTORY_TABLES:
+        for privilege in ("INSERT", "UPDATE", "DELETE", "TRUNCATE"):
+            held = conn.execute(
+                "SELECT has_table_privilege(current_user, %s, %s) AS held", (table, privilege)
+            ).fetchone()["held"]
+            if held:
+                _log.error("ledger role holds %s on %s; it must be read-only there", privilege, table)
+                return False
+        ident = sql.Identifier(table)
+        attempts = (
+            sql.SQL(_PROBE_INSERTS[table]),
+            sql.SQL("UPDATE {} SET tenant_key = tenant_key WHERE false").format(ident),
+            sql.SQL("DELETE FROM {} WHERE false").format(ident),
+        )
+        for attempt in attempts:
+            try:
+                with conn.transaction():
+                    conn.execute(attempt)
+                    raise _ProbeSucceeded()
+            except _ProbeSucceeded:
+                _log.error("a probe write to %s succeeded; the ledger role must be read-only there", table)
+                return False
+            except psycopg.errors.InsufficientPrivilege as exc:
+                message = getattr(exc.diag, "message_primary", "") or ""
+                if not message.startswith("permission denied"):  # e.g. a row-level-security refusal
+                    _log.error("probe on %s was refused for another reason: %s", table, message)
+                    return False
+            except psycopg.Error as exc:
+                _log.error("probe on %s failed unexpectedly (%s)", table, type(exc).__name__)
+                return False
+    return True

@@ -407,6 +407,11 @@ class JarvisStore:
             self._save_or_restore(lambda: self._memories.__setitem__(memory_id, removed))
             return True
 
+    def readiness(self) -> dict[str, str]:
+        """Readiness checks for /ready: can this store be served right now?  Raises if it cannot."""
+        self._ensure_loaded()
+        return {"store": "ok"}
+
     def history(self, memory_id: str, limit: int = 200) -> list[dict[str, Any]]:
         raise NotImplementedError("record history requires the PostgreSQL row store")
 

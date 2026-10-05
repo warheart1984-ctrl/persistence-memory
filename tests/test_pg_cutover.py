@@ -117,16 +117,17 @@ def test_importing_the_blob_clears_the_guard(pg, monkeypatch):
 
 
 @pg_only
-def test_health_is_503_while_legacy_data_is_unimported(pg, monkeypatch):
+def test_ready_is_503_while_legacy_data_is_unimported(pg, monkeypatch):
     _blob(pg, "operator", [_REC])
     monkeypatch.setenv("JARVIS_DATABASE_URL", pg.app_dsn)
     monkeypatch.setenv("JARVIS_DATABASE_SCHEMA", pg.schema)
     monkeypatch.delenv("JARVIS_PG_STORE", raising=False)  # the new default
     reset_store_for_tests()
     with TestClient(app, raise_server_exceptions=False) as client:
-        health = client.get("/health")
+        health = client.get("/ready")
         assert health.status_code == 503 and health.json()["status"] == "unavailable"
-        assert "legacy" not in health.text  # the hint is for logs and the operator, not the response
+        for hint in ("jarvis_tenant_ledgers", "pg_import", "JARVIS_PG_STORE"):
+            assert hint not in health.text  # remediation hints are for the log, not the response
 
 
 @pg_only

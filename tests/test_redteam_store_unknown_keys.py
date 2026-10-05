@@ -31,7 +31,7 @@ def test_misspelled_memories_key_is_503_and_file_unchanged(tmp_path):
     with TestClient(app, raise_server_exceptions=False) as client:
         assert client.get("/api/jarvis/memory").status_code == 503
         assert client.post("/api/jarvis/memory", json=_MEMORY).status_code == 503
-        assert client.get("/health").status_code == 503
+        assert client.get("/ready").status_code == 503
     assert path.read_bytes() == before
 
 

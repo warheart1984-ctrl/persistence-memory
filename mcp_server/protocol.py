@@ -277,6 +277,19 @@ MCP_TOOLS: list[dict[str, Any]] = [
 _KNOWN_TOOLS = frozenset(t["name"] for t in MCP_TOOLS)
 
 
+class ToolRefusal(Exception):
+    """A tool call refused for a reason with a stable machine-readable ``code``.
+
+    Raised by tool callers; reported as ``isError`` with ``structuredContent.error.code`` so MCP
+    clients can tell an unavailable ledger, a version conflict and a denial apart.
+    """
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
 def handle_tools_call(
     params: dict[str, Any],
     call_tool: EmrToolCaller,
@@ -290,6 +303,12 @@ def handle_tools_call(
         }
     try:
         result = call_tool(str(name), arguments if isinstance(arguments, dict) else {})
+    except ToolRefusal as exc:
+        return {
+            "content": [{"type": "text", "text": exc.message}],
+            "structuredContent": {"error": {"code": exc.code}},
+            "isError": True,
+        }
     except Exception as exc:  # noqa: BLE001 — surface as tool error to host
         return {
             "content": [{"type": "text", "text": str(exc)}],

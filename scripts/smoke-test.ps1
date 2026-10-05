@@ -17,7 +17,10 @@ Write-Host "Base: $Base"
 
 $health = Invoke-RestMethod -Uri "$Base/health" -Method GET -TimeoutSec 5
 if ($health.status -ne "ok") { throw "health failed: $($health | ConvertTo-Json -Compress)" }
-Write-Host "[ok] GET /health status=$($health.status) schema=$($health.schema) memories=$($health.memory_count)"
+Write-Host "[ok] GET /health (liveness) status=$($health.status) schema=$($health.schema)"
+$ready = Invoke-RestMethod -Uri "$Base/ready" -Method GET -TimeoutSec 5
+if ($ready.status -ne "ready") { throw "not ready: $($ready | ConvertTo-Json -Compress)" }
+Write-Host "[ok] GET /ready (readiness) status=$($ready.status)"
 
 $board = Invoke-RestMethod -Uri "$Base/api/jarvis/memory/board" -Method GET -Headers $Headers -TimeoutSec 5
 Write-Host "[ok] GET /api/jarvis/memory/board id=$($board.memory_board.board_id)"

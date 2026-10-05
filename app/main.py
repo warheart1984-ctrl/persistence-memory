@@ -9,6 +9,7 @@ from pathlib import Path
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from pydantic import BaseModel, Field
 
 from app.amul import (
@@ -81,6 +82,7 @@ from app.auth import (
 )
 from app.oauth import protected_resource_metadata
 from app.public_security import cors_origins, public_security_middleware
+from app.refusal import DENIED, LEDGER_UNAVAILABLE, VERSION_CONFLICT, json_response, retry_after_seconds
 from app.store import StoreUnavailableError, StoreVersionConflict, get_store
 from app.graph import (
     BfsBody,
@@ -94,6 +96,7 @@ from app.graph import (
     shortest_path,
 )
 from mcp_server.mcp_http import create_mcp_router
+from mcp_server.protocol import ToolRefusal
 
 app = FastAPI(
     title="Jarvis Continuity Ledger",
@@ -222,26 +225,48 @@ def index():
 
 @app.exception_handler(StoreUnavailableError)
 async def _store_unavailable(request: Request, exc: StoreUnavailableError):
-    return JSONResponse(status_code=503, content={"detail": "Ledger store unavailable"})
+    logging.getLogger("jarvis.store").error("ledger unavailable: %s", exc)
+    return json_response(503, "Ledger store unavailable", code=LEDGER_UNAVAILABLE)
+
+
+@app.exception_handler(StoreVersionConflict)
+async def _version_conflict(request: Request, exc: StoreVersionConflict):
+    return json_response(409, str(exc), code=VERSION_CONFLICT)
+
+
+@app.exception_handler(StarletteHTTPException)
+async def _http_exception(request: Request, exc: StarletteHTTPException):
+    """Same bodies as before; 401/403 gain code=denied and every 503 gains Retry-After."""
+    return json_response(exc.status_code, exc.detail, headers=getattr(exc, "headers", None))
+
+
+@app.get("/ready")
+def ready():
+    """Readiness: can the ledger be served safely right now?  503 (with Retry-After) if not.
+
+    Checked live on every call, never cached.  For PostgreSQL: SELECT 1, schema version, the role
+    is neither superuser nor BYPASSRLS, the role is *proven* unable to write the history tables, and
+    no legacy blob ledger is waiting to be imported.  Failing checks are named; details stay in the log.
+    """
+    try:
+        checks = get_store().readiness()
+    except StoreUnavailableError as exc:
+        logging.getLogger("jarvis.store").error("not ready: %s", exc)
+        checks = {"store": "failed"}
+    if all(state == "ok" for state in checks.values()):
+        return {"status": "ready", "checks": checks}
+    body = {"status": "unavailable", "code": LEDGER_UNAVAILABLE, "checks": checks}
+    return JSONResponse(status_code=503, content=body, headers={"Retry-After": str(retry_after_seconds())})
 
 
 @app.get("/health")
 def health():
-    try:
-        store = get_store()
-        board = store.get_board()
-        memory_count = len(store.list_memories(limit=9999))
-    except StoreUnavailableError:
-        return JSONResponse(
-            status_code=503,
-            content={"status": "unavailable", "service": "jarvis-memoryboard", "detail": "Ledger store unavailable"},
-        )
+    """Liveness: the process is up.  Never touches the ledger; see /ready for readiness."""
     return {
         "status": "ok",
+        "live": True,
         "service": "jarvis-memoryboard",
         "schema": "continuity-ledger-v1",
-        "memory_count": memory_count,
-        "board_id": board.board_id,
         "memory_write_enabled": memory_write_enabled(),
         "mcp_write_enabled": mcp_write_enabled(),
         "deployment": deployment_label(),
@@ -271,7 +296,6 @@ def health():
             "emr_remember": "POST /api/jarvis/tools/emr_remember",
             "emr_upsert": "POST /api/jarvis/tools/emr_upsert",
         },
-        "store_path": os.getenv("JARVIS_STORE_PATH", "data/jarvis-store.json"),
     }
 
 
@@ -781,9 +805,7 @@ def update_memory(memory_id: str, body: MemoryUpdate):
     store = get_store()
     try:
         rec = store.update_memory(memory_id, body)
-    except StoreVersionConflict as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except ValueError as exc:
+    except ValueError as exc:  # StoreVersionConflict is not a ValueError: it reaches the 409 handler
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not rec:
         raise HTTPException(status_code=404, detail="Memory not found")
@@ -1082,7 +1104,13 @@ def _invoke_emr_tool(name: str, arguments: dict) -> dict:
         return _invoke_emr_tool_unguarded(name, arguments)
     except StoreUnavailableError as exc:
         _log.error("MCP tool %s failed: %s", name, exc)
-        raise RuntimeError("Ledger store unavailable") from None
+        raise ToolRefusal(LEDGER_UNAVAILABLE, "Ledger store unavailable") from None
+    except StoreVersionConflict as exc:
+        raise ToolRefusal(VERSION_CONFLICT, str(exc)) from None
+    except HTTPException as exc:
+        if exc.status_code in (401, 403):
+            raise ToolRefusal(DENIED, str(exc.detail)) from None
+        raise
 
 
 def _invoke_emr_tool_unguarded(name: str, arguments: dict) -> dict:

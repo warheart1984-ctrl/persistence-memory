@@ -15,7 +15,11 @@ Requires **PostgreSQL 15+** (the `supersedes` foreign key uses `ON DELETE SET NU
 | `JARVIS_DATABASE_SCHEMA` | Optional schema (becomes the `search_path`). |
 | `JARVIS_DATABASE_MIGRATE_URL` | Role allowed to run DDL, used by `python -m app.pg_migrate`, `app.pg_import`, `app.pg_verify`. Falls back to `JARVIS_DATABASE_URL`. |
 | `JARVIS_DATABASE_APP_ROLE` | Role that `pg_migrate` grants DML to (optional; see *Roles*). |
-| `JARVIS_DATABASE_POOL_MAX` / `_CONNECT_TIMEOUT` / `_STATEMENT_TIMEOUT_MS` / `_LOCK_TIMEOUT_MS` | Pool size (10), connect timeout (5 s), statement timeout (10 s), lock timeout (5 s). |
+| `JARVIS_DATABASE_POOL_MAX` | Fixed pool size (10). The pool never grows. |
+| `JARVIS_DATABASE_POOL_TIMEOUT_MS` | How long a request waits for a free connection (1000). Then 503. |
+| `JARVIS_DATABASE_POOL_MAX_WAITING` | How many requests may wait at all (= pool size). Beyond that: instant 503. |
+| `JARVIS_DATABASE_CONNECT_TIMEOUT` / `_STATEMENT_TIMEOUT_MS` / `_LOCK_TIMEOUT_MS` | Connect (5 s), statement (10 s) and lock (5 s) timeouts. |
+| `JARVIS_RETRY_AFTER_SECONDS` | Value of `Retry-After` on every 503 (default 5; 1-3600). |
 | `JARVIS_LEGACY_BLOB_SCHEMA` | Where to look for the legacy `jarvis_tenant_ledgers` table (default `public`). |
 | `JARVIS_PG_IGNORE_LEGACY_BLOB` | `1` disables the legacy-data guard (see *Cutover*). |
 
@@ -24,7 +28,7 @@ Tenants: with OAuth, each subject is an opaque `tenant_key`; without OAuth there
 ## What it guarantees
 
 * **Fail closed.** Any database error — outage, timeout, missing or mismatched schema, unexpected
-  constraint failure — is HTTP 503 with a generic body (`/health` reports `unavailable`; MCP clients get
+  constraint failure — is HTTP 503 with a generic body (`/ready` reports `unavailable`; MCP clients get
   "Ledger store unavailable"). Detail goes to the `jarvis.store` log only. There is never a fallback to
   another store, and the schema version must match the code exactly.
 * **Invalid data cannot exist.** CHECK constraints mirror the models: confidence 0–1, type and status
@@ -44,6 +48,45 @@ Tenants: with OAuth, each subject is an opaque `tenant_key`; without OAuth there
   — a snapshot at that time, never a claimed past edit. `GET /api/jarvis/memory/{id}/history` reads it;
   `GET /api/jarvis/memory/history/verify` and `python -m app.pg_verify [--tenant T | --all]` recompute the
   chain and check sequence gaps, chain heads and live rows.
+
+## Error contract
+
+Three refusals look different on purpose; clients should react to the **code**, not the status text.
+
+| Situation | HTTP | `code` | `Retry-After` | What a client should do |
+|---|---|---|---|---|
+| The ledger cannot be served now (database down, timeout, pool saturated, schema/role problem, legacy data not imported) | 503 | `ledger_unavailable` | yes | Back off. Retry **at most once**, after `Retry-After` plus jitter. **Do not** treat it like a version conflict or retry in a loop. |
+| The record changed under you (`expected_version` stale, or retries exhausted under contention) | 409 | `version_conflict` | no | Re-read the record, decide, resend with the new version. Retrying the same request unchanged cannot help. |
+| Not allowed (bad or missing key/token, missing scope, writes disabled) | 401 / 403 | `denied` | no | Do not retry; fix the credential or the request. |
+
+Any other 503 (for example a deployment missing a required key) carries `Retry-After` and the generic
+code `unavailable`. Everything else (400, 404, 422, ...) keeps its previous shape. The same codes appear
+on MCP tool errors as `structuredContent.error.code`. `detail` is human-readable and never contains
+hosts, credentials or record ids; those go to the `jarvis.store` log.
+
+**Timeouts.** Statement and lock timeouts cancel the statement, which aborts and rolls back the *whole*
+transaction (row, history entry, sequence number, chain head): there is no partial write, and the caller
+gets `503 ledger_unavailable`, not a conflict. This is tested with a deliberately slow trigger and a held
+row lock.
+
+**Pool.** The pool has a fixed size, a short checkout timeout and a bounded waiting list. A saturated
+pool is shed with an immediate 503 rather than queued behind a slow database.
+
+## Liveness and readiness
+
+* `GET /health` - **liveness**: the process is up. Never touches the ledger, reports no counts or paths.
+* `GET /ready` - **readiness**: 200 only if all of these hold, checked live on every call (never cached);
+  otherwise 503 with `Retry-After` and the failing check names (no details):
+  `database` (`SELECT 1` as the application role), `schema_version` (matches the code exactly), `role`
+  (not superuser, no `BYPASSRLS`), `history_write_denied` (the role is *proven* unable to write
+  `record_history`, `chain_heads` or `history_counters`: the catalog shows no write privilege and attempted
+  INSERT/UPDATE/DELETE are refused, inside rolled-back savepoints; `TRUNCATE` is checked in the catalog
+  only because attempting it would take an exclusive lock) and `legacy_data` (no un-imported legacy
+  blob ledger). The JSON store reports a single `store` check.
+
+Point a platform's *readiness* probe (or deploy gate) at `/ready` and its *liveness* probe at `/health`.
+Using `/ready` as a liveness probe restarts the service during every database outage, which does not help.
+`render.yaml` keeps `healthCheckPath: /health` for that reason; Render has a single probe.
 
 ## Roles
 
@@ -119,18 +162,19 @@ until they are moved into the database.
 
 ## Not addressed / follow-ups
 
-* **Export chain-head hashes outside the database.** A database owner (or superuser) can rewrite the
-  history, chain heads and counters together consistently; the verifier only catches partial tampering.
-  Follow-up: periodically export each tenant's latest `(seq, chain-head hashes)` to somewhere the database
-  owner cannot rewrite (object storage with object lock, a git repository, a transparency log), and have
-  `pg_verify` compare against the last exported anchor. Not implemented.
+* **Export chain-head hashes outside the database, and verify them after a restore before serving.**
+  A database owner (or superuser) can rewrite the history, chain heads and counters together
+  consistently; the verifier only catches partial tampering, and a restore from backup can silently roll
+  the ledger back. Follow-up: periodically export each tenant's latest `(seq, chain-head hashes)` to
+  somewhere the database owner cannot rewrite (object storage with object lock, a git repository, a
+  transparency log); after any restore, run `pg_verify` against the last exported anchor and keep
+  `/ready` failing (a new readiness check, `anchor`) until it passes. Not implemented.
 * **Deletion does not erase content.** A hard delete removes the row, but its before-snapshot stays in
   `record_history` by design. Any erasure/retention workflow has to account for that and needs a
   deliberate, documented tombstoning path (it would break the hash chain by design). Not implemented.
 * **`emr_upsert` is not atomic.** It creates the new draft and archives the target as two separate store
   calls; a failure between them leaves both visible. Not addressed here.
-* **Self-minted `verified`** status, unbounded request sizes elsewhere, and `/health` information leakage
-  are unchanged from the earlier red-team list.
+* **Self-minted `verified`** status and unbounded request sizes elsewhere are unchanged from the earlier red-team list. (`/health` no longer reports the store path, record count or board id; the auth/flag summary it still shows is static configuration.)
 * **Writes within one tenant serialize on that tenant's history counter** until commit (the price of a
   gapless sequence). Fine for a memory ledger; revisit if one tenant needs high write concurrency.
 * Retry exhaustion under extreme contention returns 409 rather than waiting; there is no queue.
