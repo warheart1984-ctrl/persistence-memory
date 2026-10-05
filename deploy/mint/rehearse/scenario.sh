@@ -9,7 +9,8 @@ R="$HOME/jarvis-rehearsal"
 SRC="$R/src"
 export JARVIS_HOME="$R/home"
 export JARVIS_APP_PORT=18001            # never 8001/8011: a real instance may own those
-export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+uid="$(id -u)"
+export XDG_RUNTIME_DIR="/run/user/$uid"
 export NOTIFY_CALLS="$R/notify-send.calls"
 export PATH="$SRC/deploy/mint/rehearse/bin:$PATH"   # the fake notify-send wins over the real one
 export DISK_MIN_FREE_PCT=1              # the disk is not what is being tested (dedicated check below)
@@ -167,7 +168,7 @@ payload, err = c.try_http_json('GET', '/health'); print(err); sys.exit(0 if payl
   t "anchors file has chain heads" grep -q '^head|operator|' "$BK/$s1.anchors"
   eq "one entry in the long-lived anchors log" "$(ls "$BK"/anchors | wc -l)" "1"
   eq "backup files are private (mode 600)" "$(stat -c %a "$BK/$s1.dump" "$BK/$s1.globals.sql")" "$(printf '600\n600')"
-  eq "no temp directory left behind" "$(ls -a "$BK" | grep -c '^\.tmp-')" "0"
+  eq "no temp directory left behind" "$(find "$BK" -maxdepth 1 -name '.tmp-*' | wc -l)" "0"
   t "the data archive holds the AMUL field file" bash -c "tar -tf '$BK/$s1.data.tar' | grep -q amul-field.jsonl"
   sleep 1
   for i in 1 2 3; do mk "second wave record $i about irrigation" "topic-irrigation" >/dev/null; done
@@ -284,6 +285,7 @@ EOF
   if wait_for '[ "$(docker inspect -f "{{.State.Running}}" jarvis-db)" = true ]' 30; then ok "docker restarted the killed database by itself (restart policy)"; else echo "        note: docker did not auto-restart an explicitly killed container; the operator would run: jarvisctl up"; docker start jarvis-db >/dev/null; fi
   t "database is healthy again" wait_for '[ "$(docker inspect -f "{{.State.Health.Status}}" jarvis-db)" = healthy ]' 120
   t "the app's /ready recovers on its own" wait_for '[ "$(ready_code)" = 200 ]' 120
+  has "postgres replayed its WAL after the SIGKILL (crash recovery ran)" "automatic recovery in progress" <(docker logs jarvis-db 2>&1)
   eq "no partial write: the record count is exactly what it was" "$(api GET '/api/jarvis/memory?limit=200' | jget "len(d['memories'])")" "$n_before"
   t "history still verifies after the crash" "$BIN/jarvisctl" verify operator
 
@@ -299,9 +301,9 @@ EOF
   mk "written just before the reboot" "topic-reboot" >/dev/null
   snapshot > "$R/snap-reboot.txt"; live_anchors > "$R/anchors-reboot.txt"
   docker exec jarvis-app sh -c 'sha256sum /data/amul-field.jsonl' > "$R/amul-reboot.txt"
-  uptime -s > "$R/boot-time-before.txt"
+  ps -o lstart= -p 1 > "$R/init-start-before.txt"   # PID 1 of THIS distro (uptime would show the shared WSL VM)
   eq "snapshot holds the records" "$(wc -l < "$R/snap-reboot.txt")" "$(api GET '/api/jarvis/memory?limit=200' | jget "len(d['memories'])")"
-  echo "        records: $(wc -l < "$R/snap-reboot.txt"), anchor lines: $(wc -l < "$R/anchors-reboot.txt"); distro boot before: $(cat "$R/boot-time-before.txt")"
+  echo "        records: $(wc -l < "$R/snap-reboot.txt"), anchor lines: $(wc -l < "$R/anchors-reboot.txt"); init started: $(cat "$R/init-start-before.txt")"
   finish
 }
 
@@ -311,14 +313,14 @@ phase_b() {
   KEY="$(cat "$SEC/api-key")"
   section "B1. after the reboot: everything must have come back BY ITSELF (nothing started by hand)"
   neq() { if [ "$2" != "$3" ]; then ok "$1"; else bad "$1 (both '$2')"; fi; }
-  neq "the distro really rebooted (boot time changed)" "$(uptime -s)" "$(cat "$R/boot-time-before.txt")"
+  neq "the distro really rebooted (systemd is a new process)" "$(ps -o lstart= -p 1)" "$(cat "$R/init-start-before.txt")"
   t "docker.service started at boot" systemctl is-active docker
   t "the database came back and is healthy" wait_for '[ "$(docker inspect -f "{{.State.Health.Status}}" jarvis-db 2>/dev/null)" = healthy ]' 240
   t "the app came back and is ready" wait_for '[ "$(ready_code)" = 200 ]' 240
-  boot_epoch="$(date -d "$(uptime -s)" +%s)"
+  boot_epoch="$(date -d "$(ps -o lstart= -p 1)" +%s)"
   started="$(date -d "$(docker inspect -f '{{.State.StartedAt}}' jarvis-db)" +%s)"
   [ "$started" -ge "$boot_epoch" ] && ok "the database container was started by docker after boot (restart policy), not by hand" || bad "the database container predates the boot"
-  has "postgres performed crash recovery after the hard stop" "recovery" <(docker logs jarvis-db 2>&1)
+  if docker logs jarvis-db 2>&1 | grep -q 'automatic recovery in progress'; then echo "        note: the terminate was a hard stop: postgres ran crash recovery"; else echo "        note: docker shut postgres down cleanly during the terminate (crash recovery is proven by the SIGKILL test in A12)"; fi
   for tm in backup offsite drill watchdog; do t "timer jarvis-$tm.timer is active again (linger)" wait_for "systemctl --user is-active jarvis-$tm.timer" 120; done
   eq "every record, version and content hash survived the hard stop" "$(snapshot)" "$(cat "$R/snap-reboot.txt")"
   eq "chain-head anchors are identical" "$(live_anchors)" "$(cat "$R/anchors-reboot.txt")"
@@ -370,7 +372,7 @@ phase_b() {
   JARVIS_BACKUP_DIR="$R/badbk2" "$BIN/restore.sh" --yes-destroy-current-data > "$R/rbad2.out" 2>&1; rc=$?
   eq "restore stops at the anchors gate for a doctored set" "$([ $rc -ne 0 ] && echo stopped || echo went-through)" "stopped"
   has "...naming the anchors" "anchors after restore differ" "$R/rbad2.out"
-  app_state="$(docker inspect -f '{{.State.Running}}' jarvis-app 2>/dev/null || echo gone)"
+  app_state="$(docker inspect -f '{{.State.Running}}' jarvis-app 2>/dev/null || echo gone)"; app_state="${app_state//$'\n'/}"
   [ "$app_state" != "true" ] && ok "...and the app was NOT started (state: $app_state)" || bad "the app was started despite the failed gate"
   ls "$R"/badbk2/pre-restore-*.dump >/dev/null 2>&1 && ok "a safety dump of the pre-restore state was taken first" || bad "no pre-restore safety dump"
 

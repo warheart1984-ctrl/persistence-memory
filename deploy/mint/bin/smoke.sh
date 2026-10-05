@@ -10,6 +10,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 write=1; [ "${1:-}" = "--no-write" ] && write=0
 fails=0
 pass() { printf 'PASS  %s\n' "$1"; }
+note() { printf 'NOTE  %s\n' "$1"; }
 fail() { printf 'FAIL  %s\n' "$1"; fails=$((fails + 1)); }
 check() { local what="$1"; shift; if "$@" >/dev/null 2>&1; then pass "$what"; else fail "$what"; fi; }
 
@@ -28,7 +29,11 @@ bad="$(docker port "$APP_CONTAINER" 2>/dev/null | grep -v ' -> 127\.0\.0\.1:' ||
 [ -z "$bad" ] && pass "app is published on 127.0.0.1 only" || fail "app is published beyond loopback: $bad"
 if command -v ss >/dev/null 2>&1; then
   listeners="$(ss -ltnH 2>/dev/null | awk '{print $4}')"
-  echo "$listeners" | grep -Eq '(^|:)5432$' && fail "something listens on 5432 on the host" || pass "nothing listens on 5432 on the host"
+  # Any listener on 5432 may belong to something else on the host (e.g. a native PostgreSQL); what matters is that
+  # none of OUR containers publishes it.
+  [ -z "$(docker ps -q --filter publish=5432)" ] && pass "no container publishes 5432" || fail "a container publishes 5432"
+  other="$(echo "$listeners" | grep -E '(^|:)5432$' | tr '\n' ' ')"
+  [ -z "$other" ] || note "something that is not this stack listens on $other"
   if echo "$listeners" | grep -E ":$APP_PORT\$" | grep -vq '^127\.0\.0\.1:'; then fail "port $APP_PORT is open beyond loopback"; else pass "port $APP_PORT only on loopback"; fi
 fi
 
@@ -49,8 +54,8 @@ docker exec "$APP_CONTAINER" sh -c 'touch /app/x 2>/dev/null' && fail "app root 
   && pass "no-new-privileges is on" || fail "no-new-privileges is off"
 
 echo "== database roles"
-flags="$(pg_exec psql -X -At -d jarvis -c "select string_agg(rolname || ':' || rolsuper || rolbypassrls || rolcreaterole || rolcreatedb || rolreplication, ',' order by rolname) from pg_roles where rolname in ('jarvis_app','jarvis_migrator')")"
-[ "$flags" = "jarvis_app:fffff,jarvis_migrator:fffff" ] && pass "both ledger roles are ordinary (no superuser/bypassrls/createrole/createdb/replication)" || fail "role flags: $flags"
+flags="$(pg_exec psql -X -At -d jarvis -c "select string_agg(rolname || ':' || rolsuper::int || rolbypassrls::int || rolcreaterole::int || rolcreatedb::int || rolreplication::int, ',' order by rolname) from pg_roles where rolname in ('jarvis_app','jarvis_migrator')")"
+[ "$flags" = "jarvis_app:00000,jarvis_migrator:00000" ] && pass "both ledger roles are ordinary (no superuser/bypassrls/createrole/createdb/replication)" || fail "role flags: $flags"
 docker exec "$APP_CONTAINER" python -c "
 import os, sys, psycopg
 url = os.environ['JARVIS_DATABASE_URL'].replace('//jarvis_app:', '//postgres:')
