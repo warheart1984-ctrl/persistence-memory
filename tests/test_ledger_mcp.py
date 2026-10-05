@@ -42,6 +42,7 @@ class _Ledger(BaseHTTPRequestHandler):
     ready = True
     fail_body: str | None = None
     long_first = False
+    archived: set[int] = set()
 
     def log_message(self, *args):
         pass
@@ -70,8 +71,16 @@ class _Ledger(BaseHTTPRequestHandler):
         if url.path == "/api/jarvis/memory":
             q = parse_qs(url.query)
             limit = int(q.get("limit", ["50"])[0])
-            records = [_record(i, "x" * 1500 if (cls.long_first and i == 0) else None) for i in range(min(limit, cls.total))]
-            return self._reply(200, {"memories": records})
+            scope = q.get("truth_scope", [None])[0]
+            records = [
+                _record(i, "x" * 1500 if (cls.long_first and i == 0) else None) | {"status": "archived" if i in cls.archived else "draft"}
+                for i in range(cls.total)
+            ]
+            if scope == "live":
+                records = [r for r in records if r["status"] != "archived"]
+            elif scope == "archived":
+                records = [r for r in records if r["status"] == "archived"]
+            return self._reply(200, {"memories": records[:limit]})
         if url.path.startswith("/api/jarvis/memory/"):
             memory_id = url.path.rsplit("/", 1)[1]
             if memory_id == _record(7)["id"]:
@@ -96,6 +105,7 @@ def ledger(monkeypatch, tmp_path):
     _Ledger.ready = True
     _Ledger.fail_body = None
     _Ledger.long_first = False
+    _Ledger.archived = set()
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), _Ledger)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     key_file = tmp_path / "api-key"
@@ -189,7 +199,7 @@ def test_health_reports_not_ready_without_raising(ledger):
 def test_recall_defaults_to_50_without_provenance(ledger):
     result = call("recall")["structuredContent"]
     assert result["count"] == 50 and result["limit"] == 50 and result["capped"] is True
-    assert ledger.seen[-1]["path"] == "/api/jarvis/memory?limit=50&with_provenance=false"
+    assert ledger.seen[-1]["path"] == "/api/jarvis/memory?limit=50&with_provenance=false&truth_scope=live"
 
 
 def test_recall_up_to_200_returns_every_record_and_is_not_capped_below_the_limit(ledger):
@@ -352,3 +362,33 @@ def test_the_real_stdio_process_refuses_without_a_url_and_works_with_one(ledger,
     out, err = _stdio({"JARVIS_MEMORYBOARD_URL": os.environ["JARVIS_MEMORYBOARD_URL"], "JARVIS_API_KEY_FILE": str(key_file)}, msgs)
     assert out[2]["result"]["isError"] is False and out[2]["result"]["structuredContent"]["ready"] is True
     assert KEY not in json.dumps(out) and KEY not in err
+
+
+# --- truth_scope: archived records stay out of recall unless asked for -----------------------------------
+
+def test_recall_leaves_archived_records_out_by_default(ledger):
+    ledger.archived = {3, 4, 5}
+    result = call("recall", {"limit": 200})["structuredContent"]
+    assert result["truth_scope"] == "live" and result["count"] == 57
+    assert not any(m["status"] == "archived" for m in result["memories"])
+    assert "truth_scope=live" in ledger.seen[-1]["path"]
+
+
+def test_recall_can_ask_for_everything_or_only_archived(ledger):
+    ledger.archived = {3, 4, 5}
+    everything = call("recall", {"limit": 200, "truth_scope": "all"})["structuredContent"]
+    assert everything["count"] == 60 and "truth_scope=" not in ledger.seen[-1]["path"]
+    only = call("recall", {"limit": 200, "truth_scope": "archived"})["structuredContent"]
+    assert only["count"] == 3 and all(m["status"] == "archived" for m in only["memories"])
+    assert "truth_scope=archived" in ledger.seen[-1]["path"]
+
+
+@pytest.mark.parametrize("scope", ["draft", "verified", "grok-bot", "", "LIVE", None.__class__, 5, ["live"]])
+def test_recall_rejects_any_other_truth_scope_without_a_request(ledger, scope):
+    result = call("recall", {"truth_scope": scope})
+    assert code_of(result) == "bad_argument" and ledger.seen == []
+
+
+def test_the_recall_schema_offers_the_three_scopes():
+    schema = {t["name"]: t for t in mcp._listed_tools()}["recall"]["inputSchema"]["properties"]["truth_scope"]
+    assert schema["enum"] == ["live", "all", "archived"] and schema["default"] == "live"

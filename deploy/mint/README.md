@@ -102,7 +102,7 @@ printed, returned or sent over plain http to another host.
 | Tool (host adds the server name, e.g. `jarvis-ledger__recall`) | |
 |---|---|
 | `health` | liveness and readiness |
-| `recall` | live memories, default 50, up to 200 (`limit`), optional `query` / `type` / `status` / `subject`; content shortened to `content_chars` (default 400, 0 = full); says when the result is capped |
+| `recall` | live memories, default 50, up to 200 (`limit`), optional `query` / `type` / `status` / `subject`, and `truth_scope` (`live` by default, which leaves archived records out; `all` or `archived` to see them); content shortened to `content_chars` (default 400, 0 = full); says when the result is capped |
 | `get` | one memory by id |
 | `write` | **off unless `JARVIS_LEDGER_MCP_WRITE=1`**, and then not even listed otherwise. Stores one draft `fact` or `decision` with `source_agent` `grok-bot` (`JARVIS_LEDGER_MCP_SOURCE` renames it), needs the user's own words in `user_requested`, and refuses anything that looks like a credential |
 
