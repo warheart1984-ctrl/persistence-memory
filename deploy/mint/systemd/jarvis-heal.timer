@@ -1,0 +1,10 @@
+[Unit]
+Description=Jarvis ledger: self-heal every minute
+
+[Timer]
+OnCalendar=*:*:00
+OnBootSec=2min
+Persistent=false
+
+[Install]
+WantedBy=timers.target

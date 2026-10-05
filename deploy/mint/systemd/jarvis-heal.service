@@ -1,0 +1,13 @@
+[Unit]
+Description=Jarvis ledger: start the database/app again if they were stopped
+Documentation=file://@DEPLOY_DIR@/README.md
+
+[Service]
+Type=oneshot
+Environment=JARVIS_HOME=@JARVIS_HOME@
+EnvironmentFile=-@DEPLOY_DIR@/.env
+EnvironmentFile=-@JARVIS_HOME@/systemd.env
+ExecStart=@DEPLOY_DIR@/bin/heal.sh
+TimeoutStartSec=1min
+NoNewPrivileges=true
+PrivateTmp=true

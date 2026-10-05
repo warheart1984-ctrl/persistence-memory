@@ -25,6 +25,7 @@ jarvisctl <command>
   drill [--prove-detection]
   offsite              encrypt and send the newest set to your Windows PC
   watchdog             run the health/staleness checks once
+  heal                 start the database/app again if they were stopped (runs every minute as a timer)
   rotate app|migrator|api-key
 EOF
 }
@@ -34,10 +35,11 @@ case "$cmd" in
   secrets)  exec "$here/gen-secrets.sh" "$@" ;;
   up)
     [ -f "$SECRETS_DIR/app.env" ] || { echo "no secrets yet: run  jarvisctl secrets  first" >&2; exit 1; }
+    rm -f "$STATE_DIR/stopped-on-purpose"
     "${COMPOSE[@]}" up -d --build "$@"
     wait_healthy "$APP_CONTAINER" 240 && echo "stack is up: http://127.0.0.1:$APP_PORT (health: ok)" \
       || { echo "app did not become healthy; try: jarvisctl logs app" >&2; exit 1; } ;;
-  down)     "${COMPOSE[@]}" down "$@" ;;
+  down)     touch "$STATE_DIR/stopped-on-purpose"; "${COMPOSE[@]}" down "$@" ;;
   restart)  "${COMPOSE[@]}" restart "${@:-app}" ;;
   status)
     "${COMPOSE[@]}" ps
@@ -58,6 +60,7 @@ case "$cmd" in
   drill)    exec "$here/drill.sh" "$@" ;;
   offsite)  exec "$here/offsite.sh" "$@" ;;
   watchdog) exec "$here/watchdog.sh" "$@" ;;
+  heal)     exec "$here/heal.sh" "$@" ;;
   rotate)   exec "$here/rotate-password.sh" "$@" ;;
   help|-h|--help) usage ;;
   *) echo "unknown command: $cmd" >&2; usage >&2; exit 2 ;;

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install the backup/offsite/drill/watchdog timers as systemd USER units (so they run as you, can use docker
+# Install the backup/offsite/drill/watchdog/heal timers as systemd USER units (so they run as you, can use docker
 # and can raise desktop notifications). Linger keeps them running when you are logged out.
 #
 #   install-units.sh [--dest DIR] [--no-enable]      (--dest/--no-enable are for testing)
@@ -26,7 +26,7 @@ echo "units written to $dest"
 
 if [ "$enable" -eq 1 ]; then
   systemctl --user daemon-reload
-  for t in backup offsite drill watchdog; do
+  for t in backup offsite drill watchdog heal; do
     if [ "$t" = offsite ] && [ ! -f "$SECRETS_DIR/offsite.conf" ]; then
       echo "skipping jarvis-offsite.timer: no $SECRETS_DIR/offsite.conf yet (enable it later with: systemctl --user enable --now jarvis-offsite.timer)"
       continue
