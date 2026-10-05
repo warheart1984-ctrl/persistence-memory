@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Cursor afterAgentResponse hook — cache last assistant text for sessionEnd."""
+"""Cursor afterAgentResponse hook — cache the last assistant text in the local hook state folder.
+
+Nothing posts it to the ledger any more (the sessionEnd hook is retired); it is only a local file.
+"""
 
 from __future__ import annotations
 

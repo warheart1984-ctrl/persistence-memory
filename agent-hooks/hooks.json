@@ -12,12 +12,6 @@
         "command": "python -X utf8 jarvis-memoryboard/agent-hooks/jarvis_after_response.py",
         "timeout": 10
       }
-    ],
-    "sessionEnd": [
-      {
-        "command": "python -X utf8 jarvis-memoryboard/agent-hooks/jarvis_session_end.py",
-        "timeout": 15
-      }
     ]
   }
 }

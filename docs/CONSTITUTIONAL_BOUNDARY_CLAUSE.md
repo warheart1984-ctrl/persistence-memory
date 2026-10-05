@@ -87,7 +87,7 @@ Continuity stores **evidence**, not:
 | Path | Status vs Clause V |
 |------|--------------------|
 | Ideal CCS write path | Evidence / decision / architecture records only — **declared** |
-| `agent-hooks/jarvis_session_end.py` | Still may POST draft `type=fact` session-end notes or heuristic “decision” extracts — **transitional / partial** |
+| `agent-hooks/jarvis_session_end.py` | **Retired**: a no-op that posts nothing. Session notes are chat summaries (memory), so they no longer reach the ledger |
 | Agent rule preferring `type=decision` | Guidance only — **partial** |
 | Clause V enforcement at API | **Partial** — type (`decision`/`architecture`/`research`/`fact` only) and evidence are enforced; emotion, transient state and transcript findings are warn-only (`agent-hooks/CLAUSE_V_HYGIENE.md`) |
 

@@ -97,7 +97,7 @@ def _key_may_travel(url: str) -> bool:
 # --- secret filter for what the hooks send to the ledger ----------------------------------------------------
 # A tripwire, not a guarantee: it recognises the common shapes of credentials (and this ledger's own API key,
 # exactly). It returns the NAMES of the patterns that matched, never the matched text, so a refusal notice
-# cannot leak the thing it refused. The sessionEnd hook refuses to post anything that matches.
+# cannot leak the thing it refused. The ledger MCP server's write tool refuses to store anything that matches.
 
 _SECRET_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("private-key-block", re.compile(r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----")),

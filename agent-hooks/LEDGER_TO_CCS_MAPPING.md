@@ -13,7 +13,7 @@
 | `supersedes` | Continuity edge / replacement claim | Not a CES Decision Object — **enforced** as field |
 | `status` / `confidence` | Claimed lifecycle / caller confidence | Not Evidence Engine verification — **enforced** as stored fields |
 | `content_sha256` | Evidence / block hash building block | Content hash only — **partial** |
-| Hooks sessionEnd draft posts | Constitutional event recording | **transitional / partial** vs Boundary Clause V (memory exclusion) — may still write session facts |
+| Hooks sessionEnd draft posts | Constitutional event recording | **Retired** (the hook posts nothing). Events enter the ledger only as explicit `decision` / evidence records through the API or the MCP write tool |
 | — | CES.* registration | Stubs in `schemas/ces/` — **declared** |
 | — | RC.* registration | Stubs in `schemas/rc/` — **declared** |
 | — | Unified provenance across products | **declared** |
