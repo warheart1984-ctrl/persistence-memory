@@ -16,6 +16,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse, Response
 
 from app.public_security import is_public_deployment
+from app.refusal import json_response
 from app.identity import current_principal, reset_principal, set_principal
 from app.oauth import READ_SCOPE, WRITE_SCOPE, auth_mode, public_base_url, validate_access_token
 
@@ -167,7 +168,7 @@ async def ledger_read_protection_middleware(request: Request, call_next):
             request.headers.get("x-emr-recall-key"),
         )
     except HTTPException as exc:
-        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+        return json_response(exc.status_code, exc.detail, headers=getattr(exc, "headers", None))
     return await call_next(request)
 
 
@@ -237,6 +238,7 @@ PUBLIC_PATHS = frozenset(
     {
         "/",
         "/health",
+        "/ready",
         "/docs",
         "/openapi.json",
         "/redoc",
@@ -277,23 +279,15 @@ class ApiKeyMiddleware(BaseHTTPMiddleware):
         if expected is not None:
             presented = extract_presented_key(request)
             if presented is None or not secrets.compare_digest(presented, expected):
-                return JSONResponse(
-                    status_code=401,
-                    content={"detail": "Invalid or missing API key"},
-                )
+                return json_response(401, "Invalid or missing API key")
             return await call_next(request)
 
         if allow_unauthenticated():
             return await call_next(request)
 
-        return JSONResponse(
-            status_code=401,
-            content={
-                "detail": (
-                    "API key required. Set JARVIS_API_KEY, or for local dev only "
-                    "set JARVIS_ALLOW_UNAUTHENTICATED=1."
-                )
-            },
+        return json_response(
+            401,
+            "API key required. Set JARVIS_API_KEY, or for local dev only set JARVIS_ALLOW_UNAUTHENTICATED=1.",
         )
 
 
@@ -317,16 +311,14 @@ async def identity_middleware(request: Request, call_next):
         return await call_next(request)
     authorization = request.headers.get("authorization") or ""
     if not authorization.lower().startswith("bearer "):
-        return JSONResponse(
-            status_code=401,
-            content={"detail": "OAuth Bearer access token required"},
-            headers={"WWW-Authenticate": oauth_challenge()},
+        return json_response(
+            401, "OAuth Bearer access token required", headers={"WWW-Authenticate": oauth_challenge()}
         )
     try:
         principal = validate_access_token(authorization[7:].strip())
     except HTTPException as exc:
         headers = {"WWW-Authenticate": oauth_challenge()} if exc.status_code == 401 else {}
-        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers=headers)
+        return json_response(exc.status_code, exc.detail, headers=headers)
     token = set_principal(principal)
     try:
         return await call_next(request)

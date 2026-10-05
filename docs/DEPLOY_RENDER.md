@@ -49,7 +49,7 @@ render blueprint launch
 1. New → Web Service → connect `persistence-memory`
 2. Runtime: Docker
 3. Add **Persistent Disk**: mount `/var/data`, 1 GB
-4. Health check path: `/health`
+4. Health check path: `/health` (liveness: the process is up; it never touches the ledger). Use `GET /ready` wherever the platform has a separate readiness probe: it returns 503 with `Retry-After` unless the ledger can be served safely (see `docs/POSTGRES.md`).
 
 ### 2. Environment variables
 

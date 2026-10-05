@@ -44,6 +44,15 @@ services:
       # Render PostgreSQL internal connection string; do not commit its value.
       - key: JARVIS_DATABASE_URL
         sync: false
+      # Which ledger store to use when JARVIS_DATABASE_URL is set: "rows" (row-level tables, the code
+      # default) or "blob" (legacy: one JSONB document per tenant). Pinned to blob so that merging a
+      # commit cannot switch a running deployment's store (autoDeployTrigger: commit). Cut over with
+      # docs/POSTGRES.md (pg_migrate -> pg_import --apply -> --verify), then set this to "rows".
+      - key: JARVIS_PG_STORE
+        value: blob
+      # Optional, for the row store: a DDL-capable role for `python -m app.pg_migrate` / `app.pg_import`
+      # (defaults to JARVIS_DATABASE_URL's role). Add it in the Render dashboard when needed:
+      #   JARVIS_DATABASE_MIGRATE_URL   (sync: false)
       - key: JARVIS_OIDC_ISSUER
         sync: false
       - key: JARVIS_OIDC_AUDIENCE

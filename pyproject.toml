@@ -10,7 +10,7 @@ dependencies = [
   "pydantic==2.11.7",
   "networkx>=3.0",
   "PyJWT[crypto]==2.15.1",
-  "psycopg[binary]==3.2.9",
+  "psycopg[binary,pool]==3.2.9",
   # amul_llm calls its backend with httpx at runtime, not only in tests.
   "httpx==0.28.1",
 ]
@@ -25,4 +25,8 @@ include = ["app*", "mcp_server*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+  "postgres: needs JARVIS_TEST_PG_DSN (a throwaway Postgres server); skipped otherwise",
+  "json_store_only: about the JSON file store itself; skipped when JARVIS_TEST_BACKEND=postgres",
+]
 pythonpath = ["."]

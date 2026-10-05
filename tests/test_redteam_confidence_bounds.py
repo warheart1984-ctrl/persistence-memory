@@ -36,7 +36,7 @@ def test_out_of_range_confidence_is_503_and_file_unchanged(tmp_path, bad):
     with TestClient(app, raise_server_exceptions=False) as client:
         assert client.get("/api/jarvis/memory").status_code == 503
         assert client.post("/api/jarvis/memory", json=_MEMORY).status_code == 503
-        assert client.get("/health").status_code == 503
+        assert client.get("/ready").status_code == 503
     assert path.read_bytes() == before
 
 
@@ -65,3 +65,10 @@ def test_model_rejects_out_of_range():
     with pytest.raises(ValidationError):
         MemoryRecord(**base, confidence=5)
     assert MemoryRecord(**base, confidence=1).confidence == 1
+
+
+# The Postgres counterparts of these properties live in tests/test_pg_*.py (CHECK constraints,
+# fail-closed on a database outage, generic MCP errors, history verification).
+import pytest as _pytest_marker  # noqa: E402
+
+pytestmark = _pytest_marker.mark.json_store_only

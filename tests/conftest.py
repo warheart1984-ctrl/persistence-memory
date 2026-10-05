@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import tempfile
 from pathlib import Path
 
@@ -85,3 +86,106 @@ def _isolated_dynamics_sidecar(tmp_path):
     rag.reset_index_for_tests()
     llm.LLM_LOG_PATH, llm.LLM_URL = original_llm_paths
     emr.reset_stm_for_tests()
+
+
+# --- Postgres (throwaway server only) -------------------------------------------------
+# Tests marked ``postgres`` need JARVIS_TEST_PG_DSN pointing at a disposable superuser
+# connection (e.g. a local ``postgres:16`` container).  They skip when it is unset.
+
+import contextlib
+import secrets
+import uuid
+from dataclasses import dataclass
+
+
+@dataclass
+class PgSchema:
+    schema: str
+    admin_dsn: str
+    app_dsn: str
+
+    @contextlib.contextmanager
+    def app_conn(self, tenant: str | None):
+        """Connection as the non-superuser app role, one transaction, tenant set (or not)."""
+        import psycopg
+
+        with psycopg.connect(self.app_dsn, options=f"-c search_path={self.schema}") as conn:
+            if tenant is not None:
+                conn.execute("SELECT set_config('jarvis.tenant_key', %s, true)", (tenant,))
+            yield conn
+
+    def admin_conn(self):
+        import psycopg
+
+        return psycopg.connect(self.admin_dsn, options=f"-c search_path={self.schema}", autocommit=True)
+
+
+@pytest.fixture(scope="session")
+def pg_server():
+    dsn = os.environ.get("JARVIS_TEST_PG_DSN", "").strip()
+    if not dsn:
+        pytest.skip("JARVIS_TEST_PG_DSN not set (throwaway Postgres required)")
+    import psycopg
+    from psycopg.conninfo import make_conninfo
+
+    password = secrets.token_hex(12)
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        conn.execute("DROP ROLE IF EXISTS jarvis_app_test")
+        conn.execute(f"CREATE ROLE jarvis_app_test LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD '{password}'")
+    app_dsn = make_conninfo(dsn, user="jarvis_app_test", password=password)
+    yield dsn, app_dsn
+
+
+@pytest.fixture
+def pg_schema(pg_server):
+    """A fresh, empty schema (not yet migrated) plus DSNs for the admin and app roles."""
+    import psycopg
+
+    admin_dsn, app_dsn = pg_server
+    name = f"t_{uuid.uuid4().hex[:12]}"
+    with psycopg.connect(admin_dsn, autocommit=True) as conn:
+        conn.execute(f'CREATE SCHEMA "{name}"')
+    yield PgSchema(schema=name, admin_dsn=admin_dsn, app_dsn=app_dsn)
+    with psycopg.connect(admin_dsn, autocommit=True) as conn:
+        conn.execute(f'DROP SCHEMA "{name}" CASCADE')
+
+
+# --- Run the whole suite against the Postgres row store -------------------------------------
+# JARVIS_TEST_BACKEND=postgres (plus JARVIS_TEST_PG_DSN) points every test that goes through
+# get_store() / the HTTP API at a fresh, migrated schema on a throwaway server.  Tests that are
+# about the JSON file itself carry @pytest.mark.json_store_only and are skipped in that mode;
+# the Postgres counterparts (fail-closed, CHECK constraints, RLS, history) are tests/test_pg_*.py.
+
+_PG_MODE = os.environ.get("JARVIS_TEST_BACKEND", "").strip().lower() == "postgres"
+
+
+def pytest_configure(config):
+    if _PG_MODE and not os.environ.get("JARVIS_TEST_PG_DSN", "").strip():
+        raise pytest.UsageError("JARVIS_TEST_BACKEND=postgres requires JARVIS_TEST_PG_DSN (a throwaway server)")
+
+
+def pytest_collection_modifyitems(config, items):
+    if not _PG_MODE:
+        return
+    skip = pytest.mark.skip(reason="specific to the JSON file store; see tests/test_pg_*.py for Postgres")
+    for item in items:
+        if "json_store_only" in item.keywords:
+            item.add_marker(skip)
+
+
+@pytest.fixture(autouse=True)
+def _postgres_backend(request, monkeypatch):
+    if not _PG_MODE or request.node.get_closest_marker("postgres") is not None:
+        yield  # tests marked postgres build (and sometimes deliberately break) their own schemas
+        return
+    from app import pg_store
+    from app.pg_schema import migrate
+
+    schema = request.getfixturevalue("pg_schema")
+    migrate(schema.admin_dsn, schema=schema.schema, app_role="jarvis_app_test")
+    monkeypatch.setenv("JARVIS_DATABASE_URL", schema.app_dsn)
+    monkeypatch.setenv("JARVIS_DATABASE_SCHEMA", schema.schema)
+    monkeypatch.setenv("JARVIS_PG_STORE", "rows")
+    monkeypatch.setenv("JARVIS_DATABASE_CONNECT_TIMEOUT", "2")
+    yield
+    pg_store.close_pools()

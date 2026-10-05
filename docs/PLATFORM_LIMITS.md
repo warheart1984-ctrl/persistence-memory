@@ -40,7 +40,9 @@ If future write-slot partitioning is added to reduce contention, it must remain 
 
 **Fit:** one agent / one machine (or carefully serialized writers). Concurrent writers are the **first thing that breaks**.
 
-Do **not** claim multi-writer serialization, optimistic locking, or distributed consistency.
+Do **not** claim multi-writer serialization, optimistic locking, or distributed consistency **for the JSON file store**.
+
+**PostgreSQL row store** (`JARVIS_DATABASE_URL`, `docs/POSTGRES.md`): the ledger and board *are* safe across workers and instances (row-level writes, optimistic locking with a `version`, 409 on conflict, append-only hash-chained history). That does not extend to AMUL, STM, the EMR reinforcement overlay or RAG/LLM files, which stay per-instance.
 
 Evidence: `app/store.py` (`_save`), scorecard Platform engineering.
 

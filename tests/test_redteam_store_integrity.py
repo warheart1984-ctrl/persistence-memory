@@ -52,7 +52,7 @@ def test_health_is_not_ok_when_store_is_damaged(tmp_path):
     _seed(path)
     _truncate(path)
     with TestClient(app) as client:
-        response = client.get("/health")
+        response = client.get("/ready")
     assert response.status_code == 503
     assert response.json()["status"] != "ok"
 
@@ -149,3 +149,10 @@ def test_concurrent_writes_are_all_persisted(tmp_path):
     assert errors == []
     on_disk = json.loads(path.read_text("utf-8"))["memories"]
     assert len(on_disk) == 8 * 15
+
+
+# The Postgres counterparts of these properties live in tests/test_pg_*.py (CHECK constraints,
+# fail-closed on a database outage, generic MCP errors, history verification).
+import pytest as _pytest_marker  # noqa: E402
+
+pytestmark = _pytest_marker.mark.json_store_only

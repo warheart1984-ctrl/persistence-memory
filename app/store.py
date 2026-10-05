@@ -29,6 +29,7 @@ from app.models import (
     migrate_legacy_record,
 )
 from app.identity import current_tenant_key
+from app.store_errors import StoreUnavailableError, StoreVersionConflict
 
 
 def _now_iso() -> str:
@@ -41,8 +42,109 @@ def _make_id(prefix: str = "mem") -> str:
     return f"{prefix}-{uuid.uuid4().hex[:12]}"
 
 
-class StoreUnavailableError(RuntimeError):
-    """The ledger cannot be read or written safely; callers must fail closed."""
+def memory_matches_query(m: MemoryRecord, q: str) -> bool:
+    """Case-insensitive substring match used by every ledger backend (``q`` lower-cased)."""
+    return bool(
+        q in m.content.lower()
+        or any(q in tag.lower() for tag in m.tags)
+        or (m.subject and q in m.subject.lower())
+        or q in m.type.lower()
+        or q in m.source_agent.lower()
+        or q in m.session_id.lower()
+    )
+
+
+def ledger_retrieve(
+    store: Any,
+    *,
+    truth_scope: str | None = None,
+    query: str | None = None,
+    limit: int = 50,
+    memory_type: str | None = None,
+    status: str | None = None,
+    session_id: str | None = None,
+    subject: str | None = None,
+) -> tuple[list[MemoryRecord], list[SelectionProvenance], list[ConflictSet]]:
+    """List with selection provenance + any subject conflicts among results."""
+    memories = store.list_memories(
+        truth_scope=truth_scope,
+        query=query,
+        limit=limit,
+        memory_type=memory_type,
+        status=status,
+        session_id=session_id,
+        subject=subject,
+    )
+    selections = [
+        to_selection(
+            m,
+            query=query,
+            truth_scope=truth_scope,
+            memory_type=memory_type,
+            status=status,
+        )
+        for m in memories
+    ]
+    # Conflict scan uses full subject cohort from store (not just page)
+    all_for_conflict = store.list_memories(limit=9999, truth_scope="live")
+    conflicts = detect_conflicts(all_for_conflict, subject=subject)
+    # If subject filter unset, only include conflicts that touch returned ids
+    if subject is None:
+        returned_ids = {m.id for m in memories}
+        conflicts = [
+            c
+            for c in conflicts
+            if any(m.id in returned_ids for m in c.memories)
+        ]
+    return memories, selections, conflicts
+
+
+def parse_ledger_document(raw: dict[str, Any]) -> tuple[MemoryBoard, dict[str, MemoryRecord], bool]:
+    """Parse a whole ledger document or raise; never returns a partial ledger.
+
+    Anything skipped here would be deleted from disk by the next save, so every anomaly is
+    fatal.  The bad record's id and error go in the exception message (for logs); the HTTP
+    response stays generic.  Pure: no file or database is touched.  The third value says
+    whether legacy rows were migrated in memory (a file-backed store then re-saves).
+    """
+    if "memories" not in raw:
+        stray = sorted(k for k, v in raw.items() if k not in ("board", "schema") and v)
+        if stray:
+            raise StoreUnavailableError(
+                f"Ledger has no 'memories' key but has other data under {stray}; refusing to load as empty"
+            )
+    board = MemoryBoard()
+    board_raw = raw.get("board")
+    if board_raw is not None:
+        try:
+            if not isinstance(board_raw, dict):
+                raise TypeError(f"board is {type(board_raw).__name__}, not an object")
+            board = MemoryBoard(**board_raw)
+        except Exception as exc:
+            raise StoreUnavailableError(f"Ledger board is invalid: {exc}") from exc
+    items = raw.get("memories", [])
+    if not isinstance(items, list):
+        raise StoreUnavailableError(f"Ledger 'memories' is {type(items).__name__}, not a list")
+    memories: dict[str, MemoryRecord] = {}
+    dirty_migration = False
+    for index, item in enumerate(items):
+        label = item.get("id") if isinstance(item, dict) and item.get("id") else f"#{index}"
+        try:
+            if not isinstance(item, dict) or not item.get("id"):
+                raise ValueError("record is not an object with an id")
+            if item["id"] in memories:
+                raise ValueError("duplicate record id")
+            migrated = migrate_legacy_record(item)
+            rec = ensure_content_hash(MemoryRecord(**migrated))
+        except Exception as exc:
+            raise StoreUnavailableError(f"Ledger record {label} failed validation: {exc}") from exc
+        memories[rec.id] = rec
+        # Persist migration if legacy fields were present
+        if any(k in item for k in ("category", "state_class", "truth_status", "scope")):
+            dirty_migration = True
+        if not item.get("content_sha256"):
+            dirty_migration = True
+    return board, memories, dirty_migration
 
 
 class JarvisStore:
@@ -81,49 +183,8 @@ class JarvisStore:
         self._loaded = True
 
     def _hydrate(self, raw: dict[str, Any]) -> None:
-        """Parse the whole document or raise; never keep a partial ledger.
-
-        Anything skipped here would be deleted from disk by the next _save, so every
-        anomaly is fatal.  The bad record's id and error go in the exception message
-        (for logs); the HTTP response stays generic.
-        """
-        if "memories" not in raw:
-            stray = sorted(k for k, v in raw.items() if k not in ("board", "schema") and v)
-            if stray:
-                raise StoreUnavailableError(
-                    f"Ledger has no 'memories' key but has other data under {stray}; refusing to load as empty"
-                )
-        board = MemoryBoard()
-        board_raw = raw.get("board")
-        if board_raw is not None:
-            try:
-                if not isinstance(board_raw, dict):
-                    raise TypeError(f"board is {type(board_raw).__name__}, not an object")
-                board = MemoryBoard(**board_raw)
-            except Exception as exc:
-                raise StoreUnavailableError(f"Ledger board is invalid: {exc}") from exc
-        items = raw.get("memories", [])
-        if not isinstance(items, list):
-            raise StoreUnavailableError(f"Ledger 'memories' is {type(items).__name__}, not a list")
-        memories: dict[str, MemoryRecord] = {}
-        dirty_migration = False
-        for index, item in enumerate(items):
-            label = item.get("id") if isinstance(item, dict) and item.get("id") else f"#{index}"
-            try:
-                if not isinstance(item, dict) or not item.get("id"):
-                    raise ValueError("record is not an object with an id")
-                if item["id"] in memories:
-                    raise ValueError("duplicate record id")
-                migrated = migrate_legacy_record(item)
-                rec = ensure_content_hash(MemoryRecord(**migrated))
-            except Exception as exc:
-                raise StoreUnavailableError(f"Ledger record {label} failed validation: {exc}") from exc
-            memories[rec.id] = rec
-            # Persist migration if legacy fields were present
-            if any(k in item for k in ("category", "state_class", "truth_status", "scope")):
-                dirty_migration = True
-            if not item.get("content_sha256"):
-                dirty_migration = True
+        """Parse the whole document or raise; never keep a partial ledger."""
+        board, memories, dirty_migration = parse_ledger_document(raw)
         self._board = board
         self._memories = memories
         if dirty_migration:
@@ -232,16 +293,7 @@ class JarvisStore:
             results = [m for m in results if m.subject == subject]
         if query:
             q = query.lower()
-            results = [
-                m
-                for m in results
-                if q in m.content.lower()
-                or any(q in tag.lower() for tag in m.tags)
-                or (m.subject and q in m.subject.lower())
-                or q in m.type.lower()
-                or q in m.source_agent.lower()
-                or q in m.session_id.lower()
-            ]
+            results = [m for m in results if memory_matches_query(m, q)]
         results.sort(key=lambda m: (m.created_at, m.id), reverse=True)
         return results[:limit]
 
@@ -257,7 +309,8 @@ class JarvisStore:
         subject: str | None = None,
     ) -> tuple[list[MemoryRecord], list[SelectionProvenance], list[ConflictSet]]:
         """List with selection provenance + any subject conflicts among results."""
-        memories = self.list_memories(
+        return ledger_retrieve(
+            self,
             truth_scope=truth_scope,
             query=query,
             limit=limit,
@@ -266,28 +319,6 @@ class JarvisStore:
             session_id=session_id,
             subject=subject,
         )
-        selections = [
-            to_selection(
-                m,
-                query=query,
-                truth_scope=truth_scope,
-                memory_type=memory_type,
-                status=status,
-            )
-            for m in memories
-        ]
-        # Conflict scan uses full subject cohort from store (not just page)
-        all_for_conflict = self.list_memories(limit=9999, truth_scope="live")
-        conflicts = detect_conflicts(all_for_conflict, subject=subject)
-        # If subject filter unset, only include conflicts that touch returned ids
-        if subject is None:
-            returned_ids = {m.id for m in memories}
-            conflicts = [
-                c
-                for c in conflicts
-                if any(m.id in returned_ids for m in c.memories)
-            ]
-        return memories, selections, conflicts
 
     def get_memory(self, memory_id: str) -> MemoryRecord | None:
         self._ensure_loaded()
@@ -332,6 +363,10 @@ class JarvisStore:
         existing = self._memories.get(memory_id)
         if not existing:
             return None
+        if data.expected_version is not None and data.expected_version != existing.version:
+            raise StoreVersionConflict(
+                f"version conflict: expected {data.expected_version}, current {existing.version}"
+            )
         updates = existing.model_dump()
         for key in (
             "content",
@@ -355,6 +390,7 @@ class JarvisStore:
             raise ValueError(f"supersedes target not found: {data.supersedes}")
         # Explicit clear of supersedes via empty string not supported; use null through model
         updates["updated_at"] = _now_iso()
+        updates["version"] = existing.version + 1
         if data.content is not None:
             updates["content_sha256"] = content_sha256(data.content)
         updated = MemoryRecord(**updates)
@@ -370,6 +406,17 @@ class JarvisStore:
                 return False
             self._save_or_restore(lambda: self._memories.__setitem__(memory_id, removed))
             return True
+
+    def readiness(self) -> dict[str, str]:
+        """Readiness checks for /ready: can this store be served right now?  Raises if it cannot."""
+        self._ensure_loaded()
+        return {"store": "ok"}
+
+    def history(self, memory_id: str, limit: int = 200) -> list[dict[str, Any]]:
+        raise NotImplementedError("record history requires the PostgreSQL row store")
+
+    def verify_history(self, memory_id: str | None = None) -> list[dict[str, Any]]:
+        raise NotImplementedError("record history requires the PostgreSQL row store")
 
     def conflicts(self, subject: str | None = None) -> list[ConflictSet]:
         self._ensure_loaded()
@@ -452,6 +499,17 @@ def get_store(path: str | None = None) -> JarvisStore:
     database_url = (os.getenv("JARVIS_DATABASE_URL") or "").strip()
     if database_url:
         database_tenant = tenant or "operator"
+        mode = (os.getenv("JARVIS_PG_STORE") or "rows").strip().lower()
+        if mode == "rows":
+            schema = (os.getenv("JARVIS_DATABASE_SCHEMA") or "").strip() or None
+            cache_key = f"postgres-rows:{schema or ''}:{database_tenant}"
+            if cache_key not in _stores:
+                from app.pg_store import PostgresRowStore
+
+                _stores[cache_key] = PostgresRowStore(database_url, database_tenant, schema=schema)  # type: ignore[assignment]
+            return _stores[cache_key]
+        if mode != "blob":
+            raise StoreUnavailableError("JARVIS_PG_STORE must be 'rows' or 'blob'")
         cache_key = f"postgres:{database_tenant}"
         if cache_key not in _stores:
             _stores[cache_key] = PostgresJarvisStore(database_url, database_tenant)
@@ -467,3 +525,7 @@ def get_store(path: str | None = None) -> JarvisStore:
 def reset_store_for_tests() -> None:
     """Test helper — clear singleton."""
     _stores.clear()
+    import sys
+
+    if "app.pg_store" in sys.modules:
+        sys.modules["app.pg_store"].close_pools()

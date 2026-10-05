@@ -38,3 +38,10 @@ def test_mcp_tool_error_for_bad_store_is_generic(tmp_path, caplog, path, name, a
     assert result["content"][0]["text"] == "Ledger store unavailable"
     assert record.id not in response.text
     assert record.id in caplog.text  # the detail is kept server-side
+
+
+# The Postgres counterparts of these properties live in tests/test_pg_*.py (CHECK constraints,
+# fail-closed on a database outage, generic MCP errors, history verification).
+import pytest as _pytest_marker  # noqa: E402
+
+pytestmark = _pytest_marker.mark.json_store_only
