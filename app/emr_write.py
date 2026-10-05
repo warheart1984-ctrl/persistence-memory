@@ -21,6 +21,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.auth import mcp_write_enabled
+from app.clause_v import ClauseVViolation
 from app.continuity import content_sha256, detect_conflicts, normalize_content
 from app.models import EvidenceLink, MemoryCreate, MemoryRecord, MemoryType, MemoryUpdate
 from app.store import JarvisStore
@@ -53,6 +54,7 @@ RefuseReason = Literal[
     "ambiguous-write",
     "target-not-found",
     "supersedes-not-found",
+    "clause-v-violation",
 ]
 
 
@@ -368,6 +370,8 @@ def emr_remember(
         )
     except ValueError as exc:
         return _refuse("ambiguous-write", str(exc))
+    except ClauseVViolation as exc:
+        return _refuse("clause-v-violation", exc.message)
 
     return EmrWriteResponse(
         accepted=True,
@@ -448,6 +452,8 @@ def emr_upsert(
         store.update_memory(req.id, MemoryUpdate(status="archived"))
     except ValueError as exc:
         return _refuse("ambiguous-write", str(exc))
+    except ClauseVViolation as exc:
+        return _refuse("clause-v-violation", exc.message)
 
     return EmrWriteResponse(
         accepted=True,

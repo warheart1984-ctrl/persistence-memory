@@ -40,6 +40,7 @@ def _isolated_store_paths(tmp_path, monkeypatch):
 
     monkeypatch.setenv("JARVIS_STORE_PATH", str(tmp_path / "jarvis-store.json"))
     monkeypatch.setenv("JARVIS_STORE_BOOTSTRAP", "1")  # the tests use the JSON store on purpose
+    monkeypatch.setenv("JARVIS_CLAUSE_V", "off")  # the older tests write preference/task records on purpose; test_clause_v.py opts in
     monkeypatch.setenv("JARVIS_TENANT_STORE_DIR", str(tmp_path / "tenants"))
     reset_store_for_tests()
     yield

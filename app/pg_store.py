@@ -39,6 +39,7 @@ from app.models import (
 from app.pg_schema import check_schema_version, validate_schema_name
 from app.store import _make_id, ledger_retrieve, memory_matches_query
 from app.store_errors import StoreUnavailableError, StoreVersionConflict
+from app import clause_v
 
 _log = logging.getLogger("jarvis.store")
 
@@ -351,6 +352,7 @@ class PostgresRowStore:
         )
 
     def create_memory(self, data: MemoryCreate) -> MemoryRecord:
+        clause_v.gate_create(data)
         now = datetime.now(timezone.utc)
         for _ in range(3):
             rec_id = _make_id("mem")
@@ -396,6 +398,7 @@ class PostgresRowStore:
                     )
                 if self._after_read_hook is not None:
                     self._after_read_hook()
+                clause_v.gate_update(existing, data)
                 updates = existing.model_dump()
                 for key in (
                     "content", "source_agent", "session_id", "type", "confidence", "evidence",

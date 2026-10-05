@@ -8,6 +8,9 @@ Three refusals a client must tell apart, because the right reaction differs:
 * ``version_conflict`` (HTTP 409, no ``Retry-After``): the record changed under you.  Re-read it and
   decide; retrying the same request unchanged cannot help.
 * ``denied`` (HTTP 401/403, no ``Retry-After``): you may not do this.  Retrying will not change that.
+* ``clause_v_violation`` (HTTP 422, no ``Retry-After``): Clause V refused the write (the ledger stores evidence, not
+  memory).  The body lists ``reasons`` (each with its own ``code`` and ``field``).  Retrying unchanged cannot help:
+  change the type or add evidence.
 
 Any other 503 (for example a deployment that is missing a required key) uses the generic
 ``unavailable`` code and also carries ``Retry-After``.  The human-readable ``detail`` is unchanged and
@@ -25,6 +28,7 @@ LEDGER_UNAVAILABLE = "ledger_unavailable"
 VERSION_CONFLICT = "version_conflict"
 DENIED = "denied"
 UNAVAILABLE = "unavailable"
+CLAUSE_V_VIOLATION = "clause_v_violation"
 
 
 def retry_after_seconds() -> int:

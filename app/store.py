@@ -30,6 +30,7 @@ from app.models import (
 )
 from app.identity import current_tenant_key
 from app.store_errors import StoreUnavailableError, StoreVersionConflict
+from app import clause_v
 
 
 def _now_iso() -> str:
@@ -330,6 +331,7 @@ class JarvisStore:
 
     def _create_memory(self, data: MemoryCreate) -> MemoryRecord:
         self._ensure_loaded()
+        clause_v.gate_create(data)
         now = _now_iso()
         if data.supersedes and data.supersedes not in self._memories:
             # Allow forward-ref only if empty; otherwise require known id
@@ -367,6 +369,7 @@ class JarvisStore:
             raise StoreVersionConflict(
                 f"version conflict: expected {data.expected_version}, current {existing.version}"
             )
+        clause_v.gate_update(existing, data)
         updates = existing.model_dump()
         for key in (
             "content",
