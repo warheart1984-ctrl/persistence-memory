@@ -92,6 +92,34 @@ Remove-Item $HOME\.jarvis-api-key, $HOME\.ssh\jarvis_tunnel_ed25519*, $HOME\.ssh
 ```
 and on the box remove the tunnel key's line: `sed -i '/jarvis-tunnel@pc/d' ~/.ssh/authorized_keys`.
 
+## Connecting an MCP agent (Grok, Codex, ...)
+
+`mcp_server/ledger_stdio.py` is a small stdio MCP server for the ledger's plain API. Run it from a checkout of `main`
+(on the PC: `C:\Users\randj\persistence-memory-main`, with the tunnel up). It fails closed: without
+`JARVIS_MEMORYBOARD_URL` (no default address) or the key it refuses every tool and sends nothing, and the key is never
+printed, returned or sent over plain http to another host.
+
+| Tool (host adds the server name, e.g. `jarvis-ledger__recall`) | |
+|---|---|
+| `health` | liveness and readiness |
+| `recall` | live memories, default 50, up to 200 (`limit`), optional `query` / `type` / `status` / `subject`; content shortened to `content_chars` (default 400, 0 = full); says when the result is capped |
+| `get` | one memory by id |
+| `write` | **off unless `JARVIS_LEDGER_MCP_WRITE=1`**, and then not even listed otherwise. Stores one draft `fact` or `decision` with `source_agent` `grok-bot` (`JARVIS_LEDGER_MCP_SOURCE` renames it), needs the user's own words in `user_requested`, and refuses anything that looks like a credential |
+
+For Grok, MCP servers live in `~/.grok/config.toml` (`C:\Users\randj\.grok\config.toml`):
+```toml
+[mcp_servers.jarvis-ledger]
+command = 'C:\Users\randj\AppData\Local\Programs\Python\Python312\python.exe'
+args = ['-B', 'C:\Users\randj\persistence-memory-main\mcp_server\ledger_stdio.py']
+startup_timeout_sec = 15
+tool_timeout_sec = 30
+env = { JARVIS_MEMORYBOARD_URL = "http://127.0.0.1:8011", JARVIS_API_KEY_FILE = 'C:\Users\randj\.jarvis-api-key' }
+```
+Grok's `permission_mode = "always-approve"` runs tool calls without asking, so the guard on writing is the server's own
+switch: add `JARVIS_LEDGER_MCP_WRITE = "1"` to `env` only for as long as you want Grok to be able to store things.
+To undo it, delete the `[mcp_servers.jarvis-ledger]` block. Which Grok surfaces read `~/.grok/config.toml` is for the
+Grok docs to say; the Grok CLI does, and `~/.grokbot/settings.json` has its own (empty) `mcpBoxServers` list.
+
 ## Day to day
 
 | Command | What it does |
