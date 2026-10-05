@@ -1,0 +1,2 @@
+# Everything here runs on Linux: keep LF endings no matter where it is checked out.
+* text eol=lf

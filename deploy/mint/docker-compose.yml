@@ -1,0 +1,117 @@
+# Jarvis ledger on a single Linux box: Postgres row store + app, two roles, nothing exposed.
+#
+#   db       Postgres 16, private network only. NO published port; admin via `docker exec`.
+#   migrate  one-shot: python -m app.pg_migrate as the migrator role (DDL), then exits.
+#   app      the service on 127.0.0.1 only, as the ordinary jarvis_app role.
+#
+# No host bind mounts: configs are baked into the images, secrets arrive through env_file,
+# state lives in the named volumes pgdata (database) and appdata (AMUL/STM/overlay/RAG files).
+# Use ./bin/jarvisctl rather than calling compose directly.
+
+name: jarvis-ledger
+
+x-common: &common
+  restart: unless-stopped
+  security_opt: ["no-new-privileges:true"]
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "5" }
+
+x-app-hardening: &app-hardening
+  user: "10001:10001"
+  read_only: true
+  tmpfs: ["/tmp"]
+  cap_drop: ["ALL"]
+
+services:
+  db:
+    <<: *common
+    build:
+      context: ./db
+    image: jarvis-ledger-db:16
+    container_name: jarvis-db
+    env_file: ./secrets/db.env            # POSTGRES_PASSWORD + the two role passwords (first init only)
+    environment:
+      POSTGRES_DB: jarvis
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    command: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
+    cap_drop: ["ALL"]
+    cap_add: ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"]
+    shm_size: 128mb
+    stop_grace_period: 30s
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks: [ledger]
+    # deliberately no `ports:` - the database is reachable only from containers on the ledger network
+    healthcheck:
+      # TCP on purpose: during first initialisation the image runs a temporary server that listens on the
+      # unix socket only, and a socket check would call the database "healthy" before init has finished.
+      test: ["CMD-SHELL", "pg_isready -q -h 127.0.0.1 -U postgres -d jarvis"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+
+  migrate:
+    <<: [*common, *app-hardening]
+    build:
+      context: ../..
+      dockerfile: deploy/mint/app/Dockerfile
+    image: jarvis-ledger-app:local
+    container_name: jarvis-migrate
+    restart: "no"
+    env_file: ./secrets/migrate.env       # JARVIS_DATABASE_MIGRATE_URL (DDL role), schema, app role
+    command: ["python", "-m", "app.pg_migrate"]
+    depends_on:
+      db: { condition: service_healthy }
+    networks: [ledger]
+
+  app:
+    <<: [*common, *app-hardening]
+    image: jarvis-ledger-app:local
+    container_name: jarvis-app
+    env_file: ./secrets/app.env           # JARVIS_DATABASE_URL (ordinary role) + JARVIS_API_KEY
+    environment:
+      JARVIS_ENV: production
+      JARVIS_HOST: 0.0.0.0
+      JARVIS_DATABASE_SCHEMA: jarvis
+      JARVIS_PG_STORE: rows
+      # Private host: agents write through the REST API. MCP write tools stay off until you decide otherwise.
+      JARVIS_MEMORY_WRITE_ENABLED: "true"
+      JARVIS_MCP_WRITE_ENABLED: "false"
+      JARVIS_CORS_ORIGINS: "http://127.0.0.1:${JARVIS_APP_PORT:-8011},http://localhost:${JARVIS_APP_PORT:-8011}"
+      # Everything the app writes outside Postgres goes to the appdata volume (the image root is read-only).
+      JARVIS_STORE_PATH: /data/jarvis-store.json
+      JARVIS_AMUL_PATH: /data/amul-field.jsonl
+      JARVIS_AMUL_GC_PATH: /data/amul-checkpoints.jsonl
+      JARVIS_EMR_DYNAMICS_PATH: /data/emr-dynamics.json
+      JARVIS_RAG_DOCS_PATH: /data/amul-rag-docs.jsonl
+      JARVIS_RAG_LOG_PATH: /data/amul-rag-log.jsonl
+      JARVIS_LLM_LOG_PATH: /data/amul-llm-log.jsonl
+      JARVIS_EMR_EMBED_CACHE: /data/emr-embeddings.json
+      JARVIS_EMR_EMBED_MODEL_DIR: /data/emr-embed-model
+    ports:
+      # Loopback only. Reach it from other machines through an SSH tunnel. Default 8011 so it can run next to an
+      # older instance on 8001; change it in deploy/mint/.env (see .env.example).
+      - "127.0.0.1:${JARVIS_APP_PORT:-8011}:8001"
+    volumes:
+      - appdata:/data
+    depends_on:
+      db: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+    networks: [ledger]
+    stop_grace_period: 20s
+    healthcheck:
+      # /ready is the readiness probe: 503 unless the ledger can be served safely.
+      test: ["CMD", "python", "-c", "import sys, urllib.request as u; sys.exit(0 if u.urlopen('http://127.0.0.1:8001/ready', timeout=3).status == 200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 20s
+
+networks:
+  ledger: {}
+
+volumes:
+  pgdata: {}
+  appdata: {}
