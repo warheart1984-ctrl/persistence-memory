@@ -36,9 +36,12 @@ support client metadata documents or dynamic client registration.
 ## Writes and retention
 
 Set `JARVIS_DATABASE_URL` to the private Render PostgreSQL connection string
-before enabling OAuth. The application stores one JSONB Continuity Ledger
-document per OAuth tenant key; this preserves the ledger validation model while
-moving durability off the Render disk.
+before enabling OAuth. By default the application then stores one row per record
+per OAuth tenant key (`JARVIS_PG_STORE=rows`; row-level security, optimistic
+locking, append-only history — see `docs/POSTGRES.md`, including the cutover from
+the older one-JSONB-document-per-tenant store, which `render.yaml` keeps pinned
+with `JARVIS_PG_STORE=blob` until you migrate). This moves durability off the
+Render disk.
 
 Do not set `JARVIS_MEMORY_WRITE_ENABLED=true` or
 `JARVIS_MCP_WRITE_ENABLED=true` for the first public release. Before enabling

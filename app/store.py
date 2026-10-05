@@ -494,7 +494,7 @@ def get_store(path: str | None = None) -> JarvisStore:
     database_url = (os.getenv("JARVIS_DATABASE_URL") or "").strip()
     if database_url:
         database_tenant = tenant or "operator"
-        mode = (os.getenv("JARVIS_PG_STORE") or "blob").strip().lower()
+        mode = (os.getenv("JARVIS_PG_STORE") or "rows").strip().lower()
         if mode == "rows":
             schema = (os.getenv("JARVIS_DATABASE_SCHEMA") or "").strip() or None
             cache_key = f"postgres-rows:{schema or ''}:{database_tenant}"

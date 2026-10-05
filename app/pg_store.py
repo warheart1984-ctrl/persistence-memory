@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Iterator
 
 import psycopg
+from psycopg import sql
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
@@ -50,6 +51,7 @@ _COLUMNS = (
 
 _pools: dict[tuple[str, str], ConnectionPool] = {}
 _ready: set[tuple[str, str]] = set()
+_legacy_ok: set[tuple[tuple[str, str], str]] = set()
 _pools_lock = threading.Lock()
 
 
@@ -96,6 +98,7 @@ def close_pools() -> None:
         pools = list(_pools.values())
         _pools.clear()
         _ready.clear()
+        _legacy_ok.clear()
     for pool in pools:
         with contextlib.suppress(Exception):
             pool.close(timeout=2)
@@ -152,6 +155,9 @@ class PostgresRowStore:
                     check_schema_version(conn)
                     _require_rls_enforced(conn)
                     _ready.add(key)
+                if (key, self._tenant_key) not in _legacy_ok:
+                    _refuse_if_legacy_data_unimported(conn, self._tenant_key)
+                    _legacy_ok.add((key, self._tenant_key))
                 yield conn
         except StoreUnavailableError:
             raise
@@ -414,3 +420,47 @@ def _require_rls_enforced(conn: psycopg.Connection) -> None:
             "Connect as an ordinary role (JARVIS_DATABASE_URL); use JARVIS_DATABASE_MIGRATE_URL for DDL."
         )
         raise StoreUnavailableError("Ledger database role must not bypass row-level security")
+
+
+def _refuse_if_legacy_data_unimported(conn: psycopg.Connection, tenant: str) -> None:
+    """Fail closed rather than quietly serve an empty ledger next to an un-imported legacy one.
+
+    The older JSONB store kept one document per tenant in ``jarvis_tenant_ledgers``.  If that
+    tenant still has records there while the row store has none, someone switched stores without
+    importing; serving (and then writing to) an empty ledger would look like data loss.
+    Override with JARVIS_PG_IGNORE_LEGACY_BLOB=1.  A role that cannot read the old table is
+    skipped: there is nothing it could be protecting.
+    """
+    if os.getenv("JARVIS_PG_IGNORE_LEGACY_BLOB", "").strip().lower() in ("1", "true", "yes", "on"):
+        return
+    blob_schema = validate_schema_name((os.getenv("JARVIS_LEGACY_BLOB_SCHEMA") or "public").strip())
+    present = conn.execute(
+        "SELECT to_regclass(%s) IS NOT NULL AS present", (f"{blob_schema}.jarvis_tenant_ledgers",)
+    ).fetchone()["present"]
+    if not present:
+        return
+    try:
+        with conn.transaction():  # savepoint: a permission error must not poison the request's transaction
+            row = conn.execute(
+                sql.SQL(
+                    "SELECT coalesce(jsonb_array_length(CASE WHEN jsonb_typeof(payload->'memories') = 'array' "
+                    "THEN payload->'memories' END), 0) AS n FROM {}.jarvis_tenant_ledgers WHERE tenant_key = %s"
+                ).format(sql.Identifier(blob_schema)),
+                (tenant,),
+            ).fetchone()
+    except psycopg.errors.InsufficientPrivilege:
+        return
+    if row is None or row["n"] == 0:
+        return
+    populated = conn.execute(
+        "SELECT EXISTS (SELECT 1 FROM memories) OR EXISTS (SELECT 1 FROM record_history) AS populated"
+    ).fetchone()["populated"]
+    if populated:
+        return
+    _log.error(
+        "tenant has %s record(s) in the legacy jarvis_tenant_ledgers blob but the row store is empty; "
+        "import them (python -m app.pg_import --source-blob <tenant_key> --tenant <tenant_key> --apply), "
+        "set JARVIS_PG_STORE=blob to keep the old store, or set JARVIS_PG_IGNORE_LEGACY_BLOB=1",
+        row["n"],
+    )
+    raise StoreUnavailableError("Legacy blob ledger exists but the row store is empty; import it first")

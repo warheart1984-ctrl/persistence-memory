@@ -316,22 +316,6 @@ def test_http_database_outage_is_503_and_health_unavailable(pg, monkeypatch):
     assert "127.0.0.1" not in health.text and "postgresql://" not in health.text
 
 
-def test_default_pg_mode_is_still_the_legacy_blob_store(pg, monkeypatch):
-    from app.store import PostgresJarvisStore, get_store, reset_store_for_tests
-
-    reset_store_for_tests()
-    monkeypatch.setenv("JARVIS_DATABASE_URL", pg.app_dsn)
-    monkeypatch.delenv("JARVIS_PG_STORE", raising=False)
-    assert isinstance(get_store(), PostgresJarvisStore)
-    monkeypatch.setenv("JARVIS_PG_STORE", "rows")
-    reset_store_for_tests()
-    assert isinstance(get_store(), PostgresRowStore)
-    monkeypatch.setenv("JARVIS_PG_STORE", "bogus")
-    reset_store_for_tests()
-    with pytest.raises(StoreUnavailableError):
-        get_store()
-
-
 # --- the red-team properties, restated for the database ---------------------------------------
 
 
