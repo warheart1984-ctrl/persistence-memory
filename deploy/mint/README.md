@@ -36,22 +36,61 @@ Windows PC ──ssh -L──►  127.0.0.1:8011  ─►  app (non-root, read-on
 
 The hooks and the MCP stdio proxy have **no default address**. Without `JARVIS_MEMORYBOARD_URL` they refuse with a
 clear error, send nothing and never use the API key. (On the PC, port 8001 belongs to another program.) They send the
-key only over `https` or to `127.0.0.1`, so it cannot leak onto the LAN. You need current code in
-`G:\persistence-memory` for that.
+key only over `https` or to `127.0.0.1`, so it cannot leak onto the LAN. You need current code (`main`) for that, for
+example the clean clone `C:\Users\randj\persistence-memory-main`.
 
+**Set up permanently on the PC (verified 2026-10-05, including after a sign-out and sign-in):**
+
+* **A tunnel that starts at logon.** The scheduled task `JarvisTunnel` runs `ssh -N -L 127.0.0.1:8011:127.0.0.1:8011`
+  in a loop that retries every 10 seconds, so a killed or dropped tunnel is back in about 13 seconds. It listens on
+  the PC's loopback only.
+* **A dedicated tunnel key** (`~\.ssh\jarvis_tunnel_ed25519`). On the box it is restricted in
+  `~/.ssh/authorized_keys` to forwarding `127.0.0.1:8011` and nothing else: no shell, no commands.
+  ```
+  restrict,port-forwarding,permitopen="127.0.0.1:8011",command="/bin/false" ssh-ed25519 AAAA... jarvis-tunnel@pc
+  ```
+* **The box's host key is pinned** in `~\.ssh\jarvis_known_hosts` (`StrictHostKeyChecking=yes`). Check the fingerprint
+  against `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on the box before trusting it. On Windows,
+  `ssh-keyscan.exe` can hang; a plain `ssh` connection into a temporary `UserKnownHostsFile` captures the same key.
+* **User environment variables** `JARVIS_MEMORYBOARD_URL=http://127.0.0.1:8011` and
+  `JARVIS_API_KEY_FILE=C:\Users\randj\.jarvis-api-key`. The key file is readable only by that user and read-only on
+  purpose, so after `jarvisctl rotate api-key` delete it before copying the new one:
+  ```powershell
+  scp jon@192.168.1.102:jarvis-ledger-src/deploy/mint/secrets/api-key $HOME\.jarvis-api-key
+  icacls $HOME\.jarvis-api-key /inheritance:r /grant:r "${env:USERNAME}:R"
+  ```
+
+Check it any time:
 ```powershell
-ssh -N -L 127.0.0.1:8011:127.0.0.1:8011 jon@192.168.1.102   # the tunnel; keep it open
-scp jon@192.168.1.102:jarvis-ledger-src/deploy/mint/secrets/api-key $HOME\.jarvis-api-key
-icacls $HOME\.jarvis-api-key /inheritance:r /grant:r "${env:USERNAME}:R"
-$env:JARVIS_MEMORYBOARD_URL = "http://127.0.0.1:8011"
-$env:JARVIS_API_KEY_FILE    = "$HOME\.jarvis-api-key"
-python agent-hooks\ping_memoryboard.py    # Health / Ready / memory count / "OK: service is live"
+Get-NetTCPConnection -LocalPort 8011 -State Listen          # the tunnel
+python $HOME\persistence-memory-main\agent-hooks\ping_memoryboard.py   # Health / Ready / memory count / "OK: service is live"
 ```
-
-The key file is read-only on purpose, so after `jarvisctl rotate api-key` delete it before copying the new one.
 `ping_memoryboard.py` asks for up to 200 records and says when the list is capped; the API pages at 50 by default.
-The variables above last for one PowerShell session. Making them permanent (user environment variables, a key file
-only you can read, a tunnel that starts at login) is **not done yet**.
+
+**Creating the task.** Do not nest double quotes inside `-Command "..."`: Windows splits the command line wrongly and
+PowerShell fails to parse it (the task then exits 1 without starting a tunnel). Use an encoded command:
+```powershell
+$loop = @'
+$a = @('-N','-L','127.0.0.1:8011:127.0.0.1:8011','-i',"$env:USERPROFILE\.ssh\jarvis_tunnel_ed25519",'-o','IdentitiesOnly=yes','-o','BatchMode=yes','-o','StrictHostKeyChecking=yes','-o',"UserKnownHostsFile=$env:USERPROFILE\.ssh\jarvis_known_hosts",'-o','ServerAliveInterval=15','-o','ServerAliveCountMax=3','-o','ExitOnForwardFailure=yes','jon@192.168.1.102')
+while ($true) { & "$env:SystemRoot\System32\OpenSSH\ssh.exe" @a; Start-Sleep -Seconds 10 }
+'@
+$enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($loop))
+$act = New-ScheduledTaskAction -Execute powershell.exe -Argument "-NoProfile -WindowStyle Hidden -EncodedCommand $enc"
+$trg = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+$set = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew
+Register-ScheduledTask -TaskName JarvisTunnel -Action $act -Trigger $trg -Settings $set -Principal (New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited) -Force
+```
+A console window may flash at logon. Only one process can hold port 8011, so close any manual `ssh -L 8011:...` first.
+
+**Undoing it.**
+```powershell
+Stop-ScheduledTask JarvisTunnel; Unregister-ScheduledTask JarvisTunnel -Confirm:$false
+Get-CimInstance Win32_Process -Filter "Name='ssh.exe'" | Where-Object { $_.CommandLine -match 'jarvis_tunnel_ed25519' } | ForEach-Object { Stop-Process -Id $_.ProcessId }
+[Environment]::SetEnvironmentVariable("JARVIS_MEMORYBOARD_URL",$null,"User")
+[Environment]::SetEnvironmentVariable("JARVIS_API_KEY_FILE",$null,"User")
+Remove-Item $HOME\.jarvis-api-key, $HOME\.ssh\jarvis_tunnel_ed25519*, $HOME\.ssh\jarvis_known_hosts
+```
+and on the box remove the tunnel key's line: `sed -i '/jarvis-tunnel@pc/d' ~/.ssh/authorized_keys`.
 
 ## Day to day
 
