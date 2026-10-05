@@ -32,7 +32,7 @@ if command -v ss >/dev/null 2>&1; then
   # Any listener on 5432 may belong to something else on the host (e.g. a native PostgreSQL); what matters is that
   # none of OUR containers publishes it.
   [ -z "$(docker ps -q --filter publish=5432)" ] && pass "no container publishes 5432" || fail "a container publishes 5432"
-  other="$(echo "$listeners" | grep -E '(^|:)5432$' | tr '\n' ' ')"
+  other="$(echo "$listeners" | grep -E '(^|:)5432$' | tr '\n' ' ' || true)"
   [ -z "$other" ] || note "something that is not this stack listens on $other"
   if echo "$listeners" | grep -E ":$APP_PORT\$" | grep -vq '^127\.0\.0\.1:'; then fail "port $APP_PORT is open beyond loopback"; else pass "port $APP_PORT only on loopback"; fi
 fi
