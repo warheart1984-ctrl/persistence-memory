@@ -27,7 +27,7 @@ $body = @{
   evidence = @(@{ kind = "doc"; ref = "path/or/url"; note = "accepted design" })
 } | ConvertTo-Json -Depth 5
 
-Invoke-RestMethod http://127.0.0.1:8001/api/jarvis/memory -Method POST -Body $body -ContentType "application/json"
+Invoke-RestMethod http://127.0.0.1:8011/api/jarvis/memory -Method POST -Body $body -ContentType "application/json"
 ```
 
 3. Record `id` and `content_sha256` from the response into an operator log

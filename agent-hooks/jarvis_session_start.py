@@ -10,6 +10,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from jarvis_common import (  # noqa: E402
+    NO_BASE_URL_MESSAGE,
+    configured_base_url,
     emit,
     format_live_context,
     read_stdin_json,
@@ -32,6 +34,17 @@ def main() -> int:
         session_meta_path().write_text(json.dumps(meta, indent=2), encoding="utf-8")
     except OSError:
         pass
+
+    if configured_base_url() is None:
+        # Fail closed: no URL, no request, no key. Say so clearly instead of guessing an address.
+        print(f"jarvis hook: {NO_BASE_URL_MESSAGE}", file=sys.stderr)
+        emit(
+            {
+                "additional_context": format_live_context(None, [], error=NO_BASE_URL_MESSAGE),
+                "env": {"JARVIS_SESSION_ID": str(session_id)},
+            }
+        )
+        return 0
 
     board, board_err = try_http_json("GET", "/api/jarvis/memory/board")
     # Prefer retrieve envelope (provenance + conflicts). Fall back to list.
@@ -68,10 +81,7 @@ def main() -> int:
     out = {
         "additional_context": context,
         "env": {
-            "JARVIS_MEMORYBOARD_URL": (
-                __import__("os").environ.get("JARVIS_MEMORYBOARD_URL")
-                or "http://127.0.0.1:8001"
-            ),
+            "JARVIS_MEMORYBOARD_URL": configured_base_url(),
             "JARVIS_SESSION_ID": str(session_id),
         },
     }

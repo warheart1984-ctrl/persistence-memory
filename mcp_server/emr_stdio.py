@@ -13,6 +13,7 @@ import json
 import os
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any
 
@@ -24,7 +25,11 @@ from mcp_server.protocol import (
     dispatch_rpc,
 )
 
-DEFAULT_BASE_URL = "http://127.0.0.1:8001"
+NO_BASE_URL_MESSAGE = (
+    "JARVIS_MEMORYBOARD_URL is not set. Set it to the ledger you mean, for example "
+    "http://127.0.0.1:8011 through an SSH tunnel. There is no default address, so nothing is sent "
+    "(and the API key is never sent) until you choose one."
+)
 
 __all__ = [
     "EMR_RECALL_TOOL",
@@ -39,7 +44,10 @@ __all__ = [
 
 
 def base_url() -> str:
-    return os.environ.get("JARVIS_MEMORYBOARD_URL", DEFAULT_BASE_URL).rstrip("/")
+    url = (os.environ.get("JARVIS_MEMORYBOARD_URL") or "").strip().rstrip("/")
+    if not url:
+        raise RuntimeError(NO_BASE_URL_MESSAGE)
+    return url
 
 
 def _send(message: dict[str, Any]) -> None:
@@ -49,6 +57,7 @@ def _send(message: dict[str, Any]) -> None:
 
 def _http_post(path: str, arguments: dict[str, Any]) -> dict[str, Any]:
     url = f"{base_url()}{path}"
+    parsed = urllib.parse.urlparse(url)
     payload = json.dumps(arguments).encode("utf-8")
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
     # Server accepts EMR_RECALL_API_KEY when set, else JARVIS_API_KEY.
@@ -57,6 +66,11 @@ def _http_post(path: str, arguments: dict[str, Any]) -> dict[str, Any]:
         or (os.environ.get("JARVIS_API_KEY") or "").strip()
     )
     if api_key:
+        if parsed.scheme != "https" and (parsed.hostname or "") not in ("127.0.0.1", "localhost", "::1"):
+            raise RuntimeError(
+                "refusing to send the API key over plain http to a non-loopback host; "
+                "use https or an SSH tunnel to 127.0.0.1"
+            )
         headers["Authorization"] = f"Bearer {api_key}"
     req = urllib.request.Request(
         url,
@@ -73,7 +87,7 @@ def _http_post(path: str, arguments: dict[str, Any]) -> dict[str, Any]:
     except urllib.error.URLError as exc:
         raise RuntimeError(
             f"memoryboard unreachable at {base_url()}: {exc.reason}. "
-            "Start jarvis-memoryboard (uvicorn app.main:app --port 8001)."
+            "Check that the ledger is running and that the SSH tunnel (if you use one) is up."
         ) from exc
 
     return json.loads(body)

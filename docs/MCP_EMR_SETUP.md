@@ -7,10 +7,10 @@ Expose the Jarvis **EMR Protocol** to assistant hosts
 
 | Capability | Tag | When it works | Evidence |
 |------------|-----|---------------|----------|
-| `POST /api/jarvis/tools/emr_recall` on loopback | **live** | Memoryboard running on `127.0.0.1:8001` | `tests/test_emr_tool.py`, `tests/test_emr_mcp.py` |
+| `POST /api/jarvis/tools/emr_recall` on loopback | **live** | Memoryboard running on `127.0.0.1:8011` | `tests/test_emr_tool.py`, `tests/test_emr_mcp.py` |
 | `search` / `fetch` (OpenAI company knowledge) | **live** | Same auth as recall (`EMR_RECALL_API_KEY` when set) | `tests/test_emr_research.py` |
 | `emr_remember` / `emr_upsert` tool endpoints | **partial** | `JARVIS_MCP_WRITE_ENABLED=true` + `user_requested=true` | `tests/test_emr_write.py`, `tests/test_emr_mcp*.py` |
-| MCP stdio adapter (`python -m mcp_server`) | **live** | Same host as memoryboard; stdio process can reach `:8001` | `tests/test_emr_mcp.py` |
+| MCP stdio adapter (`python -m mcp_server`) | **live** | Same host as memoryboard; stdio process can reach the ledger at `JARVIS_MEMORYBOARD_URL` | `tests/test_emr_mcp.py` |
 | Cursor / OpenCode local MCP wiring | **live** (operator) | Host config points `cwd` at `jarvis-memoryboard` + memoryboard up | `config/mcp-cursor.example.json` |
 | Render public `POST /mcp` (Streamable HTTP) | **live** | Render deploy with `EMR_RECALL_API_KEY` | `mcp_server/mcp_http.py`, `docs/DEPLOY_RENDER.md` |
 | ChatGPT remote MCP write tools | **declared** / operator | Requires `JARVIS_MCP_WRITE_ENABLED=true` (off on Render by default) + host `requireApproval` | `app/emr_write.py` |
@@ -75,14 +75,14 @@ Run manually to verify:
 
 ```bash
 cd jarvis-memoryboard
-JARVIS_MEMORYBOARD_URL=http://127.0.0.1:8001 python -m mcp_server
+JARVIS_MEMORYBOARD_URL=http://127.0.0.1:8011 python -m mcp_server
 ```
 
 Environment:
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `JARVIS_MEMORYBOARD_URL` | `http://127.0.0.1:8001` | Memoryboard base URL |
+| `JARVIS_MEMORYBOARD_URL` | `http://127.0.0.1:8011` | Memoryboard base URL |
 | `EMR_RECALL_API_KEY` | — | Operator key when memoryboard requires auth (Render, protected local) |
 | `JARVIS_LEDGER_CITATION_BASE` | — | Optional HTTPS base for `search`/`fetch` citation URLs (default `ledger://{id}`) |
 | `JARVIS_MCP_WRITE_ENABLED` | `false` | Enable `emr_remember` / `emr_upsert` |
@@ -142,7 +142,7 @@ MCP annotations: `readOnlyHint: true`, no approval required for search/fetch.
 Example REST search:
 
 ```bash
-curl -sX POST http://127.0.0.1:8001/api/jarvis/tools/search \
+curl -sX POST http://127.0.0.1:8011/api/jarvis/tools/search \
   -H "Content-Type: application/json" \
   -d '{"query": "image generation preferences Halstead signature"}'
 ```
@@ -150,7 +150,7 @@ curl -sX POST http://127.0.0.1:8001/api/jarvis/tools/search \
 Example REST fetch:
 
 ```bash
-curl -sX POST http://127.0.0.1:8001/api/jarvis/tools/fetch \
+curl -sX POST http://127.0.0.1:8011/api/jarvis/tools/fetch \
   -H "Content-Type: application/json" \
   -d '{"id": "mem-abc123"}'
 ```
@@ -172,7 +172,7 @@ Add to your Cursor MCP config (`~/.cursor/mcp.json` or project `.cursor/mcp.json
       "args": ["-m", "mcp_server"],
       "cwd": "/absolute/path/to/jarvis-memoryboard",
       "env": {
-        "JARVIS_MEMORYBOARD_URL": "http://127.0.0.1:8001"
+        "JARVIS_MEMORYBOARD_URL": "http://127.0.0.1:8011"
       }
     }
   }
@@ -199,7 +199,7 @@ configured; EMR uses stdio because the memoryboard is local):
         "args": ["-m", "mcp_server"],
         "cwd": "jarvis-memoryboard",
         "env": {
-          "JARVIS_MEMORYBOARD_URL": "http://127.0.0.1:8001"
+          "JARVIS_MEMORYBOARD_URL": "http://127.0.0.1:8011"
         }
       }
     }
@@ -220,7 +220,7 @@ OpenAI docs: [MCP and Connectors](https://platform.openai.com/docs/mcp) ·
 
 | Path | When to use | Endpoint |
 |------|-------------|----------|
-| **Local stdio** | Cursor, OpenCode, Claude Desktop on your machine | `python -m mcp_server` → loopback `:8001` |
+| **Local stdio** | Cursor, OpenCode, Claude Desktop on your machine | `python -m mcp_server` → the ledger at `JARVIS_MEMORYBOARD_URL` (required; no default) |
 | **Public Render `/mcp`** | ChatGPT/Codex/Responses API; ledger can be on Render Disk | `https://YOUR-SERVICE.onrender.com/mcp` |
 | **Secure MCP Tunnel** | Memoryboard must stay **private** (localhost, LAN, no public ingress) | OpenAI-hosted tunnel → `tunnel-client` on your host |
 
@@ -269,7 +269,7 @@ ChatGPT / Responses API
 OpenAI tunnel control plane (tunnel_id)
         │  long-poll (outbound from your network)
         ▼
-tunnel-client  ──stdio or HTTP──►  MCP emr_recall  ──►  memoryboard :8001
+tunnel-client  ──stdio or HTTP──►  MCP emr_recall  ──►  memoryboard (`JARVIS_MEMORYBOARD_URL`)
 ```
 
 **Download:** [openai/tunnel-client releases](https://github.com/openai/tunnel-client/releases)
@@ -304,7 +304,7 @@ Terminal 2 — tunnel-client (keep running):
 ```bash
 cd jarvis-memoryboard   # same repo; needs pip install -e ".[dev]"
 export CONTROL_PLANE_API_KEY="sk-..."   # runtime API key for tunnel-client
-export JARVIS_MEMORYBOARD_URL="http://127.0.0.1:8001"
+export JARVIS_MEMORYBOARD_URL="http://127.0.0.1:8011"
 # export EMR_RECALL_API_KEY="..."       # only if local memoryboard requires it
 
 tunnel-client init \
@@ -332,7 +332,7 @@ tunnel-client init \
   --sample sample_mcp_stdio_local \
   --profile jarvis-emr-http \
   --tunnel-id tunnel_XXXX \
-  --mcp-server-url "http://127.0.0.1:8001/mcp"
+  --mcp-server-url "http://127.0.0.1:8011/mcp"
 ```
 
 If `EMR_RECALL_API_KEY` is set, configure tunnel-client / Harpoon MCP-side auth
@@ -397,7 +397,7 @@ Platform tunnel settings instead of `server_url`.
 Agents that support OpenAI function calling can call the REST API directly:
 
 ```bash
-curl -sX POST http://127.0.0.1:8001/api/jarvis/tools/emr_recall \
+curl -sX POST http://127.0.0.1:8011/api/jarvis/tools/emr_recall \
   -H "Content-Type: application/json" \
   -d '{
     "intent": "image_generation",
@@ -410,7 +410,7 @@ curl -sX POST http://127.0.0.1:8001/api/jarvis/tools/emr_recall \
 Tool catalog:
 
 ```bash
-curl -s http://127.0.0.1:8001/api/jarvis/tools
+curl -s http://127.0.0.1:8011/api/jarvis/tools
 ```
 
 ---

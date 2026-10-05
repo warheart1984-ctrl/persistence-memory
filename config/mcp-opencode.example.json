@@ -7,7 +7,7 @@
         "args": ["-m", "mcp_server"],
         "cwd": ".",
         "env": {
-          "JARVIS_MEMORYBOARD_URL": "http://127.0.0.1:8001"
+          "JARVIS_MEMORYBOARD_URL": "http://127.0.0.1:8011"
         }
       }
     }

@@ -5,7 +5,7 @@ alwaysApply: true
 
 # Jarvis Continuity Ledger (cross-chat)
 
-Shared continuity substrate at `http://localhost:8001` (or `JARVIS_MEMORYBOARD_URL`).
+Shared continuity substrate at `http://localhost:8011` (or `JARVIS_MEMORYBOARD_URL`).
 **Continuity unifies evidence, not domains** (see `jarvis-memoryboard/docs/CONSTITUTIONAL_BOUNDARY_CLAUSE.md` — declared).
 Store **decisions/evidence**, not chats. Ledger preserves continuity; it does not adjudicate truth.
 

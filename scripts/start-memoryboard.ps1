@@ -1,12 +1,13 @@
 <#
 .SYNOPSIS
-  Start Continuity Ledger on port 8001 (idempotent).
+  Start a local Continuity Ledger on the port in JARVIS_PORT (idempotent). There is no default port.
 #>
 
 $ErrorActionPreference = "Stop"
 
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
-$Port = if ($env:JARVIS_PORT) { $env:JARVIS_PORT } else { "8001" }
+if (-not $env:JARVIS_PORT) { throw "JARVIS_PORT is not set. Choose the port for this local ledger (it must not clash with another service)." }
+$Port = $env:JARVIS_PORT
 $HostBind = if ($env:JARVIS_HOST) { $env:JARVIS_HOST } else { "127.0.0.1" }
 $Base = if ($env:JARVIS_MEMORYBOARD_URL) { $env:JARVIS_MEMORYBOARD_URL.TrimEnd("/") } else { "http://127.0.0.1:$Port" }
 $LogDir = Join-Path $Root "data"

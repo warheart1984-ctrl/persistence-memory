@@ -22,20 +22,23 @@ def _load(name: str):
 
 class _Recorder(BaseHTTPRequestHandler):
     seen: list[dict] = []
+    cap = False
 
     def log_message(self, *args):  # silence
         pass
 
     def do_GET(self):
         type(self).seen.append({"path": self.path, "key": self.headers.get("X-API-Key")})
+        route = self.path.split("?", 1)[0]
+        many = [{"id": f"mem-{i}", "content": f"memory {i}"} for i in range(200)]
         routes = {
             "/health": {"status": "ok", "live": True},
             "/ready": {"status": "ready", "checks": {"store": "ok"}},
-            "/api/jarvis/memory": {"memories": [{"id": "mem-1", "content": "hello from the ledger"}]},
+            "/api/jarvis/memory": {"memories": many if "limit=200" in self.path and type(self).cap else [{"id": "mem-1", "content": "hello from the ledger"}]},
             "/api/jarvis/memory/board": {"memory_board": {"summary": "a board"}},
         }
-        body = json.dumps(routes.get(self.path, {})).encode()
-        self.send_response(200 if self.path in routes else 404)
+        body = json.dumps(routes.get(route, {})).encode()
+        self.send_response(200 if route in routes else 404)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -45,6 +48,7 @@ class _Recorder(BaseHTTPRequestHandler):
 @pytest.fixture
 def server(monkeypatch):
     _Recorder.seen = []
+    _Recorder.cap = False
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), _Recorder)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     monkeypatch.setenv("JARVIS_MEMORYBOARD_URL", f"http://127.0.0.1:{httpd.server_address[1]}")
@@ -151,3 +155,103 @@ def test_ping_script_works_with_the_current_health_shape_and_sends_the_key(serve
     out = capsys.readouterr().out
     assert "Health: ok" in out and "OK: service is live" in out and "Memories stored: 1" in out
     assert {s["key"] for s in server.seen if s["path"].startswith("/api/")} == {"ping-key"}
+
+
+# --- fail closed: no URL, no request, no key ---------------------------------------------------------------
+
+@pytest.fixture
+def no_url(monkeypatch):
+    for var in ("JARVIS_MEMORYBOARD_URL", "DIRECTOR_MEMORYBOARD_BASE_URL"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("JARVIS_API_KEY", "must-not-leak")
+
+
+def _no_network(common, monkeypatch):
+    attempted = []
+
+    def boom(*args, **kwargs):
+        attempted.append(True)
+        raise OSError("network is off in this test")
+
+    monkeypatch.setattr(common.urllib.request, "urlopen", boom)
+    return attempted
+
+
+def test_without_a_url_the_hooks_refuse_and_send_nothing(no_url, monkeypatch):
+    common = _load("jarvis_common")
+    attempted = _no_network(common, monkeypatch)
+    with pytest.raises(common.BaseURLNotSet, match="JARVIS_MEMORYBOARD_URL is not set"):
+        common.http_json("GET", "/health")
+    payload, error = common.try_http_json("GET", "/health")
+    assert payload is None and "JARVIS_MEMORYBOARD_URL is not set" in error and "must-not-leak" not in error
+    assert attempted == []
+
+
+def test_there_is_no_default_address_left_in_the_hooks():
+    for path in _HOOKS.glob("*.py"):
+        text = path.read_text("utf-8")
+        assert "127.0.0.1:8001" not in text and "DEFAULT_BASE" not in text, path.name
+
+
+def test_a_blank_url_counts_as_not_set(no_url, monkeypatch):
+    common = _load("jarvis_common")
+    monkeypatch.setenv("JARVIS_MEMORYBOARD_URL", "   ")
+    with pytest.raises(common.BaseURLNotSet):
+        common.base_url()
+
+
+def test_session_start_without_a_url_says_why_and_makes_no_request(no_url, monkeypatch, capsys):
+    start = _load("jarvis_session_start")
+    import sys
+
+    common = sys.modules["jarvis_common"]
+    attempted = _no_network(common, monkeypatch)
+    monkeypatch.setattr(start, "read_stdin_json", lambda: {"session_id": "s1"})
+    monkeypatch.setattr(start, "session_meta_path", lambda: Path("/nonexistent/x/meta.json"))
+    assert start.main() == 0
+    out, err = capsys.readouterr()
+    payload = json.loads(out)
+    assert "JARVIS_MEMORYBOARD_URL is not set" in payload["additional_context"]
+    assert "JARVIS_MEMORYBOARD_URL" not in payload["env"]  # never invents an address
+    assert "JARVIS_MEMORYBOARD_URL is not set" in err and "must-not-leak" not in out + err
+    assert attempted == []
+
+
+def test_ping_without_a_url_exits_with_a_clear_error(no_url):
+    import subprocess
+    import sys
+
+    env = {k: v for k, v in __import__("os").environ.items() if k not in ("JARVIS_MEMORYBOARD_URL", "DIRECTOR_MEMORYBOARD_BASE_URL")}
+    env["JARVIS_API_KEY"] = "must-not-leak"
+    run = subprocess.run([sys.executable, str(_HOOKS / "ping_memoryboard.py")], env=env, capture_output=True, text=True, timeout=30)
+    assert run.returncode == 2
+    assert "JARVIS_MEMORYBOARD_URL is not set" in run.stderr and "must-not-leak" not in run.stdout + run.stderr
+
+
+# --- ping_memoryboard: asks for 200 and says when the list is capped ----------------------------------------
+
+def _run_ping(capsys):
+    import sys
+
+    spec = importlib.util.spec_from_file_location("hooks_ping", _HOOKS / "ping_memoryboard.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.path.insert(0, str(_HOOKS))
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.path.remove(str(_HOOKS))
+    module.main()
+    return capsys.readouterr().out
+
+
+def test_ping_asks_for_the_largest_page(server, capsys):
+    out = _run_ping(capsys)
+    assert any(s["path"] == "/api/jarvis/memory?limit=200" for s in server.seen)
+    assert "Memories stored: 1" in out and "capped" not in out
+
+
+def test_ping_says_when_the_count_is_capped(server, capsys):
+    server.cap = True
+    out = _run_ping(capsys)
+    assert "Memories shown: 200 (capped at 200; the ledger may hold more)" in out
+    assert "Memories stored" not in out

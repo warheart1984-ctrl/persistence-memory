@@ -11,18 +11,37 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-DEFAULT_BASE = "http://127.0.0.1:8001"
 TIMEOUT_SEC = 4.0
 MAX_CONTEXT_CHARS = 12000
 MAX_MEMORY_CONTENT = 1900  # API limit is 2000
 
 
-def base_url() -> str:
-    return (
+class BaseURLNotSet(RuntimeError):
+    """No ledger URL was configured. There is deliberately no default."""
+
+
+NO_BASE_URL_MESSAGE = (
+    "JARVIS_MEMORYBOARD_URL is not set. Set it to the ledger you mean, for example "
+    "http://127.0.0.1:8011 through an SSH tunnel. There is no default address, so nothing is sent "
+    "(and the API key is never sent) until you choose one."
+)
+
+
+def configured_base_url() -> str | None:
+    """The explicitly configured ledger URL, or None. Never guesses."""
+    url = (
         os.environ.get("JARVIS_MEMORYBOARD_URL")
         or os.environ.get("DIRECTOR_MEMORYBOARD_BASE_URL")
-        or DEFAULT_BASE
-    ).rstrip("/")
+        or ""
+    ).strip()
+    return url.rstrip("/") or None
+
+
+def base_url() -> str:
+    url = configured_base_url()
+    if url is None:
+        raise BaseURLNotSet(NO_BASE_URL_MESSAGE)
+    return url
 
 
 def api_key() -> str | None:
@@ -147,17 +166,14 @@ def format_live_context(
         "Evidence-backed decisions/facts (not chat dumps). Consumers decide independently.",
         "Prefer POST type=decision with evidence + session_id; resolve conflicts via supersedes/status.",
         "",
-        f"Base URL: `{base_url()}`",
+        f"Base URL: `{configured_base_url() or '(not set)'}`",
         "",
     ]
     if error:
-        lines.extend(
-            [
-                f"**Service unavailable:** {error}",
-                "Start it with: `jarvis-memoryboard/scripts/start-memoryboard.ps1`",
-                "",
-            ]
-        )
+        lines.append(f"**Service unavailable:** {error}")
+        if configured_base_url() is not None:
+            lines.append("Check that the ledger is running and that the SSH tunnel (if you use one) is up.")
+        lines.append("")
         return "\n".join(lines)
 
     board_obj = (board or {}).get("memory_board") or board or {}

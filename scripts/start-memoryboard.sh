@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start Continuity Ledger on loopback :8001 with local MCP writes enabled.
+# Start a local Continuity Ledger on loopback, on the port in JARVIS_PORT (no default), with local MCP writes enabled.
 # Writes (emr_remember / emr_upsert) are gated in the uvicorn process — NOT the stdio MCP proxy.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -14,6 +14,6 @@ fi
 
 export JARVIS_MCP_WRITE_ENABLED="${JARVIS_MCP_WRITE_ENABLED:-true}"
 HOST="${JARVIS_HOST:-127.0.0.1}"
-PORT="${JARVIS_PORT:-8001}"
+PORT="${JARVIS_PORT:?JARVIS_PORT is not set; choose the port for this local ledger}"
 
 exec uvicorn app.main:app --host "$HOST" --port "$PORT" "$@"
