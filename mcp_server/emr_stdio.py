@@ -15,6 +15,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 from typing import Any
 
 from mcp_server.protocol import (
@@ -55,23 +56,47 @@ def _send(message: dict[str, Any]) -> None:
     sys.stdout.flush()
 
 
+def api_key() -> str:
+    """The ledger API key, or "" when none is configured.
+
+    Order: EMR_RECALL_API_KEY, JARVIS_API_KEY, then the first line of the file named by JARVIS_API_KEY_FILE.
+    A file that is NAMED but missing, unreadable or empty is an error, whatever else is set: the operator pointed
+    at a credential that is not there, so nothing is sent (no request, no key, no empty key). A blank
+    JARVIS_API_KEY_FILE counts as not named.
+    """
+    path = (os.environ.get("JARVIS_API_KEY_FILE") or "").strip()
+    from_file = ""
+    if path:
+        try:
+            lines = Path(path).read_text(encoding="utf-8").strip().splitlines()
+        except OSError:
+            lines = []
+        from_file = lines[0].strip() if lines else ""
+        if not from_file:
+            raise RuntimeError(
+                f"JARVIS_API_KEY_FILE names {path!r}, which is missing, unreadable or empty. Nothing was sent."
+            )
+    return (
+        (os.environ.get("EMR_RECALL_API_KEY") or "").strip()
+        or (os.environ.get("JARVIS_API_KEY") or "").strip()
+        or from_file
+    )
+
+
 def _http_post(path: str, arguments: dict[str, Any]) -> dict[str, Any]:
     url = f"{base_url()}{path}"
     parsed = urllib.parse.urlparse(url)
     payload = json.dumps(arguments).encode("utf-8")
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
-    # Server accepts EMR_RECALL_API_KEY when set, else JARVIS_API_KEY.
-    api_key = (
-        (os.environ.get("EMR_RECALL_API_KEY") or "").strip()
-        or (os.environ.get("JARVIS_API_KEY") or "").strip()
-    )
-    if api_key:
+    # Server accepts EMR_RECALL_API_KEY when set, else JARVIS_API_KEY; the key may come from JARVIS_API_KEY_FILE.
+    key = api_key()
+    if key:
         if parsed.scheme != "https" and (parsed.hostname or "") not in ("127.0.0.1", "localhost", "::1"):
             raise RuntimeError(
                 "refusing to send the API key over plain http to a non-loopback host; "
                 "use https or an SSH tunnel to 127.0.0.1"
             )
-        headers["Authorization"] = f"Bearer {api_key}"
+        headers["Authorization"] = f"Bearer {key}"
     req = urllib.request.Request(
         url,
         data=payload,
@@ -83,6 +108,8 @@ def _http_post(path: str, arguments: dict[str, Any]) -> dict[str, Any]:
             body = resp.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
+        if key:
+            detail = detail.replace(key, "<key>")  # never echo the credential, even if the server does
         raise RuntimeError(f"memoryboard HTTP {exc.code}: {detail}") from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(
@@ -130,6 +157,11 @@ def handle_message(message: dict[str, Any]) -> bool:
 
 
 def run_stdio() -> None:
+    for check in (base_url, api_key):
+        try:
+            check()
+        except RuntimeError as exc:  # still serve: every tool call will report the same problem
+            print(f"jarvis EMR MCP: {exc}", file=sys.stderr, flush=True)
     for line in sys.stdin:
         if not line.strip():
             continue
