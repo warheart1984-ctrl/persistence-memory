@@ -1,0 +1,77 @@
+{
+  "RC.AIKI.v1": {
+    "algorithm": null,
+    "consumer": "AIKI",
+    "description": "AIKI reconstruction rules. Declared only: their semantics and owner are not in this repository (Constitutional Boundary Clause III keeps domain logic sovereign).",
+    "determinism": [],
+    "id": "RC.AIKI.v1",
+    "owner": null,
+    "schemas": [],
+    "status": "declared",
+    "version": 1
+  },
+  "RC.ARIS.v1": {
+    "algorithm": null,
+    "consumer": "ARIS",
+    "description": "ARIS reconstruction rules. Declared only: their semantics and owner are not in this repository (Constitutional Boundary Clause III keeps domain logic sovereign).",
+    "determinism": [],
+    "id": "RC.ARIS.v1",
+    "owner": null,
+    "schemas": [],
+    "status": "declared",
+    "version": 1
+  },
+  "RC.Ledger.v1": {
+    "algorithm": "ledger-state-at-seq/v1",
+    "consumer": "Continuity Ledger (this service)",
+    "description": "Rebuild the ledger's records and ordered events as of a history seq or a sealed block.",
+    "determinism": [
+      "no wall clock, no randomness, no network: the output depends only on the tenant's history entries up to at_seq",
+      "records are ordered by id, bytewise (UTF-8)",
+      "the state root hashes row_hash values; it never re-serializes JSON, so floats and key order cannot change it",
+      "the same input gives the same output after later writes, after sealing, and after a backup and restore"
+    ],
+    "id": "RC.Ledger.v1",
+    "owner": "persistence-memory",
+    "schemas": [
+      "RC.Ledger.v1.input.schema.json",
+      "RC.Ledger.v1.state.schema.json",
+      "RC.Ledger.v1.events.schema.json"
+    ],
+    "status": "implemented",
+    "version": 1
+  },
+  "RC.Lineage.v1": {
+    "algorithm": null,
+    "consumer": "Lineage",
+    "description": "Lineage reconstruction rules. Declared only: their semantics and owner are not in this repository (Constitutional Boundary Clause III keeps domain logic sovereign).",
+    "determinism": [],
+    "id": "RC.Lineage.v1",
+    "owner": null,
+    "schemas": [],
+    "status": "declared",
+    "version": 1
+  },
+  "RC.Mandala.v1": {
+    "algorithm": null,
+    "consumer": "Mandala",
+    "description": "Mandala reconstruction rules. Declared only: their semantics and owner are not in this repository (Constitutional Boundary Clause III keeps domain logic sovereign).",
+    "determinism": [],
+    "id": "RC.Mandala.v1",
+    "owner": null,
+    "schemas": [],
+    "status": "declared",
+    "version": 1
+  },
+  "RC.SX.v1": {
+    "algorithm": null,
+    "consumer": "Sovereign X",
+    "description": "Sovereign X reconstruction rules. Declared only: their semantics and owner are not in this repository (Constitutional Boundary Clause III keeps domain logic sovereign).",
+    "determinism": [],
+    "id": "RC.SX.v1",
+    "owner": null,
+    "schemas": [],
+    "status": "declared",
+    "version": 1
+  }
+}

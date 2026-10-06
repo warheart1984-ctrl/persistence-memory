@@ -1,0 +1,179 @@
+{
+  "$defs": {
+    "EvidenceStatus": {
+      "properties": {
+        "kind": {
+          "title": "Kind",
+          "type": "string"
+        },
+        "note": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Note"
+        },
+        "ref": {
+          "title": "Ref",
+          "type": "string"
+        },
+        "status": {
+          "description": "intact | missing | tampered (evidence objects) | not-checked (every other link kind)",
+          "title": "Status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "ref",
+        "status"
+      ],
+      "title": "EvidenceStatus",
+      "type": "object"
+    },
+    "ReplayEvent": {
+      "properties": {
+        "actor": {
+          "description": "the recorded authority: whoever the ledger recorded as making the change",
+          "title": "Actor",
+          "type": "string"
+        },
+        "after": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "After"
+        },
+        "before": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Before"
+        },
+        "changed_at": {
+          "title": "Changed At",
+          "type": "string"
+        },
+        "evidence": {
+          "items": {
+            "$ref": "#/$defs/EvidenceStatus"
+          },
+          "title": "Evidence",
+          "type": "array"
+        },
+        "memory_id": {
+          "title": "Memory Id",
+          "type": "string"
+        },
+        "op": {
+          "title": "Op",
+          "type": "string"
+        },
+        "prev_hash": {
+          "title": "Prev Hash",
+          "type": "string"
+        },
+        "row_hash": {
+          "title": "Row Hash",
+          "type": "string"
+        },
+        "seq": {
+          "title": "Seq",
+          "type": "integer"
+        },
+        "version": {
+          "title": "Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "seq",
+        "memory_id",
+        "op",
+        "version",
+        "actor",
+        "changed_at",
+        "prev_hash",
+        "row_hash",
+        "before",
+        "after",
+        "evidence"
+      ],
+      "title": "ReplayEvent",
+      "type": "object"
+    }
+  },
+  "properties": {
+    "contract": {
+      "default": "RC.Ledger.v1",
+      "title": "Contract",
+      "type": "string"
+    },
+    "contract_version": {
+      "default": 1,
+      "title": "Contract Version",
+      "type": "integer"
+    },
+    "events": {
+      "items": {
+        "$ref": "#/$defs/ReplayEvent"
+      },
+      "title": "Events",
+      "type": "array"
+    },
+    "from_seq": {
+      "title": "From Seq",
+      "type": "integer"
+    },
+    "history_seq": {
+      "title": "History Seq",
+      "type": "integer"
+    },
+    "next_from_seq": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "title": "Next From Seq"
+    },
+    "tenant": {
+      "title": "Tenant",
+      "type": "string"
+    },
+    "to_seq": {
+      "title": "To Seq",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "tenant",
+    "from_seq",
+    "to_seq",
+    "history_seq",
+    "events",
+    "next_from_seq"
+  ],
+  "title": "ReplayEvents",
+  "type": "object"
+}

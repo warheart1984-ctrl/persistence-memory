@@ -88,6 +88,7 @@ from app.refusal import DENIED, LEDGER_UNAVAILABLE, VERSION_CONFLICT, json_respo
 from app import clause_v
 from app.clause_v import ClauseVViolation
 from app import evidence as evidence_objects
+from app import replay as replay_contracts
 from app.evidence import EvidenceError, EvidenceObjectCreate, require_operator_write
 from app.store import StoreUnavailableError, StoreVersionConflict, get_store
 from app.graph import (
@@ -906,6 +907,44 @@ def get_block(height: int = PathParam(ge=1)):
     if block is None:
         raise HTTPException(status_code=404, detail="no such block")
     return {"block": block}
+
+
+# --- Replay Contracts (operator key only; PostgreSQL row store only) ---
+
+def _replay_call(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except NotImplementedError as exc:
+        raise HTTPException(status_code=501, detail=str(exc)) from exc
+    except replay_contracts.ReplayError as exc:
+        raise HTTPException(status_code=exc.status, detail=f"{exc.code}: {exc.message}") from exc
+
+
+@app.get("/api/jarvis/replay/contracts", dependencies=[Depends(require_operator_read)])
+def replay_contracts_registry():
+    """The registered Replay Contracts and their status (only RC.Ledger.v1 is implemented; the rest are declared)."""
+    return {"contracts": [spec.model_dump() for spec in replay_contracts.REGISTRY.values()]}
+
+
+@app.get("/api/jarvis/replay/state", dependencies=[Depends(require_operator_read)])
+def replay_state(
+    at_seq: int | None = Query(default=None, ge=0),
+    at_block: int | None = Query(default=None, ge=1),
+    after_id: str | None = Query(default=None, max_length=128),
+    limit: int = Query(default=200, ge=1, le=replay_contracts.MAX_PAGE),
+):
+    """RC.Ledger.v1: the ledger's records as of a history seq (or the end of a sealed block), with the state root."""
+    return _replay_call(get_store().replay_state, at_seq=at_seq, at_block=at_block, after_id=after_id, limit=limit).model_dump()
+
+
+@app.get("/api/jarvis/replay/events", dependencies=[Depends(require_operator_read)])
+def replay_events(
+    from_seq: int = Query(default=1, ge=1),
+    to_seq: int | None = Query(default=None, ge=1),
+    limit: int = Query(default=200, ge=1, le=replay_contracts.MAX_PAGE),
+):
+    """RC.Ledger.v1: the ordered history entries (what happened, in what order, under which recorded actor and evidence)."""
+    return _replay_call(get_store().replay_events, from_seq=from_seq, to_seq=to_seq, limit=limit).model_dump()
 
 
 @app.post("/api/jarvis/evidence", dependencies=[Depends(require_operator_write)])

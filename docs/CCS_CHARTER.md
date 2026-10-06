@@ -33,14 +33,14 @@ CCS is the intended **root continuity authority** for Mandala Rendering Software
 |-----------|---------|-------|
 | **Continuity Blocks** | Immutable batches / blocks of continuity events | **partial** — on the PostgreSQL row store (schema v6) contiguous ranges of the history are sealed into immutable, hash-chained blocks with an RFC 6962 Merkle root, verified by `pg_verify`, and every block hash is kept outside the database in the backup anchors; **not signed**, and the JSON store has no blocks (`CONTINUITY_BLOCKS.md`) |
 | **Evidence Objects** | Typed, signed evidence payloads | **partial** — hash-only objects linked by `kind: evidence-object`; **not signed** (`EVIDENCE_OBJECTS.md`) |
-| **Replay Contracts** | Registered reconstruction rules (RC.*) | **declared** — stubs under `schemas/rc/` |
+| **Replay Contracts** | Registered reconstruction rules (RC.*) | **partial** — `RC.Ledger.v1` (the ledger's own state and events as of a history seq or sealed block) is implemented on the PostgreSQL row store; the five domain contracts are **declared** only (`REPLAY_CONTRACTS.md`) |
 | **Provenance Chains** | Linked identity → intent → evidence → … → replay | **declared** — ledger has per-record provenance, not full chain |
 
 ---
 
 ## 2. Evidence Schema Registration (CES) — **declared**
 
-Each subsystem **should** register a CES with CCS. Stubs: `schemas/ces/`. Registry: `schemas/registry.json`.
+Each subsystem **should** register a CES with CCS. **No CES schema files exist in this repository** (earlier versions of this charter said `schemas/ces/` held stubs; it never did). The only evidence schemas the ledger knows are the two local ones in `EVIDENCE_OBJECTS.md`.
 
 | CES ID | Domain | Status |
 |--------|--------|--------|
@@ -50,21 +50,22 @@ Each subsystem **should** register a CES with CCS. Stubs: `schemas/ces/`. Regist
 | `CES.Lineage.Identity.v1` | Identity & Provenance | **declared** |
 | `CES.Mandala.Render.v1` | Rendering Evidence | **declared** |
 
-Required fields for each: see the matching JSON Schema stub (versioned IDs). Field lists are **declared stubs** pending formal CES ownership sign-off; they are not runtime-validated by the current ledger API.
+Field lists for these are not written down anywhere yet: they await formal CES ownership sign-off and are not validated by the ledger API.
 
 ---
 
-## 3. Replay Contract Registration (RC) — **declared**
+## 3. Replay Contract Registration (RC) — **partial**
 
 | RC ID | Consumer | Status |
 |-------|----------|--------|
+| `RC.Ledger.v1` | The Continuity Ledger itself: state and ordered events as of a seq or sealed block | **implemented** (row store) — `schemas/rc/RC.Ledger.v1.*.schema.json`, `app/replay.py` |
 | `RC.AIKI.v1` | AIKI reconstruction rules | **declared** |
 | `RC.ARIS.v1` | ARIS reconstruction rules | **declared** |
 | `RC.SX.v1` | Sovereign X / SX reconstruction | **declared** |
 | `RC.Lineage.v1` | Lineage reconstruction | **declared** |
 | `RC.Mandala.v1` | Mandala render/replay | **declared** |
 
-Stubs: `schemas/rc/`. Not executed by this service today.
+Only `RC.Ledger.v1` has files under `schemas/rc/` (generated from the code and checked by a test). **The five domain contracts have no stubs, no owner and no algorithm**; their semantics live in other products and Clause III keeps their replay logic sovereign, so this service does not execute them. Earlier versions of this charter claimed stubs for them in `schemas/rc/`; there were none.
 
 ---
 
@@ -98,8 +99,8 @@ Promotable toward “CCS as infrastructure” when:
 
 | # | Criterion | Current |
 |---|-----------|---------|
-| P1 | All CES.* registered (schemas + owners) | **gap** — stubs only |
-| P2 | All RC.* registered | **gap** — stubs only |
+| P1 | All CES.* registered (schemas + owners) | **gap** — no CES schema files exist; only the two local evidence schemas |
+| P2 | All RC.* registered | **gap** — `RC.Ledger.v1` is implemented; the five domain RCs are declared only (no schema, owner or algorithm) |
 | P3 | Replay deterministic across registered consumers | **gap** — ledger-only enforced |
 | P4 | Evidence chains validate (signatures / hashes end-to-end) | **gap** — hashes verify end-to-end for evidence objects (`pg_verify`); no signatures |
 | P5 | Provenance unifies across AIKI/ARIS/SX/Lineage/Mandala | **gap** — declared model only |

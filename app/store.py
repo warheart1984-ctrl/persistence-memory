@@ -470,6 +470,14 @@ class JarvisStore:
     def verify_blocks(self) -> list[dict[str, Any]]:
         raise NotImplementedError("Continuity Blocks require the PostgreSQL row store")
 
+    # -- Replay Contracts (PostgreSQL row store only) -------------------------------------------------
+
+    def replay_state(self, **kwargs: Any) -> Any:
+        raise NotImplementedError("Replay Contracts require the PostgreSQL row store")
+
+    def replay_events(self, **kwargs: Any) -> Any:
+        raise NotImplementedError("Replay Contracts require the PostgreSQL row store")
+
     def conflicts(self, subject: str | None = None) -> list[ConflictSet]:
         self._ensure_loaded()
         return detect_conflicts(list(self._memories.values()), subject=subject)

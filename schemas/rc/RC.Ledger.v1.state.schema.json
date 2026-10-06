@@ -1,0 +1,166 @@
+{
+  "$defs": {
+    "BlockRef": {
+      "properties": {
+        "block_hash": {
+          "title": "Block Hash",
+          "type": "string"
+        },
+        "first_seq": {
+          "title": "First Seq",
+          "type": "integer"
+        },
+        "height": {
+          "title": "Height",
+          "type": "integer"
+        },
+        "last_seq": {
+          "title": "Last Seq",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "height",
+        "first_seq",
+        "last_seq",
+        "block_hash"
+      ],
+      "title": "BlockRef",
+      "type": "object"
+    },
+    "ReplayedRecord": {
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "record": {
+          "additionalProperties": true,
+          "description": "the record exactly as that history entry stored it",
+          "title": "Record",
+          "type": "object"
+        },
+        "row_hash": {
+          "title": "Row Hash",
+          "type": "string"
+        },
+        "seq": {
+          "description": "seq of the history entry that is this record's state at at_seq",
+          "title": "Seq",
+          "type": "integer"
+        },
+        "version": {
+          "title": "Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "seq",
+        "version",
+        "row_hash",
+        "record"
+      ],
+      "title": "ReplayedRecord",
+      "type": "object"
+    }
+  },
+  "properties": {
+    "at_block_boundary": {
+      "description": "true when at_seq is the last entry of a sealed block",
+      "title": "At Block Boundary",
+      "type": "boolean"
+    },
+    "at_seq": {
+      "title": "At Seq",
+      "type": "integer"
+    },
+    "block": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/BlockRef"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "the sealed block that covers at_seq, if any"
+    },
+    "contract": {
+      "default": "RC.Ledger.v1",
+      "title": "Contract",
+      "type": "string"
+    },
+    "contract_version": {
+      "default": 1,
+      "title": "Contract Version",
+      "type": "integer"
+    },
+    "deleted_count": {
+      "title": "Deleted Count",
+      "type": "integer"
+    },
+    "history_seq": {
+      "description": "the tenant's history counter now",
+      "title": "History Seq",
+      "type": "integer"
+    },
+    "next_after_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "pass as after_id to get the next page; null on the last page",
+      "title": "Next After Id"
+    },
+    "record_count": {
+      "title": "Record Count",
+      "type": "integer"
+    },
+    "records": {
+      "items": {
+        "$ref": "#/$defs/ReplayedRecord"
+      },
+      "title": "Records",
+      "type": "array"
+    },
+    "sealed": {
+      "description": "true when at_seq is covered by a sealed block",
+      "title": "Sealed",
+      "type": "boolean"
+    },
+    "sealed_seq": {
+      "description": "the last seq covered by a sealed block",
+      "title": "Sealed Seq",
+      "type": "integer"
+    },
+    "state_root": {
+      "title": "State Root",
+      "type": "string"
+    },
+    "tenant": {
+      "title": "Tenant",
+      "type": "string"
+    }
+  },
+  "required": [
+    "tenant",
+    "at_seq",
+    "history_seq",
+    "sealed_seq",
+    "sealed",
+    "at_block_boundary",
+    "block",
+    "record_count",
+    "deleted_count",
+    "state_root",
+    "records",
+    "next_after_id"
+  ],
+  "title": "ReplayState",
+  "type": "object"
+}
