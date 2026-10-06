@@ -452,7 +452,249 @@ CREATE POLICY tenant_isolation ON evidence_objects
     WITH CHECK (tenant_key = current_setting('jarvis.tenant_key', true));
 """
 
-MIGRATIONS: list[tuple[int, str]] = [(1, _V1), (2, _V2), (3, _V3), (4, _V4), (5, _V5)]
+# --- v6: Continuity Blocks ---------------------------------------------------------------------------------------
+# Each verification check is a separate fragment so the tests can build a copy of the verifier WITHOUT one check
+# and prove that a given tamper is caught by that check (and only by it).  See tests/test_pg_blocks.py.
+_BLOCK_CHECKS: dict[str, str] = {
+    # a missing block: heights must run 1..max without a hole
+    "heights": """
+    SELECT max(k.height) INTO maxh FROM blocks k WHERE k.tenant_key = p_tenant;
+    IF maxh IS NOT NULL THEN
+        FOR gap IN
+            SELECT g AS n FROM generate_series(1::bigint, maxh) g
+            WHERE NOT EXISTS (SELECT 1 FROM blocks k WHERE k.tenant_key = p_tenant AND k.height = g)
+            LIMIT 100
+        LOOP
+            RETURN QUERY SELECT gap.n, 'missing block (a block was removed)'::text;
+        END LOOP;
+    END IF;
+""",
+    # each block must name the hash of the block before it (genesis: 64 zeros)
+    "link": """
+        IF b.prev_block_hash <> prev_hash THEN
+            RETURN QUERY SELECT b.height,
+                'prev_block_hash does not match the previous block (a block was removed, reordered or altered)'::text;
+        END IF;
+""",
+    # blocks must tile the history: no gap and no overlap between consecutive ranges
+    "tiling": """
+        IF b.first_seq <> prev_last + 1 THEN
+            RETURN QUERY SELECT b.height,
+                format('block does not continue the history (expected first_seq %s, found %s)', prev_last + 1, b.first_seq)::text;
+        END IF;
+""",
+    # a block can never reach past what the history counter says exists
+    "counter": """
+        IF ctr IS NULL OR b.last_seq > ctr THEN
+            RETURN QUERY SELECT b.height, 'block extends past the history counter (counter altered or history removed)'::text;
+        END IF;
+""",
+    # the range must still hold exactly the entries the block says it holds
+    "count": """
+        IF n <> b.entry_count OR b.entry_count <> b.last_seq - b.first_seq + 1 THEN
+            RETURN QUERY SELECT b.height,
+                format('entry count does not match the history in the block''s range (block says %s, found %s)', b.entry_count, n)::text;
+        END IF;
+""",
+    # the Merkle root must be reproducible from the entries' row hashes (an entry or the root was altered)
+    "root": """
+        IF root IS DISTINCT FROM b.entries_root THEN
+            RETURN QUERY SELECT b.height,
+                'entries_root does not match the history entries in the block''s range (an entry or the block was altered)'::text;
+        END IF;
+""",
+    # the block hash must be reproducible from the block's own fields
+    "hash": """
+        IF jarvis_block_hash(b.format, b.tenant_key, b.height, b.first_seq, b.last_seq, b.entry_count,
+                             b.prev_block_hash, b.entries_root) <> b.block_hash THEN
+            RETURN QUERY SELECT b.height, 'block_hash does not match the block''s contents (block was altered)'::text;
+        END IF;
+""",
+}
+_BLOCK_CHECK_ORDER = ("link", "tiling", "counter", "count", "root", "hash")
+
+
+def _v6(skip: frozenset[str] | set[str] = frozenset()) -> str:
+    """The v6 migration.  ``skip`` (tests only) leaves named checks out of jarvis_verify_blocks."""
+    unknown = set(skip) - set(_BLOCK_CHECKS)
+    if unknown:
+        raise ValueError(f"unknown block checks: {sorted(unknown)}")
+    pre = "" if "heights" in skip else _BLOCK_CHECKS["heights"]
+    loop = "".join(_BLOCK_CHECKS[name] for name in _BLOCK_CHECK_ORDER if name not in skip)
+    return _V6_HEAD + f"""
+CREATE FUNCTION jarvis_verify_blocks(p_tenant text)
+RETURNS TABLE (height bigint, problem text) LANGUAGE plpgsql AS $fn$
+DECLARE
+    b record; gap record; ctr bigint; maxh bigint; n bigint; leaves text[]; root text;
+    prev_hash text := repeat('0', 64); prev_last bigint := 0;
+BEGIN
+    SELECT c.last_seq INTO ctr FROM history_counters c WHERE c.tenant_key = p_tenant;
+{pre}
+    FOR b IN SELECT * FROM blocks k WHERE k.tenant_key = p_tenant ORDER BY k.height LOOP
+        SELECT count(*), array_agg(h.row_hash ORDER BY h.seq) INTO n, leaves
+        FROM record_history h WHERE h.tenant_key = p_tenant AND h.seq BETWEEN b.first_seq AND b.last_seq;
+        root := CASE WHEN n > 0 THEN jarvis_merkle_root(leaves) END;
+{loop}
+        prev_hash := b.block_hash; prev_last := b.last_seq;
+    END LOOP;
+END
+$fn$;
+"""
+
+
+_V6_HEAD = """
+-- Continuity Blocks: immutable seals over contiguous ranges of the per-tenant history (record_history.seq).
+-- A block stores no copy of the entries and nothing in the history tables changes: membership is the seq range,
+-- the Merkle root commits to the entries' row_hash values, and prev_block_hash chains block to block.
+CREATE TABLE blocks (
+    tenant_key      text        NOT NULL CHECK (tenant_key <> ''),
+    height          bigint      NOT NULL CHECK (height >= 1),
+    first_seq       bigint      NOT NULL CHECK (first_seq >= 1),
+    last_seq        bigint      NOT NULL,
+    entry_count     bigint      NOT NULL CHECK (entry_count >= 1),
+    prev_block_hash text        NOT NULL CHECK (prev_block_hash ~ '^[0-9a-f]{64}$'),
+    entries_root    text        NOT NULL CHECK (entries_root ~ '^[0-9a-f]{64}$'),
+    block_hash      text        NOT NULL CHECK (block_hash ~ '^[0-9a-f]{64}$'),
+    format          integer     NOT NULL CHECK (format = 1),
+    sealed_at       timestamptz NOT NULL DEFAULT now(),
+    sealed_by       text        NOT NULL CHECK (char_length(sealed_by) BETWEEN 1 AND 128),
+    PRIMARY KEY (tenant_key, height),
+    UNIQUE (tenant_key, first_seq),
+    CHECK (last_seq >= first_seq)
+);
+CREATE FUNCTION jarvis_blocks_immutable() RETURNS trigger LANGUAGE plpgsql AS $fn$
+BEGIN
+    RAISE EXCEPTION 'blocks is append-only';
+END
+$fn$;
+CREATE TRIGGER blocks_no_update BEFORE UPDATE ON blocks
+    FOR EACH ROW EXECUTE FUNCTION jarvis_blocks_immutable();
+CREATE TRIGGER blocks_no_delete BEFORE DELETE ON blocks
+    FOR EACH ROW EXECUTE FUNCTION jarvis_blocks_immutable();
+CREATE TRIGGER blocks_no_truncate BEFORE TRUNCATE ON blocks
+    FOR EACH STATEMENT EXECUTE FUNCTION jarvis_blocks_immutable();
+ALTER TABLE blocks ENABLE ROW LEVEL SECURITY;
+ALTER TABLE blocks FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON blocks
+    USING (tenant_key = current_setting('jarvis.tenant_key', true))
+    WITH CHECK (tenant_key = current_setting('jarvis.tenant_key', true));
+
+-- RFC 6962 Merkle tree hash over the entries' row_hash values (hex), in order.  Leaf = sha256(0x00 || raw hash),
+-- node = sha256(0x01 || left || right).  Pairing level by level and carrying an unpaired last node up unchanged
+-- gives exactly the RFC's tree (split at the largest power of two below n); app/blocks.py implements the
+-- RFC's recursive definition separately, and the tests compare the two.
+CREATE FUNCTION jarvis_merkle_root(leaves text[]) RETURNS text LANGUAGE plpgsql IMMUTABLE AS $fn$
+DECLARE
+    lvl bytea[]; nxt bytea[]; n integer; i integer;
+BEGIN
+    n := coalesce(array_length(leaves, 1), 0);
+    IF n = 0 THEN
+        RAISE EXCEPTION 'a block must contain at least one entry';
+    END IF;
+    FOR i IN 1..n LOOP
+        lvl[i] := sha256(decode('00', 'hex') || decode(leaves[i], 'hex'));
+    END LOOP;
+    WHILE n > 1 LOOP
+        nxt := ARRAY[]::bytea[];
+        FOR i IN 1..(n / 2) LOOP
+            nxt[i] := sha256(decode('01', 'hex') || lvl[2 * i - 1] || lvl[2 * i]);
+        END LOOP;
+        IF n % 2 = 1 THEN
+            nxt[n / 2 + 1] := lvl[n];
+        END IF;
+        lvl := nxt;
+        n := array_length(lvl, 1);
+    END LOOP;
+    RETURN encode(lvl[1], 'hex');
+END
+$fn$;
+
+CREATE FUNCTION jarvis_block_hash(fmt integer, tenant text, height bigint, first_seq bigint, last_seq bigint,
+                                  entry_count bigint, prev_block_hash text, entries_root text)
+RETURNS text LANGUAGE sql IMMUTABLE AS $fn$
+    SELECT encode(sha256(convert_to(
+        'jarvis-block|v' || fmt::text || '|' || octet_length(convert_to(tenant, 'UTF8'))::text || ':' || tenant || '|' ||
+        height::text || '|' || first_seq::text || '|' || last_seq::text || '|' || entry_count::text || '|' ||
+        prev_block_hash || '|' || entries_root, 'UTF8')), 'hex')
+$fn$;
+
+-- Seal the next block of the session tenant's history.  Runs as the table owner so the application role needs
+-- no write access to blocks: it can only ask for a seal, and the hashes are computed here, never supplied.
+-- Every write holds the tenant's counter row until it commits, so commit order is seq order: any counter value a
+-- seal can read is backed by committed entries 1..counter, whatever writers are doing, and nothing here blocks
+-- them.  Sealers are serialised by an advisory lock; READ COMMITTED makes the statements after that lock see the
+-- block the previous sealer just committed (under REPEATABLE READ they would not, and would collide on the height).
+CREATE FUNCTION jarvis_seal_block(
+    p_tenant text, p_min_entries integer DEFAULT 500, p_max_age interval DEFAULT interval '1 hour',
+    p_force boolean DEFAULT false, p_max_entries integer DEFAULT 10000)
+RETURNS TABLE (sealed boolean, height bigint, first_seq bigint, last_seq bigint, entry_count bigint,
+               block_hash text, reason text)
+LANGUAGE plpgsql SECURITY DEFINER SET search_path FROM CURRENT AS $fn$
+DECLARE
+    ctr bigint; bh bigint; bl bigint; bprev text; s bigint; e bigint; n bigint; have bigint;
+    leaves text[]; root text; hsh text; oldest timestamptz; act text;
+BEGIN
+    IF p_tenant IS NULL OR p_tenant = '' THEN
+        RAISE EXCEPTION 'jarvis_seal_block: a tenant is required';
+    END IF;
+    IF current_setting('jarvis.tenant_key', true) IS DISTINCT FROM p_tenant THEN
+        RAISE EXCEPTION 'jarvis_seal_block: tenant % is not the session tenant', p_tenant;
+    END IF;
+    IF current_setting('transaction_isolation') <> 'read committed' THEN
+        RAISE EXCEPTION 'jarvis_seal_block needs READ COMMITTED (it relies on seeing the previous sealer''s block once it holds the seal lock)';
+    END IF;
+    IF p_min_entries < 1 OR p_max_entries < 1 THEN
+        RAISE EXCEPTION 'jarvis_seal_block: thresholds must be at least 1';
+    END IF;
+    PERFORM pg_advisory_xact_lock(hashtextextended('jarvis-seal/' || p_tenant, 0));
+    SELECT c.last_seq INTO ctr FROM history_counters c WHERE c.tenant_key = p_tenant;
+    IF ctr IS NULL THEN
+        RETURN QUERY SELECT false, NULL::bigint, NULL::bigint, NULL::bigint, NULL::bigint, NULL::text, 'no history to seal'::text;
+        RETURN;
+    END IF;
+    SELECT k.height, k.last_seq, k.block_hash INTO bh, bl, bprev
+        FROM blocks k WHERE k.tenant_key = p_tenant ORDER BY k.height DESC LIMIT 1;
+    IF NOT FOUND THEN
+        bh := 0; bl := 0; bprev := repeat('0', 64);
+    END IF;
+    IF bl > ctr THEN
+        RAISE EXCEPTION 'jarvis_seal_block: the last block extends past the history counter; run pg_verify before sealing';
+    END IF;
+    s := bl + 1;
+    IF s > ctr THEN
+        RETURN QUERY SELECT false, NULL::bigint, NULL::bigint, NULL::bigint, NULL::bigint, NULL::text, 'nothing new to seal'::text;
+        RETURN;
+    END IF;
+    SELECT h.changed_at INTO oldest FROM record_history h WHERE h.tenant_key = p_tenant AND h.seq = s;
+    IF oldest IS NULL THEN
+        RAISE EXCEPTION 'jarvis_seal_block: history entry % is missing; run pg_verify before sealing', s;
+    END IF;
+    IF NOT p_force AND (ctr - s + 1) < p_min_entries AND clock_timestamp() - oldest < p_max_age THEN
+        RETURN QUERY SELECT false, NULL::bigint, NULL::bigint, NULL::bigint, NULL::bigint, NULL::text,
+            format('below threshold: %s unsealed entries (need %s) and the oldest is younger than %s', ctr - s + 1, p_min_entries, p_max_age)::text;
+        RETURN;
+    END IF;
+    e := least(ctr, s + p_max_entries - 1);
+    n := e - s + 1;
+    SELECT count(*), array_agg(h.row_hash ORDER BY h.seq) INTO have, leaves
+        FROM record_history h WHERE h.tenant_key = p_tenant AND h.seq BETWEEN s AND e;
+    IF have <> n THEN
+        RAISE EXCEPTION 'jarvis_seal_block: history is missing entries between seq % and %; run pg_verify before sealing', s, e;
+    END IF;
+    root := jarvis_merkle_root(leaves);
+    hsh := jarvis_block_hash(1, p_tenant, bh + 1, s, e, n, bprev, root);
+    act := coalesce(nullif(current_setting('jarvis.actor', true), ''), 'unknown');
+    INSERT INTO blocks (tenant_key, height, first_seq, last_seq, entry_count, prev_block_hash, entries_root, block_hash, format, sealed_by)
+        VALUES (p_tenant, bh + 1, s, e, n, bprev, root, hsh, 1, act);
+    RETURN QUERY SELECT true, bh + 1, s, e, n, hsh, 'sealed'::text;
+END
+$fn$;
+REVOKE ALL ON FUNCTION jarvis_seal_block(text, integer, interval, boolean, integer) FROM PUBLIC;
+"""
+
+_V6 = _v6()
+
+MIGRATIONS: list[tuple[int, str]] = [(1, _V1), (2, _V2), (3, _V3), (4, _V4), (5, _V5), (6, _V6)]
 EXPECTED_SCHEMA_VERSION = MIGRATIONS[-1][0]
 
 
@@ -478,6 +720,12 @@ def _grant(conn: psycopg.Connection, schema: str, role: str) -> None:
         # v5+: the application can read and add evidence objects, never change or remove one
         conn.execute(sql.SQL("REVOKE ALL ON evidence_objects FROM {}").format(r))
         conn.execute(sql.SQL("GRANT SELECT, INSERT ON evidence_objects TO {}").format(r))
+    if exists("blocks"):
+        # v6+: the application reads blocks and can only ask for a seal (SECURITY DEFINER function); it never
+        # writes a block row itself
+        conn.execute(sql.SQL("REVOKE ALL ON blocks FROM {}").format(r))
+        conn.execute(sql.SQL("GRANT SELECT ON blocks TO {}").format(r))
+        conn.execute(sql.SQL("GRANT EXECUTE ON FUNCTION jarvis_seal_block(text, integer, interval, boolean, integer) TO {}").format(r))
     if not exists("chain_heads") and exists("record_history"):
         # v2 only (transitional): the invoker-rights trigger inserts as the app role
         conn.execute(sql.SQL("GRANT SELECT, INSERT ON record_history TO {}").format(r))
