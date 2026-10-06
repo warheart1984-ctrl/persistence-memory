@@ -200,10 +200,6 @@ def context_path() -> Path:
     return state_dir() / "jarvis-live-context.md"
 
 
-def last_response_path() -> Path:
-    return state_dir() / "jarvis-last-response.txt"
-
-
 def session_meta_path() -> Path:
     return state_dir() / "jarvis-session-meta.json"
 

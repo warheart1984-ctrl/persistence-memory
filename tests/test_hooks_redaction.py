@@ -160,7 +160,6 @@ def end(monkeypatch, tmp_path, common):
 )
 def test_session_end_posts_nothing_whatever_the_session_said(end, monkeypatch, capsys, tmp_path, reply):
     (tmp_path / "last.txt").write_text(reply, "utf-8")
-    monkeypatch.setattr(sys.modules["jarvis_common"], "last_response_path", lambda: tmp_path / "last.txt")
     monkeypatch.setattr(end, "read_stdin_json", lambda: {"session_id": "sess-1", "reason": "ended"})
     assert end.main() == 0
     out, err = capsys.readouterr()
@@ -177,4 +176,32 @@ def test_session_end_no_longer_knows_how_to_reach_the_ledger():
 
 def test_the_hooks_template_no_longer_lists_session_end():
     template = json.loads((_HOOKS_DIR / "hooks.json").read_text("utf-8"))
-    assert "sessionEnd" not in template["hooks"] and set(template["hooks"]) == {"sessionStart", "afterAgentResponse"}
+    assert "sessionEnd" not in template["hooks"] and set(template["hooks"]) == {"sessionStart"}
+
+
+# --- the afterAgentResponse cache is gone too ---------------------------------------------------------------------
+
+@pytest.fixture
+def after(monkeypatch, tmp_path, common):
+    module = _load("jarvis_after_response")
+    shared = sys.modules["jarvis_common"]
+    monkeypatch.setattr(shared, "state_dir", lambda: tmp_path)
+    module._dir = tmp_path
+    return module
+
+
+@pytest.mark.parametrize("text", ["a perfectly ordinary reply", "the key is sk-" + "a1B2c3D4" * 5, "x" * 20000, ""])
+def test_after_response_writes_nothing_whatever_the_reply_said(after, monkeypatch, capsys, text):
+    monkeypatch.setattr(after, "read_stdin_json", lambda: {"text": text, "conversation_id": "c1"})
+    assert after.main() == 0
+    out, err = capsys.readouterr()
+    assert json.loads(out) == {} and err == ""
+    assert list(after._dir.iterdir()) == []  # no cache file, no log, no state
+
+
+def test_the_last_response_helper_and_file_name_are_gone():
+    common = _load("jarvis_common")
+    assert not hasattr(common, "last_response_path")
+    for path in _HOOKS_DIR.glob("*.py"):
+        assert "jarvis-last-response" not in path.read_text("utf-8"), path.name
+    assert "write_text" not in (_HOOKS_DIR / "jarvis_after_response.py").read_text("utf-8")
