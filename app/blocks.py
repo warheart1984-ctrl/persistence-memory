@@ -45,6 +45,13 @@ def _mth(hashes: list[bytes]) -> bytes:
     return node_hash(_mth(hashes[:k]), _mth(hashes[k:]))
 
 
+def merkle_tree_hash(leaf_hashes: list[bytes]) -> bytes:
+    """The RFC 6962 Merkle tree hash over already-hashed leaves (used by Replay Contracts for the state root)."""
+    if not leaf_hashes:
+        raise ValueError("a tree needs at least one leaf")
+    return _mth(leaf_hashes)
+
+
 def merkle_root(row_hashes: list[str]) -> str:
     """The Merkle tree hash (hex) of the entries' row_hash values, in seq order.  Refuses an empty list."""
     if not row_hashes:

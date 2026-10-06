@@ -1,0 +1,55 @@
+{
+  "description": "What a replay is asked for: the tenant's history up to a point.  Neither bound given means the current end.",
+  "properties": {
+    "after_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "paging cursor: return records with an id after this one (bytewise)",
+      "title": "After Id"
+    },
+    "at_block": {
+      "anyOf": [
+        {
+          "minimum": 1,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "replay as of the last entry of this sealed block",
+      "title": "At Block"
+    },
+    "at_seq": {
+      "anyOf": [
+        {
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "replay as of this record_history seq (0 = empty ledger)",
+      "title": "At Seq"
+    },
+    "limit": {
+      "default": 200,
+      "maximum": 1000,
+      "minimum": 1,
+      "title": "Limit",
+      "type": "integer"
+    }
+  },
+  "title": "ReplayInput",
+  "type": "object"
+}

@@ -429,6 +429,113 @@ class PostgresRowStore:
             problems = pg_verify._block_problems(conn, self._tenant_key) + pg_verify._block_evidence_problems(conn, self._tenant_key)
         return [{"block": what, "problem": problem} for what, problem in problems]
 
+    # -- Replay Contracts (RC.Ledger.v1) ----------------------------------------
+
+    def _resolve_replay_seq(self, conn: psycopg.Connection, at_seq: int | None, at_block: int | None) -> int:
+        from app import replay
+
+        if at_seq is not None and at_block is not None:
+            raise replay.ReplayError("replay_bound_ambiguous", "give at_seq or at_block, not both")
+        counter = conn.execute("SELECT last_seq FROM history_counters WHERE tenant_key = %s", (self._tenant_key,)).fetchone()
+        history_seq = counter["last_seq"] if counter else 0
+        if at_block is not None:
+            row = conn.execute("SELECT last_seq FROM blocks WHERE tenant_key = %s AND height = %s", (self._tenant_key, at_block)).fetchone()
+            if row is None:
+                raise replay.ReplayError("replay_block_not_found", f"there is no sealed block {at_block}", 404)
+            return row["last_seq"]
+        if at_seq is None:
+            return history_seq
+        if at_seq > history_seq:
+            raise replay.ReplayError("replay_seq_out_of_range", f"at_seq {at_seq} is beyond the history counter {history_seq}")
+        return at_seq
+
+    def replay_state(self, *, at_seq: int | None = None, at_block: int | None = None, after_id: str | None = None,
+                     limit: int = 200) -> "replay.ReplayState":
+        """RC.Ledger.v1: the ledger's records as of a history seq (or the end of a sealed block), with the state root.
+
+        One transaction, so the counter, the blocks and the history it reads are one consistent picture."""
+        from app import replay
+
+        limit = max(1, min(int(limit), replay.MAX_PAGE))
+        with self._tx() as conn:
+            seq = self._resolve_replay_seq(conn, at_seq, at_block)
+            counter = conn.execute("SELECT last_seq FROM history_counters WHERE tenant_key = %s", (self._tenant_key,)).fetchone()
+            sealed_seq = conn.execute("SELECT coalesce(max(last_seq), 0) AS s FROM blocks WHERE tenant_key = %s", (self._tenant_key,)).fetchone()["s"]
+            block = conn.execute(
+                "SELECT height, first_seq, last_seq, block_hash FROM blocks WHERE tenant_key = %s AND first_seq <= %s AND last_seq >= %s",
+                (self._tenant_key, seq, seq)).fetchone()
+            heads = conn.execute(
+                "SELECT DISTINCT ON (memory_id COLLATE \"C\") memory_id, seq, op, row_hash FROM record_history "
+                "WHERE tenant_key = %s AND seq <= %s ORDER BY memory_id COLLATE \"C\", seq DESC",
+                (self._tenant_key, seq)).fetchall()
+            live = sorted((h for h in heads if h["op"] != "delete"), key=lambda h: h["memory_id"].encode("utf-8"))
+            page = [h for h in live if after_id is None or h["memory_id"].encode("utf-8") > after_id.encode("utf-8")][: limit + 1]
+            more = len(page) > limit
+            page = page[:limit]
+            images = {}
+            if page:
+                images = {r["seq"]: r for r in conn.execute(
+                    "SELECT seq, version, after FROM record_history WHERE tenant_key = %s AND seq = ANY(%s)",
+                    (self._tenant_key, [h["seq"] for h in page])).fetchall()}
+        return replay.ReplayState(
+            tenant=self._tenant_key, at_seq=seq, history_seq=counter["last_seq"] if counter else 0, sealed_seq=sealed_seq,
+            sealed=block is not None, at_block_boundary=block is not None and block["last_seq"] == seq,
+            block=replay.BlockRef(**block) if block else None,
+            record_count=len(live), deleted_count=len(heads) - len(live),
+            state_root=replay.state_root([(h["memory_id"], h["row_hash"]) for h in live]),
+            records=[replay.ReplayedRecord(id=h["memory_id"], seq=h["seq"], version=images[h["seq"]]["version"],
+                                           row_hash=h["row_hash"], record=images[h["seq"]]["after"]) for h in page],
+            next_after_id=page[-1]["memory_id"] if more else None,
+        )
+
+    def replay_events(self, *, from_seq: int = 1, to_seq: int | None = None, limit: int = 200) -> "replay.ReplayEvents":
+        """RC.Ledger.v1: the ordered history entries from from_seq to to_seq, evidence links classified."""
+        from app import replay
+
+        limit = max(1, min(int(limit), replay.MAX_PAGE))
+        if from_seq < 1:
+            raise replay.ReplayError("replay_seq_out_of_range", "from_seq starts at 1")
+        with self._tx() as conn:
+            counter = conn.execute("SELECT last_seq FROM history_counters WHERE tenant_key = %s", (self._tenant_key,)).fetchone()
+            history_seq = counter["last_seq"] if counter else 0
+            end = history_seq if to_seq is None else to_seq
+            if end > history_seq:
+                raise replay.ReplayError("replay_seq_out_of_range", f"to_seq {end} is beyond the history counter {history_seq}")
+            rows = conn.execute(
+                "SELECT seq, memory_id, op, version, actor, changed_at, prev_hash, row_hash, before, after FROM record_history "
+                "WHERE tenant_key = %s AND seq BETWEEN %s AND %s ORDER BY seq LIMIT %s",
+                (self._tenant_key, from_seq, end, limit + 1)).fetchall()
+            more = len(rows) > limit
+            rows = rows[:limit]
+            refs = sorted({link.get("ref") for r in rows for link in
+                           replay.evidence_links(r["after"]) + replay.evidence_links(r["before"])
+                           if link.get("kind") == "evidence-object" and link.get("ref")})
+            objects = {}
+            if refs:
+                for o in conn.execute(f"SELECT {self._EVIDENCE_COLUMNS} FROM evidence_objects WHERE tenant_key = %s AND id = ANY(%s)",
+                                      (self._tenant_key, refs)).fetchall():
+                    objects[o["id"]] = self._evidence_from_row(o)
+
+        def status(link: dict[str, Any]) -> str:
+            if link.get("kind") != "evidence-object":
+                return "not-checked"
+            obj = objects.get(link.get("ref"))
+            if obj is None:
+                return "missing"
+            return "tampered" if evidence_objects.verify_stored(obj) else "intact"
+
+        events = []
+        for r in rows:
+            links = replay.evidence_links(r["after"] if r["after"] is not None else r["before"])
+            events.append(replay.ReplayEvent(
+                seq=r["seq"], memory_id=r["memory_id"], op=r["op"], version=r["version"], actor=r["actor"],
+                changed_at=_iso(r["changed_at"]), prev_hash=r["prev_hash"], row_hash=r["row_hash"],
+                before=r["before"], after=r["after"],
+                evidence=[replay.EvidenceStatus(kind=str(l.get("kind", "")), ref=str(l.get("ref", "")), note=l.get("note"), status=status(l))
+                          for l in links]))
+        return replay.ReplayEvents(tenant=self._tenant_key, from_seq=from_seq, to_seq=end, history_seq=history_seq, events=events,
+                                   next_from_seq=rows[-1]["seq"] + 1 if more else None)
+
     # -- writes -----------------------------------------------------------------
 
     def _supersedes_exists(self, conn: psycopg.Connection, target: str) -> bool:

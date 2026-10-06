@@ -8,7 +8,8 @@
 | `MemoryRecord` | Continuity event inside a block | Event envelope incomplete vs CCS |
 | `evidence: EvidenceLink[]` + Evidence Objects | Evidence Object (typed, signed) | Content-addressed immutable objects (hash only, minimal local CES) linked by `kind: evidence-object`; **no signatures** — **partial** |
 | `source_agent` + `session_id` + `created_at` | Provenance Chain fragment | No Root Authority → … → Replay chain — **declared** |
-| `GET /retrieve` + `selections` | Replay against RC.* | No RC execution; filter rationale only — **enforced** replay of ledger rows |
+| `GET /retrieve` + `selections` | Replay against RC.* | Filter rationale over the current state — **enforced** replay of ledger rows |
+| `record_history` + blocks | Replay against `RC.Ledger.v1` | State and ordered events as of any seq or sealed block, committed to by a state root over the entries' `row_hash` values; verified offline against the block chain. Domain RCs not executed — **partial** |
 | `conflicts` | Continuity invariant: no silent merge | Surfaces disputes; does not evaluate truth — **enforced** |
 | `supersedes` | Continuity edge / replacement claim | Not a CES Decision Object — **enforced** as field |
 | `status` / `confidence` | Claimed lifecycle / caller confidence | Not Evidence Engine verification — **enforced** as stored fields |
