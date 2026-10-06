@@ -40,6 +40,7 @@ from app.pg_schema import check_schema_version, validate_schema_name
 from app.store import _make_id, ledger_retrieve, memory_matches_query
 from app.store_errors import StoreUnavailableError, StoreVersionConflict
 from app import clause_v
+from app import evidence as evidence_objects
 
 _log = logging.getLogger("jarvis.store")
 
@@ -352,7 +353,8 @@ class PostgresRowStore:
         )
 
     def create_memory(self, data: MemoryCreate) -> MemoryRecord:
-        clause_v.gate_create(data)
+        evidence_objects.check_links(data.evidence, self._resolve_evidence)
+        clause_v.gate_create(data, self._resolve_evidence)
         now = datetime.now(timezone.utc)
         for _ in range(3):
             rec_id = _make_id("mem")
@@ -381,6 +383,73 @@ class PostgresRowStore:
                 continue
         raise StoreUnavailableError("Could not allocate a unique memory id")  # pragma: no cover
 
+    # -- Evidence Objects ------------------------------------------------------------------------
+
+    _EVIDENCE_COLUMNS = "id, schema_id, payload, pointer, size_bytes, created_at, created_by"
+
+    @staticmethod
+    def _evidence_from_row(row: dict[str, Any]) -> "evidence_objects.EvidenceObject":
+        return evidence_objects.EvidenceObject(
+            id=row["id"], schema_id=row["schema_id"], payload=row["payload"], pointer=row["pointer"],
+            size_bytes=row["size_bytes"], created_at=_iso(row["created_at"]), created_by=row["created_by"],
+        )
+
+    def put_evidence_object(self, req: "evidence_objects.EvidenceObjectCreate") -> "tuple[evidence_objects.EvidenceObject, bool]":
+        """Store the object (idempotent: the same content is the same id). Returns (object, created)."""
+        oid, data = evidence_objects.build_object(req)
+        with self._tx() as conn:
+            row = conn.execute(
+                "INSERT INTO evidence_objects (tenant_key, id, schema_id, payload, pointer, size_bytes, created_by) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (tenant_key, id) DO NOTHING "
+                f"RETURNING {self._EVIDENCE_COLUMNS}",
+                (self._tenant_key, oid, req.schema_id, Jsonb(req.payload), Jsonb(req.pointer) if req.pointer is not None else None,
+                 len(data), req.source_agent),
+            ).fetchone()
+            created = row is not None
+            if row is None:
+                row = conn.execute(
+                    f"SELECT {self._EVIDENCE_COLUMNS} FROM evidence_objects WHERE tenant_key = %s AND id = %s",
+                    (self._tenant_key, oid),
+                ).fetchone()
+        return self._evidence_from_row(row), created
+
+    def get_evidence_object(self, oid: str) -> "evidence_objects.EvidenceObject | None":
+        with self._tx() as conn:
+            row = conn.execute(
+                f"SELECT {self._EVIDENCE_COLUMNS} FROM evidence_objects WHERE tenant_key = %s AND id = %s",
+                (self._tenant_key, oid),
+            ).fetchone()
+        return self._evidence_from_row(row) if row else None
+
+    def all_evidence_objects(self) -> "list[evidence_objects.EvidenceObject]":
+        with self._tx() as conn:
+            rows = conn.execute(
+                f"SELECT {self._EVIDENCE_COLUMNS} FROM evidence_objects WHERE tenant_key = %s ORDER BY created_at, id",
+                (self._tenant_key,),
+            ).fetchall()
+        return [self._evidence_from_row(r) for r in rows]
+
+    def _resolve_evidence_conn(self, conn: psycopg.Connection, ref: str) -> "evidence_objects.EvidenceInfo | None":
+        row = conn.execute(
+            f"SELECT {self._EVIDENCE_COLUMNS} FROM evidence_objects WHERE tenant_key = %s AND id = %s",
+            (self._tenant_key, ref),
+        ).fetchone()
+        if row is None:
+            return None
+        obj = self._evidence_from_row(row)
+        problems = evidence_objects.verify_stored(obj)
+        if problems:
+            raise evidence_objects.EvidenceError(
+                "evidence_object_invalid",
+                "the stored evidence object is damaged",
+                [{"code": "evidence_object_hash_mismatch", "ref": ref, "message": problems[0]}],
+            )
+        return evidence_objects.EvidenceInfo(obj.id, obj.schema_id)
+
+    def _resolve_evidence(self, ref: str) -> "evidence_objects.EvidenceInfo | None":
+        with self._tx() as conn:
+            return self._resolve_evidence_conn(conn, ref)
+
     def update_memory(self, memory_id: str, data: MemoryUpdate) -> MemoryRecord | None:
         """Read-modify-write guarded by the row version; retried on concurrent change."""
         for attempt in range(MAX_UPDATE_ATTEMPTS):
@@ -398,7 +467,10 @@ class PostgresRowStore:
                     )
                 if self._after_read_hook is not None:
                     self._after_read_hook()
-                clause_v.gate_update(existing, data)
+                resolve = lambda ref: self._resolve_evidence_conn(conn, ref)  # noqa: E731 - same transaction as the update
+                if data.evidence is not None:
+                    evidence_objects.check_links(data.evidence, resolve)
+                clause_v.gate_update(existing, data, resolve)
                 updates = existing.model_dump()
                 for key in (
                     "content", "source_agent", "session_id", "type", "confidence", "evidence",

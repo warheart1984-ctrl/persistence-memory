@@ -419,7 +419,40 @@ END
 $fn$;
 """
 
-MIGRATIONS: list[tuple[int, str]] = [(1, _V1), (2, _V2), (3, _V3), (4, _V4)]
+_V5 = """
+-- Evidence Objects: content-addressed, immutable evidence (id = eo:sha256:<hash of the canonical content>).
+-- Append-only like record_history: the application role can only SELECT and INSERT, and the triggers
+-- refuse UPDATE, DELETE and TRUNCATE for everyone else.
+CREATE TABLE evidence_objects (
+    tenant_key text        NOT NULL,
+    id         text        NOT NULL CHECK (id ~ '^eo:sha256:[0-9a-f]{64}$'),
+    schema_id  text        NOT NULL CHECK (char_length(schema_id) BETWEEN 1 AND 128),
+    payload    jsonb       NOT NULL CHECK (jsonb_typeof(payload) = 'object'),
+    pointer    jsonb       CHECK (pointer IS NULL OR jsonb_typeof(pointer) = 'object'),
+    size_bytes integer     NOT NULL CHECK (size_bytes BETWEEN 1 AND 65536),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    created_by text        NOT NULL CHECK (char_length(created_by) BETWEEN 1 AND 128),
+    PRIMARY KEY (tenant_key, id)
+);
+CREATE FUNCTION jarvis_evidence_immutable() RETURNS trigger LANGUAGE plpgsql AS $fn$
+BEGIN
+    RAISE EXCEPTION 'evidence_objects is append-only';
+END
+$fn$;
+CREATE TRIGGER evidence_objects_no_update BEFORE UPDATE ON evidence_objects
+    FOR EACH ROW EXECUTE FUNCTION jarvis_evidence_immutable();
+CREATE TRIGGER evidence_objects_no_delete BEFORE DELETE ON evidence_objects
+    FOR EACH ROW EXECUTE FUNCTION jarvis_evidence_immutable();
+CREATE TRIGGER evidence_objects_no_truncate BEFORE TRUNCATE ON evidence_objects
+    FOR EACH STATEMENT EXECUTE FUNCTION jarvis_evidence_immutable();
+ALTER TABLE evidence_objects ENABLE ROW LEVEL SECURITY;
+ALTER TABLE evidence_objects FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON evidence_objects
+    USING (tenant_key = current_setting('jarvis.tenant_key', true))
+    WITH CHECK (tenant_key = current_setting('jarvis.tenant_key', true));
+"""
+
+MIGRATIONS: list[tuple[int, str]] = [(1, _V1), (2, _V2), (3, _V3), (4, _V4), (5, _V5)]
 EXPECTED_SCHEMA_VERSION = MIGRATIONS[-1][0]
 
 
@@ -441,7 +474,11 @@ def _grant(conn: psycopg.Connection, schema: str, role: str) -> None:
             conn.execute(sql.SQL("REVOKE ALL ON {} FROM {}").format(sql.Identifier(table), r))
             conn.execute(sql.SQL("GRANT SELECT ON {} TO {}").format(sql.Identifier(table), r))
         conn.execute(sql.SQL("REVOKE ALL ON SEQUENCE record_history_history_id_seq FROM {}").format(r))
-    elif exists("record_history"):
+    if exists("evidence_objects"):
+        # v5+: the application can read and add evidence objects, never change or remove one
+        conn.execute(sql.SQL("REVOKE ALL ON evidence_objects FROM {}").format(r))
+        conn.execute(sql.SQL("GRANT SELECT, INSERT ON evidence_objects TO {}").format(r))
+    if not exists("chain_heads") and exists("record_history"):
         # v2 only (transitional): the invoker-rights trigger inserts as the app role
         conn.execute(sql.SQL("GRANT SELECT, INSERT ON record_history TO {}").format(r))
         conn.execute(sql.SQL("GRANT USAGE, SELECT ON SEQUENCE record_history_history_id_seq TO {}").format(r))

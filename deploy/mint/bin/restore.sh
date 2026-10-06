@@ -75,9 +75,13 @@ pg_exec pg_restore --single-transaction --exit-on-error -d jarvis < "$BACKUP_DIR
   || die "pg_restore failed (the app has NOT been started; the database volume is freshly initialised and empty)"
 
 # ---- 5. gates -----------------------------------------------------------------------------------------------------
-restored_counts="$(for t in memories boards record_history chain_heads history_counters; do
+# a set taken after schema v5 also counts evidence_objects; an older set has no such line and is checked as before
+count_tables="memories boards record_history chain_heads history_counters"
+if grep -q '^evidence_objects=' "$BACKUP_DIR/$base.counts"; then count_tables="$count_tables evidence_objects"; fi
+count_re="^($(echo "$count_tables" | tr ' ' '|'))="
+restored_counts="$(for t in $count_tables; do
   printf '%s=%s\n' "$t" "$(pg_exec psql -X -At -d jarvis -c "select count(*) from jarvis.$t")"; done | LC_ALL=C sort)"
-expected_counts="$(grep -E '^(memories|boards|record_history|chain_heads|history_counters)=' "$BACKUP_DIR/$base.counts" | LC_ALL=C sort)"
+expected_counts="$(grep -E "$count_re" "$BACKUP_DIR/$base.counts" | LC_ALL=C sort)"
 [ "$restored_counts" = "$expected_counts" ] \
   || die "row counts after restore differ from the backup set (restored: $(echo "$restored_counts" | tr '\n' ' ') expected: $(echo "$expected_counts" | tr '\n' ' ')). App NOT started."
 

@@ -85,6 +85,8 @@ from app.public_security import cors_origins, public_security_middleware
 from app.refusal import DENIED, LEDGER_UNAVAILABLE, VERSION_CONFLICT, json_response, retry_after_seconds
 from app import clause_v
 from app.clause_v import ClauseVViolation
+from app import evidence as evidence_objects
+from app.evidence import EvidenceError, EvidenceObjectCreate, require_operator_write
 from app.store import StoreUnavailableError, StoreVersionConflict, get_store
 from app.graph import (
     BfsBody,
@@ -235,6 +237,12 @@ async def _store_unavailable(request: Request, exc: StoreUnavailableError):
 async def _clause_v_violation(request: Request, exc: ClauseVViolation):
     # 422, no Retry-After: retrying the same write cannot succeed. The body names every reason.
     return JSONResponse(status_code=422, content=exc.body())
+
+
+@app.exception_handler(EvidenceError)
+async def _evidence_error(request: Request, exc: EvidenceError):
+    # 422 (413 when too large), no Retry-After: the request itself has to change.
+    return JSONResponse(status_code=exc.status, content=exc.body())
 
 
 @app.exception_handler(StoreVersionConflict)
@@ -835,6 +843,59 @@ def delete_memory(memory_id: str):
     if not ok:
         raise HTTPException(status_code=404, detail="Memory not found")
     return {"status": "deleted", "id": memory_id}
+
+
+# --- Evidence Objects (content-addressed, immutable, hashes only; created with the operator key only) ---
+
+
+def _evidence_id(evidence_id: str) -> str:
+    if not evidence_objects.ID_RE.match(evidence_id):
+        raise EvidenceError("evidence_id_invalid", "an evidence id looks like eo:sha256:<64 lowercase hex characters>")
+    return evidence_id
+
+
+@app.post("/api/jarvis/evidence", dependencies=[Depends(require_operator_write)])
+def create_evidence(body: EvidenceObjectCreate):
+    """Store an evidence object. Idempotent: the same content is the same id (``created`` says which happened)."""
+    try:
+        obj, created = get_store().put_evidence_object(body)
+    except NotImplementedError as exc:
+        raise HTTPException(status_code=501, detail=str(exc)) from exc
+    return {"evidence": obj.model_dump(), "created": created}
+
+
+@app.get("/api/jarvis/evidence/{evidence_id}")
+def get_evidence(evidence_id: str):
+    try:
+        obj = get_store().get_evidence_object(_evidence_id(evidence_id))
+    except NotImplementedError as exc:
+        raise HTTPException(status_code=501, detail=str(exc)) from exc
+    if obj is None:
+        raise HTTPException(status_code=404, detail="Evidence object not found")
+    return {"evidence": obj.model_dump()}
+
+
+@app.get("/api/jarvis/evidence/{evidence_id}/verify")
+def verify_evidence(evidence_id: str):
+    """Recompute the hash and re-check the schema of a stored object. A pointer's external content is NOT fetched."""
+    try:
+        obj = get_store().get_evidence_object(_evidence_id(evidence_id))
+    except NotImplementedError as exc:
+        raise HTTPException(status_code=501, detail=str(exc)) from exc
+    if obj is None:
+        raise HTTPException(status_code=404, detail="Evidence object not found")
+    problems = evidence_objects.verify_stored(obj)
+    return {
+        "id": obj.id,
+        "ok": not problems,
+        "problems": problems,
+        "schema_id": obj.schema_id,
+        "pointer": {
+            "present": obj.pointer is not None,
+            "content_hash_checked": False,
+            "note": "the service does not fetch pointed-at content; pointer.sha256 is recorded, not verified",
+        },
+    }
 
 
 # --- AMUL RAG (adaptive retrieval + evidence gate + replay) ---

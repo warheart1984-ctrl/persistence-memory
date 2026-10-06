@@ -123,7 +123,9 @@ def _get(item: Any, key: str, default: Any = None) -> Any:
     return item.get(key, default) if isinstance(item, dict) else getattr(item, key, default)
 
 
-def _evidence_reason(mem_type: str, evidence: Iterable[Any]) -> Reason | None:
+def _evidence_reason(mem_type: str, evidence: Iterable[Any], resolve: Any = None) -> Reason | None:
+    from app import evidence as evidence_objects  # local import: evidence.py is independent of this module
+
     links = list(evidence or [])
     if mem_type == "decision":
         if any(str(_get(e, "ref", "") or "").strip() for e in links):
@@ -131,15 +133,18 @@ def _evidence_reason(mem_type: str, evidence: Iterable[Any]) -> Reason | None:
         return Reason(EVIDENCE_REQUIRED, "A decision needs at least one evidence link (a user-request link is accepted).", "evidence")
     if any(str(_get(e, "kind", "") or "").strip().lower() in EVIDENCE_KINDS and str(_get(e, "ref", "") or "").strip() for e in links):
         return None
+    if any(evidence_objects.counts_as_fact_evidence(e, resolve) for e in links):
+        return None
     kinds = ", ".join(sorted(EVIDENCE_KINDS))
     return Reason(
         EVIDENCE_REQUIRED,
-        f"A {mem_type} needs at least one checkable evidence link (kind one of: {kinds}). A chat message is not evidence.",
+        f"A {mem_type} needs at least one checkable evidence link (kind one of: {kinds}, or an evidence-object link to an "
+        f"intact {evidence_objects.CES_FACT} object). A chat message is not evidence.",
         "evidence",
     )
 
 
-def hard_reasons(*, type: str, evidence: Iterable[Any]) -> list[Reason]:
+def hard_reasons(*, type: str, evidence: Iterable[Any], resolve: Any = None) -> list[Reason]:
     out: list[Reason] = []
     if type == "preference":
         out.append(Reason(PREFERENCE, "Preferences are memory, not evidence (Clause V). Record a decision or an architecture note instead.", "type"))
@@ -149,7 +154,7 @@ def hard_reasons(*, type: str, evidence: Iterable[Any]) -> list[Reason]:
         out.append(Reason(EXTERNAL, "External context is ungoverned context (Clause V). Record a decision that cites it as evidence.", "type"))
     elif type not in ALLOWED_TYPES:
         out.append(Reason(TYPE_NOT_ALLOWED, f"Type {type!r} is not allowed on the constitutional path (allowed: {', '.join(sorted(ALLOWED_TYPES))}).", "type"))
-    er = _evidence_reason(type, evidence)
+    er = _evidence_reason(type, evidence, resolve)
     if er is not None:
         out.append(er)
     return out
@@ -188,11 +193,11 @@ def _log(kind: str, reasons: list[Reason], *, content: str, source_agent: str | 
 
 
 def _judge(*, action: str, check_hard: bool, check_soft: bool = True, type: str, content: str, subject: str | None, tags: Iterable[str],
-           evidence: Iterable[Any], source_agent: str | None, session_id: str | None) -> None:
+           evidence: Iterable[Any], source_agent: str | None, session_id: str | None, resolve: Any = None) -> None:
     _warnings.set(None)
     if hard_mode() == "off":
         return
-    reasons: list[Reason] = hard_reasons(type=type, evidence=evidence) if check_hard else []
+    reasons: list[Reason] = hard_reasons(type=type, evidence=evidence, resolve=resolve) if check_hard else []
     soft: list[Reason] = [] if (soft_mode() == "off" or not check_soft) else soft_reasons(content=content, subject=subject, tags=tags)
     if soft and soft_mode() == "enforce":
         reasons += soft
@@ -205,13 +210,15 @@ def _judge(*, action: str, check_hard: bool, check_soft: bool = True, type: str,
         _warnings.set(soft)
 
 
-def gate_create(data: Any) -> None:
-    """Called by every store before it writes a new record. Raises ClauseVViolation, or leaves warnings behind."""
+def gate_create(data: Any, resolve: Any = None) -> None:
+    """Called by every store before it writes a new record. Raises ClauseVViolation, or leaves warnings behind.
+
+    ``resolve`` (optional) maps an evidence-object id to what it resolved to, so such links can count as evidence."""
     _judge(action="create", check_hard=True, type=data.type, content=data.content, subject=data.subject, tags=data.tags,
-           evidence=data.evidence, source_agent=data.source_agent, session_id=data.session_id)
+           evidence=data.evidence, source_agent=data.source_agent, session_id=data.session_id, resolve=resolve)
 
 
-def gate_update(existing: Any, update: Any) -> None:
+def gate_update(existing: Any, update: Any, resolve: Any = None) -> None:
     """Called by every store before it applies an update to ``existing``."""
     def pick(name: str) -> Any:
         value = getattr(update, name, None)
@@ -228,4 +235,4 @@ def gate_update(existing: Any, update: Any) -> None:
     text_changed = any(getattr(update, name, None) is not None for name in ("content", "subject", "tags"))
     _judge(action="update", check_hard=admits and status != "archived", check_soft=text_changed and status != "archived",
            type=mem_type, content=content, subject=subject, tags=tags, evidence=evidence,
-           source_agent=pick("source_agent"), session_id=pick("session_id"))
+           source_agent=pick("source_agent"), session_id=pick("session_id"), resolve=resolve)

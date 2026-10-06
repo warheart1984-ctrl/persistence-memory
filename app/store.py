@@ -31,6 +31,7 @@ from app.models import (
 from app.identity import current_tenant_key
 from app.store_errors import StoreUnavailableError, StoreVersionConflict
 from app import clause_v
+from app import evidence as evidence_objects
 
 
 def _now_iso() -> str:
@@ -331,7 +332,8 @@ class JarvisStore:
 
     def _create_memory(self, data: MemoryCreate) -> MemoryRecord:
         self._ensure_loaded()
-        clause_v.gate_create(data)
+        evidence_objects.check_links(data.evidence, self._resolve_evidence)
+        clause_v.gate_create(data, self._resolve_evidence)
         now = _now_iso()
         if data.supersedes and data.supersedes not in self._memories:
             # Allow forward-ref only if empty; otherwise require known id
@@ -369,7 +371,9 @@ class JarvisStore:
             raise StoreVersionConflict(
                 f"version conflict: expected {data.expected_version}, current {existing.version}"
             )
-        clause_v.gate_update(existing, data)
+        if data.evidence is not None:
+            evidence_objects.check_links(data.evidence, self._resolve_evidence)
+        clause_v.gate_update(existing, data, self._resolve_evidence)
         updates = existing.model_dump()
         for key in (
             "content",
@@ -400,6 +404,34 @@ class JarvisStore:
         self._memories[memory_id] = updated
         self._save_or_restore(lambda: self._memories.__setitem__(memory_id, existing))
         return updated
+
+    # -- Evidence Objects (JSON-lines sidecar next to the ledger file) ----------------------------
+
+    def put_evidence_object(self, req: "evidence_objects.EvidenceObjectCreate") -> "tuple[evidence_objects.EvidenceObject, bool]":
+        oid, data = evidence_objects.build_object(req)
+        with self._lock:
+            return evidence_objects.FileEvidenceStore(self._path).put(oid, req, len(data))
+
+    def get_evidence_object(self, oid: str) -> "evidence_objects.EvidenceObject | None":
+        with self._lock:
+            return evidence_objects.FileEvidenceStore(self._path).get(oid)
+
+    def all_evidence_objects(self) -> "list[evidence_objects.EvidenceObject]":
+        with self._lock:
+            return evidence_objects.FileEvidenceStore(self._path).all()
+
+    def _resolve_evidence(self, ref: str) -> "evidence_objects.EvidenceInfo | None":
+        obj = self.get_evidence_object(ref)
+        if obj is None:
+            return None
+        problems = evidence_objects.verify_stored(obj)
+        if problems:
+            raise evidence_objects.EvidenceError(
+                "evidence_object_invalid",
+                "the stored evidence object is damaged",
+                [{"code": "evidence_object_hash_mismatch", "ref": ref, "message": problems[0]}],
+            )
+        return evidence_objects.EvidenceInfo(obj.id, obj.schema_id)
 
     def delete_memory(self, memory_id: str) -> bool:
         with self._lock:
@@ -438,6 +470,19 @@ class PostgresJarvisStore(JarvisStore):
         super().__init__(path="")
         self._dsn = dsn
         self._tenant_key = tenant_key
+
+    # Evidence Objects need the PostgreSQL row store (or the JSON file store); the legacy JSONB-blob ledger has neither.
+    def put_evidence_object(self, req):
+        raise NotImplementedError("evidence objects require the PostgreSQL row store")
+
+    def get_evidence_object(self, oid):
+        raise NotImplementedError("evidence objects require the PostgreSQL row store")
+
+    def all_evidence_objects(self):
+        raise NotImplementedError("evidence objects require the PostgreSQL row store")
+
+    def _resolve_evidence(self, ref):
+        return None  # none can exist here, so every evidence-object link is unresolved
 
     @staticmethod
     def _ensure_schema(conn) -> None:
