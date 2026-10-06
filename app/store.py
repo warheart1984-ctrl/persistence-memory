@@ -478,6 +478,18 @@ class JarvisStore:
     def replay_events(self, **kwargs: Any) -> Any:
         raise NotImplementedError("Replay Contracts require the PostgreSQL row store")
 
+    def create_replay_receipt(self, **kwargs: Any) -> Any:
+        raise NotImplementedError("Replay Contracts require the PostgreSQL row store")
+
+    def get_replay_receipt(self, receipt_id: str) -> Any:
+        raise NotImplementedError("Replay Contracts require the PostgreSQL row store")
+
+    def list_replay_receipts(self, limit: int = 100) -> Any:
+        raise NotImplementedError("Replay Contracts require the PostgreSQL row store")
+
+    def verify_replay_receipt(self, receipt_id: str) -> Any:
+        raise NotImplementedError("Replay Contracts require the PostgreSQL row store")
+
     def conflicts(self, subject: str | None = None) -> list[ConflictSet]:
         self._ensure_loaded()
         return detect_conflicts(list(self._memories.values()), subject=subject)

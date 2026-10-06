@@ -95,6 +95,22 @@ def test_blocks_of_different_tenants_are_kept_apart(tmp_path):
     assert r.returncode == 1 and "block u|1 vanished" in r.stdout and "t|" not in r.stdout.replace("block u|1", "")
 
 
+def tips(tmp_path, lines):
+    r = bash(f'anchors_tip_blocks "{write(tmp_path, "tips", lines)}"')
+    assert r.returncode == 0, r.stderr
+    return r.stdout.splitlines()
+
+
+def test_the_tip_blocks_are_each_tenants_newest_numerically(tmp_path):
+    lines = ["counter|t|90", f"head|t|mem-a|5|{'a' * 64}|f", f"block|t|2|5|{'2' * 64}", f"block|t|10|9|{'9' * 64}", f"block|t|9|8|{'8' * 64}",
+             f"block|u|1|3|{'1' * 64}"]
+    assert tips(tmp_path, lines) == [f"t|10|{'9' * 64}", f"u|1|{'1' * 64}"]  # height 10 beats height 9 and 2 (not a string comparison)
+
+
+def test_a_set_without_blocks_has_no_tip_blocks(tmp_path):
+    assert tips(tmp_path, ["counter|t|5", f"head|t|mem-a|5|{'a' * 64}|f"]) == []
+
+
 # --- against a real database ---------------------------------------------------------------------------------------
 
 @pytest.fixture

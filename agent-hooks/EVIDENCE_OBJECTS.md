@@ -22,13 +22,14 @@ records the hash and says "not checked" when verifying.
 
 ## The minimal local CES
 
-These two schemas are local to this ledger. They are not the CCS charter's registered `CES.*` schemas (those stubs are
+These schemas are local to this ledger. They are not the CCS charter's registered `CES.*` schemas (those stubs are
 not in this repository). Extra payload fields are allowed and are part of the hash.
 
 | Schema | Required | Optional |
 |---|---|---|
 | `CES.Local.DecisionEvidence.v1` | `statement`, `authority`, `source` (non-empty strings) | `decided_at` (ISO-8601) |
 | `CES.Local.FactEvidence.v1` | `observation`, `source`, `method` (one of `file`, `url`, `commit`, `test`, `receipt`, `command`, `document`, `doc`, `issue`, `pr`, `log`) | `excerpt`, `observed_at` (ISO-8601) |
+| `CES.Local.ReplayReceipt.v1` | `contract`, `contract_version`, `tenant`, `at_seq`, `block_height`, `block_hash`, `state_root`, `record_count`, `deleted_count` (no other fields) | none. **Reserved**: only `POST /api/jarvis/replay/receipts` creates one, from a replay at a sealed point (`REPLAY_CONTRACTS.md`); the generic create route refuses it, and it does not count as Clause V fact evidence |
 
 ## API (operator key only)
 

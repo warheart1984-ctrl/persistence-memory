@@ -22,7 +22,7 @@ CCS is the intended **root continuity authority** for Mandala Rendering Software
 | Record constitutional / continuity events | Append-only style history of what was claimed | **partial** via ledger POST |
 | Store evidence objects | Typed, linked evidence | **partial** — content-addressed, immutable, hash-only Evidence Objects with a minimal local CES (`EVIDENCE_OBJECTS.md`); no signatures |
 | Lineage / provenance | Who/when/session/source | **enforced** on ledger records |
-| Deterministic replay | Same retrieve → same provenance envelope | **enforced** for ledger retrieve |
+| Deterministic replay | Same retrieve → same provenance envelope | **enforced** for ledger retrieve; `RC.Ledger.v1` rebuilds the ledger as of a sealed point, with receipts that can be re-derived |
 | Enforce continuity invariants | Required fields, no silent merge, hash fidelity helpers | **enforced** / **partial** (Drift multi-day) |
 
 “Invariants” here = continuity/governance invariants (immutability of recorded hashes, required provenance, conflict surfacing), **not** “deciding what is true.”
@@ -33,7 +33,7 @@ CCS is the intended **root continuity authority** for Mandala Rendering Software
 |-----------|---------|-------|
 | **Continuity Blocks** | Immutable batches / blocks of continuity events | **partial** — on the PostgreSQL row store (schema v6) contiguous ranges of the history are sealed into immutable, hash-chained blocks with an RFC 6962 Merkle root, verified by `pg_verify`, and every block hash is kept outside the database in the backup anchors; **not signed**, and the JSON store has no blocks (`CONTINUITY_BLOCKS.md`) |
 | **Evidence Objects** | Typed, signed evidence payloads | **partial** — hash-only objects linked by `kind: evidence-object`; **not signed** (`EVIDENCE_OBJECTS.md`) |
-| **Replay Contracts** | Registered reconstruction rules (RC.*) | **partial** — `RC.Ledger.v1` (the ledger's own state and events as of a history seq or sealed block) is implemented on the PostgreSQL row store; the five domain contracts are **declared** only (`REPLAY_CONTRACTS.md`) |
+| **Replay Contracts** | Registered reconstruction rules (RC.*) | **partial** — `RC.Ledger.v1` (the ledger's own state and events as of a history seq or sealed block, receipts at sealed points as Evidence Objects, an offline verifier, a restore-drill step) is implemented on the PostgreSQL row store; the five domain contracts are **declared** only; nothing is signed (`REPLAY_CONTRACTS.md`) |
 | **Provenance Chains** | Linked identity → intent → evidence → … → replay | **declared** — ledger has per-record provenance, not full chain |
 
 ---
@@ -88,7 +88,7 @@ Today’s ledger supplies: `source_agent`, `session_id`, `created_at`, `evidence
 |------|--------|-------|
 | Single write path | All continuity writes through CCS | **partial** — this API is a write path; not yet sole path across products |
 | Single read path | Retrieve via CCS / ledger retrieve | **partial** — retrieve API exists; not universal |
-| Deterministic replay across consumers | Same RC + evidence → same reconstruction | **declared** for multi-product; **enforced** within ledger retrieve tests |
+| Deterministic replay across consumers | Same RC + evidence → same reconstruction | **enforced** for the ledger itself (`RC.Ledger.v1`: tests, offline verifier, receipts, drill step); **declared** across products |
 | Constitutional boundaries | No emotion / transient / ungoverned memory as continuity SoT | **partial** — hooks prefer decisions; chat dumps discouraged, not fully banned at API |
 
 ---
@@ -100,8 +100,8 @@ Promotable toward “CCS as infrastructure” when:
 | # | Criterion | Current |
 |---|-----------|---------|
 | P1 | All CES.* registered (schemas + owners) | **gap** — no CES schema files exist; only the two local evidence schemas |
-| P2 | All RC.* registered | **gap** — `RC.Ledger.v1` is implemented; the five domain RCs are declared only (no schema, owner or algorithm) |
-| P3 | Replay deterministic across registered consumers | **gap** — ledger-only enforced |
+| P2 | All RC.* registered | **gap** — 1 of 6 registered: `RC.Ledger.v1` is implemented; the five domain RCs are declared only (no schema, owner or algorithm), so the criterion is not met |
+| P3 | Replay deterministic across registered consumers | **partial** — met for the one registered consumer, the ledger itself (`RC.Ledger.v1`: deterministic, verified offline against the block chain, receipts re-derivable, replayed in every restore drill); nothing is shown across consumers because no other consumer is registered |
 | P4 | Evidence chains validate (signatures / hashes end-to-end) | **gap** — hashes verify end-to-end for evidence objects (`pg_verify`); no signatures |
 | P5 | Provenance unifies across AIKI/ARIS/SX/Lineage/Mandala | **gap** — declared model only |
 | P6 | ESFR `PROMOTE_WITH_GAPS` or better for CCS milestone | **gap** — no CCS ESFR run recorded in this package |

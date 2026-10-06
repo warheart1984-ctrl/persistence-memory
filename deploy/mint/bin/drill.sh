@@ -8,7 +8,8 @@
 # the set's anchors; the history hash chain verifies for every tenant; the appdata archive lists cleanly.
 # --prove-detection then tampers with the scratch copy (removes the newest history entry) and requires the
 # verifier to FAIL, proving the alarm would actually ring; with sealed blocks it also removes the newest block and
-# requires the anchors to notice.
+# requires the anchors to notice, and alters an entry of the last block (then undoes it) and requires the replay to notice.
+# With sealed blocks the drill also replays the restored copy (RC.Ledger.v1) at each tenant's last anchored block.
 set -Eeuo pipefail
 export LOG_NAME=drill
 # shellcheck source=lib.sh
@@ -82,10 +83,50 @@ verify_scratch() {
 }
 verify_scratch || die "DRILL FAILED: the history chain does not verify in the restored copy"
 
+# Replay (RC.Ledger.v1) at each tenant's last anchored block, in the restored copy, against the set's own anchors: the state is
+# rebuilt from the raw history entries and the sealed block that covers it must be the one the anchors name (hash included).
+# Skipped, loudly, when the set has no sealed blocks or the app image predates the replay module.
+replay_scratch() {
+  local t h bh rc=0
+  while IFS='|' read -r t h bh; do
+    [ -n "$t" ] || continue
+    docker run --rm --network "$net" -e "JARVIS_DATABASE_MIGRATE_URL=postgresql://jarvis_migrator:$mig_pw@$name:5432/jarvis" \
+      -e JARVIS_DATABASE_SCHEMA=jarvis "$APP_IMAGE" python -m app.replay verify --tenant "$t" --at-block "$h" --expect-block-hash "$bh" >/dev/null 2>&1 || rc=1
+  done < <(anchors_tip_blocks "$BACKUP_DIR/$base.anchors")
+  return "$rc"
+}
+replayed=0
+if [ -z "$(anchors_tip_blocks "$BACKUP_DIR/$base.anchors")" ]; then
+  log INFO "drill: replay step skipped (the set has no sealed blocks)"
+elif ! docker run --rm --entrypoint python "$APP_IMAGE" -c "import app.replay" >/dev/null 2>&1; then
+  log WARN "drill: replay step skipped (the app image predates RC.Ledger.v1; rebuild with jarvisctl up)"
+else
+  replay_scratch || die "DRILL FAILED: replaying the restored copy at its last anchored block does not verify"
+  replayed=1
+  log INFO "drill: replay at the last anchored block verifies ($(anchors_tip_blocks "$BACKUP_DIR/$base.anchors" | tr '\n' ' '| sed 's/|[0-9a-f]\{64\}//g'))"
+fi
+
 entries="$(docker run --rm -i --entrypoint tar "$APP_IMAGE" -tf - < "$BACKUP_DIR/$base.data.tar" | wc -l)" \
   || die "DRILL FAILED: the appdata archive is unreadable"
 
 if [ "$prove" -eq 1 ]; then
+  if [ "$replayed" -eq 1 ]; then
+    # alter the newest entry of the last anchored block, require the replay to fail, then put it back exactly and require it to pass
+    IFS='|' read -r pt ph pbh < <(anchors_tip_blocks "$BACKUP_DIR/$base.anchors" | head -1)
+    if [[ "$pt" =~ ^[A-Za-z0-9_.@:-]+$ ]] && [[ "$ph" =~ ^[0-9]+$ ]]; then
+      plast="$(scratch_psql -c "select last_seq from jarvis.blocks where tenant_key = '$pt' and height = $ph")"
+      porig="$(scratch_psql -c "select row_hash from jarvis.record_history where tenant_key = '$pt' and seq = $plast")"
+      scratch_psql -c "ALTER TABLE jarvis.record_history DISABLE TRIGGER record_history_no_update" >/dev/null
+      scratch_psql -c "UPDATE jarvis.record_history SET row_hash = repeat('e', 64) WHERE tenant_key = '$pt' AND seq = $plast" >/dev/null
+      if replay_scratch; then die "DRILL FAILED: an altered entry in the last block was NOT detected by the replay"; fi
+      scratch_psql -c "UPDATE jarvis.record_history SET row_hash = '$porig' WHERE tenant_key = '$pt' AND seq = $plast" >/dev/null
+      scratch_psql -c "ALTER TABLE jarvis.record_history ENABLE TRIGGER record_history_no_update" >/dev/null
+      replay_scratch || die "DRILL FAILED: the restored copy does not replay again after the proof was undone"
+      log INFO "drill: an altered entry in the last block was detected by the replay, as it must be (and undone)"
+    else
+      log WARN "drill: replay proof skipped (unexpected tenant or height in the anchors)"
+    fi
+  fi
   if [ "$(scratch_psql -c "select count(*) from jarvis.record_history")" -gt 0 ]; then
     scratch_psql -c "ALTER TABLE jarvis.record_history DISABLE TRIGGER record_history_no_delete" >/dev/null
     scratch_psql -c "DELETE FROM jarvis.record_history WHERE seq = (SELECT max(seq) FROM jarvis.record_history)" >/dev/null
@@ -106,4 +147,4 @@ if [ "$prove" -eq 1 ]; then
 fi
 
 date +%s > "$STATE_DIR/drill.last_ok"
-log INFO "drill OK: $base restored, counts and anchors match, history verifies, appdata archive has $entries entries"
+log INFO "drill OK: $base restored, counts and anchors match, history verifies$([ "$replayed" -eq 1 ] && echo ", replay at the last anchored block verifies"), appdata archive has $entries entries"

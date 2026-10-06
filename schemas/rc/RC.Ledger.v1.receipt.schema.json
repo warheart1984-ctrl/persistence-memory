@@ -1,0 +1,63 @@
+{
+  "description": "The payload of a ``CES.Local.ReplayReceipt.v1`` evidence object: what the replay at a sealed point produced.\nNo timestamps, so the same replay always gives the same receipt (the same evidence id).",
+  "properties": {
+    "at_seq": {
+      "minimum": 0,
+      "title": "At Seq",
+      "type": "integer"
+    },
+    "block_hash": {
+      "description": "that block's hash, which the backup anchors also hold",
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Block Hash",
+      "type": "string"
+    },
+    "block_height": {
+      "description": "the sealed block that covers at_seq",
+      "minimum": 1,
+      "title": "Block Height",
+      "type": "integer"
+    },
+    "contract": {
+      "default": "RC.Ledger.v1",
+      "title": "Contract",
+      "type": "string"
+    },
+    "contract_version": {
+      "default": 1,
+      "minimum": 1,
+      "title": "Contract Version",
+      "type": "integer"
+    },
+    "deleted_count": {
+      "minimum": 0,
+      "title": "Deleted Count",
+      "type": "integer"
+    },
+    "record_count": {
+      "minimum": 0,
+      "title": "Record Count",
+      "type": "integer"
+    },
+    "state_root": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "State Root",
+      "type": "string"
+    },
+    "tenant": {
+      "title": "Tenant",
+      "type": "string"
+    }
+  },
+  "required": [
+    "tenant",
+    "at_seq",
+    "block_height",
+    "block_hash",
+    "state_root",
+    "record_count",
+    "deleted_count"
+  ],
+  "title": "ReplayReceiptPayload",
+  "type": "object"
+}

@@ -536,6 +536,89 @@ class PostgresRowStore:
         return replay.ReplayEvents(tenant=self._tenant_key, from_seq=from_seq, to_seq=end, history_seq=history_seq, events=events,
                                    next_from_seq=rows[-1]["seq"] + 1 if more else None)
 
+    # -- Replay receipts (CES.Local.ReplayReceipt.v1 evidence objects) ------------
+
+    def create_replay_receipt(self, *, at_seq: int | None = None, at_block: int | None = None,
+                              source_agent: str = "operator") -> "tuple[evidence_objects.EvidenceObject, bool, replay.ReplayState]":
+        """Replay at a SEALED point and store what it produced as an evidence object.  Idempotent: the same replay gives the
+        same receipt.  Refuses a point that no sealed block covers."""
+        from app import replay
+
+        if at_seq is None and at_block is None:
+            tip = self.block_head()["tip"]
+            if tip is None:
+                raise replay.ReplayError("replay_nothing_sealed", "no block is sealed yet, so there is nothing to give a receipt for", 409)
+            at_block = tip["height"]
+        state = self.replay_state(at_seq=at_seq, at_block=at_block, limit=1)
+        payload = replay.receipt_payload(state)
+        obj, created = self.put_evidence_object(evidence_objects.EvidenceObjectCreate(
+            schema_id=evidence_objects.CES_REPLAY_RECEIPT, payload=payload, source_agent=source_agent))
+        return obj, created, state
+
+    def get_replay_receipt(self, receipt_id: str) -> "evidence_objects.EvidenceObject":
+        from app import replay
+
+        if not evidence_objects.ID_RE.match(receipt_id or ""):
+            raise replay.ReplayError("receipt_id_invalid", "a receipt id looks like eo:sha256:<64 lowercase hex characters>")
+        obj = self.get_evidence_object(receipt_id)
+        if obj is None:
+            raise replay.ReplayError("receipt_not_found", f"there is no evidence object {receipt_id}", 404)
+        if obj.schema_id != evidence_objects.CES_REPLAY_RECEIPT:
+            raise replay.ReplayError("not_a_replay_receipt", f"{receipt_id} is a {obj.schema_id} object, not a replay receipt")
+        return obj
+
+    def list_replay_receipts(self, limit: int = 100) -> "list[evidence_objects.EvidenceObject]":
+        with self._tx() as conn:
+            rows = conn.execute(
+                f"SELECT {self._EVIDENCE_COLUMNS} FROM evidence_objects WHERE tenant_key = %s AND schema_id = %s "
+                "ORDER BY created_at DESC, id LIMIT %s",
+                (self._tenant_key, evidence_objects.CES_REPLAY_RECEIPT, max(1, min(int(limit), 1000)))).fetchall()
+        return [self._evidence_from_row(r) for r in rows]
+
+    def verify_replay_receipt(self, receipt_id: str) -> "replay.ReceiptVerification":
+        """Re-derive a receipt: the stored object must be intact, and replaying at its sealed point must give its root,
+        counts and block.  (``python -m app.replay verify --receipt`` does the same from the raw rows.)"""
+        from app import replay
+
+        obj = self.get_replay_receipt(receipt_id)
+        damaged = evidence_objects.verify_stored(obj)
+        if damaged:
+            return replay.ReceiptVerification(ok=False, receipt_id=receipt_id, problems=[
+                {"check": "receipt", "subject": receipt_id, "problem": f"the stored receipt is damaged: {p}"} for p in damaged])
+        p = obj.payload
+        problems: list[dict[str, str]] = []
+
+        def problem(message: str) -> None:
+            problems.append({"check": "receipt", "subject": receipt_id, "problem": message})
+
+        if p["contract"] != replay.CONTRACT_ID or p["contract_version"] != replay.CONTRACT_VERSION:
+            problem(f"this service knows {replay.CONTRACT_ID} version {replay.CONTRACT_VERSION}, not {p['contract']} version {p['contract_version']}")
+            return replay.ReceiptVerification(ok=False, receipt_id=receipt_id, problems=problems, receipt=replay.ReplayReceiptPayload(**p))
+        if p["tenant"] != self._tenant_key:
+            problem(f"the receipt is for tenant {p['tenant']}, not {self._tenant_key}")
+        replayed = None
+        try:
+            state = self.replay_state(at_seq=p["at_seq"], limit=1)
+        except replay.ReplayError as exc:
+            problem(f"the receipt cannot be replayed: {exc.message}")
+        else:
+            replayed = {"state_root": state.state_root, "record_count": state.record_count, "deleted_count": state.deleted_count,
+                        "block": state.block.model_dump() if state.block else None}
+            if state.state_root != p["state_root"]:
+                problem(f"the state root on replay is {state.state_root}, the receipt says {p['state_root']}")
+            for key in ("record_count", "deleted_count"):
+                if getattr(state, key) != p[key]:
+                    problem(f"{key} is {getattr(state, key)} on replay, the receipt says {p[key]}")
+            if state.block is None:
+                problem(f"no sealed block covers seq {p['at_seq']} any more")
+            else:
+                if state.block.height != p["block_height"]:
+                    problem(f"the covering block is {state.block.height}, the receipt says {p['block_height']}")
+                if state.block.block_hash != p["block_hash"]:
+                    problem(f"the covering block's hash is {state.block.block_hash}, the receipt says {p['block_hash']}")
+        return replay.ReceiptVerification(ok=not problems, receipt_id=receipt_id, problems=problems,
+                                          receipt=replay.ReplayReceiptPayload(**p), replayed=replayed)
+
     # -- writes -----------------------------------------------------------------
 
     def _supersedes_exists(self, conn: psycopg.Connection, target: str) -> bool:

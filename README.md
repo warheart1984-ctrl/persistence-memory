@@ -16,7 +16,7 @@ restore are in [`deploy/mint/README.md`](deploy/mint/README.md).
 | **Clause V** at the API: only `decision`, `architecture`, `research`, `fact`; every record needs evidence; nothing becomes `verified` without it. Emotion / transient-state / transcript heuristics only **warn** | **live**, type + evidence enforced (`docs/CLAUSE_V_HYGIENE.md`) |
 | **Evidence Objects**: content-addressed (`eo:sha256:…`), immutable, hash only, operator key to create | **live**, **unsigned** (`docs/EVIDENCE_OBJECTS.md`) |
 | **Continuity Blocks**: sealed, Merkle-rooted, hash-chained ranges of the history; every block hash is also kept outside the database in the backup anchors | **live**, **unsigned** (`docs/CONTINUITY_BLOCKS.md`) |
-| **Replay Contracts, `RC.Ledger.v1`**: rebuild the ledger's state and ordered events as of any seq or sealed block, with a state root; offline verifier `python -m app.replay verify` | **implemented on `main`, not deployed yet**: the live ledger has no `/api/jarvis/replay/*` routes (`docs/REPLAY_CONTRACTS.md`) |
+| **Replay Contracts, `RC.Ledger.v1`**: rebuild the ledger's state and ordered events as of any seq or sealed block, with a state root; receipts at sealed points (Evidence Objects); offline verifier `python -m app.replay verify`; `jarvisctl replay`; a restore-drill step | **implemented on `main`, not deployed yet**: the live ledger has no `/api/jarvis/replay/*` routes (`docs/REPLAY_CONTRACTS.md`) |
 | Domain Replay Contracts (`RC.AIKI`, `ARIS`, `SX`, `Lineage`, `Mandala`) | **declared only**: no schema, owner or algorithm exists |
 | Signatures, CES registry, unified provenance chain, ESFR promotion | **not built** (`docs/CCS_CHARTER.md`) |
 
@@ -35,7 +35,8 @@ On the box, from `deploy/mint/`: `bin/jarvisctl <command>` (`help` lists all; th
 | `smoke [--no-write]` | acceptance checks: exposure, hardening, roles, one write/history/delete round trip |
 | `seal [--force\|--status]` | seal new history into blocks now (a block is made at 500 waiting entries or when the oldest is an hour old) |
 | `backup` | take a verified backup set; its anchors (chain heads, counters, block hashes) must be a legitimate successor of the last or the dump is quarantined |
-| `drill [--prove-detection]` | restore the newest set into a scratch database and verify it; with the flag it also proves tampering and a removed block are detected |
+| `drill [--prove-detection]` | restore the newest set into a scratch database, verify it, and replay it at its last anchored block; with the flag it also proves tampering, a removed block and an altered entry are detected |
+| `replay state\|receipt\|receipts\|check\|verify` | Replay Contracts: replay the ledger at a point, issue and re-derive receipts at sealed points (needs the build with Replay Contracts deployed) |
 | `offsite` | encrypt (age) and send the newest set to the Windows PC |
 | `restore --yes-destroy-current-data` | **destructive**; the app stays down unless counts, anchors and hash chains all match |
 
@@ -72,7 +73,7 @@ write, or one without checkable evidence, is refused with `422 clause_v_violatio
 | `POST /api/jarvis/memory/pipeline` | EMR → STM → LTM consolidation, draft-only (needs `JARVIS_MCP_WRITE_ENABLED`) |
 | `POST /api/jarvis/evidence`, `GET …/{id}`, `…/{id}/verify` | Evidence Objects (create: operator key only) |
 | `POST /api/jarvis/blocks/seal`, `GET …/blocks`, `…/head`, `…/verify`, `…/{height}` | Continuity Blocks (operator key only) |
-| `GET /api/jarvis/replay/contracts`, `…/state`, `…/events` | `RC.Ledger.v1` (operator key only; **on `main`, not live yet**) |
+| `GET /api/jarvis/replay/contracts`, `…/state`, `…/events`, `POST …/receipts`, `GET …/receipts[/{id}[/verify]]` | `RC.Ledger.v1` and its receipts (operator key only; **on `main`, not live yet**) |
 
 Blocks and replay answer 501 on the JSON store, which has no history.
 
@@ -95,9 +96,9 @@ database URL or that opt-in the service answers 503 rather than creating a ledge
   not who vouches for it. Authority is the recorded actor (the tenant key) plus the record's own `source_agent`.
 * **Tamper evidence has an outside part.** Someone with full database control can rewrite history and re-seal every block; the
   database alone would pass. What exposes it is the anchors in the backups and in the encrypted offsite copies, so they matter.
-  A block sealed after the last backup is not anchored yet.
+  A block sealed after the last backup is not anchored yet; a receipt taken earlier also exposes a later rewrite.
 * **Domain Replay Contracts and CES schemas are not built.** Earlier docs claimed stubs under `schemas/rc/` and `schemas/ces/`;
-  they never existed (corrected). Only `RC.Ledger.v1` has files (`schemas/rc/`). Receipts of a replay are not built.
+  they never existed (corrected). Only `RC.Ledger.v1` has files (`schemas/rc/`). Receipts are unsigned claims until re-derived.
 * **`RC.Ledger.v1` is not on the live box until it is deployed.**
 * **Soft Clause V rules only warn** (emotion, transient state, transcripts) until the operator flips `JARVIS_CLAUSE_V_SOFT`.
 * **One box.** Wi-Fi only, disk not encrypted, an hour's worth of data at risk between backups, no automatic security updates

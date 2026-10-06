@@ -20,6 +20,7 @@ jarvisctl <command>
   verify [tenant]      verify the history hash chain and the sealed blocks (default tenant: operator)
   smoke [--no-write]   acceptance checks
   seal [--force|--status]  seal new history into Continuity Blocks now (or show the unsealed tail)
+  replay state|receipt|receipts|check|verify   Replay Contracts: replay the ledger at a point, receipts at sealed points, re-derive them
   backup               take a backup set now
   prune [--dry-run]    apply the retention policy
   restore --yes-destroy-current-data [--backup SET] [--no-start]
@@ -56,6 +57,7 @@ case "$cmd" in
     "${COMPOSE[@]}" run --rm --no-deps -T migrate python -m app.pg_verify --tenant "$t" ;;
   smoke)    exec "$here/smoke.sh" "$@" ;;
   seal)     exec "$here/seal.sh" "$@" ;;
+  replay)   exec "$here/replay.sh" "$@" ;;
   backup)   exec "$here/backup.sh" "$@" ;;
   prune)    exec "$here/prune.sh" "$@" ;;
   restore)  exec "$here/restore.sh" "$@" ;;

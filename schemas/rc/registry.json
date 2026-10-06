@@ -29,14 +29,17 @@
       "no wall clock, no randomness, no network: the output depends only on the tenant's history entries up to at_seq",
       "records are ordered by id, bytewise (UTF-8)",
       "the state root hashes row_hash values; it never re-serializes JSON, so floats and key order cannot change it",
-      "the same input gives the same output after later writes, after sealing, and after a backup and restore"
+      "the same input gives the same output after later writes, after sealing, and after a backup and restore",
+      "a receipt holds no timestamp, so the same replay at the same sealed point always gives the same receipt (the same evidence id)"
     ],
     "id": "RC.Ledger.v1",
     "owner": "persistence-memory",
     "schemas": [
       "RC.Ledger.v1.input.schema.json",
       "RC.Ledger.v1.state.schema.json",
-      "RC.Ledger.v1.events.schema.json"
+      "RC.Ledger.v1.events.schema.json",
+      "RC.Ledger.v1.receipt.schema.json",
+      "RC.Ledger.v1.receipt-verification.schema.json"
     ],
     "status": "implemented",
     "version": 1
