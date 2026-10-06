@@ -14,9 +14,10 @@ Tools (namespaced by the host with the server name, e.g. ``jarvis-ledger__recall
     health   liveness and readiness
     recall   list memories (default 50, up to 200); live ones only unless truth_scope says otherwise
     get      one memory by id
-    write    store ONE draft fact or decision. Only offered when JARVIS_LEDGER_MCP_WRITE=1; needs the user's own
-             wording in ``user_requested``; refuses anything that looks like a credential; source_agent is
-             fixed to JARVIS_LEDGER_MCP_SOURCE (default ``grok-bot``).
+    write    store ONE draft DECISION (nothing else: Clause V keeps preferences, tasks and chat out of the ledger).
+             Only offered when JARVIS_LEDGER_MCP_WRITE=1; needs the user's own wording in ``user_requested``, which is
+             kept as the decision's evidence; refuses anything that looks like a credential; source_agent is fixed to
+             JARVIS_LEDGER_MCP_SOURCE (default ``grok-bot``). The ledger applies its own Clause V gate on top.
 """
 
 from __future__ import annotations
@@ -128,6 +129,14 @@ def _request(method: str, path: str, body: dict[str, Any] | None = None, *, tole
             return resp.status, json.loads(resp.read().decode("utf-8") or "{}")
     except urllib.error.HTTPError as exc:
         text = exc.read().decode("utf-8", errors="replace")
+        if exc.code == 422:
+            try:
+                refusal = json.loads(text)
+            except json.JSONDecodeError:
+                refusal = {}
+            if isinstance(refusal, dict) and refusal.get("code") == "clause_v_violation":
+                reasons = ", ".join(str(r.get("code")) for r in refusal.get("reasons", []) if isinstance(r, dict))
+                raise Refusal("clause_v_violation", f"the ledger refused this write under Clause V ({reasons}); nothing was stored") from None
         if exc.code in tolerate:
             try:
                 return exc.code, json.loads(text)
@@ -225,8 +234,8 @@ def tool_write(args: dict[str, Any]) -> dict[str, Any]:
     session_id = args.get("session_id") or "grok-bot-session"
     if not isinstance(content, str) or not content.strip() or len(content) > MAX_CONTENT:
         raise Refusal("bad_argument", f"content must be a non-empty string of at most {MAX_CONTENT} characters")
-    if mem_type not in ("fact", "decision"):
-        raise Refusal("bad_argument", "type must be 'fact' or 'decision'")
+    if mem_type != "decision":
+        raise Refusal("bad_argument", "type must be 'decision': the ledger keeps decisions and evidence, not facts, preferences or notes")
     if not isinstance(wording, str) or len(wording.strip()) < 8:
         raise Refusal("user_request_required", "user_requested must quote the user's own words asking to store this; nothing was sent")
     if not isinstance(session_id, str) or not session_id.strip() or len(session_id) > 128:
@@ -249,7 +258,10 @@ def tool_write(args: dict[str, Any]) -> dict[str, Any]:
     }
     _, created = _request("POST", "/api/jarvis/memory", body)
     memory = created.get("memory", {})
-    return {"stored": True, "id": memory.get("id"), "type": memory.get("type"), "status": memory.get("status"), "source_agent": memory.get("source_agent")}
+    out = {"stored": True, "id": memory.get("id"), "type": memory.get("type"), "status": memory.get("status"), "source_agent": memory.get("source_agent")}
+    if created.get("clause_v_warnings"):  # warn-only findings from the ledger's Clause V gate, passed on to the caller
+        out["clause_v_warnings"] = created["clause_v_warnings"]
+    return out
 
 
 _READ_ONLY = {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}
@@ -295,16 +307,16 @@ TOOLS: dict[str, dict[str, Any]] = {
     },
     "write": {
         "description": (
-            "Store ONE draft memory (fact or decision) in the ledger. Use ONLY when the user explicitly asked you "
-            "to store something, and quote their words in user_requested. Never store credentials. Never invent "
-            "memories. Refused unless the user has switched writing on."
+            "Store ONE draft DECISION in the ledger (decisions only; not facts, preferences, tasks or conversation). Use "
+            "ONLY when the user explicitly asked you to store a decision, and quote their words in user_requested. "
+            "Never store credentials. Never invent decisions. Refused unless the user has switched writing on."
         ),
         "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
         "inputSchema": {
             "type": "object",
             "properties": {
                 "content": {"type": "string", "maxLength": MAX_CONTENT},
-                "type": {"type": "string", "enum": ["fact", "decision"]},
+                "type": {"type": "string", "enum": ["decision"]},
                 "user_requested": {"type": "string", "description": "The user's own words asking you to store this"},
                 "session_id": {"type": "string", "description": "Optional conversation or session id"},
             },

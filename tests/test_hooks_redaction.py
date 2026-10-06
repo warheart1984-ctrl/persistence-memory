@@ -1,4 +1,4 @@
-"""The sessionEnd hook must refuse to post anything that looks like a credential, and say so without leaking it.
+"""The hooks' secret filter (used by the ledger MCP server's write tool) finds credentials without leaking them.
 
 Fake secrets are assembled at run time from pieces, so no real-looking token is committed to the repository.
 """
@@ -132,83 +132,49 @@ def test_the_refusal_log_has_pattern_names_only(common, monkeypatch, tmp_path):
     assert "session=sess-42" in plain
 
 
-# --- the sessionEnd hook ------------------------------------------------------------------------------------
+# --- the sessionEnd hook is retired -----------------------------------------------------------------------------
+
+_HOOKS_DIR = Path(__file__).resolve().parents[1] / "agent-hooks"
+
 
 @pytest.fixture
 def end(monkeypatch, tmp_path, common):
     module = _load("jarvis_session_end")
     shared = sys.modules["jarvis_common"]  # the instance the hook imported from
     monkeypatch.setattr(shared, "state_dir", lambda: tmp_path)
-    last = tmp_path / "last.txt"
-    monkeypatch.setattr(module, "read_stdin_json", lambda: {"session_id": "sess-1", "reason": "ended"})
-    monkeypatch.setattr(module, "session_meta_path", lambda: tmp_path / "no-meta.json")
-    monkeypatch.setattr(module, "last_response_path", lambda: last)
-    posts: list[tuple] = []
-    monkeypatch.setattr(module, "try_http_json", lambda *args, **kwargs: posts.append((args, kwargs)) or ({}, None))
-    for var in ("JARVIS_API_KEY", "JARVIS_API_KEY_FILE", "EMR_RECALL_API_KEY", "JARVIS_HOOK_SECRET_ENTROPY"):
-        monkeypatch.delenv(var, raising=False)
-    module._last = last
-    module._posts = posts
+    calls: list = []
+    monkeypatch.setattr(shared.urllib.request, "urlopen", lambda *a, **k: calls.append(a) or (_ for _ in ()).throw(OSError("no network in this test")))
+    module._calls = calls
     module._dir = tmp_path
     return module
 
 
-def test_a_clean_session_is_still_posted(end, capsys):
-    end._last.write_text("We decided to keep the retry loop simple.\nNothing else.", "utf-8")
-    assert end.main() == 0
-    out, err = capsys.readouterr()
-    assert json.loads(out) == {}
-    assert len(end._posts) == 1
-    (method, path, body), _ = end._posts[0]
-    assert (method, path) == ("POST", "/api/jarvis/memory") and body["source_agent"] == "cursor-sessionEnd"
-    assert "not sent" not in err and not (end._dir / "jarvis-hook-refusals.log").exists()
-
-
 @pytest.mark.parametrize(
-    "secret",
+    "reply",
     [
-        "sk-" + "a1B2c3D4" * 5,
-        "ghp_" + "A1b2C3d4E5" * 4,
+        "We decided to keep the retry loop simple.",
+        "the key is sk-" + "a1B2c3D4" * 5,
         "-----BEGIN " + "RSA PRIVATE KEY-----",
-        "password = hunter22!",
-        "postgresql://jarvis_app:" + "s3cretpw" + "@db:5432/jarvis",
+        "",
     ],
 )
-def test_a_session_containing_a_secret_posts_nothing_and_leaks_nothing(end, capsys, secret):
-    end._last.write_text(f"We decided to rotate things.\nthe value is {secret}\nmore text here", "utf-8")
+def test_session_end_posts_nothing_whatever_the_session_said(end, monkeypatch, capsys, tmp_path, reply):
+    (tmp_path / "last.txt").write_text(reply, "utf-8")
+    monkeypatch.setattr(sys.modules["jarvis_common"], "last_response_path", lambda: tmp_path / "last.txt")
+    monkeypatch.setattr(end, "read_stdin_json", lambda: {"session_id": "sess-1", "reason": "ended"})
     assert end.main() == 0
     out, err = capsys.readouterr()
-    assert end._posts == []  # nothing was sent, not even a masked version
-    assert json.loads(out) == {}
-    log = (end._dir / "jarvis-hook-refusals.log").read_text("utf-8")
-    assert "not sent; matched:" in err and "not sent; matched:" in log
-    for channel in (out, err, log):
-        assert secret not in channel
-        assert secret.split("=")[-1].strip() not in channel or len(secret.split("=")[-1].strip()) < 8
+    assert json.loads(out) == {} and err == ""
+    assert end._calls == []  # no request was even attempted
+    assert sorted(p.name for p in end._dir.iterdir()) == ["last.txt"]  # nothing written either (no log, no state)
 
 
-def test_a_secret_far_beyond_the_excerpt_still_blocks_the_post(end, capsys):
-    secret = "ghp_" + "A1b2C3d4E5" * 4
-    end._last.write_text("We decided to ship.\n" + ("filler line\n" * 400) + f"token {secret}\n", "utf-8")
-    assert end.main() == 0
-    assert end._posts == []
-    assert secret not in capsys.readouterr().err
+def test_session_end_no_longer_knows_how_to_reach_the_ledger():
+    text = (_HOOKS_DIR / "jarvis_session_end.py").read_text("utf-8")
+    for needle in ("try_http_json", "http_json", "/api/jarvis/memory", "cursor-sessionEnd", "find_secrets", "urllib"):
+        assert needle not in text, needle
 
 
-def test_the_ledgers_own_key_in_a_session_blocks_the_post(end, monkeypatch, capsys):
-    monkeypatch.setenv("JARVIS_API_KEY", "Zebra-Quartz-Lantern-91")
-    end._last.write_text("We decided: the key is Zebra-Quartz-Lantern-91", "utf-8")
-    assert end.main() == 0
-    out, err = capsys.readouterr()
-    assert end._posts == [] and "ledger-api-key" in err and "Zebra-Quartz-Lantern-91" not in out + err
-
-
-def test_if_the_filter_itself_fails_nothing_is_posted(end, monkeypatch, capsys):
-    def boom(_text, **_kw):
-        raise RuntimeError("filter exploded")
-
-    monkeypatch.setattr(end, "find_secrets", boom)
-    end._last.write_text("We decided to ship.", "utf-8")
-    assert end.main() == 0
-    out, err = capsys.readouterr()
-    assert end._posts == [] and "filter-error" in err
+def test_the_hooks_template_no_longer_lists_session_end():
+    template = json.loads((_HOOKS_DIR / "hooks.json").read_text("utf-8"))
+    assert "sessionEnd" not in template["hooks"] and set(template["hooks"]) == {"sessionStart", "afterAgentResponse"}

@@ -104,7 +104,7 @@ printed, returned or sent over plain http to another host.
 | `health` | liveness and readiness |
 | `recall` | live memories, default 50, up to 200 (`limit`), optional `query` / `type` / `status` / `subject`, and `truth_scope` (`live` by default, which leaves archived records out; `all` or `archived` to see them); content shortened to `content_chars` (default 400, 0 = full); says when the result is capped |
 | `get` | one memory by id |
-| `write` | **off unless `JARVIS_LEDGER_MCP_WRITE=1`**, and then not even listed otherwise. Stores one draft `fact` or `decision` with `source_agent` `grok-bot` (`JARVIS_LEDGER_MCP_SOURCE` renames it), needs the user's own words in `user_requested`, and refuses anything that looks like a credential |
+| `write` | **off unless `JARVIS_LEDGER_MCP_WRITE=1`**, and then not even listed otherwise. Stores one draft `decision` (only decisions: the ledger refuses preferences, tasks and unevidenced facts under Clause V) with `source_agent` `grok-bot` (`JARVIS_LEDGER_MCP_SOURCE` renames it), needs the user's own words in `user_requested`, and refuses anything that looks like a credential |
 
 For Grok, MCP servers live in `~/.grok/config.toml` (`C:\Users\randj\.grok\config.toml`):
 ```toml

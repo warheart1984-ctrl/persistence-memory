@@ -43,6 +43,7 @@ class _Ledger(BaseHTTPRequestHandler):
     fail_body: str | None = None
     long_first = False
     archived: set[int] = set()
+    warn: list | None = None  # clause_v_warnings the fake ledger hands back on a create
 
     def log_message(self, *args):
         pass
@@ -93,8 +94,13 @@ class _Ledger(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(length) or b"{}")
         self._note(body)
         if urlparse(self.path).path == "/api/jarvis/memory":
+            if body["content"] == "CLAUSE-V-REFUSE-ME":
+                return self._reply(422, {"detail": "Clause V: ...", "code": "clause_v_violation", "clause": "V", "reasons": [{"code": "clause_v_evidence_required", "message": "m", "field": "evidence"}, {"code": "clause_v_preference", "message": "m", "field": "type"}]})
             record = _record(99, body["content"]) | {"source_agent": body["source_agent"], "type": body["type"], "status": body["status"]}
-            return self._reply(200, {"memory": record})
+            reply = {"memory": record}
+            if type(self).warn:
+                reply["clause_v_warnings"] = type(self).warn
+            return self._reply(200, reply)
         return self._reply(404, {})
 
 
@@ -106,6 +112,7 @@ def ledger(monkeypatch, tmp_path):
     _Ledger.fail_body = None
     _Ledger.long_first = False
     _Ledger.archived = set()
+    _Ledger.warn = None
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), _Ledger)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     key_file = tmp_path / "api-key"
@@ -240,7 +247,7 @@ def test_get_of_an_unknown_id_says_not_found(ledger):
 
 # --- writing is off unless switched on ----------------------------------------------------------------------
 
-_GOOD = {"content": "Grok test fact", "type": "fact", "user_requested": "please store this test fact"}
+_GOOD = {"content": "Grok test decision", "type": "decision", "user_requested": "please store this test decision"}
 
 
 def test_write_is_not_offered_and_does_nothing_by_default(ledger):
@@ -267,9 +274,9 @@ def test_write_posts_one_draft_with_the_fixed_source_agent(writable):
     post = [s for s in writable.seen if s["method"] == "POST"]
     assert len(post) == 1 and post[0]["key"] == KEY
     body = post[0]["body"]
-    assert body["source_agent"] == "grok-bot" and body["type"] == "fact" and body["status"] == "draft"
+    assert body["source_agent"] == "grok-bot" and body["type"] == "decision" and body["status"] == "draft"
     assert body["session_id"] == "chat-1" and body["tags"] == ["grok-bot", "user-requested"]
-    assert body["evidence"][0]["note"] == "please store this test fact"
+    assert body["evidence"][0]["note"] == "please store this test decision"
 
 
 def test_write_accepts_a_decision_and_a_custom_source_name(writable, monkeypatch):
@@ -281,8 +288,12 @@ def test_write_accepts_a_decision_and_a_custom_source_name(writable, monkeypatch
 @pytest.mark.parametrize(
     "bad",
     [
+        {"type": "fact"},
+        {"type": "architecture"},
+        {"type": "research"},
         {"type": "task"},
         {"type": "preference"},
+        {"type": "external_context"},
         {"content": ""},
         {"content": "x" * 1901},
         {"user_requested": ""},
@@ -392,3 +403,31 @@ def test_recall_rejects_any_other_truth_scope_without_a_request(ledger, scope):
 def test_the_recall_schema_offers_the_three_scopes():
     schema = {t["name"]: t for t in mcp._listed_tools()}["recall"]["inputSchema"]["properties"]["truth_scope"]
     assert schema["enum"] == ["live", "all", "archived"] and schema["default"] == "live"
+
+
+# --- Clause V: decisions only, and the ledger's own refusal is passed on cleanly ---------------------------------
+
+def test_the_write_tool_offers_only_the_decision_type():
+    schema = mcp.TOOLS["write"]["inputSchema"]["properties"]["type"]
+    assert schema["enum"] == ["decision"]
+
+
+def test_a_fact_is_refused_by_the_tool_before_any_request(writable):
+    result = call("write", _GOOD | {"type": "fact"})
+    assert code_of(result) == "bad_argument" and "decision" in result["content"][0]["text"] and writable.seen == []
+
+
+def test_the_ledgers_clause_v_refusal_becomes_a_clear_tool_error(writable):
+    result = call("write", _GOOD | {"content": "CLAUSE-V-REFUSE-ME"})
+    assert code_of(result) == "clause_v_violation"
+    text = result["content"][0]["text"]
+    assert "clause_v_evidence_required" in text and "clause_v_preference" in text and "nothing was stored" in text
+    assert KEY not in json.dumps(result)
+
+
+def test_warn_only_findings_from_the_ledger_are_passed_on(writable):
+    writable.warn = [{"code": "clause_v_emotion", "message": "m", "field": "content"}]
+    result = call("write", _GOOD)
+    assert result["isError"] is False and result["structuredContent"]["clause_v_warnings"][0]["code"] == "clause_v_emotion"
+    writable.warn = None
+    assert "clause_v_warnings" not in call("write", _GOOD)["structuredContent"]

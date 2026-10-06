@@ -44,6 +44,6 @@ CCS “enforce constitutional (continuity) invariants” means: required provena
 
 Per `CONSTITUTIONAL_BOUNDARY_CLAUSE.md` (**declared**): *Continuity unifies evidence, not domains.* This package must not collapse AIKI / ARIS / Sovereign X / Lineage / Mandala semantics. Shared substrate = evidence format, provenance, replay contracts, verification rules; meaning and authority stay domain-local.
 
-**Clause V gap:** Continuity should exclude memory/emotion/transient/ungoverned context. Current `sessionEnd` hooks may still POST memory-like draft facts — status **transitional / partial**, not enforced. See Boundary Clause V.
+**Clause V:** type and evidence are enforced at the ledger API (see `CLAUSE_V_HYGIENE.md`); emotion, transient state and transcript findings are warn-only. The `sessionEnd` hook is retired and posts nothing. Not claimed: any semantic judgement of what is true.
 
 See also: `CCS_CHARTER.md`, `ADAPTER_CONSUMERS.md`, `CONSTITUTIONAL_BOUNDARY_CLAUSE.md`.

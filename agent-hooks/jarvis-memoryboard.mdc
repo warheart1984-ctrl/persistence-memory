@@ -18,13 +18,14 @@ Store **decisions/evidence**, not chats. Ledger preserves continuity; it does no
 ## Write rules
 
 POST `/api/jarvis/memory` with Continuity Ledger fields:
-`content`, `source_agent`, `session_id`, `type` (`decision|fact|task|preference|architecture|research`),
+`content`, `source_agent`, `session_id`, `type` (`decision|architecture|research|fact`; `preference`, `task` and `external_context` are refused),
 `confidence`, `evidence`, `status` (`draft|verified|archived`), optional `supersedes`, optional `subject`.
 
-Prefer `type=decision` + evidence links for durable outcomes. Never silently merge conflicts.
+Prefer `type=decision` + evidence links for durable outcomes. A `decision` needs at least one evidence link; the other
+types need a checkable link (file, url, commit, test, ...). Never silently merge conflicts.
 
-**Clause V (declared, not enforced):** avoid posting emotion/transient chat dumps into the ledger.
-SessionEnd auto-posts are transitional — prefer explicit decision/evidence records.
+**Clause V (type and evidence enforced at the API; see `CLAUSE_V_HYGIENE.md`):** do not post emotion/transient chat dumps.
+The sessionEnd hook is retired and posts nothing — write explicit decision/evidence records instead.
 
 ## Session end
 
