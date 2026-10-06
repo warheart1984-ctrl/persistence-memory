@@ -32,6 +32,7 @@ from typing import Any, Callable
 from pydantic import BaseModel, Field
 
 from app import blocks as continuity_blocks
+from app import evidence as evidence_objects
 
 CONTRACT_ID = "RC.Ledger.v1"
 CONTRACT_VERSION = 1
@@ -70,6 +71,7 @@ _LEDGER_DETERMINISM = [
     "records are ordered by id, bytewise (UTF-8)",
     "the state root hashes row_hash values; it never re-serializes JSON, so floats and key order cannot change it",
     "the same input gives the same output after later writes, after sealing, and after a backup and restore",
+    "a receipt holds no timestamp, so the same replay at the same sealed point always gives the same receipt (the same evidence id)",
 ]
 
 REGISTRY: dict[str, ContractSpec] = {
@@ -77,7 +79,8 @@ REGISTRY: dict[str, ContractSpec] = {
         id=CONTRACT_ID, version=CONTRACT_VERSION, status="implemented", consumer="Continuity Ledger (this service)",
         description="Rebuild the ledger's records and ordered events as of a history seq or a sealed block.",
         algorithm="ledger-state-at-seq/v1", owner="persistence-memory", determinism=_LEDGER_DETERMINISM,
-        schemas=["RC.Ledger.v1.input.schema.json", "RC.Ledger.v1.state.schema.json", "RC.Ledger.v1.events.schema.json"],
+        schemas=["RC.Ledger.v1.input.schema.json", "RC.Ledger.v1.state.schema.json", "RC.Ledger.v1.events.schema.json",
+                 "RC.Ledger.v1.receipt.schema.json", "RC.Ledger.v1.receipt-verification.schema.json"],
     ),
 }
 for _rc, _consumer in (("RC.AIKI.v1", "AIKI"), ("RC.ARIS.v1", "ARIS"), ("RC.SX.v1", "Sovereign X"),
@@ -231,10 +234,54 @@ class ReplayEvents(BaseModel):
     next_from_seq: int | None
 
 
+class ReceiptRequest(BaseModel):
+    """Ask for a receipt of the replay at a sealed point.  Neither bound given means the end of the newest sealed block."""
+
+    at_seq: int | None = Field(default=None, ge=1, description="a seq covered by a sealed block")
+    at_block: int | None = Field(default=None, ge=1, description="the last entry of this sealed block")
+
+
+class ReplayReceiptPayload(BaseModel):
+    """The payload of a ``CES.Local.ReplayReceipt.v1`` evidence object: what the replay at a sealed point produced.
+    No timestamps, so the same replay always gives the same receipt (the same evidence id)."""
+
+    contract: str = CONTRACT_ID
+    contract_version: int = Field(default=CONTRACT_VERSION, ge=1)
+    tenant: str
+    at_seq: int = Field(ge=0)
+    block_height: int = Field(ge=1, description="the sealed block that covers at_seq")
+    block_hash: str = Field(pattern=r"^[0-9a-f]{64}$", description="that block's hash, which the backup anchors also hold")
+    state_root: str = Field(pattern=r"^[0-9a-f]{64}$")
+    record_count: int = Field(ge=0)
+    deleted_count: int = Field(ge=0)
+
+
+class ReceiptVerification(BaseModel):
+    """The result of re-deriving a receipt: the receipt is honest only if every problem list entry is absent."""
+
+    ok: bool
+    receipt_id: str
+    problems: list[dict[str, str]]
+    receipt: ReplayReceiptPayload | None = None
+    replayed: dict[str, Any] | None = Field(default=None, description="what the replay says now (root, counts, block)")
+
+
+def receipt_payload(state: "ReplayState") -> dict[str, Any]:
+    """The receipt payload for a replayed state (it must be at a sealed point: ``state.block`` is set)."""
+    if state.block is None:
+        raise ReplayError("replay_not_sealed", f"receipts are issued only at sealed points; the ledger is sealed through seq {state.sealed_seq}")
+    return ReplayReceiptPayload(
+        tenant=state.tenant, at_seq=state.at_seq, block_height=state.block.height, block_hash=state.block.block_hash,
+        state_root=state.state_root, record_count=state.record_count, deleted_count=state.deleted_count,
+    ).model_dump()
+
+
 SCHEMA_MODELS: dict[str, type[BaseModel]] = {
     "RC.Ledger.v1.input.schema.json": ReplayInput,
     "RC.Ledger.v1.state.schema.json": ReplayState,
     "RC.Ledger.v1.events.schema.json": ReplayEvents,
+    "RC.Ledger.v1.receipt.schema.json": ReplayReceiptPayload,
+    "RC.Ledger.v1.receipt-verification.schema.json": ReceiptVerification,
 }
 SCHEMA_DIR = Path(__file__).resolve().parents[1] / "schemas" / "rc"
 
@@ -265,6 +312,8 @@ class Ctx:
     tenant: str
     at_seq: int
     expect_root: str | None
+    expect_block_hash: str | None = None
+    expect_block_height: int | None = None
     counter: int = 0
     sealed_seq: int = 0
     entries: list[Entry] = field(default_factory=list)  # every entry with seq <= at_seq, ordered by (memory_id, seq)
@@ -352,6 +401,23 @@ def _check_blocks(ctx: Ctx) -> list[Problem]:
     return out
 
 
+def _check_expected_block(ctx: Ctx) -> list[Problem]:
+    """The sealed block that covers at_seq must be the one expected (the anchor's, or the receipt's)."""
+    if ctx.expect_block_hash is None and ctx.expect_block_height is None:
+        return []
+    row = ctx.conn.execute(
+        "SELECT height, block_hash FROM blocks WHERE tenant_key = %s AND first_seq <= %s AND last_seq >= %s",
+        (ctx.tenant, ctx.at_seq, ctx.at_seq)).fetchone()
+    if row is None:
+        return [_problem("expected_block", "block", f"no sealed block covers seq {ctx.at_seq}, but one was expected")]
+    out: list[Problem] = []
+    if ctx.expect_block_height is not None and row[0] != ctx.expect_block_height:
+        out.append(_problem("expected_block", f"block {row[0]}", f"the covering block is {row[0]}, expected block {ctx.expect_block_height}"))
+    if ctx.expect_block_hash is not None and row[1] != ctx.expect_block_hash:
+        out.append(_problem("expected_block", f"block {row[0]}", f"the covering block's hash is {row[1]}, not the expected {ctx.expect_block_hash}"))
+    return out
+
+
 # Run in this order.  A dict so a test can swap one entry out and show the tamper it exists for goes unnoticed.
 CHECKS: dict[str, Callable[[Ctx], list[Problem]]] = {
     "seq": _check_seq,
@@ -360,6 +426,7 @@ CHECKS: dict[str, Callable[[Ctx], list[Problem]]] = {
     "state_root": _check_state_root,
     "live_match": _check_live_match,
     "blocks": _check_blocks,
+    "expected_block": _check_expected_block,
 }
 
 
@@ -382,13 +449,17 @@ def resolve_at_seq(conn: Any, tenant: str, at_seq: int | None, at_block: int | N
 
 
 def verify_replay(conn: Any, tenant: str, *, at_seq: int | None = None, at_block: int | None = None,
-                  expect_root: str | None = None) -> dict[str, Any]:
+                  expect_root: str | None = None, expect_block_hash: str | None = None,
+                  expect_block_height: int | None = None) -> dict[str, Any]:
     """Replay the tenant's history up to a point from the raw entries and check everything that can be checked.
 
     ``conn`` is a psycopg connection with the ledger schema on its search path and the tenant (or a superuser) able to
     read it.  Returns {"ok", "problems", ...}; a problem names the check that found it."""
+    # Row-level security binds every role but a superuser to the tenant named here; without it the ledger looks empty.
+    conn.execute("SELECT set_config('jarvis.tenant_key', %s, true)", (tenant,))
     seq = resolve_at_seq(conn, tenant, at_seq, at_block)
-    ctx = Ctx(conn=conn, tenant=tenant, at_seq=seq, expect_root=expect_root)
+    ctx = Ctx(conn=conn, tenant=tenant, at_seq=seq, expect_root=expect_root,
+              expect_block_hash=expect_block_hash, expect_block_height=expect_block_height)
     row = conn.execute("SELECT last_seq FROM history_counters WHERE tenant_key = %s", (tenant,)).fetchone()
     ctx.counter = row[0] if row else 0
     row = conn.execute("SELECT coalesce(max(last_seq), 0) FROM blocks WHERE tenant_key = %s", (tenant,)).fetchone()
@@ -409,6 +480,50 @@ def verify_replay(conn: Any, tenant: str, *, at_seq: int | None = None, at_block
         "record_count": len(ctx.folded.live), "deleted_count": ctx.folded.deleted, "entry_count": len(ctx.entries),
         "block": {"height": covering[0], "block_hash": covering[1]} if covering else None,
     }
+
+
+def _load_receipt(conn: Any, tenant: str, receipt_id: str) -> "evidence_objects.EvidenceObject":
+    if not evidence_objects.ID_RE.match(receipt_id or ""):
+        raise ReplayError("receipt_id_invalid", "a receipt id looks like eo:sha256:<64 lowercase hex characters>")
+    conn.execute("SELECT set_config('jarvis.tenant_key', %s, true)", (tenant,))
+    row = conn.execute(
+        "SELECT id, schema_id, payload, pointer, size_bytes, created_at, created_by FROM evidence_objects WHERE tenant_key = %s AND id = %s",
+        (tenant, receipt_id)).fetchone()
+    if row is None:
+        raise ReplayError("receipt_not_found", f"there is no evidence object {receipt_id}", 404)
+    obj = evidence_objects.EvidenceObject(id=row[0], schema_id=row[1], payload=row[2], pointer=row[3], size_bytes=row[4],
+                                          created_at=row[5].isoformat(), created_by=row[6])
+    if obj.schema_id != evidence_objects.CES_REPLAY_RECEIPT:
+        raise ReplayError("not_a_replay_receipt", f"{receipt_id} is a {obj.schema_id} object, not a replay receipt")
+    return obj
+
+
+def verify_receipt(conn: Any, tenant: str, receipt_id: str) -> dict[str, Any]:
+    """Re-derive a receipt from the raw history entries: the stored object must be intact, and replaying the ledger at the
+    receipt's sealed point must give the receipt's state root, counts and covering block.  Returns a ``verify_replay``-style
+    result with a ``receipt`` entry; ``ok`` is false if anything differs."""
+    obj = _load_receipt(conn, tenant, receipt_id)
+    problems: list[Problem] = [_problem("receipt", receipt_id, f"the stored receipt is damaged: {p}") for p in evidence_objects.verify_stored(obj)]
+    if problems:
+        return {"ok": False, "problems": problems, "receipt": obj.payload, "tenant": tenant}
+    p = obj.payload
+    if p["contract"] != CONTRACT_ID or p["contract_version"] != CONTRACT_VERSION:
+        return {"ok": False, "receipt": p, "tenant": tenant,
+                "problems": [_problem("receipt", receipt_id, f"this verifier knows {CONTRACT_ID} version {CONTRACT_VERSION}, not {p['contract']} version {p['contract_version']}")]}
+    if p["tenant"] != tenant:
+        problems.append(_problem("receipt", receipt_id, f"the receipt is for tenant {p['tenant']}, not {tenant}"))
+    try:
+        result = verify_replay(conn, tenant, at_seq=p["at_seq"], expect_root=p["state_root"],
+                               expect_block_hash=p["block_hash"], expect_block_height=p["block_height"])
+    except ReplayError as exc:
+        problems.append(_problem("receipt", receipt_id, f"the receipt cannot be replayed: {exc.message}"))
+        return {"ok": False, "problems": problems, "receipt": p, "tenant": tenant}
+    problems.extend(result["problems"])
+    for key in ("record_count", "deleted_count"):
+        if result[key] != p[key]:
+            problems.append(_problem("receipt", receipt_id, f"{key} is {result[key]} on replay, the receipt says {p[key]}"))
+    result.update(problems=problems, ok=not problems, receipt=p, receipt_id=receipt_id)
+    return result
 
 
 # --- command line -----------------------------------------------------------------------------------------------
@@ -439,6 +554,8 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--at-seq", type=int)
     g.add_argument("--at-block", type=int)
     v.add_argument("--expect-root", help="fail unless the replayed state root equals this value")
+    v.add_argument("--expect-block-hash", help="fail unless the sealed block covering the point has this hash (an anchor's, for example)")
+    v.add_argument("--receipt", help="re-derive this replay receipt (an evidence object id) from the raw history instead")
     s = sub.add_parser("schemas", help="write or check the published schemas under schemas/rc/")
     sg = s.add_mutually_exclusive_group(required=True)
     sg.add_argument("--write", action="store_true")
@@ -463,7 +580,14 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     with conn:
         try:
-            result = verify_replay(conn, args.tenant, at_seq=args.at_seq, at_block=args.at_block, expect_root=args.expect_root)
+            if args.receipt:
+                if args.at_seq is not None or args.at_block is not None or args.expect_root or args.expect_block_hash:
+                    print("--receipt carries its own point, root and block; do not combine it with those options", file=sys.stderr)
+                    return 2
+                result = verify_receipt(conn, args.tenant, args.receipt)
+            else:
+                result = verify_replay(conn, args.tenant, at_seq=args.at_seq, at_block=args.at_block, expect_root=args.expect_root,
+                                       expect_block_hash=args.expect_block_hash)
         except ReplayError as exc:
             print(f"{exc.code}: {exc.message}", file=sys.stderr)
             return 2
@@ -472,6 +596,10 @@ def main(argv: list[str] | None = None) -> int:
     if result["problems"]:
         return 1
     where = f"block {result['block']['height']} ({result['block']['block_hash'][:16]}...)" if result["block"] else "not covered by a sealed block"
+    if args.receipt:
+        print(f"ok: receipt {args.receipt} re-derived: seq {result['at_seq']}, {result['record_count']} record(s), "
+              f"state root {result['state_root']}; {where}")
+        return 0
     print(f"ok: replayed {result['entry_count']} entries to seq {result['at_seq']}: {result['record_count']} record(s), "
           f"{result['deleted_count']} deleted, state root {result['state_root']}; {where}")
     return 0

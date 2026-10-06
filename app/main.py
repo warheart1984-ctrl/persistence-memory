@@ -947,9 +947,38 @@ def replay_events(
     return _replay_call(get_store().replay_events, from_seq=from_seq, to_seq=to_seq, limit=limit).model_dump()
 
 
+@app.post("/api/jarvis/replay/receipts", dependencies=[Depends(require_operator_write)])
+def create_replay_receipt(body: replay_contracts.ReceiptRequest = replay_contracts.ReceiptRequest()):
+    """Replay at a SEALED point and store the result as a receipt (a CES.Local.ReplayReceipt.v1 evidence object).
+
+    Idempotent: the same replay gives the same receipt.  A point no sealed block covers is refused."""
+    obj, created, state = _replay_call(get_store().create_replay_receipt, at_seq=body.at_seq, at_block=body.at_block)
+    return {"receipt": obj.model_dump(), "created": created,
+            "state": state.model_dump(exclude={"records", "next_after_id"})}
+
+
+@app.get("/api/jarvis/replay/receipts", dependencies=[Depends(require_operator_read)])
+def list_replay_receipts(limit: int = Query(default=100, ge=1, le=1000)):
+    receipts = _replay_call(get_store().list_replay_receipts, limit)
+    return {"receipts": [r.model_dump() for r in receipts], "count": len(receipts)}
+
+
+@app.get("/api/jarvis/replay/receipts/{receipt_id}", dependencies=[Depends(require_operator_read)])
+def get_replay_receipt(receipt_id: str):
+    return {"receipt": _replay_call(get_store().get_replay_receipt, receipt_id).model_dump()}
+
+
+@app.get("/api/jarvis/replay/receipts/{receipt_id}/verify", dependencies=[Depends(require_operator_read)])
+def verify_replay_receipt(receipt_id: str):
+    """Re-derive a receipt: intact object, same state root, same counts, same sealed block (a receipt is only a claim until this passes)."""
+    return _replay_call(get_store().verify_replay_receipt, receipt_id).model_dump()
+
+
 @app.post("/api/jarvis/evidence", dependencies=[Depends(require_operator_write)])
 def create_evidence(body: EvidenceObjectCreate):
     """Store an evidence object. Idempotent: the same content is the same id (``created`` says which happened)."""
+    if body.schema_id == evidence_objects.CES_REPLAY_RECEIPT:
+        raise EvidenceError("evidence_schema_reserved", f"{body.schema_id} objects are created only by POST /api/jarvis/replay/receipts, which derives them from a replay")
     try:
         obj, created = get_store().put_evidence_object(body)
     except NotImplementedError as exc:

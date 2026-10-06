@@ -44,6 +44,13 @@ anchors_live_psql() { pg_exec psql -X -At -d jarvis "$@"; }
 # anchors_from_db : read from the running database (as the postgres superuser, which RLS does not bind).
 anchors_from_db() { anchors_collect anchors_live_psql; }
 
+# anchors_tip_blocks FILE : "<tenant>|<height>|<block_hash>" for each tenant's newest block named in an anchors file
+# (nothing for a set taken before schema v6). The drill replays the restored copy at exactly these blocks.
+anchors_tip_blocks() {
+  awk -F'|' '$1 == "block" { if (!($2 in h) || $3 + 0 > h[$2] + 0) { h[$2] = $3; x[$2] = $5 } }
+             END { for (t in h) print t "|" h[t] "|" x[t] }' "$1" | LC_ALL=C sort
+}
+
 # anchors_check PREVIOUS NEW : exit 1 and print a line per problem if NEW is not a legitimate successor.
 # Heads may advance (new last_seq) or stay identical; they may never disappear, move backwards, or change
 # their hash without advancing. Counters may only grow. Every block that was anchored must still exist with the

@@ -55,7 +55,7 @@ def test_the_registry_lists_one_implemented_contract_and_five_declared(client):
         "RC.Ledger.v1": "implemented", "RC.AIKI.v1": "declared", "RC.ARIS.v1": "declared",
         "RC.SX.v1": "declared", "RC.Lineage.v1": "declared", "RC.Mandala.v1": "declared"}
     ledger = next(c for c in body if c["id"] == "RC.Ledger.v1")
-    assert ledger["algorithm"] == "ledger-state-at-seq/v1" and ledger["determinism"] and len(ledger["schemas"]) == 3
+    assert ledger["algorithm"] == "ledger-state-at-seq/v1" and ledger["determinism"] and len(ledger["schemas"]) == 5
 
 
 def test_state_at_the_end_and_at_a_seq(client):
@@ -142,8 +142,9 @@ def test_the_routes_are_guarded_by_the_operator_only_dependency():
     for route in app.routes:
         if getattr(route, "path", "").startswith("/api/jarvis/replay"):
             seen[route.path] = {d.call.__name__ for d in route.dependant.dependencies}
-    assert set(seen) == {"/api/jarvis/replay/contracts", "/api/jarvis/replay/state", "/api/jarvis/replay/events"}
-    assert all("require_operator_read" in names for names in seen.values())
+    assert set(seen) == {"/api/jarvis/replay/contracts", "/api/jarvis/replay/state", "/api/jarvis/replay/events"} | {
+        "/api/jarvis/replay/receipts", "/api/jarvis/replay/receipts/{receipt_id}", "/api/jarvis/replay/receipts/{receipt_id}/verify"}
+    assert all(names & {"require_operator_read", "require_operator_write"} for names in seen.values())  # the receipt routes are tested in test_replay_receipts_api.py
 
 
 def test_an_oauth_user_token_is_refused(monkeypatch):

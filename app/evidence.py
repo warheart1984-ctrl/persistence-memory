@@ -43,6 +43,11 @@ INLINE_LIMIT_BYTES = 64 * 1024
 
 CES_DECISION = "CES.Local.DecisionEvidence.v1"
 CES_FACT = "CES.Local.FactEvidence.v1"
+# A replay receipt (Replay Contracts, RC.Ledger.v1): what a replay at a sealed point produced.  Only the replay endpoint
+# creates one (the generic create route refuses this schema), and a receipt is a claim until it is re-derived.
+CES_REPLAY_RECEIPT = "CES.Local.ReplayReceipt.v1"
+KNOWN_SCHEMAS = (CES_DECISION, CES_FACT, CES_REPLAY_RECEIPT)
+_HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 
 # How a fact was observed: the same checkable kinds the Clause V gate accepts for link evidence.
 FACT_METHODS = frozenset({"file", "url", "commit", "test", "receipt", "command", "document", "doc", "issue", "pr", "log"})
@@ -184,6 +189,20 @@ def validate_payload(schema_id: str, payload: dict[str, Any]) -> list[str]:
             problems.append(f"payload.method must be one of: {', '.join(sorted(FACT_METHODS))}")
         if "observed_at" in payload and not _is_iso(payload["observed_at"]):
             problems.append("payload.observed_at must be an ISO-8601 timestamp")
+    elif schema_id == CES_REPLAY_RECEIPT:
+        _text(payload, "contract", 64, problems, True)
+        _text(payload, "tenant", 128, problems, True)
+        for key, floor in (("contract_version", 1), ("at_seq", 0), ("block_height", 1), ("record_count", 0), ("deleted_count", 0)):
+            value = payload.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or value < floor:
+                problems.append(f"payload.{key} must be an integer of at least {floor}")
+        for key in ("block_hash", "state_root"):
+            value = payload.get(key)
+            if not isinstance(value, str) or not _HEX64_RE.match(value):
+                problems.append(f"payload.{key} must be 64 lowercase hex characters")
+        extra = sorted(set(payload) - {"contract", "contract_version", "tenant", "at_seq", "block_height", "block_hash", "state_root", "record_count", "deleted_count"})
+        if extra:
+            problems.append(f"payload has fields a receipt does not have: {', '.join(extra)}")
     else:
         problems.append(f"unknown schema_id {schema_id!r}")
     return problems
@@ -215,10 +234,10 @@ def _problem_reasons(problems: list[str]) -> list[dict[str, Any]]:
 
 def build_object(req: EvidenceObjectCreate) -> tuple[str, bytes]:
     """Validate a create request and return (id, canonical bytes). Raises EvidenceError."""
-    if req.schema_id not in (CES_DECISION, CES_FACT):
+    if req.schema_id not in KNOWN_SCHEMAS:
         raise EvidenceError(
             "evidence_schema_unknown",
-            f"unknown schema_id {req.schema_id!r}; known: {CES_DECISION}, {CES_FACT}",
+            f"unknown schema_id {req.schema_id!r}; known: {', '.join(KNOWN_SCHEMAS)}",
         )
     problems: list[str] = []
     _walk(req.payload, 0, [0], problems, "payload")

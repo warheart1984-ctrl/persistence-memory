@@ -131,6 +131,7 @@ Grok docs to say; the Grok CLI does, and `~/.grokbot/settings.json` has its own 
 | `jarvisctl restore --yes-destroy-current-data [--backup SET]` | **destructive**: see below |
 | `jarvisctl offsite` | encrypt and send the newest set to the PC |
 | `jarvisctl verify [tenant]` | recompute the history hash chain and every sealed block |
+| `jarvisctl replay state\|receipt\|receipts\|check\|verify` | Replay Contracts (RC.Ledger.v1): replay the ledger at a point, issue receipts at **sealed** points, re-derive them (`check` asks the service, `verify` replays the raw rows in a one-off container). Needs the build that has Replay Contracts; see `docs/REPLAY_CONTRACTS.md` |
 | `jarvisctl seal [--force\|--status]` | seal new history into Continuity Blocks now (or show the unsealed tail); the hourly timer is **not enabled** by default, see below |
 | `jarvisctl watchdog` / `heal` | run the health checks / the self-heal once |
 | `jarvisctl psql` | admin session inside the database container |
@@ -164,7 +165,9 @@ notification. `jarvisctl down` leaves a marker so a stop on purpose is respected
   `pre-restore-*` dumps are never pruned.
 * **`/data` (AMUL field, STM overlay, RAG files)** is archived in every set; those files are not in Postgres.
 * **Restore drill** weekly, with `--prove-detection`: restores into a scratch database, verifies counts, anchors and
-  the hash chain, then tampers with the copy and requires the verifier to fail.
+  the hash chain, **replays the copy at each tenant's last anchored block against the set's own anchors** (skipped with a warning
+  when the app image predates Replay Contracts or the set has no sealed blocks), then tampers with the copy and requires the verifier,
+  the anchors and the replay to fail.
 
 ### The offsite copy
 Daily, the newest complete set is packed, encrypted with age and sent by `scp` to `G:\jarvis-backups` on the PC,

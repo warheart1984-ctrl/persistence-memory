@@ -1,9 +1,9 @@
 # Replay Contracts
 
-**Status: partial.** `RC.Ledger.v1`, the ledger's own contract, is implemented on the PostgreSQL row store (read-only, no schema
-change). The five domain contracts (`RC.AIKI.v1`, `RC.ARIS.v1`, `RC.SX.v1`, `RC.Lineage.v1`, `RC.Mandala.v1`) are **declared only**:
-they have no schema files, no owner and no algorithm here. Not built yet: receipts (a stored, content-addressed record of a replay
-at a sealed point), `jarvisctl replay`, and the restore-drill step that replays a restored copy.
+**Status: partial.** `RC.Ledger.v1`, the ledger's own contract, is implemented on the PostgreSQL row store: state and events as of
+a point in the history, receipts at sealed points (stored as Evidence Objects), an offline verifier, `jarvisctl replay`, and a
+restore-drill step. No schema change (still v6). The five domain contracts (`RC.AIKI.v1`, `RC.ARIS.v1`, `RC.SX.v1`, `RC.Lineage.v1`,
+`RC.Mandala.v1`) are **declared only**: they have no schema files, no owner and no algorithm here. Nothing is signed.
 
 ## What a Replay Contract is
 
@@ -53,9 +53,10 @@ schema).
 
 ## Verifying a replay
 
-`python -m app.replay verify [--tenant T] [--at-seq N | --at-block H] [--expect-root HEX]` (exit 0 = verified, 1 = problems,
-2 = bad request or no database URL; same connection variables as `pg_verify`) replays the entries **from the raw rows**, not
-from the SQL that serves the endpoints, and checks:
+`python -m app.replay verify [--tenant T] [--at-seq N | --at-block H] [--expect-root HEX] [--expect-block-hash HEX]` or
+`... verify --receipt EO_ID` (exit 0 = verified, 1 = problems, 2 = bad request or no database URL; same connection variables as
+`pg_verify`, and it sets the tenant itself so row-level security cannot hide the ledger from a non-superuser role) replays the
+entries **from the raw rows**, not from the SQL that serves the endpoints, and checks:
 
 | check | finds |
 |---|---|
@@ -65,9 +66,41 @@ from the SQL that serves the endpoints, and checks:
 | `state_root` | the replayed root differing from `--expect-root` (a receipt, an anchor, an earlier run) |
 | `live_match` | at the current end: a live record that differs from its latest history entry, or is missing or extra |
 | `blocks` | any sealed block up to the covering one failing its checks (the same ones `pg_verify` runs) |
+| `expected_block` | the sealed block covering the point not being the one expected: `--expect-block-hash` (an anchor's hash, as the drill passes it) or a receipt's block |
 
 `python -m app.replay schemas --write | --check` regenerates / checks the files under `schemas/rc/` (a test fails if they drift
 from the models).
+
+## Receipts
+
+A receipt records what the replay at a **sealed** point produced: contract and version, tenant, `at_seq`, the covering block's height
+and hash, the state root, and the record and deleted counts. It is stored as an Evidence Object, `CES.Local.ReplayReceipt.v1`
+(`EVIDENCE_OBJECTS.md`), so it is content-addressed and immutable. There is no timestamp in it, so the same replay at the same point
+always gives the same receipt, and asking twice returns the existing one (`created: false`).
+
+* `POST /api/jarvis/replay/receipts` (`{"at_seq": N}` or `{"at_block": H}` or nothing = the end of the newest sealed block; operator
+  key; writes must be enabled). A point no sealed block covers is refused (`replay_not_sealed`, 422; `replay_nothing_sealed`, 409).
+* `GET /api/jarvis/replay/receipts` (newest first), `GET .../receipts/{id}`, `GET .../receipts/{id}/verify`.
+* **Typed-in receipts are impossible through the API**: the generic `POST /api/jarvis/evidence` refuses this schema
+  (`evidence_schema_reserved`). A receipt written straight into the database is still just a claim, which is why `verify` exists.
+* **`verify` re-derives it**: the stored object must still hash to its id, and replaying at its point must give the same state root, the
+  same counts, and the same covering block (height and hash). The service answers from its own SQL; `python -m app.replay verify
+  --receipt` does it from the raw rows.
+* **A receipt taken now is what exposes a later rewrite.** An entry rewritten consistently with every later block re-sealed passes the
+  database's own checks, but no longer replays to the root and block hash a receipt recorded earlier (tested).
+* Receipts are Evidence Objects but do **not** count as Clause V fact evidence.
+
+## Operating it
+
+`jarvisctl replay state [--at-seq N | --at-block H]` (the root, the counts, whether the point is sealed) · `receipt [...]` (issue) ·
+`receipts` (list) · `check ID` (the service re-derives it) · `verify [--tenant T] [--receipt ID | --at-seq N | --at-block H]
+[--expect-root R] [--expect-block-hash H]` (the offline verifier in a one-off container, from the raw rows; exit code passed through).
+
+**The restore drill replays too.** After restoring the newest backup into a scratch database, `jarvisctl drill` replays it at every
+tenant's last anchored block (`app.replay verify --at-block H --expect-block-hash <hash from the set's own anchors>`): the state is
+rebuilt from the raw entries and the sealed block covering it must be exactly the block the anchors name. With `--prove-detection` it
+also alters the newest entry of that block, requires the replay to fail, puts it back exactly, and requires it to pass again. The step
+is skipped, with a warning, for a set with no sealed blocks or when the app image predates this module.
 
 ## What this does and does not defend against
 
@@ -76,7 +109,11 @@ from the models).
 * An entry rewritten **consistently** (its hash, its record's chain, the live row): the record checks pass; the block root of a
   sealed point catches it.
 * An entry rewritten consistently **and every later block re-sealed**: the database alone passes. The block anchors in the backups
-  catch it, and so will any state root recorded earlier: `--expect-root`, and receipts once they exist.
+  catch it, and so does any receipt (or state root) recorded earlier. Only history that was never anchored or receipted is exposed.
+* **A receipt is a claim until it is verified**, and it is unsigned: anyone with the database owner's power can add a receipt object
+  that is well-formed and correctly hashed. `verify` exposes one whose content does not replay.
+* **Rolling back to a build older than this one while receipts exist** makes that build's `pg_verify` report them as an unknown
+  schema. Forward upgrades are unaffected.
 * **Authority is the recorded actor, not a proof.** Today that is the tenant key (`operator`) plus the record's own `source_agent`;
   nothing is signed.
 * A point after the last sealed block is replayable (`sealed: false`) but only chain-verified, not block-anchored.
