@@ -1,6 +1,6 @@
 # Constitutional Boundary Clause
 
-**Binding design law for CCS under `jarvis-memoryboard/`.**  
+**Binding design law for CCS in this repository (`persistence-memory`).**  
 **Status: declared** — charter law for CCS design. Not promoted into repo constitution (`constitution/`, `AGENTS.md`, governance policies) unless the user later authorizes that explicitly.
 
 **Root principle:** *Continuity unifies evidence, not domains.*

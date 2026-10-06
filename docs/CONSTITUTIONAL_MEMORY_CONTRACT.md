@@ -1,7 +1,7 @@
 # Constitutional Memory Contract (EMR / STM / LTM)
 
 **Status:** partial (Memoryboard EMR/STM view enforced in this package; AMUL substrate architecture declared/partial)  
-**Scope:** `jarvis-memoryboard/` (API + EMR/STM). AMUL Architect is the LTM substrate architecture — **declared/partial**, not claimed as invented by EMR.  
+**Scope:** this repository, `persistence-memory` (API + EMR/STM). AMUL Architect is the LTM substrate architecture — **declared/partial**, not claimed as invented by EMR.  
 **Does not modify:** Continuity Ledger CRUD invariants, conflict non-merge, domain authority, or repo governance charters outside this package.
 
 ## Canonical stack (binding)

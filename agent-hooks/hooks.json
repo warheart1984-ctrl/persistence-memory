@@ -3,7 +3,7 @@
   "hooks": {
     "sessionStart": [
       {
-        "command": "python -X utf8 jarvis-memoryboard/agent-hooks/jarvis_session_start.py",
+        "command": "python -X utf8 agent-hooks/jarvis_session_start.py",
         "timeout": 15
       }
     ]

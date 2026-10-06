@@ -47,7 +47,7 @@ Invoke-RestMethod http://127.0.0.1:8011/api/jarvis/memory -Method POST -Body $bo
 ## Automated partial check
 
 ```powershell
-cd jarvis-memoryboard
+cd persistence-memory   # the repository root
 python -m pytest tests/test_acceptance.py::TestDriftAcceptance -q
 ```
 

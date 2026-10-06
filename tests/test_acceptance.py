@@ -60,7 +60,7 @@ class TestContinuityAcceptance:
                 session_id="chat-a",
                 type="decision",
                 subject="memory-sot",
-                evidence=[{"kind": "doc", "ref": "jarvis-memoryboard/README.md"}],
+                evidence=[{"kind": "doc", "ref": "README.md"}],
             ),
         ).json()["memory"]
         mem_id = created["id"]

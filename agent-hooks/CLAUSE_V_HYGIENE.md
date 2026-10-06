@@ -12,8 +12,7 @@ Continuity should store **evidence** (decisions, architecture notes with provena
 - Transient session noise
 - Ungoverned memory-as-SoT
 
-Lineage reference (Mandala docs; not imported as runtime):  
-`jarvis-memoryboard/docs/CONSTITUTIONAL_BOUNDARY_CLAUSE.md` § Clause V.
+Reference: `docs/CONSTITUTIONAL_BOUNDARY_CLAUSE.md` § Clause V (the Mandala project keeps its own copy; not imported as runtime).
 
 ## What this service does today
 
