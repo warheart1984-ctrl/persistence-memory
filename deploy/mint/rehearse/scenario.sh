@@ -36,7 +36,8 @@ snapshot() { api GET "/api/jarvis/memory?limit=200" | python3 -c "
 import sys, json
 rows = json.load(sys.stdin)['memories']
 print('\n'.join(sorted(f\"{m['id']}:v{m['version']}:{m['status']}:{m['content_sha256'][:12]}\" for m in rows)))"; }
-mk() { api POST /api/jarvis/memory -d "$(printf '{"content":"%s","source_agent":"rehearsal","session_id":"rehearse-1","type":"fact","subject":"%s","tags":["rehearsal"]}' "$1" "$2")"; }
+# Clause V: the ledger keeps decisions (with evidence), not bare facts, so the rehearsal's fixtures are decisions.
+mk() { api POST /api/jarvis/memory -d "$(printf '{"content":"%s","source_agent":"rehearsal","session_id":"rehearse-1","type":"decision","subject":"%s","tags":["rehearsal"],"evidence":[{"kind":"user-request","ref":"rehearse:scenario","note":"rehearsal fixture"}]}' "$1" "$2")"; }
 newest_set() { ls -1 "$BK" | sed -n 's/^\(jarvis-[0-9]\{8\}T[0-9]\{6\}Z\)\.sha256$/\1/p' | LC_ALL=C sort | tail -1; }
 wait_for() { local i=0; while [ "$i" -lt "$2" ]; do eval "$1" >/dev/null 2>&1 && return 0; sleep 2; i=$((i + 2)); done; return 1; }
 ready_code() { code "http://127.0.0.1:$JARVIS_APP_PORT/ready"; }
@@ -279,7 +280,7 @@ EOF
   echo "$hdr" | grep -qi '^retry-after: 5' && ok "503 carries Retry-After" || bad "no Retry-After on the 503"
   has "503 body has the ledger_unavailable code" '"code":"ledger_unavailable"' "$R/outage.body"
   tn "the outage body leaks no host/user/password" grep -Eiq 'jarvis-db|jarvis_app|postgresql://|password' "$R/outage.body"
-  eq "a write during the outage is a 503" "$(code -X POST -H "X-API-Key: $KEY" -H 'Content-Type: application/json' -d '{"content":"written during an outage","source_agent":"t","session_id":"s","type":"fact"}' "http://127.0.0.1:$JARVIS_APP_PORT/api/jarvis/memory")" "503"
+  eq "a write during the outage is a 503" "$(code -X POST -H "X-API-Key: $KEY" -H 'Content-Type: application/json' -d '{"content":"written during an outage","source_agent":"t","session_id":"s","type":"decision","evidence":[{"kind":"user-request","ref":"rehearse:outage","note":"gate-valid on purpose: it must reach the database to prove the 503"}]}' "http://127.0.0.1:$JARVIS_APP_PORT/api/jarvis/memory")" "503"
   eq "/ready is 503 during the outage" "$(ready_code)" "503"
   eq "/health (liveness) stays 200 during the outage" "$(code "http://127.0.0.1:$JARVIS_APP_PORT/health")" "200"
   # Docker never auto-restarts a container that was killed through the API, so the 1-minute self-heal timer must.
