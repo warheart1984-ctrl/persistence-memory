@@ -81,7 +81,7 @@ PY
 if [ "$write" -eq 1 ]; then
   echo "== one write, history, verify, delete (leaves a trace in history, by design)"
   created="$(curl -sS -m 15 -H "X-API-Key: $key" -H 'Content-Type: application/json' \
-     -d '{"content":"smoke test record - safe to ignore","source_agent":"smoke","session_id":"smoke","type":"fact","subject":"smoke-test"}' "$base/api/jarvis/memory")"
+     -d '{"content":"smoke test record - safe to ignore","source_agent":"smoke","session_id":"smoke","type":"decision","subject":"smoke-test","evidence":[{"kind":"user-request","ref":"smoke:jarvisctl-smoke","note":"jarvisctl smoke writes one test decision and deletes it"}]}' "$base/api/jarvis/memory")"
   id="$(echo "$created" | sed -n 's/.*"id":"\(mem-[0-9a-f]*\)".*/\1/p' | head -1)"
   [ -n "$id" ] && pass "write created $id" || fail "write failed: $created"
   if [ -n "$id" ]; then
