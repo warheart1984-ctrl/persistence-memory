@@ -1,177 +1,112 @@
 # Jarvis Continuity Ledger
 
-**Continuity infrastructure** for Mandala Rendering Software agents — isolated under
-`jarvis-memoryboard/`. The service is **stateless/replaceable**; continuity lives in
-governed ledger records — not in chat transcripts.
+A governed, evidence-first memory ledger for AI agents, backed by PostgreSQL. It **preserves what was recorded**, with
+provenance, and proves it was not quietly changed. It does **not** decide what is true (`docs/CONTINUITY_LEDGER_SOC.md`).
+Continuity lives in ledger records, not in chat transcripts; the service itself is replaceable.
 
-The Continuity Ledger **preserves what was recorded** with provenance. It does **not**
-determine epistemic truth (see `docs/CONTINUITY_LEDGER_SOC.md`). The broader
-**Constitutional Continuity Service (CCS)** vision is largely **declared**
-(`docs/CCS_CHARTER.md`).
+## What is live (checked 2026-10-06)
 
-## Maturity (evidence-bound)
+One ledger runs in Docker on a private Linux box at **`127.0.0.1:8011`** (PostgreSQL row store, schema **v6**). Nothing is
+reachable from the network; the PC and the agents reach it through an SSH tunnel. Deployment, operations and the rehearsed
+restore are in [`deploy/mint/README.md`](deploy/mint/README.md).
 
-### Continuity Ledger (this package)
+| Capability | Status |
+|---|---|
+| **Postgres row store**: one row per record, forced row-level security, two roles (the app cannot change history), hash-chained `record_history` | **live** (`docs/POSTGRES.md`) |
+| **Clause V** at the API: only `decision`, `architecture`, `research`, `fact`; every record needs evidence; nothing becomes `verified` without it. Emotion / transient-state / transcript heuristics only **warn** | **live**, type + evidence enforced (`docs/CLAUSE_V_HYGIENE.md`) |
+| **Evidence Objects**: content-addressed (`eo:sha256:…`), immutable, hash only, operator key to create | **live**, **unsigned** (`docs/EVIDENCE_OBJECTS.md`) |
+| **Continuity Blocks**: sealed, Merkle-rooted, hash-chained ranges of the history; every block hash is also kept outside the database in the backup anchors | **live**, **unsigned** (`docs/CONTINUITY_BLOCKS.md`) |
+| **Replay Contracts, `RC.Ledger.v1`**: rebuild the ledger's state and ordered events as of any seq or sealed block, with a state root; offline verifier `python -m app.replay verify` | **implemented on `main`, not deployed yet**: the live ledger has no `/api/jarvis/replay/*` routes (`docs/REPLAY_CONTRACTS.md`) |
+| Domain Replay Contracts (`RC.AIKI`, `ARIS`, `SX`, `Lineage`, `Mandala`) | **declared only**: no schema, owner or algorithm exists |
+| Signatures, CES registry, unified provenance chain, ESFR promotion | **not built** (`docs/CCS_CHARTER.md`) |
 
-| Capability | Status | Evidence |
-|------------|--------|----------|
-| Continuity (A→B→C same restore) | **enforced** | `tests/test_acceptance.py::TestContinuityAcceptance` |
-| Replay (why/where/when/session) | **enforced** | `TestReplayAcceptance` + `/api/jarvis/memory/retrieve` |
-| Conflict (no silent merge / no truth pick) | **enforced** | `TestConflictAcceptance` + `/api/jarvis/memory/conflicts` |
-| Drift (multi-day fidelity) | **partial** | hash check enforced; protocol in `docs/DRIFT_PROTOCOL.md` |
-| AMUL substrate (`app/amul.py`) | **partial** | append-only field, lineage, verify/drift **enforced** (`tests/test_amul.py`); scale/GC/index **declared** |
-| AMUL RAG (`app/amul_rag.py`) | **partial** | classifier/modes, lexical vector+BM25, evidence gate, replay log **enforced** (`tests/test_amul_rag.py`); neural embeddings **declared**, LLM generation **extractive-v0 / partial** (`JARVIS_RAG_LLM_URL` hook) |
+Also enforced by tests: continuity across sessions, replay of a retrieve with why / where / when / session, conflicts surfaced
+and never silently merged (`tests/test_acceptance.py`). Drift checking and the AMUL / RAG parts are partial
+(`docs/DRIFT_PROTOCOL.md`, `app/amul*.py`).
 
-### Four-layer SoC
+## Operating it: `jarvisctl`
 
-| Layer | Status | Notes |
-|-------|--------|-------|
-| Continuity Ledger / Memory | **enforced** (subset) | Store, retrieve, conflicts, provenance |
-| Evidence Engine | **declared** | Out of package — `docs/ADAPTER_CONSUMERS.md` |
-| Knowledge Engine | **declared** | Out of package |
-| Understanding Engine | **declared** | Out of package |
+On the box, from `deploy/mint/`: `bin/jarvisctl <command>` (`help` lists all; the table is the usual set).
 
-### CCS roadmap (not claimed implemented)
+| Command | Does |
+|---|---|
+| `up` | build and start db → migrate → app (this is how a schema upgrade is applied) |
+| `verify [tenant]` | recompute the history chain and every sealed block; reports the unsealed tail |
+| `smoke [--no-write]` | acceptance checks: exposure, hardening, roles, one write/history/delete round trip |
+| `seal [--force\|--status]` | seal new history into blocks now (a block is made at 500 waiting entries or when the oldest is an hour old) |
+| `backup` | take a verified backup set; its anchors (chain heads, counters, block hashes) must be a legitimate successor of the last or the dump is quarantined |
+| `drill [--prove-detection]` | restore the newest set into a scratch database and verify it; with the flag it also proves tampering and a removed block are detected |
+| `offsite` | encrypt (age) and send the newest set to the Windows PC |
+| `restore --yes-destroy-current-data` | **destructive**; the app stays down unless counts, anchors and hash chains all match |
 
-| Component | Status | Evidence |
-|-----------|--------|----------|
-| CCS as root continuity authority | **declared** | `docs/CCS_CHARTER.md` |
-| Constitutional Boundary Clause (I–VI) | **declared** | `docs/CONSTITUTIONAL_BOUNDARY_CLAUSE.md` |
-| Continuity Blocks (immutable) | **declared** | Charter §1.2; gap in `docs/LEDGER_TO_CCS_MAPPING.md` |
-| Signed Evidence Objects | **declared** / **skeleton** | CES stubs only |
-| CES.* registration | **declared** | `schemas/ces/*`, `schemas/registry.json` |
-| RC.* registration | **declared** | `schemas/rc/*` |
-| Unified provenance chain | **declared** | Charter §4 |
-| Multi-product single read/write path | **declared** | Charter §5 |
-| Clause V memory exclusion | **partial** / **transitional** | Hooks may still POST session facts; not API-enforced |
-| ESFR promotion of CCS | **declared** | Charter §6 checklist — all gaps |
+Timers (systemd user units) run the hourly backup, daily offsite copy, weekly drill, 15-minute watchdog and 1-minute self-heal.
+**`jarvis-seal.timer` (hourly at :55, five minutes before the backup) was enabled on 2026-10-06 after an explicit OK**; stop it with
+`systemctl --user disable --now jarvis-seal.timer`. Upgrade and rollback rules (v5 code refuses v6 and the reverse) are in the
+Mint README.
 
-## Architecture docs
+## Reaching it: tunnel and agents
 
-- `docs/CONSTITUTIONAL_BOUNDARY_CLAUSE.md` — *Continuity unifies evidence, not domains* (declared)
-- `docs/CONTINUITY_LEDGER_SOC.md` — SoC boundaries & non-goals
-- `docs/CCS_CHARTER.md` — CCS charter (declared)
-- `docs/LEDGER_TO_CCS_MAPPING.md` — today → CCS gap map
-- `docs/ADAPTER_CONSUMERS.md` — read-only consumer contract (declared)
-- `docs/DRIFT_PROTOCOL.md` — drift operator protocol
+* **SSH tunnel.** A scheduled task on the PC keeps `ssh -N -L 127.0.0.1:8011:127.0.0.1:8011` up with a dedicated key that the
+  box restricts to forwarding that one port (no shell). Setup, key restriction, host-key pinning and undo are in
+  `deploy/mint/README.md`.
+* **Address and key.** `JARVIS_MEMORYBOARD_URL=http://127.0.0.1:8011` and `JARVIS_API_KEY_FILE=<file holding the operator key>`.
+  There is **no default address**: the hooks and MCP servers refuse to run without it and never send the key anywhere else.
+  Every `/api/jarvis/*` route needs the key (`X-API-Key` or `Authorization: Bearer`).
+* **MCP.** `mcp_server/ledger_stdio.py` (`health`, `recall`, `get`; `write` only when `JARVIS_LEDGER_MCP_WRITE=1`, decisions only,
+  user's own words required, credentials refused) and `python -m mcp_server` (EMR tools `emr_recall`, `emr_remember`, `emr_upsert`;
+  the write tools are off on the live ledger, `JARVIS_MCP_WRITE_ENABLED=false`). Examples: `config/`, `docs/MCP_EMR_SETUP.md`.
+* **Hooks.** Cursor's `sessionStart` hook only reads; `sessionEnd` and `afterAgentResponse` are retired no-ops (`agent-hooks/`).
 
-## Canonical record fields (`continuity-ledger-v1`)
+## Records and API
 
-Every memory includes:
+Each record has `id`, `content`, `type`, `status` (`draft | verified | archived`), caller-asserted `confidence`, `evidence`
+(`{kind, ref, note?}` links, including `evidence-object` links), `source_agent`, `session_id`, optional `subject` and `supersedes`
+(a recorded claim, never a silent merge), timestamps, a database-owned `version` (optimistic locking, 409 on conflict) and
+`content_sha256`. The API accepts `decision`, `architecture`, `research` and `fact`; a `preference`, `task` or `external_context`
+write, or one without checkable evidence, is refused with `422 clause_v_violation` and the reasons. Older records stay readable.
 
-| Field | Required | Notes |
-|-------|----------|-------|
-| `id` | yes | `mem-…` |
-| `created_at` / `updated_at` | yes | ISO-8601 UTC timestamps |
-| `source_agent` | yes | Who wrote it |
-| `session_id` | yes | Which session produced it |
-| `type` | yes | `decision \| fact \| task \| preference \| architecture \| research` |
-| `confidence` | yes | Caller-asserted `0.0–1.0` (not inferred by ledger) |
-| `evidence` | yes | list of `{kind, ref, note?}` (may be empty) |
-| `supersedes` | optional | Recorded replacement **claim** — never silent merge |
-| `status` | yes | Claimed lifecycle: `draft \| verified \| archived` |
-| `content` | yes | Decision/fact text (not a chat dump) |
-| `subject` | optional | Conflict grouping key |
-| `content_sha256` | yes | Normalized-content hash for drift checks |
+| Route | |
+|---|---|
+| `GET /health`, `/ready` | liveness; readiness (database, schema version, roles) |
+| `GET/POST/PATCH/DELETE /api/jarvis/memory[/{id}]`, `GET …/retrieve`, `…/conflicts`, `…/{id}/history`, `…/history/verify` | the ledger |
+| `POST /api/jarvis/memory/pipeline` | EMR → STM → LTM consolidation, draft-only (needs `JARVIS_MCP_WRITE_ENABLED`) |
+| `POST /api/jarvis/evidence`, `GET …/{id}`, `…/{id}/verify` | Evidence Objects (create: operator key only) |
+| `POST /api/jarvis/blocks/seal`, `GET …/blocks`, `…/head`, `…/verify`, `…/{height}` | Continuity Blocks (operator key only) |
+| `GET /api/jarvis/replay/contracts`, `…/state`, `…/events` | `RC.Ledger.v1` (operator key only; **on `main`, not live yet**) |
 
-Legacy rows migrate on load to ledger fields and re-save with `"schema": "continuity-ledger-v1"`.
+Blocks and replay answer 501 on the JSON store, which has no history.
 
-## Quick start
-
-```powershell
-.\jarvis-memoryboard\scripts\start-memoryboard.ps1
-.\jarvis-memoryboard\scripts\install-cursor-hooks.ps1
-.\jarvis-memoryboard\scripts\install-autostart.ps1
-cd jarvis-memoryboard; python -m pytest -q
-.\jarvis-memoryboard\scripts\smoke-test.ps1
-```
-
-URL: set `JARVIS_MEMORYBOARD_URL` explicitly, for example `http://127.0.0.1:8011` (the Mint stack, through an SSH tunnel).
-The hooks and the MCP stdio proxy have **no default address**: without it they refuse, and never send the API key.
-
-## EMR MCP Tools: Constitutional Memory for AI
-
-This package exposes a governed memory interface for MCP-compatible agents (ChatGPT, Cursor, OpenCode, etc.).
-EMR sits between the agent and the Continuity Ledger, enforcing provenance, abstention, conflict membranes, and STM/LTM separation.
-
-### Available Tools
-
-- `emr_remember` — create a governed durable memory (**draft**; requires `JARVIS_MCP_WRITE_ENABLED=true` + `user_requested=true`)
-- `emr_upsert` — update or supersede an existing memory (lineage preserved; same gates)
-- `emr_recall` — retrieve a governed recall bundle for the current intent
-
-### Architecture
-
-```
-Agent (ChatGPT) → EMR (write) → Continuity Ledger (LTM)
-Continuity Ledger → EMR (read) → STM → Agent (ChatGPT)
-```
-
-The agent never touches the ledger directly; all reads/writes flow through EMR.
-
-### EMR → STM → LTM pipeline (`POST /api/jarvis/memory/pipeline`)
-
-A single governed entry point that runs the full memory hierarchy end-to-end:
-
-```
-LTM (Continuity Ledger) --excite--> STM (active working set)
-STM  ------consolidate----->  LTM (governed DRAFT write back)
-```
-
-1. **EMR → STM**: `excite()` scores LTM candidates, promotes the active working
-   set into the session's STM view (budgeted, decay-aware, abstention-safe).
-2. **STM → LTM**: newly-promoted entries are consolidated back to the ledger as
-   ONE governed **draft** summary record via the `emr_write` gateway — never
-   verified, never bypassing the conflict membrane / transcript gate, and with
-   full `stm-provenance` evidence back to the source `memory_id`s.
-
-The pipeline **never auto-verifies** (`manifest.verified == 0`); verification
-stays operator/off-band. If a caller-supplied subject already has active claims,
-the consolidated draft falls back to an un-subjected summary to preserve the
-conflict membrane. Returns a replayable `PipelineTrace` (STM view + promoted ids
-+ consolidation outcome + manifest).
-
-Example:
+## Develop and test
 
 ```bash
-curl -s -X POST http://127.0.0.1:8011/api/jarvis/memory/pipeline \
-  -H "Content-Type: application/json" \
-  -d '{"query":"axiom gpu delegation","session_id":"chat-c","source_agent":"chatgpt","user_requested":true}'
+pip install -e ".[dev]"
+python -m pytest -q                 # JSON-store suite; Postgres tests skip without a server
+scripts/test-postgres.sh            # the full suite against a throwaway Postgres container
 ```
 
-Requires `JARVIS_MCP_WRITE_ENABLED=true` and, at the endpoint, the memory-write
-gate. See `app/emr_pipeline.py` and `tests/test_emr_pipeline.py`.
+With your own throwaway server: `JARVIS_TEST_PG_DSN=postgresql://postgres:…@localhost:5432/postgres python -m pytest -q`, and
+`JARVIS_TEST_BACKEND=postgres` runs the whole HTTP suite on the row store. For local poking only,
+`JARVIS_STORE_BOOTSTRAP=1 uvicorn app.main:app --host 127.0.0.1 --port 8000` starts the **dev/test JSON file store**; without a
+database URL or that opt-in the service answers 503 rather than creating a ledger. CI runs both suites on every PR.
 
-See:
+## Honest limits
 
-- `docs/CONSTITUTIONAL_MEMORY_CONTRACT.md`
-- `docs/EMR_RECALL_PROTOCOL.md`
-- `docs/EMR_WHITEPAPER.md`
-- `docs/MCP_EMR_SETUP.md`
+* **Nothing is signed.** Evidence Objects, blocks and any future receipt prove what was recorded and that it was not altered,
+  not who vouches for it. Authority is the recorded actor (the tenant key) plus the record's own `source_agent`.
+* **Tamper evidence has an outside part.** Someone with full database control can rewrite history and re-seal every block; the
+  database alone would pass. What exposes it is the anchors in the backups and in the encrypted offsite copies, so they matter.
+  A block sealed after the last backup is not anchored yet.
+* **Domain Replay Contracts and CES schemas are not built.** Earlier docs claimed stubs under `schemas/rc/` and `schemas/ces/`;
+  they never existed (corrected). Only `RC.Ledger.v1` has files (`schemas/rc/`). Receipts of a replay are not built.
+* **`RC.Ledger.v1` is not on the live box until it is deployed.**
+* **Soft Clause V rules only warn** (emotion, transient state, transcripts) until the operator flips `JARVIS_CLAUSE_V_SOFT`.
+* **One box.** Wi-Fi only, disk not encrypted, an hour's worth of data at risk between backups, no automatic security updates
+  (`deploy/mint/README.md`, "Honest limits").
+* The ledger records claims; it does not evaluate them.
 
-### Developer onboarding (short)
+## Docs
 
-1. Understand layers: EMR (governed activation) · Continuity Ledger (LTM SoT) · STM (view-only) · Agent (proposes via MCP).
-2. Run tests: `cd jarvis-memoryboard && pytest tests/test_emr*.py -q`
-3. Start service: `JARVIS_STORE_BOOTSTRAP=1 uvicorn app.main:app --host 127.0.0.1 --port 8001`
-   (`JARVIS_STORE_BOOTSTRAP=1` opts in to the local JSON file store. Without it, and without `JARVIS_DATABASE_URL`, the
-   service refuses with 503 instead of quietly creating a local ledger.)
-4. Confirm catalog: `GET /api/jarvis/tools` lists all three tools.
-5. For writes locally: `export JARVIS_MCP_WRITE_ENABLED=true` and always pass `user_requested=true`.
-6. Keep public Render recall-only until you intentionally enable MCP writes on a private host.
-
-## Prove Continuity across chats
-
-1. Chat A: POST `type=decision` with `session_id=chat-a` and stable `subject`.
-2. Chat B: `GET /api/jarvis/memory/retrieve?query=…&truth_scope=live` — same `id` + `content_sha256`.
-3. Chat C: `GET /api/jarvis/memory/{id}` — identical content + provenance.
-4. Or: `python -m pytest tests/test_acceptance.py::TestContinuityAcceptance -q`
-
-## API
-
-- `GET /health` — `schema: continuity-ledger-v1`
-- `GET /api/jarvis/memory/retrieve` — memories + `selections` + `conflicts` (surfaces disputes; does not pick truth)
-- `GET /api/jarvis/memory/conflicts?subject=`
-- `GET/POST/PATCH/DELETE /api/jarvis/memory[/{id}]`
-- Board: `GET/POST/PATCH /api/jarvis/memory/board`
-- `POST /api/jarvis/memory/pipeline` — EMR → STM → LTM governed consolidation (draft-only)
+`docs/CCS_CHARTER.md` and `docs/LEDGER_TO_CCS_MAPPING.md` (what is declared versus built) · `docs/CONSTITUTIONAL_BOUNDARY_CLAUSE.md` ·
+`docs/CONTINUITY_LEDGER_SOC.md` · `docs/CONSTITUTIONAL_MEMORY_CONTRACT.md` · `docs/EMR_RECALL_PROTOCOL.md` · `docs/ADAPTER_CONSUMERS.md` ·
+`docs/POSTGRES.md` · `docs/CLAUSE_V_HYGIENE.md` · `docs/EVIDENCE_OBJECTS.md` · `docs/CONTINUITY_BLOCKS.md` · `docs/REPLAY_CONTRACTS.md` ·
+`SECURITY.md`.
