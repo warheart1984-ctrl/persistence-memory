@@ -453,6 +453,23 @@ class JarvisStore:
     def verify_history(self, memory_id: str | None = None) -> list[dict[str, Any]]:
         raise NotImplementedError("record history requires the PostgreSQL row store")
 
+    # -- Continuity Blocks (PostgreSQL row store only) ------------------------------------------------
+
+    def seal_blocks(self, **kwargs: Any) -> dict[str, Any]:
+        raise NotImplementedError("Continuity Blocks require the PostgreSQL row store")
+
+    def list_blocks(self, after_height: int = 0, limit: int = 100) -> list[dict[str, Any]]:
+        raise NotImplementedError("Continuity Blocks require the PostgreSQL row store")
+
+    def get_block(self, height: int) -> dict[str, Any] | None:
+        raise NotImplementedError("Continuity Blocks require the PostgreSQL row store")
+
+    def block_head(self) -> dict[str, Any]:
+        raise NotImplementedError("Continuity Blocks require the PostgreSQL row store")
+
+    def verify_blocks(self) -> list[dict[str, Any]]:
+        raise NotImplementedError("Continuity Blocks require the PostgreSQL row store")
+
     def conflicts(self, subject: str | None = None) -> list[ConflictSet]:
         self._ensure_loaded()
         return detect_conflicts(list(self._memories.values()), subject=subject)

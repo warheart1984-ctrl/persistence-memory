@@ -151,6 +151,12 @@ def require_memory_write() -> None:
         )
 
 
+def require_operator_read() -> None:
+    """Continuity Block reads are for the operator key only: never through an OAuth user token."""
+    if oauth_enabled():
+        raise HTTPException(status_code=403, detail="Continuity Blocks can be read with the operator key only")
+
+
 LEDGER_READ_PREFIX = "/api/jarvis/memory"
 
 

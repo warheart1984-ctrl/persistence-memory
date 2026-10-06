@@ -7,6 +7,7 @@ import secrets
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi import Path as PathParam
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -77,6 +78,7 @@ from app.auth import (
     require_emr_recall_api_key,
     require_mcp_write_scope,
     require_memory_write,
+    require_operator_read,
     identity_middleware,
     oauth_enabled,
 )
@@ -852,6 +854,58 @@ def _evidence_id(evidence_id: str) -> str:
     if not evidence_objects.ID_RE.match(evidence_id):
         raise EvidenceError("evidence_id_invalid", "an evidence id looks like eo:sha256:<64 lowercase hex characters>")
     return evidence_id
+
+
+# --- Continuity Blocks (operator key only; PostgreSQL row store only) ---
+
+class SealBlocksBody(BaseModel):
+    """Seal rules.  Defaults: seal at 500 unsealed entries or when the oldest is an hour old."""
+
+    force: bool = False
+    min_entries: int = Field(default=500, ge=1, le=1_000_000)
+    max_age_seconds: int = Field(default=3600, ge=0, le=31_536_000)
+    max_entries: int = Field(default=10_000, ge=1, le=100_000)
+
+
+def _blocks_call(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except NotImplementedError as exc:
+        raise HTTPException(status_code=501, detail=str(exc)) from exc
+
+
+@app.post("/api/jarvis/blocks/seal", dependencies=[Depends(require_operator_write)])
+def seal_blocks(body: SealBlocksBody = SealBlocksBody()):
+    """Seal the unsealed history into blocks (what the seal timer calls).  Sealing is idempotent and changes no record."""
+    return _blocks_call(get_store().seal_blocks, force=body.force, min_entries=body.min_entries,
+                        max_age_seconds=body.max_age_seconds, max_entries=body.max_entries)
+
+
+@app.get("/api/jarvis/blocks", dependencies=[Depends(require_operator_read)])
+def list_blocks(after_height: int = Query(default=0, ge=0), limit: int = Query(default=100, ge=1, le=1000)):
+    blocks = _blocks_call(get_store().list_blocks, after_height, limit)
+    return {"blocks": blocks, "count": len(blocks)}
+
+
+@app.get("/api/jarvis/blocks/head", dependencies=[Depends(require_operator_read)])
+def blocks_head():
+    """The newest block and how much history is not sealed yet."""
+    return _blocks_call(get_store().block_head)
+
+
+@app.get("/api/jarvis/blocks/verify", dependencies=[Depends(require_operator_read)])
+def verify_blocks():
+    """Recompute every block (database verifier + independent recomputation + cited evidence)."""
+    problems = _blocks_call(get_store().verify_blocks)
+    return {"ok": not problems, "problems": problems}
+
+
+@app.get("/api/jarvis/blocks/{height}", dependencies=[Depends(require_operator_read)])
+def get_block(height: int = PathParam(ge=1)):
+    block = _blocks_call(get_store().get_block, height)
+    if block is None:
+        raise HTTPException(status_code=404, detail="no such block")
+    return {"block": block}
 
 
 @app.post("/api/jarvis/evidence", dependencies=[Depends(require_operator_write)])

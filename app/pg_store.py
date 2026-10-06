@@ -23,7 +23,7 @@ from typing import Any, Callable, Iterator
 
 import psycopg
 from psycopg import sql
-from psycopg.rows import dict_row
+from psycopg.rows import dict_row, tuple_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
@@ -341,6 +341,93 @@ class PostgresRowStore:
                 "SELECT history_id, memory_id, problem FROM jarvis_verify_history(%s, %s)",
                 (self._tenant_key, memory_id),
             ).fetchall()
+
+    # -- Continuity Blocks ------------------------------------------------------
+
+    _BLOCK_COLUMNS = ("height, first_seq, last_seq, entry_count, prev_block_hash, entries_root, block_hash, "
+                      "format, sealed_at, sealed_by")
+
+    @staticmethod
+    def _block(row: dict[str, Any]) -> dict[str, Any]:
+        out = dict(row)
+        out["sealed_at"] = _iso(out["sealed_at"])
+        return out
+
+    def seal_blocks(self, *, force: bool = False, min_entries: int = 500, max_age_seconds: int = 3600,
+                    max_entries: int = 10000, max_blocks: int = 20) -> dict[str, Any]:
+        """Seal the unsealed tail, one block per transaction, until nothing is left that meets the rules.
+
+        Returns {"sealed": [blocks], "reason": why it stopped, "head": block_head()}.  The hashes are computed by
+        ``jarvis_seal_block`` in the database; nothing here supplies one."""
+        sealed: list[dict[str, Any]] = []
+        reason = "nothing new to seal"
+        for _ in range(max(1, int(max_blocks))):
+            with self._tx() as conn:
+                row = conn.execute(
+                    "SELECT sealed, height, first_seq, last_seq, entry_count, block_hash, reason "
+                    "FROM jarvis_seal_block(%s, %s, make_interval(secs => %s), %s, %s)",
+                    (self._tenant_key, int(min_entries), int(max_age_seconds), bool(force), int(max_entries)),
+                ).fetchone()
+                if row["sealed"]:
+                    full = conn.execute(
+                        f"SELECT {self._BLOCK_COLUMNS} FROM blocks WHERE tenant_key = %s AND height = %s",
+                        (self._tenant_key, row["height"]),
+                    ).fetchone()
+            reason = row["reason"]
+            if not row["sealed"]:
+                break
+            sealed.append(self._block(full))
+        return {"sealed": sealed, "reason": reason, "head": self.block_head()}
+
+    def list_blocks(self, after_height: int = 0, limit: int = 100) -> list[dict[str, Any]]:
+        with self._tx() as conn:
+            rows = conn.execute(
+                f"SELECT {self._BLOCK_COLUMNS} FROM blocks WHERE tenant_key = %s AND height > %s ORDER BY height LIMIT %s",
+                (self._tenant_key, max(0, int(after_height)), max(1, min(int(limit), 1000))),
+            ).fetchall()
+        return [self._block(r) for r in rows]
+
+    def get_block(self, height: int) -> dict[str, Any] | None:
+        with self._tx() as conn:
+            row = conn.execute(
+                f"SELECT {self._BLOCK_COLUMNS} FROM blocks WHERE tenant_key = %s AND height = %s",
+                (self._tenant_key, int(height)),
+            ).fetchone()
+        return self._block(row) if row else None
+
+    def block_head(self) -> dict[str, Any]:
+        """The newest block and what is not sealed yet."""
+        with self._tx() as conn:
+            tip = conn.execute(
+                f"SELECT {self._BLOCK_COLUMNS} FROM blocks WHERE tenant_key = %s ORDER BY height DESC LIMIT 1",
+                (self._tenant_key,),
+            ).fetchone()
+            sealed_seq = tip["last_seq"] if tip else 0
+            counter = conn.execute(
+                "SELECT last_seq FROM history_counters WHERE tenant_key = %s", (self._tenant_key,)
+            ).fetchone()
+            oldest = conn.execute(
+                "SELECT min(changed_at) AS oldest FROM record_history WHERE tenant_key = %s AND seq > %s",
+                (self._tenant_key, sealed_seq),
+            ).fetchone()
+        history_seq = counter["last_seq"] if counter else 0
+        return {
+            "tip": self._block(tip) if tip else None,
+            "sealed_seq": sealed_seq,
+            "history_seq": history_seq,
+            "unsealed_entries": max(0, history_seq - sealed_seq),
+            "oldest_unsealed_at": _iso(oldest["oldest"]) if oldest and oldest["oldest"] else None,
+        }
+
+    def verify_blocks(self) -> list[dict[str, Any]]:
+        """The database's verifier plus the independent recomputation and the cited-evidence check (the same
+        code ``python -m app.pg_verify`` runs); [] means intact."""
+        from app import pg_verify  # local import: pg_verify is a command-line module that imports the schema code
+
+        with self._tx() as conn:
+            conn.row_factory = tuple_row
+            problems = pg_verify._block_problems(conn, self._tenant_key) + pg_verify._block_evidence_problems(conn, self._tenant_key)
+        return [{"block": what, "problem": problem} for what, problem in problems]
 
     # -- writes -----------------------------------------------------------------
 

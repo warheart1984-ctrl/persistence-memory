@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install the backup/offsite/drill/watchdog/heal timers as systemd USER units (so they run as you, can use docker
+# Install the backup/offsite/drill/watchdog/heal timers (and write, but do NOT enable, the seal timer) as systemd USER units (so they run as you, can use docker
 # and can raise desktop notifications). Linger keeps them running when you are logged out.
 #
 #   install-units.sh [--dest DIR] [--no-enable]      (--dest/--no-enable are for testing)
@@ -23,6 +23,7 @@ for unit in "$JARVIS_DEPLOY_DIR"/systemd/*.service "$JARVIS_DEPLOY_DIR"/systemd/
   sed -e "s#@DEPLOY_DIR@#$JARVIS_DEPLOY_DIR#g" -e "s#@JARVIS_HOME@#$JARVIS_HOME#g" "$unit" > "$dest/$(basename "$unit")"
 done
 echo "units written to $dest"
+echo "jarvis-seal.timer is installed but NOT enabled; once the ledger is at schema v6 enable it with: systemctl --user enable --now jarvis-seal.timer"
 
 if [ "$enable" -eq 1 ]; then
   systemctl --user daemon-reload

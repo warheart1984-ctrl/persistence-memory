@@ -7,7 +7,8 @@
 # Checks: checksums; single-transaction restore; restored row counts == the set's counts; restored anchors ==
 # the set's anchors; the history hash chain verifies for every tenant; the appdata archive lists cleanly.
 # --prove-detection then tampers with the scratch copy (removes the newest history entry) and requires the
-# verifier to FAIL, proving the alarm would actually ring.
+# verifier to FAIL, proving the alarm would actually ring; with sealed blocks it also removes the newest block and
+# requires the anchors to notice.
 set -Eeuo pipefail
 export LOG_NAME=drill
 # shellcheck source=lib.sh
@@ -57,21 +58,18 @@ docker exec -i -u postgres "$name" pg_restore --single-transaction --exit-on-err
   || die "DRILL FAILED: the backup does not restore"
 
 scratch_psql() { docker exec -i -u postgres "$name" psql -X -At -d jarvis "$@"; }
-# a set taken after schema v5 also counts evidence_objects; an older set has no such line and is checked as before
+# a set taken after schema v5 also counts evidence_objects, after v6 also blocks; an older set has no such line and is
+# checked as before
 count_tables="memories boards record_history chain_heads history_counters"
 if grep -q '^evidence_objects=' "$BACKUP_DIR/$base.counts"; then count_tables="$count_tables evidence_objects"; fi
+if grep -q '^blocks=' "$BACKUP_DIR/$base.counts"; then count_tables="$count_tables blocks"; fi
 count_re="^($(echo "$count_tables" | tr ' ' '|'))="
 restored="$(for t in $count_tables; do
   printf '%s=%s\n' "$t" "$(scratch_psql -c "select count(*) from jarvis.$t")"; done | LC_ALL=C sort)"
 expected="$(grep -E "$count_re" "$BACKUP_DIR/$base.counts" | LC_ALL=C sort)"
 [ "$restored" = "$expected" ] || die "DRILL FAILED: restored row counts differ from the backup set"
 
-scratch_anchors() {
-  {
-    scratch_psql -c "COPY (SELECT 'head', tenant_key, id, last_seq, last_hash, deleted FROM jarvis.chain_heads) TO STDOUT WITH (FORMAT text, DELIMITER '|')"
-    scratch_psql -c "COPY (SELECT 'counter', tenant_key, last_seq FROM jarvis.history_counters) TO STDOUT WITH (FORMAT text, DELIMITER '|')"
-  } | LC_ALL=C sort
-}
+scratch_anchors() { anchors_collect scratch_psql; }
 diff <(scratch_anchors) "$BACKUP_DIR/$base.anchors" >/dev/null || die "DRILL FAILED: restored anchors differ from the backup set"
 
 verify_scratch() {
@@ -95,6 +93,15 @@ if [ "$prove" -eq 1 ]; then
     log INFO "drill: tampering with the scratch copy was detected, as it must be"
   else
     log WARN "drill: --prove-detection skipped (no history yet)"
+  fi
+  if [ "$(scratch_psql -c "select case when to_regclass('jarvis.blocks') is null then 0 else (select count(*) from jarvis.blocks) end")" -gt 0 ]; then
+    # the anchor must notice a removed newest block, which nothing inside the database can
+    scratch_psql -c "ALTER TABLE jarvis.blocks DISABLE TRIGGER blocks_no_delete" >/dev/null
+    scratch_psql -c "DELETE FROM jarvis.blocks WHERE height = (SELECT max(height) FROM jarvis.blocks)" >/dev/null
+    if diff <(scratch_anchors) "$BACKUP_DIR/$base.anchors" >/dev/null; then die "DRILL FAILED: removing the newest block was NOT detected by the anchors"; fi
+    log INFO "drill: removing the newest block of the scratch copy was detected by the anchors, as it must be"
+  else
+    log WARN "drill: block anchor proof skipped (no sealed blocks yet)"
   fi
 fi
 

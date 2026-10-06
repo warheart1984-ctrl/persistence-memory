@@ -11,6 +11,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/anchors.sh"
 BACKUP_MAX_AGE="${BACKUP_MAX_AGE:-7800}"        # 130 min: an hourly job may be late, not missing
 OFFSITE_MAX_AGE="${OFFSITE_MAX_AGE:-172800}"    # 48 h
 DRILL_MAX_AGE="${DRILL_MAX_AGE:-864000}"        # 10 days
+SEAL_MAX_AGE="${SEAL_MAX_AGE:-7800}"            # 130 min, like the backup it precedes
 DISK_MIN_FREE_PCT="${DISK_MIN_FREE_PCT:-10}"
 
 problems=0
@@ -26,6 +27,8 @@ stale() {  # stale <state-file> <max-age> <title> <what>
 stale backup.last_ok "$BACKUP_MAX_AGE" "backup is stale" "the hourly backup"
 [ ! -f "$SECRETS_DIR/offsite.conf" ] || stale offsite.last_ok "$OFFSITE_MAX_AGE" "offsite copy is stale" "the offsite copy"
 stale drill.last_ok "$DRILL_MAX_AGE" "restore drill overdue" "the restore drill"
+# the seal timer is optional: it is only watched once it has succeeded at least once (rm state/seal.last_ok after turning it off on purpose)
+[ ! -f "$STATE_DIR/seal.last_ok" ] || stale seal.last_ok "$SEAL_MAX_AGE" "block seal is stale" "the block seal"
 
 used="$(df -P "$BACKUP_DIR" | awk 'NR==2 { gsub("%", "", $5); print $5 }')"
 [ $(( 100 - used )) -ge "$DISK_MIN_FREE_PCT" ] || problem "the backup disk is ${used}% full" "backup disk almost full"

@@ -7,6 +7,7 @@
 # Canonical line formats (sorted, '|'-separated):
 #   head|<tenant>|<record id>|<last_seq>|<last_hash>|<deleted t/f>
 #   counter|<tenant>|<last_seq>
+#   block|<tenant>|<height>|<last_seq>|<block_hash>        (schema v6+: every sealed Continuity Block)
 # shellcheck shell=bash
 
 # anchors_from_dump FILE : read straight out of a pg_dump -Fc file (so it always matches the dump).
@@ -14,33 +15,51 @@ anchors_from_dump() {
   pg_exec pg_restore --data-only -f - -n jarvis < "$1" | awk -F'\t' '
     /^COPY jarvis\.chain_heads / { mode = "head"; next }
     /^COPY jarvis\.history_counters / { mode = "counter"; next }
+    /^COPY jarvis\.blocks / { mode = "block"; next }
     /^COPY / { mode = ""; next }
     /^\\\.$/ { mode = ""; next }
     mode == "head" && NF >= 5    { print "head|" $1 "|" $2 "|" $3 "|" $4 "|" $5 }
     mode == "counter" && NF >= 2 { print "counter|" $1 "|" $2 }
+    # blocks columns: tenant_key height first_seq last_seq entry_count prev_block_hash entries_root block_hash ...
+    mode == "block" && NF >= 8   { print "block|" $1 "|" $2 "|" $4 "|" $8 }
   ' | LC_ALL=C sort
 }
 
-# anchors_from_db : read from the running database (as the postgres superuser, which RLS does not bind).
-anchors_from_db() {
+# anchors_collect RUNNER : the anchor lines of a live database. RUNNER is a command that runs psql, with the
+# arguments it is given, as a role that RLS does not bind (the postgres superuser). A database older than schema v6
+# has no blocks table and simply contributes no block lines.
+anchors_collect() {
+  local run="$1"
   {
-    pg_exec psql -X -q -d jarvis -c "COPY (SELECT 'head', tenant_key, id, last_seq, last_hash, deleted FROM jarvis.chain_heads) TO STDOUT WITH (FORMAT text, DELIMITER '|')"
-    pg_exec psql -X -q -d jarvis -c "COPY (SELECT 'counter', tenant_key, last_seq FROM jarvis.history_counters) TO STDOUT WITH (FORMAT text, DELIMITER '|')"
+    "$run" -c "COPY (SELECT 'head', tenant_key, id, last_seq, last_hash, deleted FROM jarvis.chain_heads) TO STDOUT WITH (FORMAT text, DELIMITER '|')"
+    "$run" -c "COPY (SELECT 'counter', tenant_key, last_seq FROM jarvis.history_counters) TO STDOUT WITH (FORMAT text, DELIMITER '|')"
+    if [ "$("$run" -c "select to_regclass('jarvis.blocks') is not null")" = "t" ]; then
+      "$run" -c "COPY (SELECT 'block', tenant_key, height, last_seq, block_hash FROM jarvis.blocks) TO STDOUT WITH (FORMAT text, DELIMITER '|')"
+    fi
   } | LC_ALL=C sort
 }
 
+anchors_live_psql() { pg_exec psql -X -At -d jarvis "$@"; }
+
+# anchors_from_db : read from the running database (as the postgres superuser, which RLS does not bind).
+anchors_from_db() { anchors_collect anchors_live_psql; }
+
 # anchors_check PREVIOUS NEW : exit 1 and print a line per problem if NEW is not a legitimate successor.
 # Heads may advance (new last_seq) or stay identical; they may never disappear, move backwards, or change
-# their hash without advancing. Counters may only grow.
+# their hash without advancing. Counters may only grow. Every block that was anchored must still exist with the
+# very same hash: a block can be added, never removed and never re-sealed (that is what catches a removed newest
+# block, or a rewritten history whose blocks were all re-sealed consistently - neither is visible inside the database).
 anchors_check() {
   awk -F'|' -v prev="$1" '
     FILENAME == prev {
       if ($1 == "head")    { ps[$2 "|" $3] = $4; ph[$2 "|" $3] = $5 }
       if ($1 == "counter") { pc[$2] = $3 }
+      if ($1 == "block")   { pb[$2 "|" $3] = $5 }
       next
     }
     $1 == "head"    { ns[$2 "|" $3] = $4; nh[$2 "|" $3] = $5 }
     $1 == "counter" { nc[$2] = $3 }
+    $1 == "block"   { nb[$2 "|" $3] = $5 }
     END {
       bad = 0
       for (k in ps) {
@@ -51,6 +70,10 @@ anchors_check() {
       for (t in pc) {
         if (!(t in nc))            { print "anchor problem: tenant " t " counter vanished"; bad = 1 }
         else if (nc[t] + 0 < pc[t] + 0) { print "anchor problem: tenant " t " counter went BACKWARDS (" pc[t] " -> " nc[t] ")"; bad = 1 }
+      }
+      for (k in pb) {
+        if (!(k in nb))          { print "anchor problem: block " k " vanished (a block was removed)"; bad = 1 }
+        else if (nb[k] != pb[k]) { print "anchor problem: block " k " changed its hash (the blocks were re-sealed)"; bad = 1 }
       }
       exit bad
     }

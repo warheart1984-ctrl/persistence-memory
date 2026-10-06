@@ -1,0 +1,13 @@
+[Unit]
+Description=Jarvis ledger: seal blocks hourly, just before the backup takes its anchors
+
+[Timer]
+# five minutes before the hourly backup, so the backup's anchors include the newest block
+OnCalendar=*:55:00
+RandomizedDelaySec=30
+Persistent=true
+
+# Installed by install-units.sh but NOT enabled automatically. After the ledger is at schema v6:
+#   systemctl --user enable --now jarvis-seal.timer
+[Install]
+WantedBy=timers.target

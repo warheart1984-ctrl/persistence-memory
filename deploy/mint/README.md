@@ -130,7 +130,8 @@ Grok docs to say; the Grok CLI does, and `~/.grokbot/settings.json` has its own 
 | `jarvisctl drill [--prove-detection]` | restore the newest set into a scratch database and verify it |
 | `jarvisctl restore --yes-destroy-current-data [--backup SET]` | **destructive**: see below |
 | `jarvisctl offsite` | encrypt and send the newest set to the PC |
-| `jarvisctl verify [tenant]` | recompute the history hash chain |
+| `jarvisctl verify [tenant]` | recompute the history hash chain and every sealed block |
+| `jarvisctl seal [--force\|--status]` | seal new history into Continuity Blocks now (or show the unsealed tail); the hourly timer is **not enabled** by default, see below |
 | `jarvisctl watchdog` / `heal` | run the health checks / the self-heal once |
 | `jarvisctl psql` | admin session inside the database container |
 | `jarvisctl rotate app\|migrator\|api-key` | new random credential, never shown; api-key then needs copying to the PC |
@@ -155,6 +156,10 @@ notification. `jarvisctl down` leaves a marker so a stop on purpose is respected
   that is never pruned, and inside every offsite bundle. A new set must be a legitimate successor of the last: if a
   record vanished or moved backwards the dump is **quarantined** and an alert is raised instead of being kept as
   "good". This is the interim form of the "export chain-head hashes outside the database" follow-up.
+* **Block anchors (schema v6):** the anchors also carry one line per sealed Continuity Block (`block|<tenant>|<height>|<last_seq>|<block_hash>`).
+  A new set must still contain every block of the last set with the same hash: a removed block, or blocks re-sealed after
+  a rewritten history, quarantines the dump and raises the same alert. The database alone cannot see either of those.
+  `jarvisctl drill --prove-detection` proves it too, by removing the newest block from the scratch copy.
 * **Retention:** newest 48, one per day for 14 days, one per week for 12 weeks. Anchors, `quarantine/` and
   `pre-restore-*` dumps are never pruned.
 * **`/data` (AMUL field, STM overlay, RAG files)** is archived in every set; those files are not in Postgres.
@@ -179,6 +184,24 @@ then hashed again on the PC (PowerShell `Get-FileHash`) and compared. Only the a
   `cp offsite.conf.example secrets/offsite.conf`, fill it in, and run `jarvisctl offsite` once by hand.
 * **The offsite SSH user is currently an administrator** on the PC, so that key can run commands there. A normal
   Windows user that owns only `G:\jarvis-backups` would be safer. Not done yet.
+
+### Sealing blocks
+
+`jarvisctl seal` asks the ledger (operator key, `POST /api/jarvis/blocks/seal`) to seal whatever is due: a block is made when
+500 history entries are waiting or the oldest waiting entry is an hour old; `--force` seals what is waiting, `--status` only
+shows the tail. `jarvis-seal.timer` (five minutes before each hourly backup, so the backup's anchors include the newest
+block) is **installed by `install-units.sh` but not enabled**. Enable it once the ledger is at schema v6:
+`systemctl --user enable --now jarvis-seal.timer`. The watchdog only watches the seal after it has succeeded once
+(`state/seal.last_ok`); remove that file after turning the timer off on purpose. `jarvisctl verify` reports how many entries
+are still unsealed and warns when the oldest is more than 24 hours old.
+
+### Upgrading to schema v6 and rolling back
+
+Backup first (`jarvisctl backup`, then `jarvisctl drill`), then pull and `jarvisctl up` (v5 to v6, additive). The code checks the
+schema version exactly, so **v5 code refuses a v6 database and v6 code refuses a v5 one: rolling back means checking out the old
+code and restoring the backup taken before the upgrade** (writes made after it are lost). After such a rollback the newer
+backup sets and anchors no longer fit the restored database (their blocks "vanished"), so move the newer `jarvis-*` sets and the
+newer `anchors/anchors-*.txt` files aside before the next backup, or it will quarantine its dump.
 
 ### Restoring (destructive)
 ```bash
@@ -220,7 +243,7 @@ Steps that need `sudo` are yours to run; nothing here asks for or stores a sudo 
    ```bash
    bin/jarvisctl up                  # db -> migrate -> app; builds the images the first time
    bin/jarvisctl smoke               # every line must say PASS
-   bin/install-units.sh              # the five timers; the offsite timer needs secrets/offsite.conf first
+   bin/install-units.sh              # the five timers (+ the seal timer, installed but not enabled); the offsite timer needs secrets/offsite.conf first
    bin/jarvisctl backup && bin/jarvisctl drill --prove-detection
    bin/jarvisctl offsite
    ```
@@ -237,8 +260,8 @@ Steps that need `sudo` are yours to run; nothing here asks for or stores a sudo 
 * **Wi-Fi** is the box's only network interface; an unreliable link delays the offsite copy, not the local backups.
 * **RPO is one hour** (hourly dumps). Point-in-time recovery is a later option.
 * **Automatic security updates are not set up** (`unattended-upgrades` is not installed).
-* A compromised **database owner** can rewrite history, heads and counters consistently; the anchors outside the
-  database are what would expose it, as long as the PC's copies are intact.
+* A compromised **database owner** can rewrite history, heads, counters and blocks consistently; the anchors outside the
+  database are what would expose it, as long as the PC's copies are intact. Blocks are **not signed**.
 * **No LLM adapter on port 8011.** The old service on 8001 called llm-gateway (tenant `memory`, `JARVIS_LLM_*`
   in `~/.config/persistence-memory/memory.env`) for the AMUL LLM adapter. The 8011 stack sets no `JARVIS_LLM_*`
   variables, so that adapter is off. Recall, writes, history, backups and the rest do not use it. To get it back,
