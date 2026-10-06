@@ -1,0 +1,14 @@
+[Unit]
+Description=Jarvis ledger: seal new history into Continuity Blocks
+Documentation=file://@DEPLOY_DIR@/README.md
+
+[Service]
+Type=oneshot
+Environment=JARVIS_HOME=@JARVIS_HOME@
+# optional tuning (JARVIS_APP_PORT, ...); the dash makes the file optional
+EnvironmentFile=-@DEPLOY_DIR@/.env
+EnvironmentFile=-@JARVIS_HOME@/systemd.env
+ExecStart=@DEPLOY_DIR@/bin/seal.sh
+TimeoutStartSec=5min
+NoNewPrivileges=true
+PrivateTmp=true

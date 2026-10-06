@@ -10,7 +10,7 @@
 #   4. the database initialises (roles are created from secrets/db.env) and the dump is restored in ONE
 #      transaction (all or nothing);
 #   5. gates: restored row counts == the set's counts; restored chain-head anchors == the set's anchors;
-#      the history hash chain verifies for every tenant;
+#      the history hash chain (and, from schema v6, every sealed block) verifies for every tenant;
 #   6. only then the app is started and must report /ready.
 # This is the interim, scripted form of "verify against exported anchors after a restore, before serving".
 set -Eeuo pipefail
@@ -75,9 +75,11 @@ pg_exec pg_restore --single-transaction --exit-on-error -d jarvis < "$BACKUP_DIR
   || die "pg_restore failed (the app has NOT been started; the database volume is freshly initialised and empty)"
 
 # ---- 5. gates -----------------------------------------------------------------------------------------------------
-# a set taken after schema v5 also counts evidence_objects; an older set has no such line and is checked as before
+# a set taken after schema v5 also counts evidence_objects, after v6 also blocks; an older set has no such line and is
+# checked as before
 count_tables="memories boards record_history chain_heads history_counters"
 if grep -q '^evidence_objects=' "$BACKUP_DIR/$base.counts"; then count_tables="$count_tables evidence_objects"; fi
+if grep -q '^blocks=' "$BACKUP_DIR/$base.counts"; then count_tables="$count_tables blocks"; fi
 count_re="^($(echo "$count_tables" | tr ' ' '|'))="
 restored_counts="$(for t in $count_tables; do
   printf '%s=%s\n' "$t" "$(pg_exec psql -X -At -d jarvis -c "select count(*) from jarvis.$t")"; done | LC_ALL=C sort)"

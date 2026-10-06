@@ -17,8 +17,9 @@ jarvisctl <command>
   status               containers, health, last backup/offsite/drill ages
   logs [service]       follow logs (db | app | migrate)
   psql                 an admin psql session inside the database container (as postgres)
-  verify [tenant]      verify the history hash chain (default tenant: operator)
+  verify [tenant]      verify the history hash chain and the sealed blocks (default tenant: operator)
   smoke [--no-write]   acceptance checks
+  seal [--force|--status]  seal new history into Continuity Blocks now (or show the unsealed tail)
   backup               take a backup set now
   prune [--dry-run]    apply the retention policy
   restore --yes-destroy-current-data [--backup SET] [--no-start]
@@ -43,7 +44,7 @@ case "$cmd" in
   restart)  "${COMPOSE[@]}" restart "${@:-app}" ;;
   status)
     "${COMPOSE[@]}" ps
-    for f in backup offsite drill; do
+    for f in backup offsite drill seal; do
       if [ -f "$STATE_DIR/$f.last_ok" ]; then printf '%-8s last ok %s min ago\n' "$f" $(( ($(date +%s) - $(cat "$STATE_DIR/$f.last_ok")) / 60 ))
       else printf '%-8s never\n' "$f"; fi
     done
@@ -54,6 +55,7 @@ case "$cmd" in
     t="${1:-operator}"
     "${COMPOSE[@]}" run --rm --no-deps -T migrate python -m app.pg_verify --tenant "$t" ;;
   smoke)    exec "$here/smoke.sh" "$@" ;;
+  seal)     exec "$here/seal.sh" "$@" ;;
   backup)   exec "$here/backup.sh" "$@" ;;
   prune)    exec "$here/prune.sh" "$@" ;;
   restore)  exec "$here/restore.sh" "$@" ;;

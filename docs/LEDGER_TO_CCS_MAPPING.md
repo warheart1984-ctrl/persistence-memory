@@ -4,7 +4,7 @@
 
 | Today (`continuity-ledger-v1`) | Future CCS construct | Gap |
 |--------------------------------|----------------------|-----|
-| Flat `memories[]` in JSON store | Continuity Block (immutable batch) | No block hashing / chaining / Merkle — **declared** |
+| `record_history` entries (row store) | Continuity Block (immutable batch) | Sealed ranges, RFC 6962 Merkle root, `prev_block_hash` chain, external anchor; **no signatures**, no block for the JSON store, not yet sealed automatically until the seal timer is enabled — **partial** |
 | `MemoryRecord` | Continuity event inside a block | Event envelope incomplete vs CCS |
 | `evidence: EvidenceLink[]` + Evidence Objects | Evidence Object (typed, signed) | Content-addressed immutable objects (hash only, minimal local CES) linked by `kind: evidence-object`; **no signatures** — **partial** |
 | `source_agent` + `session_id` + `created_at` | Provenance Chain fragment | No Root Authority → … → Replay chain — **declared** |
@@ -19,4 +19,4 @@
 | — | Unified provenance across products | **declared** |
 | — | Domain merger prevention (Boundary Clauses I–VI) | **declared** charter; not runtime-enforced |
 
-**Bottom line:** today’s ledger is a **working continuity store** with provenance and conflict surfacing. It is **not** yet CCS infrastructure (blocks, signed evidence objects, CES/RC registry runtime, multi-product provenance).
+**Bottom line:** today’s ledger is a **working continuity store** with provenance and conflict surfacing. It is **not** yet CCS infrastructure (signed blocks and evidence objects, CES/RC registry runtime, multi-product provenance).

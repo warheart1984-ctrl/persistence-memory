@@ -31,7 +31,7 @@ CCS is the intended **root continuity authority** for Mandala Rendering Software
 
 | Construct | Meaning | Today |
 |-----------|---------|-------|
-| **Continuity Blocks** | Immutable batches / blocks of continuity events | **declared** — current store is a flat JSON memory list |
+| **Continuity Blocks** | Immutable batches / blocks of continuity events | **partial** — on the PostgreSQL row store (schema v6) contiguous ranges of the history are sealed into immutable, hash-chained blocks with an RFC 6962 Merkle root, verified by `pg_verify`, and every block hash is kept outside the database in the backup anchors; **not signed**, and the JSON store has no blocks (`CONTINUITY_BLOCKS.md`) |
 | **Evidence Objects** | Typed, signed evidence payloads | **partial** — hash-only objects linked by `kind: evidence-object`; **not signed** (`EVIDENCE_OBJECTS.md`) |
 | **Replay Contracts** | Registered reconstruction rules (RC.*) | **declared** — stubs under `schemas/rc/` |
 | **Provenance Chains** | Linked identity → intent → evidence → … → replay | **declared** — ledger has per-record provenance, not full chain |

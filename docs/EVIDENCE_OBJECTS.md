@@ -1,8 +1,7 @@
 # Evidence Objects
 
 **Status: partial.** Content-addressed, immutable evidence objects exist, with hashes only and a minimal local schema.
-There are **no signatures** (that is a root-authority question, deliberately not answered here), no Continuity Blocks and
-no Replay Contracts yet. An Evidence Object proves *what was recorded*, not who vouches for it.
+There are **no signatures** (that is a root-authority question, deliberately not answered here), no Replay Contracts yet (Continuity Blocks exist, partial and unsigned: `CONTINUITY_BLOCKS.md`). An Evidence Object proves *what was recorded*, not who vouches for it.
 
 ## What it is
 
@@ -64,4 +63,4 @@ checkable evidence for `fact`, `architecture` and `research` only when it resolv
 ## Not claimed
 
 Signatures, authorship proof, that a pointer's content still matches, that the evidence is true, or any CCS root
-authority. Next in the roadmap: Continuity Blocks, then Replay Contracts.
+authority. Continuity Blocks are in (`CONTINUITY_BLOCKS.md`); next in the roadmap: Replay Contracts.

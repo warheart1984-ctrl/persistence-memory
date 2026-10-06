@@ -1,9 +1,21 @@
 # Continuity Blocks
 
-**Status: partial (schema v6, database layer only).** Blocks can be sealed and verified inside the database. Not built
-yet: the HTTP endpoints, `jarvisctl seal` and its timer, and the block head in the backup anchors (next PR). Nothing seals
-by itself until that timer is switched on. Blocks are **unsigned** (signatures are deferred, together with Evidence Object
-signing).
+**Status: partial (schema v6).** Blocks are sealed and verified inside the database, exposed through operator-key endpoints,
+sealed by `jarvisctl seal` / `jarvis-seal.timer` (installed, **not enabled** by default), and every block hash is kept outside
+the database in the backup anchors. Blocks are **unsigned** (signatures are deferred, together with Evidence Object signing)
+and exist only on the PostgreSQL row store.
+
+## Endpoints (operator key only; 501 on the JSON store; an OAuth user token is refused with 403)
+
+| | |
+|---|---|
+| `POST /api/jarvis/blocks/seal` | seal what is due (`{"force", "min_entries", "max_age_seconds", "max_entries"}`, all optional); returns the blocks sealed, why it stopped and the head |
+| `GET /api/jarvis/blocks?after_height=&limit=` | list blocks |
+| `GET /api/jarvis/blocks/{height}` | one block |
+| `GET /api/jarvis/blocks/head` | the newest block and the unsealed tail |
+| `GET /api/jarvis/blocks/verify` | the database verifier, the independent recomputation and the cited-evidence check |
+
+The caller never supplies a hash or a height: the database computes them.
 
 ## What a block is
 
@@ -57,9 +69,13 @@ more than 24 hours old, which means the seal timer has probably stopped.
 | **the newest block removed** | **not by the database alone** |
 | **an entry rewritten and every later block re-sealed consistently** | **not by the database alone** |
 
-The last two need a hash kept **outside** the database: the block head (`height` and `block_hash`) will be written into the
-backup anchors (`anchors.sh`) in the next PR, and `backup.sh` already refuses an anchor set that is not a successor of the
-last one. Until then these are known limits; `tests/test_pg_blocks.py` pins both so they cannot be mistaken for guarded cases.
+The last two need a hash kept **outside** the database, and that is the **block anchor**: every backup writes one line per sealed
+block (`block|<tenant>|<height>|<last_seq>|<block_hash>`) into the anchors, and `backup.sh` refuses (and quarantines) a new set in
+which a previously anchored block is missing or has a different hash. `tests/test_pg_blocks.py` pins that the database alone
+cannot see these two; `tests/test_block_anchors.py` proves the anchor catches both, and that the check is what does it (a copy of
+the rule with the comparison removed lets them through). The drill (`jarvisctl drill --prove-detection`) repeats the proof on
+every run. The protection is only as good as the anchors' copies: a block sealed after the last backup is not yet anchored, and
+someone who can also rewrite the anchors log and its offsite copies defeats it.
 
 ## Migration and rollback
 
@@ -67,7 +83,8 @@ Schema v6 is additive: the `blocks` table, its triggers (UPDATE, DELETE and TRUN
 tenant, four functions and grants. No existing table is altered; a test compares every existing table byte for byte before
 and after the migration and after the first seal. The code checks the schema version exactly, so v5 code refuses a v6
 database. **Rollback is restoring the backup taken before the migration** (writes made after the migration are lost).
-Take and drill a backup first.
+Take and drill a backup first; after a rollback restore, move the newer backup sets and anchors files aside (see
+`deploy/mint/README.md`), because their blocks no longer exist in the restored database.
 
 ## Tests
 
