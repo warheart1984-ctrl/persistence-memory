@@ -1,13 +1,13 @@
 # Continuity Ledger — Separation of Concerns
 
 **Status:** enforced for boundary wording in this package; other engines = **declared** / out of package.  
-**Scope:** `jarvis-memoryboard/` only.
+**Scope:** this repository (`persistence-memory`) only.
 
 ## Four layers
 
 | Layer | Role | Ownership |
 |-------|------|-----------|
-| **Memory / Continuity Ledger** (this package) | Stores replayable records with provenance. Preserves what was recorded. Enforces continuity invariants (immutability of content hashes once written, required provenance fields, no silent merge, deterministic retrieve envelopes). Does **not** infer or decide what is epistemically true. | `jarvis-memoryboard/` |
+| **Memory / Continuity Ledger** (this package) | Stores replayable records with provenance. Preserves what was recorded. Enforces continuity invariants (immutability of content hashes once written, required provenance fields, no silent merge, deterministic retrieve envelopes). Does **not** infer or decide what is epistemically true. | this repository (`persistence-memory`) |
 | **Evidence Engine** | Evaluates whether evidence warrants a claim. | **declared** — not in this package |
 | **Knowledge Engine** | Organizes verified knowledge. | **declared** — not in this package |
 | **Understanding Engine** | Builds explanations and mental models. | **declared** — not in this package |

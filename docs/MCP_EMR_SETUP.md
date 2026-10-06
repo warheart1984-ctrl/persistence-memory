@@ -11,7 +11,7 @@ Expose the Jarvis **EMR Protocol** to assistant hosts
 | `search` / `fetch` (OpenAI company knowledge) | **live** | Same auth as recall (`EMR_RECALL_API_KEY` when set) | `tests/test_emr_research.py` |
 | `emr_remember` / `emr_upsert` tool endpoints | **partial** | `JARVIS_MCP_WRITE_ENABLED=true` + `user_requested=true` | `tests/test_emr_write.py`, `tests/test_emr_mcp*.py` |
 | MCP stdio adapter (`python -m mcp_server`) | **live** | Same host as memoryboard; stdio process can reach the ledger at `JARVIS_MEMORYBOARD_URL` | `tests/test_emr_mcp.py` |
-| Cursor / OpenCode local MCP wiring | **live** (operator) | Host config points `cwd` at `jarvis-memoryboard` + memoryboard up | `config/mcp-cursor.example.json` |
+| Cursor / OpenCode local MCP wiring | **live** (operator) | Host config points `cwd` at the `persistence-memory` checkout + memoryboard up | `config/mcp-cursor.example.json` |
 | Render public `POST /mcp` (Streamable HTTP) | **live** | Render deploy with `EMR_RECALL_API_KEY` | `mcp_server/mcp_http.py`, `docs/DEPLOY_RENDER.md` |
 | ChatGPT remote MCP write tools | **declared** / operator | Requires `JARVIS_MCP_WRITE_ENABLED=true` (off on Render by default) + host `requireApproval` | `app/emr_write.py` |
 
@@ -55,7 +55,7 @@ without explicit `user_requested=true`. Public Render keeps writes off until
 1. **Jarvis Memoryboard** running on port 8001:
 
 ```bash
-cd jarvis-memoryboard
+cd persistence-memory
 . .venv/bin/activate
 uvicorn app.main:app --host 127.0.0.1 --port 8001
 ```
@@ -65,7 +65,7 @@ Or use the systemd user unit (`jarvis-memoryboard.service`) if installed.
 2. Python 3.11+ with `jarvis-memoryboard` installed (editable install from repo root):
 
 ```bash
-cd jarvis-memoryboard
+cd persistence-memory
 pip install -e ".[dev]"
 ```
 
@@ -74,7 +74,7 @@ pip install -e ".[dev]"
 Run manually to verify:
 
 ```bash
-cd jarvis-memoryboard
+cd persistence-memory
 JARVIS_MEMORYBOARD_URL=http://127.0.0.1:8011 python -m mcp_server
 ```
 
@@ -170,7 +170,7 @@ Add to your Cursor MCP config (`~/.cursor/mcp.json` or project `.cursor/mcp.json
     "jarvis-emr": {
       "command": "python",
       "args": ["-m", "mcp_server"],
-      "cwd": "/absolute/path/to/jarvis-memoryboard",
+      "cwd": "/absolute/path/to/persistence-memory",
       "env": {
         "JARVIS_MEMORYBOARD_URL": "http://127.0.0.1:8011"
       }
@@ -197,7 +197,7 @@ configured; EMR uses stdio because the memoryboard is local):
       "jarvis-emr": {
         "command": "python",
         "args": ["-m", "mcp_server"],
-        "cwd": "jarvis-memoryboard",
+        "cwd": ".",
         "env": {
           "JARVIS_MEMORYBOARD_URL": "http://127.0.0.1:8011"
         }
@@ -294,7 +294,7 @@ Example init/run script (no secrets): `config/tunnel-client.example.sh`
 Terminal 1 — memoryboard (loopback only):
 
 ```bash
-cd jarvis-memoryboard   # or /home/jon/dev/persistence-memory
+cd persistence-memory   # or /home/jon/dev/persistence-memory
 . .venv/bin/activate
 uvicorn app.main:app --host 127.0.0.1 --port 8001
 ```
@@ -302,7 +302,7 @@ uvicorn app.main:app --host 127.0.0.1 --port 8001
 Terminal 2 — tunnel-client (keep running):
 
 ```bash
-cd jarvis-memoryboard   # same repo; needs pip install -e ".[dev]"
+cd persistence-memory   # same repo; needs pip install -e ".[dev]"
 export CONTROL_PLANE_API_KEY="sk-..."   # runtime API key for tunnel-client
 export JARVIS_MEMORYBOARD_URL="http://127.0.0.1:8011"
 # export EMR_RECALL_API_KEY="..."       # only if local memoryboard requires it
@@ -418,7 +418,7 @@ curl -s http://127.0.0.1:8011/api/jarvis/tools
 ## Verification
 
 ```bash
-cd jarvis-memoryboard
+cd persistence-memory
 . .venv/bin/activate
 pytest tests/test_emr*.py -q
 ```

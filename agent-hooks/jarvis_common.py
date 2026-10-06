@@ -186,7 +186,7 @@ def log_refusal(hook: str, session_id: str, names: list[str]) -> str:
 
 
 def repo_root() -> Path:
-    # agent-hooks/ -> jarvis-memoryboard/ -> repo root
+    # agent-hooks/ -> the repository root -> the folder that holds the checkout (where a workspace's .cursor/ lives)
     return Path(__file__).resolve().parents[2]
 
 
