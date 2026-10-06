@@ -6,7 +6,7 @@
 |--------------------------------|----------------------|-----|
 | Flat `memories[]` in JSON store | Continuity Block (immutable batch) | No block hashing / chaining / Merkle — **declared** |
 | `MemoryRecord` | Continuity event inside a block | Event envelope incomplete vs CCS |
-| `evidence: EvidenceLink[]` | Evidence Object (typed, signed) | Links only; no signature/payload store — **declared** |
+| `evidence: EvidenceLink[]` + Evidence Objects | Evidence Object (typed, signed) | Content-addressed immutable objects (hash only, minimal local CES) linked by `kind: evidence-object`; **no signatures** — **partial** |
 | `source_agent` + `session_id` + `created_at` | Provenance Chain fragment | No Root Authority → … → Replay chain — **declared** |
 | `GET /retrieve` + `selections` | Replay against RC.* | No RC execution; filter rationale only — **enforced** replay of ledger rows |
 | `conflicts` | Continuity invariant: no silent merge | Surfaces disputes; does not evaluate truth — **enforced** |

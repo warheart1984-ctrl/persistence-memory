@@ -57,9 +57,13 @@ docker exec -i -u postgres "$name" pg_restore --single-transaction --exit-on-err
   || die "DRILL FAILED: the backup does not restore"
 
 scratch_psql() { docker exec -i -u postgres "$name" psql -X -At -d jarvis "$@"; }
-restored="$(for t in memories boards record_history chain_heads history_counters; do
+# a set taken after schema v5 also counts evidence_objects; an older set has no such line and is checked as before
+count_tables="memories boards record_history chain_heads history_counters"
+if grep -q '^evidence_objects=' "$BACKUP_DIR/$base.counts"; then count_tables="$count_tables evidence_objects"; fi
+count_re="^($(echo "$count_tables" | tr ' ' '|'))="
+restored="$(for t in $count_tables; do
   printf '%s=%s\n' "$t" "$(scratch_psql -c "select count(*) from jarvis.$t")"; done | LC_ALL=C sort)"
-expected="$(grep -E '^(memories|boards|record_history|chain_heads|history_counters)=' "$BACKUP_DIR/$base.counts" | LC_ALL=C sort)"
+expected="$(grep -E "$count_re" "$BACKUP_DIR/$base.counts" | LC_ALL=C sort)"
 [ "$restored" = "$expected" ] || die "DRILL FAILED: restored row counts differ from the backup set"
 
 scratch_anchors() {

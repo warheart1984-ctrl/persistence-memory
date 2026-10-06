@@ -20,7 +20,7 @@ CCS is the intended **root continuity authority** for Mandala Rendering Software
 | Function | Intent | Status |
 |----------|--------|--------|
 | Record constitutional / continuity events | Append-only style history of what was claimed | **partial** via ledger POST |
-| Store evidence objects | Typed, linked evidence | **partial** — `evidence[]` links only; no signed Evidence Objects |
+| Store evidence objects | Typed, linked evidence | **partial** — content-addressed, immutable, hash-only Evidence Objects with a minimal local CES (`EVIDENCE_OBJECTS.md`); no signatures |
 | Lineage / provenance | Who/when/session/source | **enforced** on ledger records |
 | Deterministic replay | Same retrieve → same provenance envelope | **enforced** for ledger retrieve |
 | Enforce continuity invariants | Required fields, no silent merge, hash fidelity helpers | **enforced** / **partial** (Drift multi-day) |
@@ -32,7 +32,7 @@ CCS is the intended **root continuity authority** for Mandala Rendering Software
 | Construct | Meaning | Today |
 |-----------|---------|-------|
 | **Continuity Blocks** | Immutable batches / blocks of continuity events | **declared** — current store is a flat JSON memory list |
-| **Evidence Objects** | Typed, signed evidence payloads | **declared** — only `EvidenceLink` refs on records |
+| **Evidence Objects** | Typed, signed evidence payloads | **partial** — hash-only objects linked by `kind: evidence-object`; **not signed** (`EVIDENCE_OBJECTS.md`) |
 | **Replay Contracts** | Registered reconstruction rules (RC.*) | **declared** — stubs under `schemas/rc/` |
 | **Provenance Chains** | Linked identity → intent → evidence → … → replay | **declared** — ledger has per-record provenance, not full chain |
 
@@ -101,7 +101,7 @@ Promotable toward “CCS as infrastructure” when:
 | P1 | All CES.* registered (schemas + owners) | **gap** — stubs only |
 | P2 | All RC.* registered | **gap** — stubs only |
 | P3 | Replay deterministic across registered consumers | **gap** — ledger-only enforced |
-| P4 | Evidence chains validate (signatures / hashes end-to-end) | **gap** — content hash only |
+| P4 | Evidence chains validate (signatures / hashes end-to-end) | **gap** — hashes verify end-to-end for evidence objects (`pg_verify`); no signatures |
 | P5 | Provenance unifies across AIKI/ARIS/SX/Lineage/Mandala | **gap** — declared model only |
 | P6 | ESFR `PROMOTE_WITH_GAPS` or better for CCS milestone | **gap** — no CCS ESFR run recorded in this package |
 

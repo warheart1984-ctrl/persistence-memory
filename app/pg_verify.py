@@ -15,6 +15,7 @@ import sys
 import psycopg
 from psycopg import sql
 
+from app import evidence as evidence_objects
 from app.pg_schema import check_schema_version, validate_schema_name
 
 
@@ -32,6 +33,7 @@ def main(argv: list[str] | None = None) -> int:
     schema = (os.getenv("JARVIS_DATABASE_SCHEMA") or "").strip() or None
 
     problems: list[tuple[str, str, str]] = []
+    evidence_total = 0
     with psycopg.connect(dsn, connect_timeout=5) as conn:
         if schema:
             conn.execute(sql.SQL("SET LOCAL search_path TO {}").format(sql.Identifier(validate_schema_name(schema))))
@@ -47,11 +49,26 @@ def main(argv: list[str] | None = None) -> int:
                 "SELECT history_id, memory_id, problem FROM jarvis_verify_history(%s)", (tenant,)
             ):
                 problems.append((tenant, memory_id, problem))
+            if conn.execute("SELECT to_regclass('evidence_objects') IS NOT NULL").fetchone()[0]:
+                for row in conn.execute(
+                    "SELECT id, schema_id, payload, pointer, size_bytes, created_at, created_by "
+                    "FROM evidence_objects WHERE tenant_key = %s ORDER BY id", (tenant,)
+                ).fetchall():
+                    obj = evidence_objects.EvidenceObject(
+                        id=row[0], schema_id=row[1], payload=row[2], pointer=row[3], size_bytes=row[4],
+                        created_at=row[5].isoformat(), created_by=row[6],
+                    )
+                    for problem in evidence_objects.verify_stored(obj):
+                        problems.append((tenant, obj.id, f"evidence object: {problem}"))
+                evidence_total += conn.execute(
+                    "SELECT count(*) FROM evidence_objects WHERE tenant_key = %s", (tenant,)
+                ).fetchone()[0]
     if problems:
         for tenant, memory_id, problem in problems:
             print(f"PROBLEM tenant={tenant} record={memory_id}: {problem}")
         return 1
-    print(f"ok: history intact for {len(tenants)} tenant(s)")
+    note = f"; {evidence_total} evidence object(s) re-hashed" if evidence_total else ""
+    print(f"ok: history intact for {len(tenants)} tenant(s){note}")
     return 0
 
 

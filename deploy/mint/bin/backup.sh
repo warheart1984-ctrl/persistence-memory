@@ -34,7 +34,10 @@ pg_exec pg_dump -Fc -d jarvis > "$tmp/$base.dump" || die "pg_dump failed"
 
 # 2. is it a real dump of the ledger?
 pg_exec pg_restore --list < "$tmp/$base.dump" > "$tmp/toc.txt" || die "pg_restore --list rejects the dump"
-for table in memories boards record_history chain_heads history_counters schema_version; do
+# Databases at schema v5 or later also hold evidence_objects; older ones do not and must keep backing up.
+evidence_table=""
+if grep -Eq "TABLE jarvis evidence_objects " "$tmp/toc.txt"; then evidence_table="evidence_objects"; fi
+for table in memories boards record_history chain_heads history_counters schema_version $evidence_table; do
   grep -Eq "TABLE DATA jarvis $table " "$tmp/toc.txt" || die "dump has no data section for jarvis.$table"
 done
 
@@ -44,7 +47,7 @@ pg_exec pg_restore --data-only -f - -n jarvis < "$tmp/$base.dump" | awk '
   /^\\\.$/        { inside = 0; next }
   inside          { rows[table]++ }
   END { for (t in rows) print t "=" rows[t] }' | LC_ALL=C sort > "$tmp/$base.counts"
-for table in memories boards record_history chain_heads history_counters; do
+for table in memories boards record_history chain_heads history_counters $evidence_table; do
   grep -q "^$table=" "$tmp/$base.counts" || die "could not count rows of $table in the dump"
 done
 
