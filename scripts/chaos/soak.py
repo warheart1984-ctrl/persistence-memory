@@ -14,6 +14,9 @@ report a chaos-throwaway: identity; it reads memory only from the throwaway's ow
   idle      no traffic: does memory come back?
   control   the application container is restarted and given the same read load.  If memory returns to the same level on the same ledger, the memory is
             explained by the ledger (state the process holds because of its size), not by the process's age
+  concurrency  (``--concurrency``, on its own or after the rest) a restarted process is given the same reads at 1, 4, 16 and 40 callers at once and its
+            high-water mark is read after each: a retrieve that materialises the ledger makes the peak follow callers x ledger size, which is how a
+            flood of readers can look like a leak
 
 The verdict is computed from the samples and printed with the numbers; it claims no more than they show.  Standard library only.
 """
@@ -138,6 +141,23 @@ def power_law_exponent(xs: list[float], ys: list[float]) -> dict[str, float]:
     return {"exponent": fit["slope"], "r2": fit["r2"], "n": fit["n"]}
 
 
+def concurrency_note(levels: list[dict]) -> dict[str, Any]:
+    """levels: [{"callers", "hwm_mib", "anon_mib"}] in ascending order of callers, one restarted process.  Does the high-water mark follow the callers?"""
+    if len(levels) < 3:
+        return {"notes": []}
+    f = linear_fit([l["callers"] for l in levels], [l["hwm_mib"] for l in levels])
+    out = {"mib_per_caller": round(f["slope"], 2), "r2": round(f["r2"], 3), "levels": levels}
+    first, last = levels[0], levels[-1]
+    rise = last["hwm_mib"] - first["hwm_mib"]
+    if f["r2"] >= 0.8 and f["slope"] > 0.5 and rise > 10:
+        out["notes"] = [f"the high-water mark follows the number of simultaneous callers: about {f['slope']:.1f} MiB per extra caller on this ledger "
+                        f"({first['hwm_mib']:.0f} MiB at {first['callers']} caller to {last['hwm_mib']:.0f} MiB at {last['callers']}): each retrieve holds a copy of the "
+                        "ledger while it runs, so a burst of readers raises the peak without any request leaking"]
+    else:
+        out["notes"] = [f"the high-water mark does not follow the number of simultaneous callers ({first['hwm_mib']:.0f} -> {last['hwm_mib']:.0f} MiB)"]
+    return out
+
+
 def verdict(growth: list[dict], reads: list[dict], idle: list[dict], control: list[dict]) -> dict[str, Any]:
     """Memory: is it a leak (it grows with REQUESTS on a constant ledger, and a restart gets it back) or the ledger (it returns to the same level after a
     restart on the same ledger)?  Latency: how does retrieval follow the number of records?"""
@@ -206,6 +226,45 @@ def sample(client, stack, phase: str, t0: float, requests: int, records: int) ->
     return s
 
 
+def run_concurrency(args, stack, target, client, stats, out_dir) -> int:
+    """Restart the application, then read at 1, 4, 16 and 40 callers at once (ascending: the high-water mark only rises), and read the mark after each."""
+    lines = []
+
+    def log(line: str) -> None:
+        print(line, flush=True)
+        lines.append(line)
+
+    head = client.get("/api/jarvis/blocks/head").json
+    first = client.get("/api/jarvis/memory/retrieve?query=chaos100x&limit=1").json
+    record_id = (first["memories"][0]["id"] if first and first.get("memories") else "mem-none")
+    log(f"concurrency: ledger at {head['history_seq']} entries; restarting the application container and reading at 1, 4, 16, 40 callers for {args.concurrency_seconds:g} s each")
+    run = chaos.run_cmd(["docker", "restart", stack["containers"]["app"]], timeout=120)
+    if run.returncode != 0:
+        log(f"could not restart the application: {run.stderr[:100]}")
+    for _ in range(120):
+        if chaos.fetch_ready(target["url"])[0] == 200:
+            break
+        time.sleep(1)
+    levels = [{"callers": 0, "hwm_mib": process_memory(stack["containers"]["app"]).get("VmHWM", 0) / 1024, "anon_mib": process_memory(stack["containers"]["app"]).get("RssAnon", 0) / 1024,
+               "requests": 0, "p50_ms": None, "p99_ms": None, "unanswered": 0}]
+    log(f"  after restart: high-water {levels[0]['hwm_mib']:.1f} MiB, anonymous {levels[0]['anon_mib']:.1f} MiB")
+    for callers in (1, 4, 16, 40):
+        load = Load(client, record_id, threads=callers).start()
+        time.sleep(args.concurrency_seconds)
+        load.stop()
+        mem = process_memory(stack["containers"]["app"])
+        lat = sorted(l for l in client.stats.latencies.get("-", [])[-max(load.count, 1):])
+        levels.append({"callers": callers, "hwm_mib": round(mem.get("VmHWM", 0) / 1024, 1), "anon_mib": round(mem.get("RssAnon", 0) / 1024, 1), "requests": load.count,
+                       "p50_ms": round(chaos.pct(lat, 0.5), 1) if lat else None, "p99_ms": round(chaos.pct(lat, 0.99), 1) if lat else None, "unanswered": load.errors})
+        log(f"  {callers:>2} callers: {load.count:>5} requests ({load.errors} not 200), high-water {levels[-1]['hwm_mib']:.1f} MiB, anonymous {levels[-1]['anon_mib']:.1f} MiB, "
+            f"p50 {levels[-1]['p50_ms']} ms p99 {levels[-1]['p99_ms']} ms")
+    result = {"ledger_entries": head["history_seq"], "levels": levels, "analysis": concurrency_note([l for l in levels if l["callers"] > 0])}
+    log(json.dumps(result["analysis"]["notes"], indent=1))
+    if out_dir:
+        (out_dir / "concurrency.json").write_text(json.dumps(result, indent=2))
+    return chaos.EXIT_OK
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="soak.py", description="Soak a THROWAWAY stack: leak or cache, and retrieval against ledger size")
     ap.add_argument("--stack-dir", default=os.environ.get("JARVIS_CHAOS_DIR") or str(Path(os.environ.get("TMPDIR", "/tmp")) / "jarvis-chaos100x"))
@@ -219,6 +278,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--records-per-tick", type=int, default=40)
     ap.add_argument("--sample-s", type=float, default=90)
     ap.add_argument("--max-records", type=int, default=40000, help="the ledger is bounded: growth stops here")
+    ap.add_argument("--concurrency", action="store_true", help="run only the concurrency phase on the existing ledger (restarts the application container)")
+    ap.add_argument("--concurrency-seconds", type=float, default=45)
     ap.add_argument("--i-know-this-is-live", action="store_true", dest="allow_live", help="never used")
     args = ap.parse_args(argv)
 
@@ -248,6 +309,8 @@ def main(argv: list[str] | None = None) -> int:
             log_file.write(line + "\n")
             log_file.flush()
 
+    if args.concurrency:
+        return run_concurrency(args, stack, target, client, stats, out_dir)
     tag = os.urandom(3).hex()
     t0 = time.time()
     samples: dict[str, list[dict]] = {"growth": [], "reads": [], "idle": [], "control": []}

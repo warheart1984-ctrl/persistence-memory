@@ -362,13 +362,14 @@ class Ctx:
 
     def ensure_receipt(self) -> dict[str, Any]:
         """A replay receipt taken BEFORE a fault (the one phase F made this round, or one made now) for the gates to re-derive afterwards."""
-        if "f1" not in self.state:
+        if self.state.get("f1_round") != self.round:                          # a receipt of THIS round, taken before this round's faults
             self.create(content=self.content("receipt anchor"))
             self.seal(max_entries=5)
             tip = self.head()["tip"]
             r = self.client.post("/api/jarvis/replay/receipts", {"at_block": tip["height"]})
             status_is(r, 200, what="issue the receipt the fault gates will re-derive")
             self.state["f1"] = {"id": r.json["receipt"]["id"], "block": tip["height"], "at_seq": tip["last_seq"], "root": r.json["receipt"]["payload"]["state_root"]}
+            self.state["f1_round"] = self.round
         return self.state["f1"]
 
     def mint_script(self, name: str, *args: str, timeout: float = 600) -> subprocess.CompletedProcess:
@@ -689,6 +690,7 @@ def f1(ctx: Ctx) -> None:
     check(p["block_height"] == tip["height"] and p["block_hash"] == tip["block_hash"] and p["at_seq"] == tip["last_seq"], f"receipt payload {p}")
     check(r.json["receipt"]["schema_id"] == "CES.Local.ReplayReceipt.v1", "wrong schema id")
     ctx.state["f1"] = {"id": r.json["receipt"]["id"], "block": tip["height"], "at_seq": tip["last_seq"], "root": p["state_root"]}
+    ctx.state["f1_round"] = ctx.round
 
 
 @probe("F2", "F", "issuing the same receipt again is idempotent: same id, not created twice")

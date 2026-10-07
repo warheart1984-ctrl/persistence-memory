@@ -195,3 +195,17 @@ def test_a_steep_slope_over_a_tiny_total_rise_is_not_called_a_leak():
     assert f["r2"] > 0.99 and f["mib_per_100k_requests"] > 2.0 and f["last_mib"] - f["first_mib"] < 2.0    # the premise
     v = soak.verdict(growth_series(), reads, [mem(101.5, 50_000)], [mem(60, 0), mem(62, 50_000)])
     assert not any("LEAK SUSPECTED" in n for n in v["notes"])
+
+
+def test_a_high_water_mark_that_follows_the_callers_is_named_as_such():
+    levels = [{"callers": c, "hwm_mib": 90 + 4 * c, "anon_mib": 80 + 4 * c} for c in (1, 4, 16, 40)]
+    out = soak.concurrency_note(levels)
+    assert out["mib_per_caller"] == pytest.approx(4.0, abs=0.01) and out["r2"] > 0.99
+    assert "follows the number of simultaneous callers" in out["notes"][0] and "without any request leaking" in out["notes"][0]
+
+
+def test_a_flat_high_water_mark_is_not_called_a_function_of_the_callers():
+    out = soak.concurrency_note([{"callers": c, "hwm_mib": 100 + (c % 2), "anon_mib": 90} for c in (1, 4, 16, 40)])
+    assert "does not follow" in out["notes"][0]
+    assert "does not follow" in soak.concurrency_note([{"callers": c, "hwm_mib": 100 + 0.01 * c, "anon_mib": 90} for c in (1, 4, 16, 40)])["notes"][0]     # a steep line over nothing
+    assert soak.concurrency_note([{"callers": 1, "hwm_mib": 100, "anon_mib": 90}])["notes"] == []

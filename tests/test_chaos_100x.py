@@ -792,3 +792,34 @@ def test_the_chaos_tooling_leaves_signatures_in_warn_mode_and_never_touches_the_
         assert "jarvis-sign.timer" not in text and "enable --now" not in text and "install-units" not in text, path
     assert "mode is warn" in next(p.title for p in chaos.PROBES if p.id == "G0")
     assert "expected warn" in SCRIPT.read_text()                       # G0 fails if the throwaway ever runs in another mode
+
+
+def test_each_round_gets_its_own_receipt_taken_before_its_faults_and_a_full_round_reuses_phase_fs():
+    class Fake:
+        def __init__(self, rnd, state):
+            self.round, self.state, self.made = rnd, state, 0
+            self.client = self
+
+        def create(self, **kw):
+            self.made += 1
+            return {"id": "mem-x"}
+
+        def content(self, w="p"):
+            return w
+
+        def seal(self, max_entries=5):
+            return {}
+
+        def head(self):
+            return {"tip": {"height": 7 + self.made, "last_seq": 40 + self.made}}
+
+        def post(self, path, body):
+            return chaos.Response(200, {"receipt": {"id": f"eo:sha256:{self.made:064d}", "payload": {"state_root": "r" * 64}}}, {}, 1.0)
+
+    state = {}
+    one = chaos.Ctx.ensure_receipt(Fake(1, state))
+    again = chaos.Ctx.ensure_receipt(Fake(1, state))
+    two = chaos.Ctx.ensure_receipt(Fake(2, state))
+    assert one is again and one["id"] != two["id"] and state["f1_round"] == 2
+    state2 = {"f1": {"id": "from-phase-f"}, "f1_round": 3}                                       # phase F made this round's receipt: the faults use it
+    assert chaos.Ctx.ensure_receipt(Fake(3, state2))["id"] == "from-phase-f"
