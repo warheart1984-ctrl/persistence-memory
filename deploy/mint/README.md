@@ -13,11 +13,11 @@ Windows PC ──ssh -L──►  127.0.0.1:8011  ─►  app (non-root, read-on
    backups (hourly, verified) ──► ~/jarvis-ledger/backups ──► age-encrypted daily ──► Windows PC (G:)
 ```
 
-## Where things stand (2026-10-05)
+## Where things stand (updated 2026-10-07; the box was last deployed 2026-10-06)
 
 * **Running:** the stack on `127.0.0.1:8011`, on Linux Mint 22.3 (4 CPUs, 15 GiB RAM, Wi-Fi only, disk not
   encrypted). Docker 29.1.3, compose 2.40.3 and age 1.1.1 come from Ubuntu's own archive.
-* **Data:** 59 records imported from the PC's `jarvis-store.json` with `pg_import` (manifest in
+* **Data (at import, 2026-10-05; not re-counted since):** 59 records imported from the PC's `jarvis-store.json` with `pg_import` (manifest in
   `~/jarvis-ledger/state/import-manifest.json`), plus one record migrated from the old service
   (`mem-da3ddefda22a`, copied from `mem-79f9aa7e7e44`). 60 live records.
 * **The old service on 8001 is retired:** `persistence-memory.service` is stopped and disabled. Its data
@@ -27,7 +27,13 @@ Windows PC ──ssh -L──►  127.0.0.1:8011  ─►  app (non-root, read-on
 * **Firewall:** `ufw` is on and allows SSH only from `192.168.1.0/24`. Grafana, `llm-gateway` and Prometheus are
   on the box and untouched.
 * **Timers (systemd user units, linger on):** hourly backup, daily offsite copy, weekly restore drill, 15-minute
-  watchdog, 1-minute self-heal.
+  watchdog, 1-minute self-heal, and (since 2026-10-06, after an explicit OK) the hourly seal at :55. The sign timer is **off**.
+* **Deployed on 2026-10-06:** schema **v6** with Clause V, Evidence Objects and Continuity Blocks, and Replay Contracts (`RC.Ledger.v1`: the
+  `/api/jarvis/replay/*` routes, receipts at sealed points, `jarvisctl replay`, the drill's replay step). The domain replay contracts are on hold
+  (declared only).
+* **Not deployed:** signatures. The signer, the witness tool, schema v7 and the custody guards are on `main` but shelved: no key has been made, no key
+  ceremony done, the sign timer is off, and nothing on the box is signed. Deploying `main` would migrate the database to v7; read "Signatures
+  (schema v7)" below and take a backup first.
 * **Checked on this hardware:** `jarvisctl smoke` passes every check; a `docker kill` of the database was back in
   48 s with `/ready` 200 and no lost record; a crash (`pg_ctl stop -m immediate`) was restarted by Docker itself in
   3 s; the restore drill passes; the offsite copy was verified by hash on the Windows side and decrypts.
