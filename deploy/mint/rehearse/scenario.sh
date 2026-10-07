@@ -2,6 +2,11 @@
 # The rehearsal scenario. Run INSIDE the WSL distro as the normal user, by rehearse-wsl.sh:
 #   scenario.sh phase-a | phase-b | teardown
 # Prints ok/FAIL per check; exit status is non-zero if anything failed.
+#
+# DANGER: this scenario uses the REAL names (jarvis-db, jarvis-app, jarvis-migrate, jarvis-ledger_*), kills and removes them, destroys the
+# volumes, and in teardown deletes the user's jarvis-*.timer / .service units.  On a box that runs the live ledger that is the live ledger.
+# It therefore REFUSES to start unless the Docker engine is blank (see require_isolated_engine), and phase-b / teardown refuse unless THIS
+# engine passed that check in phase-a.  Do not weaken that to make it run somewhere else.
 set -uo pipefail
 
 PHASE="${1:-}"
@@ -45,8 +50,45 @@ live_anchors() { ( pg_exec() { docker exec -i -u postgres jarvis-db "$@"; }; sou
 finish() { printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"; exit $(( FAIL > 0 )); }
 
 # =================================================================================================================
+# The guard.  Nothing below may run a docker command before this has passed.
+refuse() {
+  echo "REFUSED: $*" >&2
+  echo "This rehearsal kills and removes containers, volumes, networks, images and systemd timers by their REAL names (jarvis-db, jarvis-app," >&2
+  echo "jarvis-ledger_*, jarvis-*.timer). It runs only in a dedicated WSL distro with its own Docker Engine and nothing of the ledger on it" >&2
+  echo "(deploy/mint/rehearse/rehearse-wsl.sh). To rehearse on a box that already runs the ledger, use scripts/chaos/throwaway_stack.sh instead." >&2
+  exit 2
+}
+engine_id() { docker info --format '{{.ID}}' 2>/dev/null; }
+require_isolated_engine() {
+  local phase="$1" stamp="$R/engine.ok" eid found
+  command -v docker >/dev/null 2>&1 || refuse "docker is not installed here"
+  eid="$(engine_id)"
+  [ -n "$eid" ] || refuse "cannot read this Docker engine's identity (docker info failed), so it cannot be proven to be a dedicated engine"
+  if [ "$phase" = phase-a ]; then
+    found="$(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -E '^(jarvis-db|jarvis-app|jarvis-migrate|jarvis-drill-db|jarvis-rehearsal-pc)$' | paste -sd' ' -)"
+    [ -z "$found" ] || refuse "containers with the ledger's names already exist on this engine: $found"
+    found="$(docker volume ls -q 2>/dev/null | grep -E '^jarvis-(ledger|drill)' | paste -sd' ' -)"
+    [ -z "$found" ] || refuse "volumes of a ledger already exist on this engine: $found"
+    found="$(docker network ls --format '{{.Name}}' 2>/dev/null | grep -E '^(jarvis-ledger_|jarvis-drill)' | paste -sd' ' -)"
+    [ -z "$found" ] || refuse "networks of a ledger already exist on this engine: $found"
+    found="$(docker image ls --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -E '^(jarvis-ledger-app|jarvis-ledger-db):' | paste -sd' ' -)"
+    [ -z "$found" ] || refuse "images of a ledger build already exist on this engine: $found"
+    command -v ss >/dev/null 2>&1 || refuse "ss is needed to prove the ledger's port is not in use"
+    ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE ':(8001|8011|18001)$' && refuse "something is listening on 8001, 8011 or 18001 (a ledger, or the rehearsal's port)"
+    [ ! -e "$HOME/jarvis-ledger" ] || refuse "$HOME/jarvis-ledger exists: this account runs (or ran) the live ledger"
+    found="$(ls "$HOME"/.config/systemd/user/jarvis-*.timer "$HOME"/.config/systemd/user/jarvis-*.service 2>/dev/null | paste -sd' ' -)"
+    [ -z "$found" ] || refuse "this account already has the ledger's systemd units: $found"
+  else
+    [ -f "$stamp" ] || refuse "no $stamp: phase-a never passed on this engine, so it is not proven to be a rehearsal engine"
+    [ "$(cat "$stamp")" = "$eid" ] || refuse "this Docker engine is not the one that passed the blank-engine check in phase-a"
+  fi
+  [ "${REHEARSAL_GUARD_ONLY:-0}" != 1 ] || { echo "guard passed ($phase)"; exit 0; }   # for the guard's own tests
+}
+
+# =================================================================================================================
 prepare() {
   rm -rf "$R"; mkdir -p "$SRC" "$JARVIS_HOME"
+  engine_id > "$R/engine.ok"                                 # the proof that this engine was blank when the rehearsal began
   # the working tree minus anything private: no data/, no .git, no secrets
   tar -C "$SRC_FROM" --exclude='__pycache__' --exclude='*.pyc' --exclude='deploy/mint/secrets' \
       -cf - app mcp_server agent-hooks pyproject.toml deploy | tar -xf - -C "$SRC"
@@ -435,6 +477,8 @@ teardown() {
   rm -rf "$R"
   echo "rehearsal environment removed"
 }
+
+case "$PHASE" in phase-a|phase-b|teardown) require_isolated_engine "$PHASE" ;; esac
 
 case "$PHASE" in
   phase-a)  phase_a ;;
