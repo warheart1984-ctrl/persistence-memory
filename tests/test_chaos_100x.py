@@ -922,3 +922,15 @@ def test_waiting_for_the_server_to_reap_orphans_reports_how_long_it_took_and_fai
     monkeypatch.setattr(chaos, "orphaned_sessions", lambda ctx: [7, 8])
     with pytest.raises(chaos.ProbeFail, match="2 database session"):
         REAL_WAIT_NO_ORPHANS(object(), seconds=60)
+
+
+def test_rebuild_refreshes_only_the_database_build_directory_from_the_checkout(existing_stack):
+    existing_stack.ready.write_text('{"stack":"chaos-throwaway:jarvis-chaos100x"}')
+    db = existing_stack.dir / "mint" / "db"
+    db.mkdir()
+    (db / "postgresql.conf").write_text("# stale copy\n")
+    (existing_stack.dir / "mint" / "bin" / "lib.sh").write_text("# renamed copy: PROJECT=jarvis-chaos100x\n")
+    r = rebuild(existing_stack)
+    assert r.returncode == 0, r.stderr
+    assert (db / "postgresql.conf").read_text() == (ROOT / "deploy" / "mint" / "db" / "postgresql.conf").read_text()       # the checkout's database config
+    assert (existing_stack.dir / "mint" / "bin" / "lib.sh").read_text() == "# renamed copy: PROJECT=jarvis-chaos100x\n"   # the renamed scripts are left alone

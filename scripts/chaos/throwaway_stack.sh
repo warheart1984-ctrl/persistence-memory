@@ -142,6 +142,10 @@ rebuild() {
   ready="$(curl -s -m 5 "http://127.0.0.1:$port/ready" 2>/dev/null || true)"
   python3 -c 'import json,sys; sys.exit(0 if str(json.loads(sys.argv[1]).get("stack","")).startswith("chaos-throwaway:") else 1)' "${ready:-null}" 2>/dev/null \
     || die "refusing to run jarvisctl up: http://127.0.0.1:$port/ready is missing, or does not report a chaos-throwaway: identity (jarvis-live and unlabelled stacks are refused)"
+  # The application image is built from this checkout, but the database image is built from the copy made when the stack was created: refresh just that
+  # directory (nothing in it names the stack), so a change to postgresql.conf or the init scripts reaches the throwaway. bin/ and the compose file are NOT
+  # refreshed: the copy's lib.sh and compose carry the rename.
+  rm -rf "$MINT/db" && cp -a "$REPO/deploy/mint/db" "$MINT/db"
   JARVIS_HOME="$CHAOS_DIR/home" "$MINT/bin/jarvisctl" up
 }
 
