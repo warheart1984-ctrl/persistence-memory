@@ -24,7 +24,8 @@ def box(tmp_path):
     state.mkdir()
     for name in ("containers", "volumes", "networks", "images", "ports"):
         (state / name).write_text("")
-    (state / "labels").mkdir()
+    for d in ("labels", "mounts", "nets"):
+        (state / d).mkdir()
     (state / "engine_id").write_text("ENGINE-A\n")
     log = tmp_path / "calls.log"
     bindir = tmp_path / "bin"
@@ -44,6 +45,9 @@ case "$1 $2" in
     for n in "$@"; do
       case "$fmt" in
         *config_files*) cat {state}/labels/"$n" 2>/dev/null || echo ;;
+        *Mounts*) cat {state}/mounts/"$n" 2>/dev/null || echo ;;
+        *NetworkSettings*) cat {state}/nets/"$n" 2>/dev/null || echo ;;
+        *rehearsal.dir*) cat {state}/pc_label 2>/dev/null || echo ;;
         *.Image*) echo "sha256:img-$n" ;;
       esac
     done ;;
@@ -59,7 +63,9 @@ echo "State Recv-Q Send-Q Local Address:Port Peer Address:Port"
 while read -r port; do [ -n "$port" ] && echo "LISTEN 0 4096 127.0.0.1:$port 0.0.0.0:*"; done < {state}/ports
 exit 0
 """)
-    for f in (docker, ss):
+    systemctl = bindir / "systemctl"            # a fake first on PATH: a test must never reach the real one
+    systemctl.write_text(f"""#!/usr/bin/env bash\necho "systemctl $*" >> {log}\nexit 0\n""")
+    for f in (docker, ss, systemctl):
         f.chmod(f.stat().st_mode | stat.S_IEXEC)
     return type("Box", (), {"home": home, "state": state, "log": log, "bindir": bindir, "tmp": tmp_path})
 
@@ -219,7 +225,7 @@ def test_the_guard_runs_before_any_other_command_in_the_script():
     top_level = [l for l in text[:dispatch].splitlines() if re.match(r"docker\b", l)]
     assert top_level == []
     # the destructive commands exist only inside functions the dispatcher calls after the guard
-    for needle in ("docker kill jarvis-db", "docker rm -f \"$PC\" jarvis-db", "systemctl --user disable --now"):
+    for needle in ("docker kill jarvis-db", "docker rm -f jarvis-db jarvis-app jarvis-migrate", "systemctl --user disable --now"):
         pos = text.index(needle)
         assert text.rfind("\n}\n", 0, pos) < text.rfind("() {", 0, pos), f"{needle!r} is not inside a function"
 
@@ -342,11 +348,16 @@ def rehearsal_compose(box):
     return str(box.home / "jarvis-rehearsal" / "src" / "deploy" / "mint" / "docker-compose.yml")
 
 
-def containers(box, labels):
-    """containers on the fake engine: {name: compose-file label}"""
+MOUNTS = {"jarvis-db": "jarvis-ledger_pgdata", "jarvis-app": "jarvis-ledger_appdata"}
+
+
+def containers(box, labels, mounts=None, nets="jarvis-ledger_ledger"):
+    """containers on the fake engine: {name: compose-file label}; each mounts its own data volume and sits on the ledger network unless told otherwise"""
     (box.state / "containers").write_text("".join(f"{n}\n" for n in labels))
     for n, label in labels.items():
         (box.state / "labels" / n).write_text(label + "\n")
+        (box.state / "mounts" / n).write_text((mounts or MOUNTS).get(n, "") + "\n")
+        (box.state / "nets" / n).write_text(nets + "\n")
 
 
 LIVE_COMPOSE = "/home/jon/jarvis-ledger-src/deploy/mint/docker-compose.yml"
@@ -385,15 +396,132 @@ def test_containers_created_by_this_rehearsals_compose_file_are_accepted(box, ph
     assert r.returncode == 0 and "guard passed" in r.stdout, r.stderr
 
 
-@pytest.mark.parametrize("state_file,content,why", [("volumes", "jarvis-ledger_pgdata\n", "volumes of a ledger exist but no container"),
-                                                    ("networks", "jarvis-ledger_ledger\n", "networks of a ledger exist but no container"),
-                                                    ("volumes", "jarvis-drill-x\n", "volumes of a ledger exist but no container")])
+@pytest.mark.parametrize("state_file,content,why", [("volumes", "jarvis-ledger_pgdata\n", "its container jarvis-db is not an authenticated container"),
+                                                    ("volumes", "jarvis-ledger_appdata\n", "its container jarvis-app is not an authenticated container"),
+                                                    ("networks", "jarvis-ledger_ledger\n", "no authenticated container of this rehearsal is attached"),
+                                                    ("volumes", "jarvis-drill-x\n", "is not one this rehearsal creates"),
+                                                    ("volumes", "jarvis-ledger_other\n", "is not one this rehearsal creates"),
+                                                    ("networks", "jarvis-ledger_other\n", "is not one this rehearsal creates")])
 def test_volumes_and_networks_of_a_ledger_with_no_container_to_vouch_for_them_are_refused(box, state_file, content, why):
     """The live stack taken down but its volumes kept: nothing on the engine proves they are the rehearsal's."""
     write_stamp(box)
     (box.state / state_file).write_text(content)
     refused(run(box, "teardown"), why)
     assert_nothing_destructive_ran(box)
+
+
+def own_containers(box, names=("jarvis-db", "jarvis-app", "jarvis-migrate"), **kw):
+    containers(box, {n: rehearsal_compose(box) for n in names}, **kw)
+
+
+def test_one_authenticated_container_does_not_vouch_for_a_volume_it_does_not_own(box):
+    """The review's case: jarvis-migrate is the rehearsal's, but it mounts no data volume; the live stack's volumes must not ride on it."""
+    write_stamp(box)
+    own_containers(box, names=("jarvis-migrate",))
+    (box.state / "volumes").write_text("jarvis-ledger_pgdata\njarvis-ledger_appdata\n")
+    refused(run(box, "teardown"), "its container jarvis-db is not an authenticated container")
+    own_containers(box, names=("jarvis-migrate", "jarvis-db"))
+    refused(run(box, "teardown"), "its container jarvis-app is not an authenticated container")      # db vouches for pgdata only
+    assert_nothing_destructive_ran(box)
+
+
+@pytest.mark.parametrize("mounts", [{}, {"jarvis-db": "somebody-elses-volume", "jarvis-app": "jarvis-ledger_appdata"}, {"jarvis-db": "jarvis-ledger_appdata", "jarvis-app": "jarvis-ledger_pgdata"}])
+def test_a_volume_must_actually_be_mounted_by_the_authenticated_container_that_owns_it(box, mounts):
+    write_stamp(box)
+    own_containers(box, mounts=mounts or {"jarvis-db": "x", "jarvis-app": "y"})
+    (box.state / "volumes").write_text("jarvis-ledger_pgdata\njarvis-ledger_appdata\n")
+    refused(run(box, "teardown"), "is not mounted by")
+
+
+def test_the_ledger_network_needs_an_authenticated_container_attached_to_it(box):
+    write_stamp(box)
+    own_containers(box, nets="some-other-network")
+    (box.state / "networks").write_text("jarvis-ledger_ledger\n")
+    refused(run(box, "teardown"), "no authenticated container of this rehearsal is attached")
+    own_containers(box)
+    assert run(box, "teardown").returncode == 0
+
+
+def test_a_drill_container_or_network_does_not_block_and_is_never_removed_by_name(box):
+    """drill.sh creates and removes them itself and they carry no identity: the guard lets teardown proceed, and teardown leaves them alone."""
+    write_stamp(box)
+    own_containers(box)
+    (box.state / "containers").write_text((box.state / "containers").read_text() + "jarvis-drill-db\n")
+    (box.state / "networks").write_text("jarvis-ledger_ledger\njarvis-drill-net\n")
+    assert run(box, "teardown").returncode == 0
+    text = SCENARIO.read_text()
+    teardown = text[text.index("teardown() {"):text.index('case "$PHASE" in phase-a|phase-b')]
+    removals = [l for l in teardown.splitlines() if re.search(r"docker (rm|network rm|volume rm|rmi)\b", l)]
+    assert removals and not any("jarvis-drill" in l for l in removals), removals
+    assert "left in place" in teardown
+
+
+def test_the_pc_stand_in_is_labelled_when_created_and_removed_only_if_the_label_matches():
+    text = SCENARIO.read_text()
+    assert text.count('com.jarvis.rehearsal.dir=$R') == 2                         # the image build and the container run
+    teardown = text[text.index("teardown() {"):text.index('case "$PHASE" in phase-a|phase-b')]
+    assert '"com.jarvis.rehearsal.dir"' in teardown and 'pc_owned="$PC"' in teardown
+    assert 'docker rm -f "$PC"' not in teardown and 'docker rmi -f "$PC"' not in teardown    # never by its bare name
+
+
+# --- the systemd units teardown deletes are the rehearsal's own ------------------------------------------------------------------------------------
+
+def write_units(box, directory=None, *, deploy=None, home=None, names=("backup", "drill")):
+    d = directory or (box.home / ".config" / "systemd" / "user")
+    d.mkdir(parents=True, exist_ok=True)
+    deploy = deploy or str(box.home / "jarvis-rehearsal" / "src" / "deploy" / "mint")
+    home = home or str(box.home / "jarvis-rehearsal" / "home")
+    for n in names:
+        (d / f"jarvis-{n}.service").write_text(f"[Service]\nEnvironment=JARVIS_HOME={home}\nExecStart={deploy}/bin/{n}.sh\n")
+        (d / f"jarvis-{n}.timer").write_text("[Timer]\nOnCalendar=hourly\n")
+    return d
+
+
+def test_the_rehearsals_own_units_pass_in_either_unit_directory(box):
+    write_stamp(box)
+    write_units(box)
+    assert run(box, "teardown").returncode == 0
+    xdg = box.tmp / "xdg"
+    write_units(box, xdg / "systemd" / "user")
+    assert run(box, "teardown", extra_env={"XDG_CONFIG_HOME": str(xdg)}).returncode == 0
+
+
+@pytest.mark.parametrize("kwargs,why", [
+    ({"deploy": "/home/jon/jarvis-ledger-src/deploy/mint"}, "does not run this rehearsal's checkout"),
+    ({"home": "/home/jon/jarvis-ledger"}, "does not use this rehearsal's home"),
+])
+@pytest.mark.parametrize("phase", ["phase-b", "teardown"])
+def test_units_that_belong_to_another_deployment_stop_the_later_phases(box, kwargs, why, phase):
+    """The review's case: a valid stamp, the Docker stack gone or stopped, a production deployment's units installed in the same account."""
+    write_stamp(box)
+    d = write_units(box, **kwargs)
+    refused(run(box, phase), why)
+    assert (d / "jarvis-backup.service").exists()
+    assert_nothing_destructive_ran(box)
+
+
+def test_one_foreign_unit_among_the_rehearsals_own_is_enough_to_refuse(box):
+    write_stamp(box)
+    d = write_units(box)
+    (d / "jarvis-seal.service").write_text("[Service]\nEnvironment=JARVIS_HOME=/home/jon/jarvis-ledger\nExecStart=/home/jon/jarvis-ledger-src/deploy/mint/bin/seal.sh\n")
+    refused(run(box, "teardown"), "jarvis-seal.service does not run this rehearsal's checkout")
+
+
+def test_a_timer_without_a_service_of_the_rehearsal_beside_it_is_refused(box):
+    write_stamp(box)
+    d = box.home / ".config" / "systemd" / "user"
+    d.mkdir(parents=True)
+    (d / "jarvis-seal.timer").write_text("[Timer]\nOnCalendar=hourly\n")
+    refused(run(box, "teardown"), "has no service of this rehearsal beside it")
+
+
+def test_the_default_unit_directory_is_checked_even_when_xdg_config_home_points_elsewhere(box):
+    write_stamp(box)
+    foreign = write_units(box, deploy="/home/jon/jarvis-ledger-src/deploy/mint")
+    other = box.tmp / "elsewhere"
+    other.mkdir()
+    refused(run(box, "teardown", extra_env={"XDG_CONFIG_HOME": str(other)}), "does not run this rehearsal's checkout")
+    assert foreign.exists()
 
 
 @pytest.mark.parametrize("failing,why", [("ps -a", "docker ps failed"), ("inspect -f", "cannot inspect"), ("volume ls", "docker volume ls failed"),
@@ -410,5 +538,56 @@ def test_teardown_removes_images_by_the_id_of_this_rehearsals_containers_never_b
     text = SCENARIO.read_text()
     teardown = text[text.index("teardown() {"):text.index('case "$PHASE" in phase-a|phase-b')]
     assert "jarvis-ledger-app:local" not in teardown and "jarvis-ledger-db:16" not in teardown
-    assert "docker inspect -f '{{.Image}}' jarvis-db jarvis-app jarvis-migrate" in teardown and 'docker rmi -f "$PC" $imgs' in teardown
+    assert "docker inspect -f '{{.Image}}' jarvis-db jarvis-app jarvis-migrate" in teardown and "docker rmi -f $pc_owned $imgs" in teardown
     assert teardown.index("imgs=") < teardown.index("docker rm -f")      # read before the containers are removed
+
+
+# --- teardown itself, run for real against the fakes: exactly what it removes -------------------------------------------------------------------------
+
+def full_rehearsal(box, pc_label=None):
+    write_stamp(box)
+    own_containers(box)
+    (box.state / "containers").write_text((box.state / "containers").read_text() + "jarvis-rehearsal-pc\njarvis-drill-db\n")
+    (box.state / "volumes").write_text("jarvis-ledger_pgdata\njarvis-ledger_appdata\n")
+    (box.state / "networks").write_text("jarvis-ledger_ledger\njarvis-drill-net\n")
+    (box.state / "pc_label").write_text((pc_label or str(box.home / "jarvis-rehearsal")) + "\n")
+    write_units(box)
+
+
+def test_teardown_removes_what_was_authenticated_and_nothing_else(box):
+    full_rehearsal(box)
+    r = run(box, "teardown", guard_only=False)
+    assert r.returncode == 0 and "rehearsal environment removed" in r.stdout, r.stderr
+    docker_calls = [c for c in calls(box) if c.startswith("docker ") and c.split()[1] in {"rm", "rmi", "network", "volume", "compose"}]
+    assert "docker rm -f jarvis-rehearsal-pc" in docker_calls                                            # labelled with this rehearsal's directory
+    assert "docker rm -f jarvis-db jarvis-app jarvis-migrate" in docker_calls
+    assert "docker network rm jarvis-ledger_ledger" in docker_calls and "docker volume rm -f jarvis-ledger_pgdata jarvis-ledger_appdata" in docker_calls
+    rmi = next(c for c in docker_calls if c.startswith("docker rmi"))
+    assert rmi.startswith("docker rmi -f jarvis-rehearsal-pc ") and "sha256:img-jarvis-db" in rmi and "sha256:img-jarvis-app" in rmi and "jarvis-ledger-" not in rmi      # by id
+    assert not any("jarvis-drill" in c for c in docker_calls)                                                   # a drill's scratch resources are left alone
+    assert "left in place" in r.stderr and "jarvis-drill-db" in r.stderr
+    assert not (box.home / "jarvis-rehearsal").exists()
+    assert not list((box.home / ".config" / "systemd" / "user").glob("jarvis-*"))                             # its own units are gone
+
+
+def test_teardown_leaves_a_pc_container_that_does_not_carry_this_rehearsals_label(box):
+    full_rehearsal(box, pc_label="/home/someone/else/jarvis-rehearsal")
+    r = run(box, "teardown", guard_only=False)
+    assert r.returncode == 0
+    docker_calls = [c for c in calls(box) if c.startswith("docker ") and c.split()[1] in {"rm", "rmi"}]
+    assert not any("jarvis-rehearsal-pc" in c for c in docker_calls), docker_calls
+    assert "docker rm -f jarvis-db jarvis-app jarvis-migrate" in docker_calls
+
+
+def test_teardown_refuses_before_removing_anything_when_one_resource_is_not_the_rehearsals(box):
+    full_rehearsal(box)
+    (box.state / "labels" / "jarvis-app").write_text(LIVE_COMPOSE + "\n")
+    r = run(box, "teardown", guard_only=False)
+    assert r.returncode == 2 and "REFUSED" in r.stderr
+    assert_nothing_destructive_ran(box)
+    assert not any(c.startswith("systemctl") for c in calls(box))                                           # no unit was touched either
+    assert (box.home / "jarvis-rehearsal").exists()
+
+
+def test_the_pc_ownership_test_is_in_the_script_verbatim():
+    assert '[ "$(docker inspect -f \'{{index .Config.Labels "com.jarvis.rehearsal.dir"}}\' "$PC" 2>/dev/null)" = "$R" ] && pc_owned="$PC"' in SCENARIO.read_text()
