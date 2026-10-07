@@ -32,6 +32,7 @@ def box(tmp_path):
     docker = bindir / "docker"
     docker.write_text(f"""#!/usr/bin/env bash
 echo "docker $*" >> {log}
+[ -f {state}/fail ] && [ "$(cat {state}/fail)" = "$1 $2" ] && exit 1      # a probe that fails while the engine itself answers
 case "$1 $2" in
   "info --format") cat {state}/engine_id ;;
   "ps -a") cat {state}/containers ;;
@@ -45,6 +46,7 @@ exit 0
     ss = bindir / "ss"
     ss.write_text(f"""#!/usr/bin/env bash
 echo "ss $*" >> {log}
+[ -f {state}/fail ] && [ "$(cat {state}/fail)" = "ss" ] && exit 1
 echo "State Recv-Q Send-Q Local Address:Port Peer Address:Port"
 while read -r port; do [ -n "$port" ] && echo "LISTEN 0 4096 127.0.0.1:$port 0.0.0.0:*"; done < {state}/ports
 exit 0
@@ -121,6 +123,20 @@ def test_an_account_with_the_ledgers_systemd_units_is_refused(box, unit):
     (d / unit).write_text("[Timer]\n")
     refused(run(box, "phase-a"), "already has the ledger's systemd units")
     assert (d / unit).exists()
+
+
+@pytest.mark.parametrize("failing,why", [("ps -a", "docker ps failed"), ("volume ls", "docker volume ls failed"), ("network ls", "docker network ls failed"),
+                                         ("image ls", "docker image ls failed"), ("ss", "ss failed")])
+def test_a_probe_that_fails_while_the_engine_answers_is_a_refusal_not_a_blank_engine(box, failing, why):
+    """`docker info` works but one question fails (a daemon hiccup): the empty answer must never be read as "nothing of the ledger is here"."""
+    hidden = {"ps -a": ("containers", "jarvis-db\n"), "volume ls": ("volumes", "jarvis-ledger_pgdata\n"), "network ls": ("networks", "jarvis-ledger_ledger\n"),
+              "image ls": ("images", "jarvis-ledger-app:local\n"), "ss": ("ports", "8011\n")}
+    name, trace = hidden[failing]
+    (box.state / name).write_text(trace)                       # the live trace IS there; only the failing probe hides it
+    (box.state / "fail").write_text(failing)
+    r = run(box, "phase-a")
+    refused(r, why)
+    assert_nothing_destructive_ran(box)
 
 
 def test_an_unreadable_engine_is_refused(box):

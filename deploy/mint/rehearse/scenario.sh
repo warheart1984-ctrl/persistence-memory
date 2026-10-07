@@ -65,16 +65,26 @@ require_isolated_engine() {
   eid="$(engine_id)"
   [ -n "$eid" ] || refuse "cannot read this Docker engine's identity (docker info failed), so it cannot be proven to be a dedicated engine"
   if [ "$phase" = phase-a ]; then
-    found="$(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -E '^(jarvis-db|jarvis-app|jarvis-migrate|jarvis-drill-db|jarvis-rehearsal-pc)$' | paste -sd' ' -)"
+    # Every probe's exit status is checked BEFORE its output is filtered: a probe that fails (a daemon hiccup, a missing tool) says nothing about
+    # the engine, and an empty answer from a failed probe must never be read as "blank".
+    local out
+    out="$(docker ps -a --format '{{.Names}}' 2>/dev/null)" || refuse "docker ps failed, so this engine cannot be proven blank"
+    found="$(printf '%s\n' "$out" | grep -E '^(jarvis-db|jarvis-app|jarvis-migrate|jarvis-drill-db|jarvis-rehearsal-pc)$' | paste -sd' ' -)"
     [ -z "$found" ] || refuse "containers with the ledger's names already exist on this engine: $found"
-    found="$(docker volume ls -q 2>/dev/null | grep -E '^jarvis-(ledger|drill)' | paste -sd' ' -)"
+    out="$(docker volume ls -q 2>/dev/null)" || refuse "docker volume ls failed, so this engine cannot be proven blank"
+    found="$(printf '%s\n' "$out" | grep -E '^jarvis-(ledger|drill)' | paste -sd' ' -)"
     [ -z "$found" ] || refuse "volumes of a ledger already exist on this engine: $found"
-    found="$(docker network ls --format '{{.Name}}' 2>/dev/null | grep -E '^(jarvis-ledger_|jarvis-drill)' | paste -sd' ' -)"
+    out="$(docker network ls --format '{{.Name}}' 2>/dev/null)" || refuse "docker network ls failed, so this engine cannot be proven blank"
+    found="$(printf '%s\n' "$out" | grep -E '^(jarvis-ledger_|jarvis-drill)' | paste -sd' ' -)"
     [ -z "$found" ] || refuse "networks of a ledger already exist on this engine: $found"
-    found="$(docker image ls --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -E '^(jarvis-ledger-app|jarvis-ledger-db):' | paste -sd' ' -)"
+    out="$(docker image ls --format '{{.Repository}}:{{.Tag}}' 2>/dev/null)" || refuse "docker image ls failed, so this engine cannot be proven blank"
+    found="$(printf '%s\n' "$out" | grep -E '^(jarvis-ledger-app|jarvis-ledger-db):' | paste -sd' ' -)"
     [ -z "$found" ] || refuse "images of a ledger build already exist on this engine: $found"
     command -v ss >/dev/null 2>&1 || refuse "ss is needed to prove the ledger's port is not in use"
-    ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE ':(8001|8011|18001)$' && refuse "something is listening on 8001, 8011 or 18001 (a ledger, or the rehearsal's port)"
+    out="$(ss -ltn 2>/dev/null)" || refuse "ss failed, so the ledger's port cannot be proven free"
+    if printf '%s\n' "$out" | awk '{print $4}' | grep -qE ':(8001|8011|18001)$'; then
+      refuse "something is listening on 8001, 8011 or 18001 (a ledger, or the rehearsal's port)"
+    fi
     [ ! -e "$HOME/jarvis-ledger" ] || refuse "$HOME/jarvis-ledger exists: this account runs (or ran) the live ledger"
     found="$(ls "$HOME"/.config/systemd/user/jarvis-*.timer "$HOME"/.config/systemd/user/jarvis-*.service 2>/dev/null | paste -sd' ' -)"
     [ -z "$found" ] || refuse "this account already has the ledger's systemd units: $found"
