@@ -13,7 +13,6 @@ from pathlib import Path
 import pytest
 
 SCENARIO = Path(__file__).resolve().parents[1] / "deploy" / "mint" / "rehearse" / "scenario.sh"
-DESTRUCTIVE = re.compile(r"\b(kill|rm|rmi|stop|down|volume rm|network rm|system prune|run|compose)\b")
 
 
 @pytest.fixture
@@ -25,6 +24,7 @@ def box(tmp_path):
     state.mkdir()
     for name in ("containers", "volumes", "networks", "images", "ports"):
         (state / name).write_text("")
+    (state / "labels").mkdir()
     (state / "engine_id").write_text("ENGINE-A\n")
     log = tmp_path / "calls.log"
     bindir = tmp_path / "bin"
@@ -39,6 +39,14 @@ case "$1 $2" in
   "volume ls") cat {state}/volumes ;;
   "network ls") cat {state}/networks ;;
   "image ls") cat {state}/images ;;
+  "inspect -f")
+    fmt="$3"; shift 3
+    for n in "$@"; do
+      case "$fmt" in
+        *config_files*) cat {state}/labels/"$n" 2>/dev/null || echo ;;
+        *.Image*) echo "sha256:img-$n" ;;
+      esac
+    done ;;
   *) ;;
 esac
 exit 0
@@ -68,7 +76,15 @@ def calls(box):
 
 
 def assert_nothing_destructive_ran(box):
-    bad = [c for c in calls(box) if c.startswith("docker ") and DESTRUCTIVE.search(c.split(" ", 1)[1])]
+    """Only the docker SUBCOMMAND counts: `inspect -f ...compose...` is a question, `rm`, `kill`, `compose down` and the like are not."""
+    bad = []
+    for c in calls(box):
+        if not c.startswith("docker "):
+            continue
+        words = c.split()[1:]
+        sub = words[0] if words else ""
+        if sub in {"kill", "rm", "rmi", "stop", "run", "compose", "system", "restart", "start", "exec", "build"} or (sub in {"volume", "network", "image"} and len(words) > 1 and words[1] in {"rm", "prune"}):
+            bad.append(c)
     assert bad == [], bad
 
 
@@ -318,3 +334,81 @@ def test_the_stamp_records_the_id_the_guard_already_validated_and_a_failed_write
         box.home.chmod(0o755)
     assert r.returncode == 2 and "cannot record the engine stamp" in r.stderr, (r.returncode, r.stderr)
     assert_nothing_destructive_ran(box)
+
+
+# --- the later phases tie what they remove to THIS rehearsal's compose file ------------------------------------------------------------------
+
+def rehearsal_compose(box):
+    return str(box.home / "jarvis-rehearsal" / "src" / "deploy" / "mint" / "docker-compose.yml")
+
+
+def containers(box, labels):
+    """containers on the fake engine: {name: compose-file label}"""
+    (box.state / "containers").write_text("".join(f"{n}\n" for n in labels))
+    for n, label in labels.items():
+        (box.state / "labels" / n).write_text(label + "\n")
+
+
+LIVE_COMPOSE = "/home/jon/jarvis-ledger-src/deploy/mint/docker-compose.yml"
+
+
+@pytest.mark.parametrize("phase", ["phase-b", "teardown"])
+def test_containers_created_by_another_compose_file_are_never_touched_whatever_the_stamp_says(box, phase):
+    """The reviewer's case: a fresh stamp, the engine since given to the live ledger with a custom JARVIS_HOME and port (so no ~/jarvis-ledger, nothing
+    on 8011), live containers present."""
+    write_stamp(box)
+    (box.state / "ports").write_text("9999\n")
+    containers(box, {"jarvis-db": LIVE_COMPOSE, "jarvis-app": LIVE_COMPOSE, "jarvis-migrate": LIVE_COMPOSE})
+    (box.state / "volumes").write_text("jarvis-ledger_pgdata\njarvis-ledger_appdata\n")
+    refused(run(box, phase), "was not created by this rehearsal's compose file")
+    assert_nothing_destructive_ran(box)
+
+
+@pytest.mark.parametrize("mixed", [
+    {"jarvis-db": "OWN", "jarvis-app": LIVE_COMPOSE},
+    {"jarvis-db": LIVE_COMPOSE, "jarvis-app": "OWN"},
+    {"jarvis-db": "OWN", "jarvis-app": "OWN", "jarvis-migrate": ""},          # a container with no compose label at all
+])
+def test_one_container_that_is_not_the_rehearsals_is_enough_to_refuse(box, mixed):
+    write_stamp(box)
+    containers(box, {n: (rehearsal_compose(box) if v == "OWN" else v) for n, v in mixed.items()})
+    refused(run(box, "teardown"), "was not created by this rehearsal's compose file")
+
+
+@pytest.mark.parametrize("phase", ["phase-b", "teardown"])
+def test_containers_created_by_this_rehearsals_compose_file_are_accepted(box, phase):
+    write_stamp(box)
+    containers(box, {n: rehearsal_compose(box) for n in ("jarvis-db", "jarvis-app", "jarvis-migrate")})
+    (box.state / "volumes").write_text("jarvis-ledger_pgdata\njarvis-ledger_appdata\n")
+    (box.state / "networks").write_text("jarvis-ledger_ledger\n")
+    r = run(box, phase)
+    assert r.returncode == 0 and "guard passed" in r.stdout, r.stderr
+
+
+@pytest.mark.parametrize("state_file,content,why", [("volumes", "jarvis-ledger_pgdata\n", "volumes of a ledger exist but no container"),
+                                                    ("networks", "jarvis-ledger_ledger\n", "networks of a ledger exist but no container"),
+                                                    ("volumes", "jarvis-drill-x\n", "volumes of a ledger exist but no container")])
+def test_volumes_and_networks_of_a_ledger_with_no_container_to_vouch_for_them_are_refused(box, state_file, content, why):
+    """The live stack taken down but its volumes kept: nothing on the engine proves they are the rehearsal's."""
+    write_stamp(box)
+    (box.state / state_file).write_text(content)
+    refused(run(box, "teardown"), why)
+    assert_nothing_destructive_ran(box)
+
+
+@pytest.mark.parametrize("failing,why", [("ps -a", "docker ps failed"), ("inspect -f", "cannot inspect"), ("volume ls", "docker volume ls failed"),
+                                         ("network ls", "docker network ls failed")])
+def test_later_phases_refuse_when_a_probe_of_ownership_fails(box, failing, why):
+    write_stamp(box)
+    containers(box, {"jarvis-db": rehearsal_compose(box)})
+    (box.state / "fail").write_text(failing)
+    refused(run(box, "teardown"), why)
+    assert_nothing_destructive_ran(box)
+
+
+def test_teardown_removes_images_by_the_id_of_this_rehearsals_containers_never_by_tag():
+    text = SCENARIO.read_text()
+    teardown = text[text.index("teardown() {"):text.index('case "$PHASE" in phase-a|phase-b')]
+    assert "jarvis-ledger-app:local" not in teardown and "jarvis-ledger-db:16" not in teardown
+    assert "docker inspect -f '{{.Image}}' jarvis-db jarvis-app jarvis-migrate" in teardown and 'docker rmi -f "$PC" $imgs' in teardown
+    assert teardown.index("imgs=") < teardown.index("docker rm -f")      # read before the containers are removed

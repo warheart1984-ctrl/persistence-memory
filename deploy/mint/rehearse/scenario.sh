@@ -70,6 +70,27 @@ require_ports_free() {
     refuse "something is listening on a ledger port ($2)"
   fi
 }
+# phase-b and teardown act on containers, volumes, networks and images by their real names.  Before they do, every ledger container on the engine must
+# have been created by THIS rehearsal's compose file (docker records the file's path in a label that survives a recreate), and a volume or network
+# of a ledger may exist only if such a container does.  An engine that was given to the live ledger since the stamp was written fails this.
+require_rehearsal_owns_the_ledger() {
+  local names name cfg owned=0 out want="$SRC/deploy/mint/docker-compose.yml"
+  names="$(docker ps -a --format '{{.Names}}' 2>/dev/null)" || refuse "docker ps failed, so the containers cannot be tied to this rehearsal"
+  for name in jarvis-db jarvis-app jarvis-migrate; do
+    printf '%s\n' "$names" | grep -qx "$name" || continue
+    cfg="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project.config_files"}}' "$name" 2>/dev/null)" || refuse "cannot inspect container $name"
+    [ "$cfg" = "$want" ] || refuse "container $name was not created by this rehearsal's compose file (it says: ${cfg:-nothing}; expected $want)"
+    owned=1
+  done
+  out="$(docker volume ls -q 2>/dev/null)" || refuse "docker volume ls failed, so the volumes cannot be tied to this rehearsal"
+  if printf '%s\n' "$out" | grep -qE '^jarvis-(ledger|drill)' && [ "$owned" = 0 ]; then
+    refuse "volumes of a ledger exist but no container of this rehearsal owns them"
+  fi
+  out="$(docker network ls --format '{{.Name}}' 2>/dev/null)" || refuse "docker network ls failed, so the networks cannot be tied to this rehearsal"
+  if printf '%s\n' "$out" | grep -qE '^(jarvis-ledger_|jarvis-drill)' && [ "$owned" = 0 ]; then
+    refuse "networks of a ledger exist but no container of this rehearsal owns them"
+  fi
+}
 require_isolated_engine() {
   local phase="$1" stamp="$R/engine.ok" eid found
   # A phase-a that is refused (or fails to prove anything) must not leave an OLD stamp behind to authorize a later teardown on an engine
@@ -106,6 +127,7 @@ require_isolated_engine() {
     # even with a valid stamp: an engine that is serving the live ledger is not a rehearsal engine, whatever it once was
     [ ! -e "$HOME/jarvis-ledger" ] || refuse "$HOME/jarvis-ledger exists: this account runs (or ran) the live ledger"
     require_ports_free ':(8001|8011)$' "8001 or 8011"
+    require_rehearsal_owns_the_ledger
   fi
   [ "${REHEARSAL_GUARD_ONLY:-0}" != 1 ] || { echo "guard passed ($phase)"; exit 0; }   # for the guard's own tests
 }
@@ -495,11 +517,14 @@ teardown() {
   systemctl --user stop jarvis-backup.service jarvis-offsite.service jarvis-drill.service jarvis-watchdog.service jarvis-heal.service >/dev/null 2>&1
   rm -f "$UNIT_DIR"/jarvis-*.service "$UNIT_DIR"/jarvis-*.timer
   systemctl --user daemon-reload >/dev/null 2>&1
+  # the images are removed by ID, and only those that this rehearsal's own (label-checked) containers run; never by tag
+  imgs="$(docker inspect -f '{{.Image}}' jarvis-db jarvis-app jarvis-migrate 2>/dev/null | sort -u | paste -sd' ' -)"
   docker compose -f "$SRC/deploy/mint/docker-compose.yml" down -v >/dev/null 2>&1
   docker rm -f "$PC" jarvis-db jarvis-app jarvis-migrate jarvis-drill-db >/dev/null 2>&1
   docker network rm jarvis-ledger_ledger jarvis-drill-net >/dev/null 2>&1
   docker volume rm -f jarvis-ledger_pgdata jarvis-ledger_appdata >/dev/null 2>&1
-  docker rmi -f "$PC" jarvis-ledger-app:local jarvis-ledger-db:16 >/dev/null 2>&1
+  # shellcheck disable=SC2086  # $imgs is a list of image ids
+  docker rmi -f "$PC" $imgs >/dev/null 2>&1
   rm -rf "$R"
   echo "rehearsal environment removed"
 }
