@@ -1597,7 +1597,8 @@ def summarize(results: list[dict[str, Any]], stats: Stats, rounds_done: int, sta
     unexpected = [e for e in stats.five_xx if not e["expected"]]
     return {
         "name": "CL_CHAOS_100x", "probes_per_round": PROBES_PER_ROUND, "rounds_requested": args.rounds, "rounds_completed": rounds_done,
-        "probe_runs": len(results), "expected_probe_runs": PROBES_PER_ROUND * rounds_done, "capped": capped,
+        "probe_runs": len(results), "probes_selected_per_round": len({r["probe"] for r in results if r["round"] == 1}) or PROBES_PER_ROUND,
+        "expected_probe_runs": (len({r["probe"] for r in results if r["round"] == 1}) or PROBES_PER_ROUND) * rounds_done, "capped": capped,
         "seconds": round(time.time() - started, 1),
         "status_counts": dict(Counter(r["status"] for r in results)),
         "failures": [r for r in results if r["status"] in ("FAIL", "ERROR")],
@@ -1675,7 +1676,9 @@ def main(argv: list[str] | None = None) -> int:
         wanted = {p.id for p in PROBES if p.phase in set(args.phases.upper().split(","))}
         only = wanted if only is None else (only | wanted)
     args.seed = args.seed or os.urandom(4).hex()
-    log(f"CL_CHAOS_100x: seed {args.seed}; {PROBES_PER_ROUND} probes per round, {args.rounds} round(s) = {PROBES_PER_ROUND * args.rounds} probe runs; "
+    selected = [p for p in PROBES if not only or p.id in only]
+    shown = f"{PROBES_PER_ROUND} probes per round" + (f" ({len(selected)} selected)" if len(selected) != PROBES_PER_ROUND else "")
+    log(f"CL_CHAOS_100x: seed {args.seed}; {shown}, {args.rounds} round(s) = {len(selected) * args.rounds} probe runs; "
         f"target {target['url']} stack {target['stack']}; destructive probes {'ENABLED' if not destructive_blocked else 'SKIPPED (' + destructive_blocked + ')'}")
     state: dict[str, Any] = {}
     results: list[dict[str, Any]] = []

@@ -814,7 +814,7 @@ def test_each_round_gets_its_own_receipt_taken_before_its_faults_and_a_full_roun
             return {"tip": {"height": 7 + self.made, "last_seq": 40 + self.made}}
 
         def post(self, path, body):
-            return chaos.Response(200, {"receipt": {"id": f"eo:sha256:{self.made:064d}", "payload": {"state_root": "r" * 64}}}, {}, 1.0)
+            return chaos.Response(200, {"receipt": {"id": f"eo:sha256:{self.round * 100 + self.made:064d}", "payload": {"state_root": "r" * 64}}}, {}, 1.0)
 
     state = {}
     one = chaos.Ctx.ensure_receipt(Fake(1, state))
@@ -823,3 +823,19 @@ def test_each_round_gets_its_own_receipt_taken_before_its_faults_and_a_full_roun
     assert one is again and one["id"] != two["id"] and state["f1_round"] == 2
     state2 = {"f1": {"id": "from-phase-f"}, "f1_round": 3}                                       # phase F made this round's receipt: the faults use it
     assert chaos.Ctx.ensure_receipt(Fake(3, state2))["id"] == "from-phase-f"
+
+
+def test_the_header_counts_only_the_selected_probes_and_a_full_run_says_the_plain_count(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(chaos, "fetch_ready", lambda url: (200, {"stack": GOOD}))
+    monkeypatch.setattr(chaos, "live_ports", lambda: {8011})
+    (tmp_path / "secrets").mkdir()
+    (tmp_path / "secrets" / "api-key").write_text("k")
+    (tmp_path / "stack.json").write_text(json.dumps({"url": "http://127.0.0.1:18017", "port": 18017, "project": "p", "secrets_dir": str(tmp_path / "secrets"), "containers": {},
+                                                     "keys_dir": str(tmp_path), "dir": str(tmp_path)}))
+    monkeypatch.setattr(chaos, "run_round", lambda *a, **k: [])
+    monkeypatch.setattr(chaos.Client, "request", lambda self, *a, **k: chaos.Response(200, {"history_seq": 0, "tip": None}, {}, 1.0))
+    monkeypatch.setattr(chaos, "final_checks", lambda *a, **k: {"history_verify": {"ok": True}, "blocks_verify": {"ok": True}, "attestations_verify": {"ok": True}, "receipts": {"failing_rederivation": []}})
+    chaos.main(["--stack-dir", str(tmp_path), "--rounds", "10", "--phases", "I,J,K"])
+    assert f"{chaos.PROBES_PER_ROUND} probes per round (3 selected), 10 round(s) = 30 probe runs" in capsys.readouterr().out
+    chaos.main(["--stack-dir", str(tmp_path), "--rounds", "2"])
+    assert f"{chaos.PROBES_PER_ROUND} probes per round, 2 round(s) = {2 * chaos.PROBES_PER_ROUND} probe runs" in capsys.readouterr().out
