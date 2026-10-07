@@ -839,3 +839,23 @@ def test_the_header_counts_only_the_selected_probes_and_a_full_run_says_the_plai
     assert f"{chaos.PROBES_PER_ROUND} probes per round (3 selected), 10 round(s) = 30 probe runs" in capsys.readouterr().out
     chaos.main(["--stack-dir", str(tmp_path), "--rounds", "2"])
     assert f"{chaos.PROBES_PER_ROUND} probes per round, 2 round(s) = {2 * chaos.PROBES_PER_ROUND} probe runs" in capsys.readouterr().out
+
+
+def test_a_partial_fault_may_acknowledge_during_it_but_never_refuse_with_anything_but_the_allowed_status():
+    attempts = [att("a", 503, 2.0, 2.1), att("b", 200, 2.5, 2.6, "mem-1"), att("c", 503, 3.0, 3.1)]
+    with pytest.raises(chaos.ProbeFail, match="acknowledged with 200 while it was in force"):
+        chaos.fail_closed(attempts, t_fault=1.0, t_up=8.0, allowed=(503,))                                      # the strict default (a severed link, a dead process)
+    out = chaos.fail_closed(attempts, t_fault=1.0, t_up=8.0, allowed=(503,), acks_allowed=True)
+    assert out["statuses_during_fault"] == {503: 2, 200: 1}
+    with pytest.raises(chaos.ProbeFail, match=r"answered \[500\]"):
+        chaos.fail_closed(attempts + [att("d", 500, 3.2, 3.3)], t_fault=1.0, t_up=8.0, allowed=(503,), acks_allowed=True)     # a 500 is never acceptable
+    assert "acks_allowed=True" in SCRIPT.read_text().split("def k1(")[1].split("# --- the runner")[0]                       # only the full-disk fault uses it
+    for pid in ("i1", "j1"):
+        body = SCRIPT.read_text().split(f"def {pid}(")[1].split("@probe(")[0]
+        assert "acks_allowed" not in body
+
+
+def test_the_full_disk_probe_insists_that_something_was_refused():
+    body = SCRIPT.read_text().split("def k1(")[1].split("# --- the runner")[0]
+    assert 'check(closed["refused_while_full"] > 0, "nothing was refused while the volume was full")' in body
+    assert 'check(first_failure is not None, "no write failed within 25 s of filling the volume: the fault did not bite")' in body

@@ -1356,14 +1356,17 @@ def fault_gates(ctx: "Ctx", attempts: list[Attempt], label: str) -> dict[str, An
     return {"attempts": len(attempts), "acknowledged": len(acked), "failed": len(attempts) - len(acked), "landed_but_unacknowledged": landed_unacked}
 
 
-def fail_closed(attempts: list[Attempt], t_fault: float, t_up: float | None, *, allowed: tuple[int, ...], settle: float = 0.5) -> dict[str, Any]:
-    """During the fault: no write started after it (plus a moment to settle) was acknowledged, and every refusal is one of the ``allowed`` statuses."""
+def fail_closed(attempts: list[Attempt], t_fault: float, t_up: float | None, *, allowed: tuple[int, ...], settle: float = 0.5,
+                acks_allowed: bool = False) -> dict[str, Any]:
+    """During the fault: no write started after it (plus a moment to settle) was acknowledged, and every refusal is one of the ``allowed`` statuses.
+    ``acks_allowed`` is for a fault that is partial by nature (a nearly full volume: a write that fits in a page that already exists succeeds, the next that
+    needs a new page is refused): acknowledgements are then permitted DURING it, and the gates afterwards must find each one whole and durable."""
     end = t_up if t_up else float("inf")
     window = [a for a in attempts if a.t0 > t_fault + settle and a.t1 < end - 0.5]
     wrong = [a for a in window if a.status == 200]
     odd = sorted({a.status for a in window if a.status != 200 and a.status not in allowed})
     hang = max((a.t1 - a.t0 for a in attempts if a.t0 >= t_fault - 0.1), default=0.0)
-    if wrong:
+    if wrong and not acks_allowed:
         raise ProbeFail(f"{len(wrong)} write(s) begun after the fault were acknowledged with 200 while it was in force (first: {wrong[0].token})")
     check(not odd, f"during the fault the API answered {odd}, not only {list(allowed)}")
     return {"writes_during_fault": len(window), "statuses_during_fault": dict(Counter(a.status for a in window)), "longest_request_s": round(hang, 2)}
@@ -1498,7 +1501,10 @@ def k1(ctx: Ctx) -> None:
         if not freed:
             ctx.docker("exec", keeper, "rm", "-f", "/keep/chaos-filler", timeout=60)
         attempts = writers.stop()
-    closed = fail_closed(attempts, first_failure.t0, t_free, allowed=(503,), settle=0.5)
+    closed = fail_closed(attempts, first_failure.t0, t_free, allowed=(503,), settle=0.5, acks_allowed=True)
+    closed["acknowledged_while_full"] = sum(1 for a in attempts if a.status == 200 and first_failure.t0 + 0.5 < a.t0 and a.t1 < t_free - 0.5)
+    closed["refused_while_full"] = sum(1 for a in attempts if a.status == 503 and first_failure.t0 + 0.5 < a.t0 and a.t1 < t_free - 0.5)
+    check(closed["refused_while_full"] > 0, "nothing was refused while the volume was full")
     gates = fault_gates(ctx, attempts, "k1")
     logs = ctx.docker("logs", "--since", since, db, timeout=60)
     text = logs.stdout + logs.stderr
