@@ -10,6 +10,8 @@ dependencies = [
   "pydantic==2.11.7",
   "networkx>=3.0",
   "PyJWT[crypto]==2.15.1",
+  # Ed25519 verification of OpenSSH signatures (app/attest.py); already pulled in by PyJWT[crypto], named here because it is used directly
+  "cryptography>=42",
   "psycopg[binary,pool]==3.2.9",
   # amul_llm calls its backend with httpx at runtime, not only in tests.
   "httpx==0.28.1",

@@ -1,0 +1,4 @@
+# Jarvis ledger trust roots: the PUBLIC keys of the root keys, one OpenSSH line each (ssh-ed25519 AAAA... comment).
+# NO KEYS YET: the key ceremony has not happened. Until a root is listed here (and this file is given to the service through
+# JARVIS_TRUST_ROOTS_FILE) nothing can be verified, and verification says so instead of passing.
+# Never put a private key here. See docs/SIGNATURES.md.

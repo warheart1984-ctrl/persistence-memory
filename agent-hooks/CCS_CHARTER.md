@@ -102,8 +102,8 @@ Promotable toward “CCS as infrastructure” when:
 | P1 | All CES.* registered (schemas + owners) | **gap** — no CES schema files exist; only the two local evidence schemas |
 | P2 | All RC.* registered | **gap** — 1 of 6 registered: `RC.Ledger.v1` is implemented; the five domain RCs are declared only (no schema, owner or algorithm), so the criterion is not met |
 | P3 | Replay deterministic across registered consumers | **partial** — met for the one registered consumer, the ledger itself (`RC.Ledger.v1`: deterministic, verified offline against the block chain, receipts re-derivable, replayed in every restore drill); nothing is shown across consumers because no other consumer is registered |
-| P4 | Evidence chains validate (signatures / hashes end-to-end) | **gap** — hashes verify end-to-end for evidence objects (`pg_verify`); no signatures |
-| P5 | Provenance unifies across AIKI/ARIS/SX/Lineage/Mandala | **gap** — declared model only |
+| P4 | Evidence chains validate (signatures / hashes end-to-end) | **gap** — hashes verify end-to-end (`pg_verify`, blocks, anchors, replay receipts); **nothing is signed today**. **Planned:** Ed25519 attestations of blocks and replay receipts (evidence objects through the blocks that cite them) by a key held on the Mint box and authorized by an off-box root key, with off-box copies and cosigned checkpoints so a rewrite of already-witnessed history shows up (a taken Mint key could still sign false *new* entries until detected and rotated). **Built on `main`, not deployed:** the verification side only (schema v7 logs, trust statements, attestation checks, API, `pg_verify` section). **Not built:** the signer, the key ceremony, the off-box cosign tool (`SIGNATURES.md`) |
+| P5 | Provenance unifies across AIKI/ARIS/SX/Lineage/Mandala | **gap** — declared model only. The **planned** signatures would supply only the "verification" link of the chain, not identity, intent or execution, and not authorship by the originating agent |
 | P6 | ESFR `PROMOTE_WITH_GAPS` or better for CCS milestone | **gap** — no CCS ESFR run recorded in this package |
 
 ---

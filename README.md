@@ -18,7 +18,8 @@ restore are in [`deploy/mint/README.md`](deploy/mint/README.md).
 | **Continuity Blocks**: sealed, Merkle-rooted, hash-chained ranges of the history; every block hash is also kept outside the database in the backup anchors | **live**, **unsigned** (`docs/CONTINUITY_BLOCKS.md`) |
 | **Replay Contracts, `RC.Ledger.v1`**: rebuild the ledger's state and ordered events as of any seq or sealed block, with a state root; receipts at sealed points (Evidence Objects); offline verifier `python -m app.replay verify`; `jarvisctl replay`; a restore-drill step | **implemented on `main`, not deployed yet**: the live ledger has no `/api/jarvis/replay/*` routes (`docs/REPLAY_CONTRACTS.md`) |
 | Domain Replay Contracts (`RC.AIKI`, `ARIS`, `SX`, `Lineage`, `Mandala`) | **declared only**: no schema, owner or algorithm exists |
-| Signatures, CES registry, unified provenance chain, ESFR promotion | **not built** (`docs/CCS_CHARTER.md`) |
+| **Signatures**, verification side: attestations of blocks, receipts and checkpoints by a key a root key authorized, a trust log, `pg_verify` section (schema v7, `docs/SIGNATURES.md`) | **on `main`, not deployed**; there is **no signer yet and nothing is signed** |
+| CES registry, unified provenance chain, ESFR promotion | **not built** (`docs/CCS_CHARTER.md`) |
 
 Also enforced by tests: continuity across sessions, replay of a retrieve with why / where / when / session, conflicts surfaced
 and never silently merged (`tests/test_acceptance.py`). Drift checking and the AMUL / RAG parts are partial
@@ -92,8 +93,8 @@ database URL or that opt-in the service answers 503 rather than creating a ledge
 
 ## Honest limits
 
-* **Nothing is signed.** Evidence Objects, blocks and any future receipt prove what was recorded and that it was not altered,
-  not who vouches for it. Authority is the recorded actor (the tenant key) plus the record's own `source_agent`.
+* **Nothing is signed (yet).** Evidence Objects, blocks and receipts prove what was recorded and that it was not altered,
+  not who vouches for it. The verification code for signatures is on `main` but not deployed, and no signer exists. Authority is the recorded actor (the tenant key) plus the record's own `source_agent`.
 * **Tamper evidence has an outside part.** Someone with full database control can rewrite history and re-seal every block; the
   database alone would pass. What exposes it is the anchors in the backups and in the encrypted offsite copies, so they matter.
   A block sealed after the last backup is not anchored yet; a receipt taken earlier also exposes a later rewrite.

@@ -15,6 +15,7 @@ import sys
 import psycopg
 from psycopg import sql
 
+from app import attest
 from app import blocks as continuity_blocks
 from app import evidence as evidence_objects
 from app.pg_schema import check_schema_version, validate_schema_name
@@ -111,6 +112,7 @@ def main(argv: list[str] | None = None) -> int:
     problems: list[tuple[str, str, str]] = []
     evidence_total = 0
     block_notes: list[str] = []
+    sig_notes: list[str] = []
     warnings: list[str] = []
     with psycopg.connect(dsn, connect_timeout=5) as conn:
         if schema:
@@ -147,6 +149,12 @@ def main(argv: list[str] | None = None) -> int:
                 if conn.execute("SELECT to_regclass('evidence_objects') IS NOT NULL").fetchone()[0]:
                     for what, problem in _block_evidence_problems(conn, tenant):
                         problems.append((tenant, what, f"blocks: {problem}"))
+                if conn.execute("SELECT to_regclass('attestations') IS NOT NULL").fetchone()[0]:
+                    sig = attest.verify_tenant(conn, tenant)
+                    for p in sig["problems"]:
+                        problems.append((tenant, p["subject"], f"signatures: [{p['check']}] {p['problem']}"))
+                    warnings.extend(f"WARNING tenant={tenant}: {w}" for w in sig["warnings"])
+                    sig_notes.extend(sig["notes"])
                 st = _block_status(conn, tenant)
                 block_notes.append(
                     f"{st['blocks']} block(s) sealed through seq {st['sealed_seq']}, {st['unsealed']} entr{'y' if st['unsealed'] == 1 else 'ies'} unsealed")
@@ -162,6 +170,8 @@ def main(argv: list[str] | None = None) -> int:
     if block_notes:
         note += "; blocks intact: " + ("; ".join(block_notes) if len(tenants) > 1 else block_notes[0])
     print(f"ok: history intact for {len(tenants)} tenant(s){note}")
+    for line in sig_notes:
+        print(line)
     for line in warnings:
         print(line)
     return 0
