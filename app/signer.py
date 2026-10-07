@@ -1,6 +1,7 @@
-"""The signer: runs on the Mint box as the box user, never in a container, and signs attestations of sealed blocks and checkpoints.
+"""The signer: runs on the Mint box as the box user, never in a container, and signs attestations of sealed blocks, replay receipts
+(which exist only at sealed points) and checkpoints.
 
-    python3 -m app.signer sign [--dry-run]     sign what is pending (blocks, then one checkpoint)
+    python3 -m app.signer sign [--dry-run]     sign what is pending (blocks, then receipts, then one checkpoint)
     python3 -m app.signer status               what it would do, and the state of the key (never prints a secret)
     python3 -m app.signer init-key             create the signing key in the custody directory (refuses to overwrite)
 
@@ -13,10 +14,13 @@ Rules this program enforces (docs/SIGNATURES.md, docs/SIGNING_RUNBOOK.md):
   block's own fields, the chain position from the log's head); it never signs text the service hands it.
 * **It signs only what an independent check accepted.**  Before it signs blocks it requires the offline replay verifier (raw rows, in a
   one-off container, as the migrate role) to accept the newest pending block and its hash, and requires the existing signing log to
-  verify cleanly: it will not extend a log that already has problems.
+  verify cleanly: it will not extend a log that already has problems.  Before it signs a receipt it re-derives that receipt the same
+  way (``replay verify --receipt``, raw rows), checks that the receipt's sealed block is the real block (hash recomputed from the
+  block's own fields) and covers the receipt's point, and signs it only after that block's attestation (the same pass or earlier).
+  A receipt that fails is refused and reported (exit 4); it never stops the others from being signed, and is never signed.
 * **It checks its own work**: each signature is verified (against the key it came from) before it is posted.
 
-Receipts are signed by a later step (PR C); this one signs blocks and checkpoints.  Standard library only (plus ``ssh-keygen``), so it
+Standard library only (plus ``ssh-keygen``), so it
 runs on the host without the application's dependencies.
 """
 
@@ -196,14 +200,68 @@ def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+RECEIPT_SCHEMA = "CES.Local.ReplayReceipt.v1"
+EO_PREFIX = "eo:sha256:"
+DEFAULT_MAX_RECEIPTS = 25
+
+
+def max_receipts() -> int:
+    try:
+        return max(0, int(os.getenv("JARVIS_SIGN_MAX_RECEIPTS") or DEFAULT_MAX_RECEIPTS))
+    except ValueError:
+        return DEFAULT_MAX_RECEIPTS
+
+
 def default_verify_block(height: int, block_hash: str) -> None:
     """The independent check before signing: replay the ledger up to this block from the RAW rows, in a one-off container (never
     the service's own SQL), and require the block to be exactly the one about to be signed."""
     script = repo_root() / "deploy" / "mint" / "bin" / "replay.sh"
-    r = subprocess.run([str(script), "verify", "--at-block", str(height), "--expect-block-hash", block_hash], capture_output=True, text=True, timeout=600)
+    # --signatures off: the question is whether the block is what the raw rows say, not whether it is signed yet
+    r = subprocess.run([str(script), "verify", "--at-block", str(height), "--expect-block-hash", block_hash, "--signatures", "off"],
+                       capture_output=True, text=True, timeout=600)
     if r.returncode != 0:
         tail = (r.stdout + r.stderr).strip().splitlines()[-3:]
         raise SignerError("pre_sign_verify_failed", f"the offline replay does not accept block {height}: {' | '.join(tail)}", EXIT_UNHEALTHY)
+
+
+def default_verify_receipt(receipt_id: str) -> None:
+    """Re-derive the receipt from the RAW rows in a one-off container (``replay verify --receipt``): the stored object must be
+    intact and the replay at its sealed point must give its state root, counts and block."""
+    script = repo_root() / "deploy" / "mint" / "bin" / "replay.sh"
+    r = subprocess.run([str(script), "verify", "--receipt", receipt_id, "--signatures", "off"], capture_output=True, text=True, timeout=600)
+    if r.returncode != 0:
+        tail = (r.stdout + r.stderr).strip().splitlines()[-3:]
+        raise SignerError("pre_sign_verify_failed", f"the offline replay does not re-derive receipt {receipt_id}: {' | '.join(tail)}", EXIT_UNHEALTHY)
+
+
+def _receipt_to_sign(api: Api, tenant: str, receipt_id: str) -> str:
+    """Checks the signer makes itself on a receipt before it spends a replay on it.  Returns "" if fine, else why it is refused."""
+    if not (receipt_id.startswith(EO_PREFIX) and len(receipt_id) == len(EO_PREFIX) + 64 and all(c in "0123456789abcdef" for c in receipt_id[len(EO_PREFIX):])):
+        return "not an evidence object id"
+    status_code, body = api.request("GET", f"/api/jarvis/replay/receipts/{receipt_id}")
+    if status_code != 200:
+        return f"the service does not return it (HTTP {status_code})"
+    obj = body.get("receipt") or {}
+    p = obj.get("payload") or {}
+    if obj.get("id") != receipt_id or obj.get("schema_id") != RECEIPT_SCHEMA:
+        return "the service returned a different object than asked for, or one that is not a replay receipt"
+    if p.get("tenant") != tenant:
+        return f"it is for tenant {p.get('tenant')!r}, not {tenant!r}"
+    height, at_seq = p.get("block_height"), p.get("at_seq")
+    if not isinstance(height, int) or not isinstance(at_seq, int):
+        return "its sealed point is malformed"
+    status_code, bbody = api.request("GET", f"/api/jarvis/blocks/{height}")
+    if status_code != 200:
+        return f"its block {height} does not exist (HTTP {status_code}): a receipt is signed only at a sealed point"
+    block = bbody["block"]
+    recomputed = blocks.block_hash(tenant=tenant, height=block["height"], first_seq=block["first_seq"], last_seq=block["last_seq"],
+                                   entry_count=block["entry_count"], prev_block_hash=block["prev_block_hash"], entries_root=block["entries_root"],
+                                   fmt=block["format"])
+    if recomputed != block["block_hash"] or block["block_hash"] != p.get("block_hash"):
+        return f"block {height} is not the block the receipt names (hash {str(p.get('block_hash'))[:16]}...)"
+    if not block["first_seq"] <= at_seq <= block["last_seq"]:
+        return f"seq {at_seq} is not inside block {height} ({block['first_seq']}..{block['last_seq']}), so it is not a sealed point"
+    return ""
 
 
 def status(api: Api, key: KeyInfo) -> dict[str, Any]:
@@ -216,8 +274,10 @@ def status(api: Api, key: KeyInfo) -> dict[str, Any]:
 
 
 def run_sign(api: Api, key: KeyInfo, *, dry_run: bool = False, verify_block: Callable[[int, str], None] = default_verify_block,
+             verify_receipt: Callable[[str], None] = default_verify_receipt, limit_receipts: int | None = None,
              now: Callable[[], str] = _now) -> dict[str, Any]:
-    """Sign every pending sealed block (oldest first), then one checkpoint if anything new was signed.  Returns what was done."""
+    """Sign every pending sealed block (oldest first), then every pending receipt that re-derives (oldest first, at most
+    ``limit_receipts`` per pass), then one checkpoint if anything new was signed.  Returns what was done and what was refused."""
     st = status(api, key)
     if not st["trust_roots_configured"]:
         raise SignerError("no_trust_root", "the service has no trust root configured, so it cannot verify (or accept) anything; run: jarvisctl attest install-roots", EXIT_UNHEALTHY)
@@ -246,14 +306,26 @@ def run_sign(api: Api, key: KeyInfo, *, dry_run: bool = False, verify_block: Cal
         if recomputed != block["block_hash"] or block["block_hash"] != item["block_hash"]:
             raise SignerError("block_inconsistent", f"block {item['height']}'s hash does not match its own fields; refusing to sign it", EXIT_UNHEALTHY)
         plan.append({"height": block["height"], "block_hash": block["block_hash"]})
-    result: dict[str, Any] = {"tenant": tenant, "signed_blocks": [], "checkpoint": None, "dry_run": dry_run, "planned_blocks": [p["height"] for p in plan],
-                              "skipped_receipts": len(pending["receipts"])}
-    if dry_run or not plan:
-        if not plan:
-            result["note"] = "nothing pending"
+    # Every block is either already attested (the log verified clean above) or in `plan`, which is signed before any receipt below, so a
+    # receipt is never attested ahead of its block; _receipt_to_sign refuses a receipt whose block does not exist.
+    cap = max_receipts() if limit_receipts is None else limit_receipts
+    rplan, refused = [], []
+    for item in sorted(pending["receipts"], key=lambda r: (r["created_at"], r["id"])):
+        why = _receipt_to_sign(api, tenant, item["id"])
+        if why:
+            refused.append({"id": item["id"], "why": why})
+        elif len(rplan) < cap:
+            rplan.append(item["id"])
+    result: dict[str, Any] = {"tenant": tenant, "signed_blocks": [], "signed_receipts": [], "checkpoint": None, "dry_run": dry_run,
+                              "planned_blocks": [p["height"] for p in plan], "planned_receipts": list(rplan), "refused_receipts": refused,
+                              "deferred_receipts": max(0, len(pending["receipts"]) - len(refused) - len(rplan))}
+    if dry_run or not (plan or rplan):
+        if not (plan or rplan):
+            result["note"] = "nothing pending" if not refused else "nothing signable"
         return result
 
-    verify_block(plan[-1]["height"], plan[-1]["block_hash"])  # the newest block's check covers every block before it (the chain and the replay)
+    if plan:
+        verify_block(plan[-1]["height"], plan[-1]["block_hash"])  # the newest block's check covers every block before it (the chain and the replay)
     seq, prev = head["next_signer_seq"], head["prev_hash"]
     for p in plan:
         message = attest.attestation_message("block", tenant, f"block:{p['height']}", p["block_hash"], seq, prev, now())
@@ -269,6 +341,28 @@ def run_sign(api: Api, key: KeyInfo, *, dry_run: bool = False, verify_block: Cal
         result["signed_blocks"].append({"height": p["height"], "signer_seq": seq})
         seq, prev = seq + 1, resp["attestation_hash"]
 
+    for rid in rplan:
+        try:
+            verify_receipt(rid)  # re-derived from the raw rows now, not trusted from when it was issued
+        except SignerError as exc:
+            refused.append({"id": rid, "why": exc.message})
+            continue
+        subject_hash = rid[len(EO_PREFIX):]
+        message = attest.attestation_message("receipt", tenant, rid, subject_hash, seq, prev, now())
+        sig = sign_message(key, message)
+        status_code, resp = api.request("POST", "/api/jarvis/attestations", {
+            "kind": "receipt", "subject": rid, "subject_hash": subject_hash, "signer_seq": seq, "prev_hash": prev,
+            "key_id": key.public.key_id, "signed_at": message.rsplit("|", 1)[1], "signature": sig})
+        if status_code != 200:
+            raise SignerError("store_refused", f"the service refused the attestation of receipt {rid}: HTTP {status_code} {resp.get('detail', '')}", EXIT_API)
+        if resp["signer_seq"] != seq:
+            raise SignerError("store_unexpected", "the service stored the attestation at an unexpected position", EXIT_API)
+        result["signed_receipts"].append({"id": rid, "signer_seq": seq})
+        seq, prev = seq + 1, resp["attestation_hash"]
+
+    if not (result["signed_blocks"] or result["signed_receipts"]):
+        result["note"] = "nothing signable"
+        return result
     tip = api.get("/api/jarvis/attestations/head")
     covered_seq, covered_head = seq - 1, prev
     subject = attest.checkpoint_subject(covered_seq, covered_head, tip["tip_height"], tip["tip_block_hash"])
@@ -336,12 +430,17 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{exc.code}: {exc.message}", file=sys.stderr)
         return exc.exit_code
     if result["dry_run"]:
-        print(f"dry run: would sign blocks {result['planned_blocks'] or 'none'} and a checkpoint; {result['skipped_receipts']} receipt(s) wait for a later step")
-    elif result["signed_blocks"]:
-        print("signed blocks " + ",".join(str(b["height"]) for b in result["signed_blocks"])
+        print(f"dry run: would sign blocks {result['planned_blocks'] or 'none'}, {len(result['planned_receipts'])} receipt(s) and a checkpoint; "
+              f"{len(result['refused_receipts'])} receipt(s) would be refused, {result['deferred_receipts']} deferred")
+    elif result["signed_blocks"] or result["signed_receipts"]:
+        print("signed blocks " + (",".join(str(b["height"]) for b in result["signed_blocks"]) or "none") + f", {len(result['signed_receipts'])} receipt(s)"
               + f"; checkpoint {result['checkpoint']['signer_seq']} covers {result['checkpoint']['covers']}")
     else:
         print(f"nothing to sign ({result.get('note', '')})")
+    for r in result["refused_receipts"]:
+        print(f"REFUSED receipt {r['id']}: {r['why']}", file=sys.stderr)
+    if result["refused_receipts"]:
+        return EXIT_UNHEALTHY
     return EXIT_OK
 
 

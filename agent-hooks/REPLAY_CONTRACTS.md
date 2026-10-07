@@ -3,7 +3,9 @@
 **Status: partial.** `RC.Ledger.v1`, the ledger's own contract, is implemented on the PostgreSQL row store: state and events as of
 a point in the history, receipts at sealed points (stored as Evidence Objects), an offline verifier, `jarvisctl replay`, and a
 restore-drill step. No schema change (still v6). The five domain contracts (`RC.AIKI.v1`, `RC.ARIS.v1`, `RC.SX.v1`, `RC.Lineage.v1`,
-`RC.Mandala.v1`) are **declared only**: they have no schema files, no owner and no algorithm here. Nothing is signed.
+`RC.Mandala.v1`) are **declared only**: they have no schema files, no owner and no algorithm here. Receipts and the blocks they sit in can
+be signed (the signer, signature levels L0/L1/L2 in `replay verify`, the `JARVIS_SIGNATURES` switch: `SIGNATURES.md`), but that is built, not
+deployed: **nothing on the live ledger is signed**.
 
 ## What a Replay Contract is
 
@@ -21,9 +23,11 @@ of that sealed block), or neither (the current end). Output:
 * **state** (`GET /api/jarvis/replay/state`): every record as it was at that seq, exactly as its history entry stored it, with
   the count of records deleted by then and the **state root**. Paged by `after_id` and `limit`; the root always covers the whole
   state. `sealed` says whether the point lies inside a sealed block, `at_block_boundary` whether it is that block's last entry,
-  and `block` names the covering block and its hash.
+  and `block` names the covering block and its hash, plus `signed` and `signature_level` (additive fields; the contract version is still 1):
+  `signed` is true only when a valid attestation of that block was verified against the pinned roots (L1 or better), `signature_level` is
+  0 unsigned / 1 Mint-signed / 2 root-cosigned, or null when `JARVIS_SIGNATURES=off`. They never enter a receipt, which stays deterministic.
 * **events** (`GET /api/jarvis/replay/events`): the ordered history entries, each with op, version, the **recorded actor**
-  (whoever the ledger recorded as making the change; there are no signatures), the entry's hashes, the `before` / `after` images
+  (whoever the ledger recorded as making the change; history entries carry no signatures), the entry's hashes, the `before` / `after` images
   and its evidence links. An evidence-object link is resolved and re-hashed (`intact`, `missing` or `tampered`); every other link
   kind is a pointer and is reported `not-checked`.
 
@@ -110,10 +114,14 @@ is skipped, with a warning, for a set with no sealed blocks or when the app imag
   sealed point catches it.
 * An entry rewritten consistently **and every later block re-sealed**: the database alone passes. The block anchors in the backups
   catch it, and so does any receipt (or state root) recorded earlier. Only history that was never anchored or receipted is exposed.
-* **A receipt is a claim until it is verified**, and it is unsigned: anyone with the database owner's power can add a receipt object
-  that is well-formed and correctly hashed. `verify` exposes one whose content does not replay.
+* **A receipt is a claim until it is verified**: anyone with the database owner's power can add a receipt object that is well-formed and
+  correctly hashed. `verify` exposes one whose content does not replay. A receipt can also carry a Mint-key attestation (made by the host
+  signer only after it re-derived the receipt from the raw rows), and `verify` reports it, together with its block's, as **L0 unsigned, L1
+  Mint-signed or L2 root-cosigned**; the receipt is only as signed as its block. That is the signer's word about a digest, not proof that
+  the replay is right: re-deriving is what shows that. `JARVIS_SIGNATURES=require` makes unsigned or invalid a failure and never reports
+  success without a trust root; the default is `warn`. None of this runs on the live ledger yet.
 * **Rolling back to a build older than this one while receipts exist** makes that build's `pg_verify` report them as an unknown
   schema. Forward upgrades are unaffected.
 * **Authority is the recorded actor, not a proof.** Today that is the tenant key (`operator`) plus the record's own `source_agent`;
-  nothing is signed.
+  records are not signed, and a signature on a block or receipt does not say who wrote what is in it.
 * A point after the last sealed block is replayable (`sealed: false`) but only chain-verified, not block-anchored.

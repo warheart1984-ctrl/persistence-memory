@@ -196,3 +196,18 @@ def test_jarvisctl_routes_replay_and_lists_it_in_help(deploy, ledger, tmp_path):
     r = subprocess.run([str(deploy / "bin" / "jarvisctl"), "replay", "state"], capture_output=True, text=True, env=env, timeout=60)
     assert r.returncode == 0 and "state root" in r.stdout
     assert "replay state|receipt|receipts|check|verify" in subprocess.run([str(deploy / "bin" / "jarvisctl"), "help"], capture_output=True, text=True, env=env).stdout
+
+
+def test_verify_forwards_the_signatures_switch_to_the_verifier(deploy, ledger, tmp_path, fake_docker):
+    bindir, log = fake_docker
+    assert run(deploy, ledger(), tmp_path, "verify", "--receipt", RECEIPT_ID, "--signatures", "off", path_prefix=bindir).returncode == 0
+    assert log.read_text().strip().endswith(f"python -m app.replay verify --tenant operator --receipt {RECEIPT_ID} --signatures off")
+
+
+def test_check_prints_the_signature_level_and_its_warnings(deploy, ledger, tmp_path):
+    body = {"ok": True, "receipt_id": RECEIPT_ID, "problems": [], "receipt": {"at_seq": 6, "record_count": 5, "state_root": "ab" * 32, "block_height": 2},
+            "signatures": {"mode": "warn", "label": "L0 unsigned", "warnings": ["receipt eo:sha256:x is unsigned"], "problems": []}}
+    r = run(deploy, ledger(body=body), tmp_path, "check", RECEIPT_ID)
+    assert r.returncode == 0 and "signatures (warn): L0 unsigned" in r.stdout and "WARNING: receipt eo:sha256:x is unsigned" in r.stdout
+    body["signatures"] = None
+    assert "signatures" not in run(deploy, ledger(body=body), tmp_path, "check", RECEIPT_ID).stdout

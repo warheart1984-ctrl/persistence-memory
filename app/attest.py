@@ -471,6 +471,13 @@ class AttestationSummary:
     cosigned_checkpoint_seq: int = 0
     keys_used: set[str] = field(default_factory=set)
     voided: list[int] = field(default_factory=list)
+    # which VALID attestation vouches for which subject, so a caller can ask about one block or one receipt (signature levels)
+    bad_seqs: set[int] = field(default_factory=set)
+    block_seq: dict[int, int] = field(default_factory=dict)
+    block_subject_hash: dict[int, str] = field(default_factory=dict)
+    receipt_seq: dict[str, int] = field(default_factory=dict)
+    valid_checkpoints: dict[int, int] = field(default_factory=dict)  # checkpoint signer_seq -> the last attestation it covers
+    cosigned_checkpoints: set[int] = field(default_factory=set)      # checkpoints a root cosigned (the cosign matched the log)
 
 
 def evaluate_attestations(tenant: str, trust: TrustState, rows: list[Attestation], truth: Truth) -> tuple[list[Problem], AttestationSummary]:
@@ -524,6 +531,8 @@ def evaluate_attestations(tenant: str, trust: TrustState, rows: list[Attestation
             seen[(a.kind, a.subject)] = a
         for b in bad:
             problems.append(_problem("attestation", who, b))
+        if bad:
+            summary.bad_seqs.add(a.signer_seq)
         if voided:
             summary.voided.append(a.signer_seq)
         elif not bad:
@@ -532,10 +541,15 @@ def evaluate_attestations(tenant: str, trust: TrustState, rows: list[Attestation
                 h = parse_block_subject(a.subject)
                 if h is not None:
                     summary.blocks.add(h)
+                    summary.block_seq[h], summary.block_subject_hash[h] = a.signer_seq, a.subject_hash
             elif a.kind == "receipt":
                 summary.receipts.add(a.subject)
+                summary.receipt_seq[a.subject] = a.signer_seq
             else:
                 summary.newest_checkpoint_seq = max(summary.newest_checkpoint_seq, a.signer_seq)
+                cp = parse_checkpoint_subject(a.subject)
+                if cp is not None:
+                    summary.valid_checkpoints[a.signer_seq] = cp[0]
         by_seq[a.signer_seq] = a
         expected, last = a.signer_seq + 1, a.attestation_hash
         summary.count += 1
@@ -547,6 +561,7 @@ def evaluate_attestations(tenant: str, trust: TrustState, rows: list[Attestation
                                      f"the root {c.root_id} cosigned checkpoint {c.checkpoint_seq} with hash {c.checkpoint_hash[:16]}..., which is not what the log holds (a fork, or a rewritten log)"))
         else:
             summary.cosigned_checkpoint_seq = max(summary.cosigned_checkpoint_seq, c.checkpoint_seq)
+            summary.cosigned_checkpoints.add(c.checkpoint_seq)
     return problems, summary
 
 
@@ -714,6 +729,108 @@ def verify_tenant(conn: Any, tenant: str, *, mode: str | None = None, now: Any =
         f"signatures: {summary.count} attestation(s) up to {summary.head_seq}, {len(summary.blocks)} block(s) and {len(summary.receipts)} receipt(s) signed, "
         f"{len(unsigned)} unsigned{f', {len(summary.voided)} voided by a root' if summary.voided else ''}; newest checkpoint {summary.newest_checkpoint_seq or 'none'}, cosigned checkpoint {summary.cosigned_checkpoint_seq or 'none'}")
     return out
+
+
+# --- signature levels for one block or receipt ----------------------------------------------------------------------------------
+
+LEVEL_LABELS = {0: "L0 unsigned", 1: "L1 Mint-signed", 2: "L2 root-cosigned"}
+
+
+def attestation_level(summary: AttestationSummary, signer_seq: int | None) -> int:
+    """0 = no valid attestation, 1 = a valid attestation by an authorized, unrevoked Mint key, 2 = additionally covered by a checkpoint
+    that a root cosigned (the cosign names the checkpoint's hash, which names the whole log up to it)."""
+    if signer_seq is None:
+        return 0
+    for c in summary.cosigned_checkpoints:
+        covered = summary.valid_checkpoints.get(c)  # only a checkpoint that itself verified counts
+        if covered is not None and covered >= signer_seq:
+            return 2
+    return 1
+
+
+def signature_report(conn: Any, tenant: str, *, block_height: int | None, block_hash: str | None, receipt_id: str | None = None,
+                     mode: str | None = None, roots: dict[str, PublicKey] | None = None) -> dict[str, Any]:
+    """How well signed is this block (and, if given, this receipt)?  Never raises for a signature problem; says so in the result.
+
+    ``level`` is the lowest of the parts: a receipt is only as signed as its block.  A problem is always a failure: an attestation for
+    this subject that does not verify, or (in ``require``) any problem anywhere in the signing logs, no trust root, or a part that is
+    unsigned.  In ``warn`` an unsigned part and unrelated log problems are warnings.  No trust root: nothing is verified, level 0, and
+    ``require`` fails.  No grace period applies here: asked about one subject, an unsigned one is unsigned."""
+    mode = mode or signatures_mode()
+    report: dict[str, Any] = {"mode": mode, "verified": False, "level": None, "label": "not checked (JARVIS_SIGNATURES=off)",
+                              "block": None, "receipt": None, "problems": [], "warnings": []}
+    if mode == "off":
+        return report
+    require = mode == "require"
+    wanted = ([f"block:{block_height}"] if block_height is not None else []) + ([receipt_id] if receipt_id else [])
+    parts: dict[str, dict[str, Any]] = {}
+    if block_height is not None:
+        parts["block"] = {"height": block_height, "subject": f"block:{block_height}", "level": 0, "attestation_seq": None}
+    if receipt_id:
+        parts["receipt"] = {"id": receipt_id, "subject": receipt_id, "level": 0, "attestation_seq": None}
+
+    def finish() -> dict[str, Any]:
+        level = min((p["level"] for p in parts.values()), default=0)
+        for name, p in parts.items():
+            p["label"] = LEVEL_LABELS[p["level"]]
+            report[name] = {k: v for k, v in p.items() if k != "subject"}
+        report["level"], report["label"] = level, LEVEL_LABELS[level] + ("" if report["verified"] else " (not verified)")
+        return report
+
+    def unsigned(text: str, subject: str) -> None:
+        if require:
+            report["problems"].append(_problem("signatures", subject, text))
+        else:
+            report["warnings"].append(text)
+
+    roots = load_roots() if roots is None else roots
+    conn.execute("SELECT set_config('jarvis.tenant_key', %s, true)", (tenant,))
+    statements = load_statements(conn, tenant)
+    attestations = load_attestations(conn, tenant)
+    if not roots:
+        text = f"signatures not verified: no trust root is configured ({ROOTS_ENV}), so nothing can be checked and nothing is called signed"
+        if require:
+            report["problems"].append(_problem("signatures", "trust roots", text))
+        else:
+            report["warnings"].append(text)
+        return finish()
+    report["verified"] = True
+    if not statements and not attestations:
+        for name, p in parts.items():
+            unsigned(f"{name} {p.get('id') or p.get('height')} is unsigned: signing is not set up (no key authorized, nothing signed)", p["subject"])
+        return finish()
+    trust = evaluate_trust(tenant, roots, statements)
+    truth, _, _ = load_truth(conn, tenant)
+    log_problems, summary = evaluate_attestations(tenant, trust, attestations, truth)
+    subject_of = {a.signer_seq: a.subject for a in attestations}
+    mine = [p for p in log_problems if subject_of.get(int(p["subject"].split()[-1])) in wanted] if log_problems else []
+    others = [p for p in log_problems if p not in mine] + list(trust.problems)
+    report["problems"].extend(_problem("signatures", p["subject"], p["problem"]) for p in mine)
+    if others:
+        text = f"the signing logs have {len(others)} other problem(s) (first: {others[0]['subject']}: {others[0]['problem']}); see /api/jarvis/attestations/verify"
+        if require:
+            report["problems"].append(_problem("signatures", "signing log", text))
+        else:
+            report["warnings"].append(text)
+    if "block" in parts:
+        seq = summary.block_seq.get(block_height)
+        if seq is not None and block_hash is not None and summary.block_subject_hash.get(block_height) != block_hash:
+            report["problems"].append(_problem("signatures", f"block {block_height}", "the attestation names a different block hash than the block's"))
+            seq = None
+        parts["block"].update(attestation_seq=seq, level=attestation_level(summary, seq))
+    if "receipt" in parts:
+        seq = summary.receipt_seq.get(receipt_id)
+        parts["receipt"].update(attestation_seq=seq, level=attestation_level(summary, seq))
+    for name, p in parts.items():
+        who = f"{name} {p.get('id') or p.get('height')}"
+        if p["level"] == 0:
+            if p["subject"] in {subject_of[s] for s in summary.voided}:
+                unsigned(f"{who} is unsigned: its attestation was voided by a root", p["subject"])
+            else:
+                unsigned(f"{who} is unsigned", p["subject"])
+    if "block" in parts and "receipt" in parts and parts["receipt"]["level"] > 0 and parts["block"]["level"] == 0:
+        unsigned(f"the receipt is signed but its block {block_height} is not; the receipt is only as signed as its block", f"block {block_height}")
+    return finish()
 
 
 # --- command line -------------------------------------------------------------------------------------------------------------

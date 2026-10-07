@@ -131,7 +131,7 @@ Grok docs to say; the Grok CLI does, and `~/.grokbot/settings.json` has its own 
 | `jarvisctl restore --yes-destroy-current-data [--backup SET]` | **destructive**: see below |
 | `jarvisctl offsite` | encrypt and send the newest set to the PC |
 | `jarvisctl verify [tenant]` | recompute the history hash chain and every sealed block |
-| `jarvisctl replay state\|receipt\|receipts\|check\|verify` | Replay Contracts (RC.Ledger.v1): replay the ledger at a point, issue receipts at **sealed** points, re-derive them (`check` asks the service, `verify` replays the raw rows in a one-off container). Needs the build that has Replay Contracts; see `docs/REPLAY_CONTRACTS.md` |
+| `jarvisctl replay state\|receipt\|receipts\|check\|verify` | Replay Contracts (RC.Ledger.v1): replay the ledger at a point, issue receipts at **sealed** points, re-derive them (`check` asks the service, `verify` replays the raw rows in a one-off container; both print the signature level L0/L1/L2, and `verify` takes `--signatures off\|warn\|require`). Needs the build that has Replay Contracts; see `docs/REPLAY_CONTRACTS.md` |
 | `jarvisctl seal [--force\|--status]` | seal new history into Continuity Blocks now (or show the unsealed tail); the hourly timer is **not enabled** by default, see below |
 | `jarvisctl attest status\|sign [--dry-run]\|init-key\|install-roots\|verify` | the host signer (schema v7 only): the signing key lives in `~/jarvis-ledger/keys/` and **never enters a backup, a volume or a container**; ceremony and routines in `docs/SIGNING_RUNBOOK.md`. `jarvis-sign.timer` is installed, **not enabled** |
 | `jarvisctl watchdog` / `heal` | run the health checks / the self-heal once |
@@ -213,7 +213,7 @@ Backup sets carry `<set>.signatures.json` (the attestations, trust statements an
 `att|` and `trust|` lines: a signing log that loses or rewrites an entry is quarantined like a block would be. `backup.sh` refuses to
 publish a set containing the signing key (exact secret in any encoding, or a private-key header in a file); key-shaped text inside the
 database only warns. The drill re-checks restored signatures with the pinned roots (`secrets/trust-roots.pub`, public keys only,
-created empty by `jarvisctl up`) and, with `--prove-detection`, proves a damaged signature is caught. The watchdog watches
+created empty by `jarvisctl up`) and, with `--prove-detection`, proves a damaged signature is caught. The signer signs blocks, then replay receipts (each re-derived from the raw rows first, at most `JARVIS_SIGN_MAX_RECEIPTS`=25 per pass; a receipt it cannot vouch for is refused and reported with exit 4), then a checkpoint. `JARVIS_SIGNATURES=off|warn|require` (default `warn`, set in `.env`, reaches the app and the verifier): in `require`, verification fails for anything unsigned or invalid and never reports success without a trust root; do not switch it before seven quiet days in `warn` (`docs/SIGNING_RUNBOOK.md`). The watchdog watches
 `state/sign.last_ok` (once the signer has succeeded) and warns when no cosign has been posted for 72 hours. Rollback: v6 code refuses
 v7 and the reverse, so, as for v6, roll back by checking out the old code and restoring the backup taken before the upgrade.
 

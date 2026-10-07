@@ -2,8 +2,9 @@
 
 **Status: built, not deployed, not enabled.** The verification side (schema v7 logs, the checks, the API, the `pg_verify` section), the host
 signer, the backup, restore and drill handling, the custody guards and the PC-side witness are on `main`. **Nothing is deployed, no key
-exists, no root is pinned, the sign timer is not enabled, and nothing in the live ledger is signed.** Receipts are not signed yet (a later
-step). The key ceremony is in `SIGNING_RUNBOOK.md`.
+exists, no root is pinned, the sign timer is not enabled, and nothing in the live ledger is signed.** The signer attests replay receipts (at sealed
+points only) as well as blocks, verification reports L0/L1/L2 levels, and `JARVIS_SIGNATURES=require` exists with `warn` as the default;
+none of it has run against the live ledger. The key ceremony is in `SIGNING_RUNBOOK.md`.
 
 ## What a signature says, and what it does not
 
@@ -52,6 +53,42 @@ name. `JARVIS_SIGNATURES=off|warn|require` (default `warn`):
 Endpoints (operator key): `GET /api/jarvis/attestations[/head|/pending|/verify]`, `POST /api/jarvis/attestations`,
 `GET /api/jarvis/trust`, `GET|POST /api/jarvis/trust/statements`.
 
+## Signature levels, and the `require` switch (built)
+
+Replay verification now says how well signed a block or a receipt is:
+
+| Level | Meaning |
+|---|---|
+| **L0 unsigned** | no valid attestation: none exists, it does not verify (forged, wrong or unauthorized key, signed after a revocation cutoff, wrong hash), no trust root is configured so nothing could be checked, or a root voided it |
+| **L1 Mint-signed** | a valid attestation by a key a root authorized and has not revoked (before its cutoff), checked against the pinned roots |
+| **L2 root-cosigned** | L1, and a checkpoint that itself verifies and covers this attestation's place in the log was cosigned by a root |
+
+A receipt is checked together with **its own sealed block**: the reported `level` is the lower of the two, so a signed receipt whose
+block is unsigned is L0 (and says so). L2 witnesses the *position in the signing log*, which names the block hash and the receipt id the
+Mint key attested; it does not mean a root read the receipt's content, and L1 is the Mint key's word, nothing more.
+
+Where it appears: `GET /api/jarvis/replay/receipts/{id}/verify` (`signatures`: mode, level, label, `block` and `receipt` parts, warnings,
+problems), `GET /api/jarvis/replay/state` (`block.signed`, `block.signature_level`), `python -m app.replay verify [--receipt ID | --at-block H]
+[--signatures off|warn|require]`, and `jarvisctl replay check|verify`. `block.signed` is **true only when a valid attestation was verified
+against the pinned roots** (L1 or better); with no trust root, or with checking off, it is false, never "unknown, assumed fine".
+
+`JARVIS_SIGNATURES` (default **`warn`**; any other value falls back to `warn`; set it in `deploy/mint/.env`, which reaches the app and the
+verifier):
+
+| | `off` | `warn` (default) | `require` |
+|---|---|---|---|
+| unsigned block or receipt (L0) | not checked | a warning, the result still passes | **a failure** |
+| an attestation for this subject that does not verify | not checked | **a failure** | **a failure** |
+| a problem elsewhere in the signing logs | not checked | a warning | **a failure** |
+| no trust root configured (or an empty roots file) | not checked | a warning; reported L0 "not verified" | **a failure, never success** |
+| signing not set up (no key authorized) | not checked | a warning | **a failure** |
+
+Notes that matter: the per-subject check has **no grace period**: asked about one receipt, an unsigned receipt is unsigned (a receipt just
+issued fails `replay check` in `require` until the next signing pass; `pg_verify`/`attestations/verify` keep the 2-hour grace). `require`
+changes what *verification reports*; it does not block writes, sealing or issuing receipts. The signer's own pre-sign re-derivation runs with
+`--signatures off`, because it asks whether the receipt re-derives, not whether it is signed yet (otherwise `require` could never sign
+anything). Switch to `require` only after seven days in `warn` with a quiet watchdog (`SIGNING_RUNBOOK.md`).
+
 ## Key custody (enforced; the ceremony is in `SIGNING_RUNBOOK.md`)
 
 1. **The Mint private key never enters a backup, a volume or a container.** It lives in `~/jarvis-ledger/keys/` (directory 700, key 600,
@@ -71,7 +108,7 @@ Endpoints (operator key): `GET /api/jarvis/attestations[/head|/pending|/verify]`
 | | |
 |---|---|
 | `app/attest.py` | formats, trust and attestation checks, `python -m app.attest verify` |
-| `app/signer.py` | the host signer: custody checks, builds its own messages, pre-sign offline verification, self-check; `init-key`, `status`, `sign` |
+| `app/signer.py` | the host signer: custody checks, builds its own messages, pre-sign offline verification of every block and every receipt, self-check; signs blocks, then receipts, then one checkpoint; `init-key`, `status`, `sign` |
 | `app/witness.py` | the PC side: `verify-export` (remembers what it saw), `cosign`, ceremony `statement`s; runs without the application's packages |
 | `deploy/mint/bin/attest.sh` | `jarvisctl attest status\|sign\|init-key\|install-roots\|verify` |
 | `deploy/mint/bin/sigexport.py` | the `<set>.signatures.json` export that rides with every backup set and every offsite bundle |
@@ -95,7 +132,7 @@ Endpoints (operator key): `GET /api/jarvis/attestations[/head|/pending|/verify]`
 
 ## Planned, not built
 
-* Signing replay receipts in the signing pass, signature levels in `replay verify`, and the `require` switch after seven days in `warn`
-  (longer if the watchdog is noisy).
+* Turning `require` on: a decision for after seven days in `warn` (longer if the watchdog is noisy). The switch is built; the live ledger
+  has run no days in `warn` yet because nothing is deployed.
 * The hardware root and the statement flow to add it (the statement exists; the hardware-key signature format does not yet).
 * A scripted PC routine (decrypt the offsite bundle, verify, cosign). The commands are in the runbook, run by hand.

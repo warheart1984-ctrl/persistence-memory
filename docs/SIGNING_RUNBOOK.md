@@ -56,7 +56,8 @@ python -m app.witness statement key --roots trust\roots.pub --root-key $HOME\.ss
   --mint-pub .\jarvis-sign-ed25519.pub --from-seq 1 --post
 ```
 
-**5. On the box: check, then one manual signing pass.**
+**5. On the box: check, then one manual signing pass.** A pass signs every pending block (after the offline replay accepted the newest),
+then every pending replay receipt (each re-derived from the raw rows first, at most 25 per pass; `JARVIS_SIGN_MAX_RECEIPTS`), then one checkpoint.
 
 ```bash
 deploy/mint/bin/jarvisctl attest status            # authorized: true
@@ -68,6 +69,32 @@ deploy/mint/bin/jarvisctl verify                   # now reports the signatures 
 **6. Only with your explicit OK:** `systemctl --user enable --now jarvis-sign.timer` (hourly at :56, after the seal and before the backup).
 Run in `warn` mode for 7 days (`JARVIS_SIGNATURES=warn`, the default); if the watchdog was quiet, switch to `require`
 (`JARVIS_SIGNATURES=require` in the service's environment). If it was noisy, stay in `warn` another week and find out why.
+
+## Receipts and the signing pass
+
+* The signer signs a receipt only at a **sealed point**: the receipt's block must exist, have the hash the receipt names (recomputed from the
+  block's own fields), and cover the receipt's seq. It builds the message itself from the receipt's id, runs `replay verify --receipt` on the
+  raw rows in a one-off container, and checks its own signature. Blocks are always signed first, so a receipt is never attested ahead of its block.
+* A receipt that fails any of that is **refused, never signed, and reported** (`REFUSED receipt ...` on stderr, exit 4, so the unit fails and the
+  watchdog notices); the other receipts and the checkpoint still go ahead. Find out why before anything else: a receipt that does not re-derive
+  means the ledger or the receipt differs from what was issued.
+* `jarvisctl replay check|verify` now print **L0 unsigned / L1 Mint-signed / L2 root-cosigned** for the receipt and its block. L2 appears once you
+  have cosigned a checkpoint that covers them (the daily routine below). A receipt is only as signed as its block.
+
+## Switching to `require` (and back)
+
+`JARVIS_SIGNATURES` is `warn` unless you set it, and shipping it switched on is blocked by a test. Do not switch until **all** of these hold:
+
+1. The sign timer has run for seven days in `warn` (it only runs after your separate OK), the watchdog has not complained about the signer or the
+   cosign age in that time, and `jarvisctl attest verify` shows no warnings except for the newest hour or two.
+2. `jarvisctl attest status` shows the key authorized, `jarvisctl verify` is clean, and a drill passed since the last signing pass.
+3. You have cosigned at least one checkpoint (the daily routine) and know how to do it again.
+
+To switch: put `JARVIS_SIGNATURES=require` in `deploy/mint/.env`, then `deploy/mint/bin/jarvisctl up` (recreates the app and the verifier with it).
+What changes: verification **fails** for an unsigned block or receipt (after the 2-hour grace in `verify`/`attest verify`; **immediately** for a
+single `replay check`, so a receipt issued a minute ago fails until the next :56 pass), for any signing-log problem, and with no trust root. What does
+not change: writes, sealing, and issuing receipts still work. To switch back, set `warn` (or delete the line) and run `jarvisctl up`. If the
+watchdog or `verify` starts failing right after the switch, that is the switch doing its job: look at `jarvisctl attest verify` before reverting.
 
 ## The daily routine on the PC (witness and cosign)
 
@@ -96,6 +123,9 @@ The watchdog warns if no cosign has been made for 72 hours.
 | `bad signature`, `no root authorized`, `revoked ... cutoff` | A forged, unauthorized or post-revocation attestation | Find how it got into the database; revoke if the key may be exposed |
 | `cosign ... a fork` | A cosigned checkpoint is not what the log holds | Same as a rewrite |
 | `no trust roots` | Wrong or empty `--roots` file | Fix the file; nothing was verified |
+
+On the box, `jarvisctl replay check <receipt>` reporting **L0** after the signer ran usually means the receipt was created after the last pass (wait
+for :56), the signer refused it (see its stderr), or the roots file is empty (then it says "not verified").
 
 ## Rotation (planned, or after a scare)
 
