@@ -39,6 +39,7 @@ from app.models import (
 from app.pg_schema import check_schema_version, validate_schema_name
 from app.store import _make_id, ledger_retrieve, memory_matches_query
 from app.store_errors import StoreUnavailableError, StoreVersionConflict
+from app import attest
 from app import clause_v
 from app import evidence as evidence_objects
 
@@ -535,6 +536,158 @@ class PostgresRowStore:
                           for l in links]))
         return replay.ReplayEvents(tenant=self._tenant_key, from_seq=from_seq, to_seq=end, history_seq=history_seq, events=events,
                                    next_from_seq=rows[-1]["seq"] + 1 if more else None)
+
+    # -- Signatures: attestations and trust statements (verification side; nothing here signs) ----------
+
+    _ATT_COLUMNS = "signer_seq, kind, subject, subject_hash, prev_hash, key_id, signed_at, signature, attestation_hash, stored_at"
+    _STMT_COLUMNS = "stmt_seq, kind, key_id, pubkey, arg, subject_hash, prev_hash, signed_by, signature, statement_hash, stored_at"
+
+    @staticmethod
+    def _plain(row: tuple[Any, ...], names: str) -> dict[str, Any]:
+        out = dict(zip([n.strip() for n in names.split(",")], row))
+        if "stored_at" in out:
+            out["stored_at"] = _iso(out["stored_at"])
+        return out
+
+    def list_attestations(self, after_seq: int = 0, limit: int = 100) -> list[dict[str, Any]]:
+        with self._tx() as conn:
+            conn.row_factory = tuple_row
+            rows = conn.execute(
+                f"SELECT {self._ATT_COLUMNS} FROM attestations WHERE tenant_key = %s AND signer_seq > %s ORDER BY signer_seq LIMIT %s",
+                (self._tenant_key, max(0, int(after_seq)), max(1, min(int(limit), 1000)))).fetchall()
+        return [self._plain(r, self._ATT_COLUMNS) for r in rows]
+
+    def attestation_head(self) -> dict[str, Any]:
+        """Where the signing log ends: the next signer_seq and the hash the next attestation must name as prev_hash."""
+        with self._tx() as conn:
+            conn.row_factory = tuple_row
+            row = conn.execute("SELECT signer_seq, attestation_hash, kind, subject FROM attestations WHERE tenant_key = %s ORDER BY signer_seq DESC LIMIT 1",
+                               (self._tenant_key,)).fetchone()
+            stmt = conn.execute("SELECT stmt_seq, statement_hash FROM trust_statements WHERE tenant_key = %s ORDER BY stmt_seq DESC LIMIT 1",
+                                (self._tenant_key,)).fetchone()
+            tip = conn.execute("SELECT height, block_hash FROM blocks WHERE tenant_key = %s ORDER BY height DESC LIMIT 1", (self._tenant_key,)).fetchone()
+        return {
+            "head_seq": row[0] if row else 0, "head_hash": row[1] if row else attest.GENESIS,
+            "next_signer_seq": (row[0] if row else 0) + 1, "prev_hash": row[1] if row else attest.GENESIS,
+            "trust_head_seq": stmt[0] if stmt else 0, "trust_head_hash": stmt[1] if stmt else attest.GENESIS, "next_stmt_seq": (stmt[0] if stmt else 0) + 1,
+            "tip_height": tip[0] if tip else 0, "tip_block_hash": tip[1] if tip else attest.GENESIS,
+        }
+
+    def list_trust_statements(self, after_seq: int = 0, limit: int = 100) -> list[dict[str, Any]]:
+        with self._tx() as conn:
+            conn.row_factory = tuple_row
+            rows = conn.execute(
+                f"SELECT {self._STMT_COLUMNS} FROM trust_statements WHERE tenant_key = %s AND stmt_seq > %s ORDER BY stmt_seq LIMIT %s",
+                (self._tenant_key, max(0, int(after_seq)), max(1, min(int(limit), 1000)))).fetchall()
+        return [self._plain(r, self._STMT_COLUMNS) for r in rows]
+
+    def trust_state(self) -> dict[str, Any]:
+        """Which roots are pinned (outside the database) and added, which signing keys are authorized, revoked and cosigned."""
+        with self._tx() as conn:
+            conn.row_factory = tuple_row
+            roots = attest.load_roots()
+            trust = attest.evaluate_trust(self._tenant_key, roots, attest.load_statements(conn, self._tenant_key))
+        return {
+            "pinned_roots": sorted(roots), "roots": sorted(trust.roots),
+            "keys": [{"key_id": k, "from_signer_seq": a.from_seq, "revoked_after_signer_seq": a.cutoff, "authorized_by_statement": a.stmt_seq}
+                     for k, a in sorted(trust.keys.items())],
+            "cosigns": [{"checkpoint_seq": c.checkpoint_seq, "checkpoint_hash": c.checkpoint_hash, "root": c.root_id} for c in trust.cosigns],
+            "voids": [{"signer_seq": k, "attestation_hash": v} for k, v in sorted(trust.voids.items())],
+            "statements": trust.head_seq, "problems": trust.problems, "trust_roots_configured": bool(roots),
+        }
+
+    def pending_attestations(self) -> dict[str, Any]:
+        """What has no attestation yet (what a signer would sign next), plus where the log ends."""
+        with self._tx() as conn:
+            conn.row_factory = tuple_row
+            done = {a.subject for a in attest.load_attestations(conn, self._tenant_key)}
+            _, blocks, receipts = attest.load_truth(conn, self._tenant_key)
+        return {
+            "blocks": [{"height": h, "block_hash": bh, "sealed_at": _iso(sealed)} for h, bh, sealed in blocks if f"block:{h}" not in done],
+            "receipts": [{"id": rid, "created_at": _iso(created)} for rid, created in receipts if rid not in done],
+            "head": self.attestation_head(),
+        }
+
+    def verify_signatures(self) -> dict[str, Any]:
+        with self._tx() as conn:
+            conn.row_factory = tuple_row
+            return attest.verify_tenant(conn, self._tenant_key)
+
+    def store_attestation(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Verify an attestation (position, signature, key authorization, subject) and add it to the log; the database function
+        then enforces the chain and computes the stored hash.  The application never makes a signature."""
+        sig = attest.normalize_signature(str(body.get("signature", "")))
+        roots = attest.load_roots()
+        if not roots:
+            raise attest.AttestError("no_trust_root", f"no trust root is configured ({attest.ROOTS_ENV}); nothing can be verified, so nothing is stored", 409)
+        with self._tx() as conn:
+            conn.row_factory = tuple_row
+            tenant = self._tenant_key
+            trust = attest.evaluate_trust(tenant, roots, attest.load_statements(conn, tenant))
+            existing = attest.load_attestations(conn, tenant)
+            truth, _, _ = attest.load_truth(conn, tenant)
+            last = existing[-1] if existing else None
+            seq, prev = int(body["signer_seq"]), str(body["prev_hash"])
+            if seq != (last.signer_seq if last else 0) + 1 or prev != (last.attestation_hash if last else attest.GENESIS):
+                raise attest.AttestError("attestation_out_of_order", f"the next attestation is {(last.signer_seq if last else 0) + 1} and must name {(last.attestation_hash if last else attest.GENESIS)} as prev_hash", 409)
+            message = attest.attestation_message(str(body["kind"]), tenant, str(body["subject"]), str(body["subject_hash"]), seq, prev, str(body["signed_at"]))
+            row = attest.Attestation(signer_seq=seq, kind=str(body["kind"]), subject=str(body["subject"]), subject_hash=str(body["subject_hash"]), prev_hash=prev,
+                                     key_id=str(body["key_id"]), signed_at=str(body["signed_at"]), signature=sig,
+                                     attestation_hash=attest.attestation_hash(message, str(body["key_id"]), sig))
+            problems, _ = attest.evaluate_attestations(tenant, trust, existing + [row], truth)
+            mine = [p["problem"] for p in problems if p["subject"] == f"attestation {seq}"]
+            if mine:
+                code = "already_attested" if any("already attested" in m for m in mine) else "attestation_invalid"
+                raise attest.AttestError(code, "; ".join(mine), 409 if code == "already_attested" else 422)
+            try:
+                got = conn.execute("SELECT signer_seq, attestation_hash FROM jarvis_store_attestation(%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                                   (tenant, row.kind, row.subject, row.subject_hash, seq, prev, row.key_id, row.signed_at, sig)).fetchone()
+            except psycopg.DatabaseError as exc:
+                if getattr(exc, "sqlstate", "") == "JA001":
+                    raise attest.AttestError("attestation_out_of_order", str(exc).splitlines()[0], 409) from exc
+                raise
+        return {"signer_seq": got[0], "attestation_hash": got[1], "key_id": row.key_id}
+
+    def store_trust_statement(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Verify a root-signed trust statement against the pinned roots and the log so far, then add it."""
+        sig = attest.normalize_signature(str(body.get("signature", "")))
+        roots = attest.load_roots()
+        if not roots:
+            raise attest.AttestError("no_trust_root", f"no trust root is configured ({attest.ROOTS_ENV}); no statement can be verified, so none is stored", 409)
+        with self._tx() as conn:
+            conn.row_factory = tuple_row
+            tenant = self._tenant_key
+            existing = attest.load_statements(conn, tenant)
+            last = existing[-1] if existing else None
+            seq, prev = int(body["stmt_seq"]), str(body["prev_hash"])
+            if seq != (last.stmt_seq if last else 0) + 1 or prev != (last.statement_hash if last else attest.GENESIS):
+                raise attest.AttestError("statement_out_of_order", f"the next statement is {(last.stmt_seq if last else 0) + 1} and must name {(last.statement_hash if last else attest.GENESIS)} as prev_hash", 409)
+            kind, key_id = str(body["kind"]), str(body["key_id"])
+            arg = None if body.get("arg") is None else int(body["arg"])
+            shash = body.get("subject_hash") or None
+            message = attest.trust_message(kind, tenant, key_id, arg, shash, seq, prev)
+            row = attest.Statement(stmt_seq=seq, kind=kind, key_id=key_id, pubkey=body.get("pubkey") or None, arg=arg, subject_hash=shash, prev_hash=prev,
+                                   signed_by=str(body["signed_by"]), signature=sig, statement_hash=attest.statement_hash(message, str(body["signed_by"]), sig))
+            if kind == "cosign":
+                target = conn.execute("SELECT attestation_hash FROM attestations WHERE tenant_key = %s AND signer_seq = %s AND kind = 'checkpoint'", (tenant, arg)).fetchone()
+                if target is None or target[0] != shash:
+                    raise attest.AttestError("cosign_unknown_checkpoint", "there is no checkpoint attestation with that signer_seq and hash to cosign", 422)
+            if kind == "void":
+                target = conn.execute("SELECT attestation_hash FROM attestations WHERE tenant_key = %s AND signer_seq = %s", (tenant, arg)).fetchone()
+                if target is None or target[0] != shash:
+                    raise attest.AttestError("void_unknown_attestation", "there is no attestation with that signer_seq and hash to void", 422)
+            trust = attest.evaluate_trust(tenant, roots, existing + [row])
+            mine = [p["problem"] for p in trust.problems if p["subject"] == f"trust statement {seq}"]
+            if mine:
+                raise attest.AttestError("statement_invalid", "; ".join(mine), 422)
+            try:
+                got = conn.execute("SELECT stmt_seq, statement_hash FROM jarvis_store_trust_statement(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                                   (tenant, kind, key_id, row.pubkey, arg, shash, seq, prev, row.signed_by, sig)).fetchone()
+            except psycopg.DatabaseError as exc:
+                if getattr(exc, "sqlstate", "") == "JA001":
+                    raise attest.AttestError("statement_out_of_order", str(exc).splitlines()[0], 409) from exc
+                raise
+        return {"stmt_seq": got[0], "statement_hash": got[1], "kind": kind, "key_id": key_id}
 
     # -- Replay receipts (CES.Local.ReplayReceipt.v1 evidence objects) ------------
 

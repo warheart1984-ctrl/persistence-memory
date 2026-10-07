@@ -694,7 +694,148 @@ REVOKE ALL ON FUNCTION jarvis_seal_block(text, integer, interval, boolean, integ
 
 _V6 = _v6()
 
-MIGRATIONS: list[tuple[int, str]] = [(1, _V1), (2, _V2), (3, _V3), (4, _V4), (5, _V5), (6, _V6)]
+_V7 = """
+-- Signatures, verification side: the log of attestations (blocks, replay receipts, checkpoints) and the log of trust statements
+-- (which keys may sign).  Both append-only like record_history; the application role can read them and can only add a row
+-- through the store functions, which enforce the chain (gapless sequence, previous hash) and compute the hashes.  The signature
+-- itself is checked by the application before it calls the function (the database has no Ed25519), and again by every verifier.
+-- Nothing here holds a private key.
+CREATE FUNCTION jarvis_attestation_message(kind text, tenant text, subject text, subject_hash text, signer_seq bigint,
+                                           prev_hash text, signed_at text) RETURNS text LANGUAGE sql IMMUTABLE AS $fn$
+    SELECT 'jarvis-attest|v1|' || kind || '|' || octet_length(convert_to(tenant, 'UTF8'))::text || ':' || tenant || '|' ||
+           subject || '|' || subject_hash || '|' || signer_seq::text || '|' || prev_hash || '|' || signed_at
+$fn$;
+
+CREATE FUNCTION jarvis_trust_message(kind text, tenant text, key_id text, arg bigint, subject_hash text, stmt_seq bigint,
+                                     prev_hash text) RETURNS text LANGUAGE sql IMMUTABLE AS $fn$
+    SELECT 'jarvis-trust|v1|' || kind || '|' || octet_length(convert_to(tenant, 'UTF8'))::text || ':' || tenant || '|' ||
+           key_id || '|' || coalesce(arg::text, '') || '|' || coalesce(subject_hash, '') || '|' || stmt_seq::text || '|' || prev_hash
+$fn$;
+
+-- sha256(message || LF || key id || LF || signature): the signature is stored already normalised (LF line ends, no blanks around)
+CREATE FUNCTION jarvis_signed_hash(message text, key_id text, signature text) RETURNS text LANGUAGE sql IMMUTABLE AS $fn$
+    SELECT encode(sha256(convert_to(message || chr(10) || key_id || chr(10) || signature, 'UTF8')), 'hex')
+$fn$;
+
+CREATE TABLE attestations (
+    tenant_key       text        NOT NULL CHECK (tenant_key <> ''),
+    signer_seq       bigint      NOT NULL CHECK (signer_seq >= 1),
+    kind             text        NOT NULL CHECK (kind IN ('block', 'receipt', 'checkpoint')),
+    subject          text        NOT NULL CHECK (char_length(subject) BETWEEN 1 AND 300 AND subject !~ '[|[:cntrl:]]'),
+    subject_hash     text        NOT NULL CHECK (subject_hash ~ '^[0-9a-f]{64}$'),
+    prev_hash        text        NOT NULL CHECK (prev_hash ~ '^[0-9a-f]{64}$'),
+    key_id           text        NOT NULL CHECK (key_id ~ '^SHA256:[A-Za-z0-9+/]{43}$'),
+    signed_at        text        NOT NULL CHECK (signed_at ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'),
+    signature        text        NOT NULL CHECK (char_length(signature) BETWEEN 100 AND 4000
+                                                 AND signature = btrim(signature, ' ' || chr(10) || chr(13) || chr(9))
+                                                 AND position(chr(13) in signature) = 0),
+    attestation_hash text        NOT NULL CHECK (attestation_hash ~ '^[0-9a-f]{64}$'),
+    stored_at        timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant_key, signer_seq)
+);
+
+CREATE TABLE trust_statements (
+    tenant_key     text        NOT NULL CHECK (tenant_key <> ''),
+    stmt_seq       bigint      NOT NULL CHECK (stmt_seq >= 1),
+    kind           text        NOT NULL CHECK (kind IN ('key', 'revoke', 'root_add', 'cosign', 'void')),
+    key_id         text        NOT NULL CHECK (key_id ~ '^SHA256:[A-Za-z0-9+/]{43}$'),
+    pubkey         text        CHECK (pubkey IS NULL OR char_length(pubkey) BETWEEN 50 AND 600),
+    arg            bigint      CHECK (arg IS NULL OR arg >= 0),
+    subject_hash   text        CHECK (subject_hash IS NULL OR subject_hash ~ '^[0-9a-f]{64}$'),
+    prev_hash      text        NOT NULL CHECK (prev_hash ~ '^[0-9a-f]{64}$'),
+    signed_by      text        NOT NULL CHECK (signed_by ~ '^SHA256:[A-Za-z0-9+/]{43}$'),
+    signature      text        NOT NULL CHECK (char_length(signature) BETWEEN 100 AND 4000
+                                               AND signature = btrim(signature, ' ' || chr(10) || chr(13) || chr(9))
+                                               AND position(chr(13) in signature) = 0),
+    statement_hash text        NOT NULL CHECK (statement_hash ~ '^[0-9a-f]{64}$'),
+    stored_at      timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant_key, stmt_seq)
+);
+
+CREATE FUNCTION jarvis_signatures_immutable() RETURNS trigger LANGUAGE plpgsql AS $fn$
+BEGIN
+    RAISE EXCEPTION '% is append-only', TG_TABLE_NAME;
+END
+$fn$;
+CREATE TRIGGER attestations_no_update BEFORE UPDATE ON attestations FOR EACH ROW EXECUTE FUNCTION jarvis_signatures_immutable();
+CREATE TRIGGER attestations_no_delete BEFORE DELETE ON attestations FOR EACH ROW EXECUTE FUNCTION jarvis_signatures_immutable();
+CREATE TRIGGER attestations_no_truncate BEFORE TRUNCATE ON attestations FOR EACH STATEMENT EXECUTE FUNCTION jarvis_signatures_immutable();
+CREATE TRIGGER trust_statements_no_update BEFORE UPDATE ON trust_statements FOR EACH ROW EXECUTE FUNCTION jarvis_signatures_immutable();
+CREATE TRIGGER trust_statements_no_delete BEFORE DELETE ON trust_statements FOR EACH ROW EXECUTE FUNCTION jarvis_signatures_immutable();
+CREATE TRIGGER trust_statements_no_truncate BEFORE TRUNCATE ON trust_statements FOR EACH STATEMENT EXECUTE FUNCTION jarvis_signatures_immutable();
+ALTER TABLE attestations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE attestations FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON attestations USING (tenant_key = current_setting('jarvis.tenant_key', true))
+    WITH CHECK (tenant_key = current_setting('jarvis.tenant_key', true));
+ALTER TABLE trust_statements ENABLE ROW LEVEL SECURITY;
+ALTER TABLE trust_statements FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON trust_statements USING (tenant_key = current_setting('jarvis.tenant_key', true))
+    WITH CHECK (tenant_key = current_setting('jarvis.tenant_key', true));
+
+-- Add the next attestation.  Runs as the table owner; enforces the chain (the next signer_seq, the previous attestation's hash)
+-- and computes the stored hash.  SQLSTATE JA001 = the sequence or previous hash is wrong (someone else added one first).
+CREATE FUNCTION jarvis_store_attestation(p_tenant text, p_kind text, p_subject text, p_subject_hash text, p_signer_seq bigint,
+                                         p_prev_hash text, p_key_id text, p_signed_at text, p_signature text)
+RETURNS TABLE (signer_seq bigint, attestation_hash text) LANGUAGE plpgsql SECURITY DEFINER SET search_path FROM CURRENT AS $fn$
+DECLARE
+    last_seq bigint; last_hash text; msg text; h text;
+BEGIN
+    IF current_setting('jarvis.tenant_key', true) IS DISTINCT FROM p_tenant THEN
+        RAISE EXCEPTION 'jarvis_store_attestation: tenant % is not the session tenant', p_tenant;
+    END IF;
+    PERFORM pg_advisory_xact_lock(hashtextextended('jarvis-attest/' || p_tenant, 0));
+    SELECT a.signer_seq, a.attestation_hash INTO last_seq, last_hash
+        FROM attestations a WHERE a.tenant_key = p_tenant ORDER BY a.signer_seq DESC LIMIT 1;
+    IF NOT FOUND THEN
+        last_seq := 0; last_hash := repeat('0', 64);
+    END IF;
+    IF p_signer_seq <> last_seq + 1 THEN
+        RAISE EXCEPTION 'signer_seq must be % (the log head is %)', last_seq + 1, last_seq USING ERRCODE = 'JA001';
+    END IF;
+    IF p_prev_hash <> last_hash THEN
+        RAISE EXCEPTION 'prev_hash is not the hash of attestation %', last_seq USING ERRCODE = 'JA001';
+    END IF;
+    msg := jarvis_attestation_message(p_kind, p_tenant, p_subject, p_subject_hash, p_signer_seq, p_prev_hash, p_signed_at);
+    h := jarvis_signed_hash(msg, p_key_id, p_signature);
+    INSERT INTO attestations (tenant_key, signer_seq, kind, subject, subject_hash, prev_hash, key_id, signed_at, signature, attestation_hash)
+        VALUES (p_tenant, p_signer_seq, p_kind, p_subject, p_subject_hash, p_prev_hash, p_key_id, p_signed_at, p_signature, h);
+    RETURN QUERY SELECT p_signer_seq, h;
+END
+$fn$;
+
+CREATE FUNCTION jarvis_store_trust_statement(p_tenant text, p_kind text, p_key_id text, p_pubkey text, p_arg bigint,
+                                             p_subject_hash text, p_stmt_seq bigint, p_prev_hash text, p_signed_by text, p_signature text)
+RETURNS TABLE (stmt_seq bigint, statement_hash text) LANGUAGE plpgsql SECURITY DEFINER SET search_path FROM CURRENT AS $fn$
+DECLARE
+    last_seq bigint; last_hash text; msg text; h text;
+BEGIN
+    IF current_setting('jarvis.tenant_key', true) IS DISTINCT FROM p_tenant THEN
+        RAISE EXCEPTION 'jarvis_store_trust_statement: tenant % is not the session tenant', p_tenant;
+    END IF;
+    PERFORM pg_advisory_xact_lock(hashtextextended('jarvis-trust/' || p_tenant, 0));
+    SELECT t.stmt_seq, t.statement_hash INTO last_seq, last_hash
+        FROM trust_statements t WHERE t.tenant_key = p_tenant ORDER BY t.stmt_seq DESC LIMIT 1;
+    IF NOT FOUND THEN
+        last_seq := 0; last_hash := repeat('0', 64);
+    END IF;
+    IF p_stmt_seq <> last_seq + 1 THEN
+        RAISE EXCEPTION 'stmt_seq must be % (the log head is %)', last_seq + 1, last_seq USING ERRCODE = 'JA001';
+    END IF;
+    IF p_prev_hash <> last_hash THEN
+        RAISE EXCEPTION 'prev_hash is not the hash of statement %', last_seq USING ERRCODE = 'JA001';
+    END IF;
+    msg := jarvis_trust_message(p_kind, p_tenant, p_key_id, p_arg, p_subject_hash, p_stmt_seq, p_prev_hash);
+    h := jarvis_signed_hash(msg, p_signed_by, p_signature);
+    INSERT INTO trust_statements (tenant_key, stmt_seq, kind, key_id, pubkey, arg, subject_hash, prev_hash, signed_by, signature, statement_hash)
+        VALUES (p_tenant, p_stmt_seq, p_kind, p_key_id, p_pubkey, p_arg, p_subject_hash, p_prev_hash, p_signed_by, p_signature, h);
+    RETURN QUERY SELECT p_stmt_seq, h;
+END
+$fn$;
+REVOKE ALL ON FUNCTION jarvis_store_attestation(text, text, text, text, bigint, text, text, text, text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION jarvis_store_trust_statement(text, text, text, text, bigint, text, bigint, text, text, text) FROM PUBLIC;
+"""
+
+MIGRATIONS: list[tuple[int, str]] = [(1, _V1), (2, _V2), (3, _V3), (4, _V4), (5, _V5), (6, _V6), (7, _V7)]
 EXPECTED_SCHEMA_VERSION = MIGRATIONS[-1][0]
 
 
@@ -726,6 +867,13 @@ def _grant(conn: psycopg.Connection, schema: str, role: str) -> None:
         conn.execute(sql.SQL("REVOKE ALL ON blocks FROM {}").format(r))
         conn.execute(sql.SQL("GRANT SELECT ON blocks TO {}").format(r))
         conn.execute(sql.SQL("GRANT EXECUTE ON FUNCTION jarvis_seal_block(text, integer, interval, boolean, integer) TO {}").format(r))
+    if exists("attestations"):
+        # v7+: the application reads the signing logs and can only add to them through the store functions
+        for table in ("attestations", "trust_statements"):
+            conn.execute(sql.SQL("REVOKE ALL ON {} FROM {}").format(sql.Identifier(table), r))
+            conn.execute(sql.SQL("GRANT SELECT ON {} TO {}").format(sql.Identifier(table), r))
+        conn.execute(sql.SQL("GRANT EXECUTE ON FUNCTION jarvis_store_attestation(text, text, text, text, bigint, text, text, text, text) TO {}").format(r))
+        conn.execute(sql.SQL("GRANT EXECUTE ON FUNCTION jarvis_store_trust_statement(text, text, text, text, bigint, text, bigint, text, text, text) TO {}").format(r))
     if not exists("chain_heads") and exists("record_history"):
         # v2 only (transitional): the invoker-rights trigger inserts as the app role
         conn.execute(sql.SQL("GRANT SELECT, INSERT ON record_history TO {}").format(r))

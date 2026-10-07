@@ -89,6 +89,7 @@ from app import clause_v
 from app.clause_v import ClauseVViolation
 from app import evidence as evidence_objects
 from app import replay as replay_contracts
+from app import attest as attest_module
 from app.evidence import EvidenceError, EvidenceObjectCreate, require_operator_write
 from app.store import StoreUnavailableError, StoreVersionConflict, get_store
 from app.graph import (
@@ -240,6 +241,11 @@ async def _store_unavailable(request: Request, exc: StoreUnavailableError):
 async def _clause_v_violation(request: Request, exc: ClauseVViolation):
     # 422, no Retry-After: retrying the same write cannot succeed. The body names every reason.
     return JSONResponse(status_code=422, content=exc.body())
+
+
+@app.exception_handler(attest_module.AttestError)
+async def _attest_error(request: Request, exc: attest_module.AttestError):
+    return JSONResponse(status_code=exc.status, content={"detail": exc.message, "code": exc.code})
 
 
 @app.exception_handler(EvidenceError)
@@ -972,6 +978,91 @@ def get_replay_receipt(receipt_id: str):
 def verify_replay_receipt(receipt_id: str):
     """Re-derive a receipt: intact object, same state root, same counts, same sealed block (a receipt is only a claim until this passes)."""
     return _replay_call(get_store().verify_replay_receipt, receipt_id).model_dump()
+
+
+# --- Signatures: attestations and trust statements (operator key only; PostgreSQL row store only; verification side, nothing here signs) ---
+
+class AttestationBody(BaseModel):
+    """An attestation made elsewhere (by the signer, on the host).  The service verifies it before it stores it."""
+
+    kind: str = Field(min_length=1, max_length=20)
+    subject: str = Field(min_length=1, max_length=300)
+    subject_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    signer_seq: int = Field(ge=1)
+    prev_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    key_id: str = Field(pattern=r"^SHA256:[A-Za-z0-9+/]{43}$")
+    signed_at: str = Field(pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
+    signature: str = Field(min_length=100, max_length=4000)
+
+
+class TrustStatementBody(BaseModel):
+    """A trust statement signed by a root key (authorize or revoke a signing key, add a root, cosign a checkpoint)."""
+
+    kind: str = Field(min_length=1, max_length=20)
+    key_id: str = Field(pattern=r"^SHA256:[A-Za-z0-9+/]{43}$")
+    pubkey: str | None = Field(default=None, max_length=600)
+    arg: int | None = Field(default=None, ge=0)
+    subject_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    stmt_seq: int = Field(ge=1)
+    prev_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    signed_by: str = Field(pattern=r"^SHA256:[A-Za-z0-9+/]{43}$")
+    signature: str = Field(min_length=100, max_length=4000)
+
+
+def _sig_call(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except NotImplementedError as exc:
+        raise HTTPException(status_code=501, detail=str(exc)) from exc
+
+
+@app.get("/api/jarvis/attestations", dependencies=[Depends(require_operator_read)])
+def list_attestations(after_seq: int = Query(default=0, ge=0), limit: int = Query(default=100, ge=1, le=1000)):
+    rows = _sig_call(get_store().list_attestations, after_seq, limit)
+    return {"attestations": rows, "count": len(rows)}
+
+
+@app.get("/api/jarvis/attestations/head", dependencies=[Depends(require_operator_read)])
+def attestation_head():
+    """Where the signing log ends: the next signer_seq and the prev_hash the next attestation must name."""
+    return _sig_call(get_store().attestation_head)
+
+
+@app.get("/api/jarvis/attestations/pending", dependencies=[Depends(require_operator_read)])
+def pending_attestations():
+    """Sealed blocks and receipts that have no attestation yet (what a signer would sign next)."""
+    return _sig_call(get_store().pending_attestations)
+
+
+@app.get("/api/jarvis/attestations/verify", dependencies=[Depends(require_operator_read)])
+def verify_signatures():
+    """Check every attestation and trust statement against the pinned roots (never reports success without a trust root)."""
+    result = _sig_call(get_store().verify_signatures)
+    return {"ok": not result["problems"], **result}
+
+
+@app.post("/api/jarvis/attestations", dependencies=[Depends(require_operator_write)])
+def store_attestation(body: AttestationBody):
+    """Store an attestation after verifying its position in the log, its signature, the key's authorization and its subject."""
+    return _sig_call(get_store().store_attestation, body.model_dump())
+
+
+@app.get("/api/jarvis/trust", dependencies=[Depends(require_operator_read)])
+def trust_state():
+    """The pinned roots, the roots added since, the authorized signing keys (with revocation cutoffs) and the cosigned checkpoints."""
+    return _sig_call(get_store().trust_state)
+
+
+@app.get("/api/jarvis/trust/statements", dependencies=[Depends(require_operator_read)])
+def list_trust_statements(after_seq: int = Query(default=0, ge=0), limit: int = Query(default=100, ge=1, le=1000)):
+    rows = _sig_call(get_store().list_trust_statements, after_seq, limit)
+    return {"statements": rows, "count": len(rows)}
+
+
+@app.post("/api/jarvis/trust/statements", dependencies=[Depends(require_operator_write)])
+def store_trust_statement(body: TrustStatementBody):
+    """Store a root-signed statement after verifying it against the pinned roots and the statement log so far."""
+    return _sig_call(get_store().store_trust_statement, body.model_dump())
 
 
 @app.post("/api/jarvis/evidence", dependencies=[Depends(require_operator_write)])

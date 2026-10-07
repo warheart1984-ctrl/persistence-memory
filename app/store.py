@@ -490,6 +490,32 @@ class JarvisStore:
     def verify_replay_receipt(self, receipt_id: str) -> Any:
         raise NotImplementedError("Replay Contracts require the PostgreSQL row store")
 
+    # -- Signatures (PostgreSQL row store only) -------------------------------------------------------
+
+    def list_attestations(self, after_seq: int = 0, limit: int = 100) -> Any:
+        raise NotImplementedError("Signatures require the PostgreSQL row store")
+
+    def attestation_head(self) -> Any:
+        raise NotImplementedError("Signatures require the PostgreSQL row store")
+
+    def pending_attestations(self) -> Any:
+        raise NotImplementedError("Signatures require the PostgreSQL row store")
+
+    def verify_signatures(self) -> Any:
+        raise NotImplementedError("Signatures require the PostgreSQL row store")
+
+    def store_attestation(self, body: Any) -> Any:
+        raise NotImplementedError("Signatures require the PostgreSQL row store")
+
+    def list_trust_statements(self, after_seq: int = 0, limit: int = 100) -> Any:
+        raise NotImplementedError("Signatures require the PostgreSQL row store")
+
+    def trust_state(self) -> Any:
+        raise NotImplementedError("Signatures require the PostgreSQL row store")
+
+    def store_trust_statement(self, body: Any) -> Any:
+        raise NotImplementedError("Signatures require the PostgreSQL row store")
+
     def conflicts(self, subject: str | None = None) -> list[ConflictSet]:
         self._ensure_loaded()
         return detect_conflicts(list(self._memories.values()), subject=subject)
