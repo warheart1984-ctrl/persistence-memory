@@ -2,7 +2,7 @@
 
 **Status: partial.** `RC.Ledger.v1`, the ledger's own contract, is implemented on the PostgreSQL row store: state and events as of
 a point in the history, receipts at sealed points (stored as Evidence Objects), an offline verifier, `jarvisctl replay`, and a
-restore-drill step. No schema change (still v6). The five domain contracts (`RC.AIKI.v1`, `RC.ARIS.v1`, `RC.SX.v1`, `RC.Lineage.v1`,
+restore-drill step. No schema change (still v6). **Deployed to the Mint box on 2026-10-06** (routes, receipts, `jarvisctl replay`, the drill step); the domain contracts below are on hold. The five domain contracts (`RC.AIKI.v1`, `RC.ARIS.v1`, `RC.SX.v1`, `RC.Lineage.v1`,
 `RC.Mandala.v1`) are **declared only**: they have no schema files, no owner and no algorithm here. Receipts and the blocks they sit in can
 be signed (the signer, signature levels L0/L1/L2 in `replay verify`, the `JARVIS_SIGNATURES` switch: `SIGNATURES.md`), but that is built, not
 deployed: **nothing on the live ledger is signed**.

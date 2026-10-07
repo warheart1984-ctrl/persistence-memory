@@ -2,6 +2,11 @@
 # The rehearsal scenario. Run INSIDE the WSL distro as the normal user, by rehearse-wsl.sh:
 #   scenario.sh phase-a | phase-b | teardown
 # Prints ok/FAIL per check; exit status is non-zero if anything failed.
+#
+# DANGER: this scenario uses the REAL names (jarvis-db, jarvis-app, jarvis-migrate, jarvis-ledger_*), kills and removes them, destroys the
+# volumes, and in teardown deletes the user's jarvis-*.timer / .service units.  On a box that runs the live ledger that is the live ledger.
+# It therefore REFUSES to start unless the Docker engine is blank (see require_isolated_engine), and phase-b / teardown refuse unless THIS
+# engine passed that check in phase-a.  Do not weaken that to make it run somewhere else.
 set -uo pipefail
 
 PHASE="${1:-}"
@@ -19,6 +24,8 @@ BIN="$SRC/deploy/mint/bin"
 SEC="$SRC/deploy/mint/secrets"
 BK="$JARVIS_HOME/backups"
 PC=jarvis-rehearsal-pc
+UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"    # where install-units.sh puts the units (the guard and teardown use the same place)
+STAMP_MAX_MIN=1440                                          # a phase-a stamp older than this no longer authorizes phase-b or teardown
 
 PASS=0; FAIL=0
 ok()      { PASS=$((PASS + 1)); printf '  ok    %s\n' "$*"; }
@@ -45,8 +52,91 @@ live_anchors() { ( pg_exec() { docker exec -i -u postgres jarvis-db "$@"; }; sou
 finish() { printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"; exit $(( FAIL > 0 )); }
 
 # =================================================================================================================
+# The guard.  Nothing below may run a docker command before this has passed.
+refuse() {
+  echo "REFUSED: $*" >&2
+  echo "This rehearsal kills and removes containers, volumes, networks, images and systemd timers by their REAL names (jarvis-db, jarvis-app," >&2
+  echo "jarvis-ledger_*, jarvis-*.timer). It runs only in a dedicated WSL distro with its own Docker Engine and nothing of the ledger on it" >&2
+  echo "(deploy/mint/rehearse/rehearse-wsl.sh). To rehearse on a box that already runs the ledger, use scripts/chaos/throwaway_stack.sh instead." >&2
+  exit 2
+}
+engine_id() { docker info --format '{{.ID}}' 2>/dev/null; }
+# nothing may be listening on the ledger's ports (8001, 8011) or the rehearsal's (18001), checked with the status of ss itself
+require_ports_free() {
+  local listening
+  command -v ss >/dev/null 2>&1 || refuse "ss is needed to prove the ledger's port is not in use"
+  listening="$(ss -ltn 2>/dev/null)" || refuse "ss failed, so the ledger's port cannot be proven free"
+  if printf '%s\n' "$listening" | awk '{print $4}' | grep -qE "$1"; then
+    refuse "something is listening on a ledger port ($2)"
+  fi
+}
+# phase-b and teardown act on containers, volumes, networks and images by their real names.  Before they do, every ledger container on the engine must
+# have been created by THIS rehearsal's compose file (docker records the file's path in a label that survives a recreate), and a volume or network
+# of a ledger may exist only if such a container does.  An engine that was given to the live ledger since the stamp was written fails this.
+require_rehearsal_owns_the_ledger() {
+  local names name cfg owned=0 out want="$SRC/deploy/mint/docker-compose.yml"
+  names="$(docker ps -a --format '{{.Names}}' 2>/dev/null)" || refuse "docker ps failed, so the containers cannot be tied to this rehearsal"
+  for name in jarvis-db jarvis-app jarvis-migrate; do
+    printf '%s\n' "$names" | grep -qx "$name" || continue
+    cfg="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project.config_files"}}' "$name" 2>/dev/null)" || refuse "cannot inspect container $name"
+    [ "$cfg" = "$want" ] || refuse "container $name was not created by this rehearsal's compose file (it says: ${cfg:-nothing}; expected $want)"
+    owned=1
+  done
+  out="$(docker volume ls -q 2>/dev/null)" || refuse "docker volume ls failed, so the volumes cannot be tied to this rehearsal"
+  if printf '%s\n' "$out" | grep -qE '^jarvis-(ledger|drill)' && [ "$owned" = 0 ]; then
+    refuse "volumes of a ledger exist but no container of this rehearsal owns them"
+  fi
+  out="$(docker network ls --format '{{.Name}}' 2>/dev/null)" || refuse "docker network ls failed, so the networks cannot be tied to this rehearsal"
+  if printf '%s\n' "$out" | grep -qE '^(jarvis-ledger_|jarvis-drill)' && [ "$owned" = 0 ]; then
+    refuse "networks of a ledger exist but no container of this rehearsal owns them"
+  fi
+}
+require_isolated_engine() {
+  local phase="$1" stamp="$R/engine.ok" eid found
+  # A phase-a that is refused (or fails to prove anything) must not leave an OLD stamp behind to authorize a later teardown on an engine
+  # that has since been given to the live ledger: the stamp is removed before anything else is asked.
+  [ "$phase" != phase-a ] || rm -f "$stamp"
+  command -v docker >/dev/null 2>&1 || refuse "docker is not installed here"
+  eid="$(engine_id)"
+  [ -n "$eid" ] || refuse "cannot read this Docker engine's identity (docker info failed), so it cannot be proven to be a dedicated engine"
+  ENGINE_ID_VALIDATED="$eid"          # the id the guard itself read; phase-a records THIS, it does not ask the engine a second time
+  if [ "$phase" = phase-a ]; then
+    # Every probe's exit status is checked BEFORE its output is filtered: a probe that fails (a daemon hiccup, a missing tool) says nothing about
+    # the engine, and an empty answer from a failed probe must never be read as "blank".
+    local out
+    out="$(docker ps -a --format '{{.Names}}' 2>/dev/null)" || refuse "docker ps failed, so this engine cannot be proven blank"
+    found="$(printf '%s\n' "$out" | grep -E '^(jarvis-db|jarvis-app|jarvis-migrate|jarvis-drill-db|jarvis-rehearsal-pc)$' | paste -sd' ' -)"
+    [ -z "$found" ] || refuse "containers with the ledger's names already exist on this engine: $found"
+    out="$(docker volume ls -q 2>/dev/null)" || refuse "docker volume ls failed, so this engine cannot be proven blank"
+    found="$(printf '%s\n' "$out" | grep -E '^jarvis-(ledger|drill)' | paste -sd' ' -)"
+    [ -z "$found" ] || refuse "volumes of a ledger already exist on this engine: $found"
+    out="$(docker network ls --format '{{.Name}}' 2>/dev/null)" || refuse "docker network ls failed, so this engine cannot be proven blank"
+    found="$(printf '%s\n' "$out" | grep -E '^(jarvis-ledger_|jarvis-drill)' | paste -sd' ' -)"
+    [ -z "$found" ] || refuse "networks of a ledger already exist on this engine: $found"
+    out="$(docker image ls --format '{{.Repository}}:{{.Tag}}' 2>/dev/null)" || refuse "docker image ls failed, so this engine cannot be proven blank"
+    found="$(printf '%s\n' "$out" | grep -E '^(jarvis-ledger-app|jarvis-ledger-db):' | paste -sd' ' -)"
+    [ -z "$found" ] || refuse "images of a ledger build already exist on this engine: $found"
+    require_ports_free ':(8001|8011|18001)$' "8001, 8011 or 18001"
+    [ ! -e "$HOME/jarvis-ledger" ] || refuse "$HOME/jarvis-ledger exists: this account runs (or ran) the live ledger"
+    found="$(ls "$UNIT_DIR"/jarvis-*.timer "$UNIT_DIR"/jarvis-*.service "$HOME"/.config/systemd/user/jarvis-*.timer "$HOME"/.config/systemd/user/jarvis-*.service 2>/dev/null | sort -u | paste -sd' ' -)"
+    [ -z "$found" ] || refuse "this account already has the ledger's systemd units: $found"
+  else
+    [ -f "$stamp" ] || refuse "no $stamp: phase-a never passed on this engine, so it is not proven to be a rehearsal engine"
+    [ "$(cat "$stamp")" = "$eid" ] || refuse "this Docker engine is not the one that passed the blank-engine check in phase-a"
+    [ -z "$(find "$stamp" -mmin "+$STAMP_MAX_MIN" 2>/dev/null)" ] || refuse "$stamp is older than $STAMP_MAX_MIN minutes: a leftover from an old rehearsal (remove it only on an engine you know is the rehearsal's)"
+    # even with a valid stamp: an engine that is serving the live ledger is not a rehearsal engine, whatever it once was
+    [ ! -e "$HOME/jarvis-ledger" ] || refuse "$HOME/jarvis-ledger exists: this account runs (or ran) the live ledger"
+    require_ports_free ':(8001|8011)$' "8001 or 8011"
+    require_rehearsal_owns_the_ledger
+  fi
+  [ "${REHEARSAL_GUARD_ONLY:-0}" != 1 ] || { echo "guard passed ($phase)"; exit 0; }   # for the guard's own tests
+}
+
+# =================================================================================================================
 prepare() {
   rm -rf "$R"; mkdir -p "$SRC" "$JARVIS_HOME"
+  [ -n "${ENGINE_ID_VALIDATED:-}" ] || refuse "internal: the guard did not record an engine id"
+  printf '%s\n' "$ENGINE_ID_VALIDATED" > "$R/engine.ok" || refuse "cannot record the engine stamp in $R"   # the proof that this engine was blank when the rehearsal began
   # the working tree minus anything private: no data/, no .git, no secrets
   tar -C "$SRC_FROM" --exclude='__pycache__' --exclude='*.pyc' --exclude='deploy/mint/secrets' \
       -cf - app mcp_server agent-hooks pyproject.toml deploy | tar -xf - -C "$SRC"
@@ -425,16 +515,21 @@ teardown() {
   cd "$SRC/deploy/mint" 2>/dev/null || true
   systemctl --user disable --now jarvis-backup.timer jarvis-offsite.timer jarvis-drill.timer jarvis-watchdog.timer jarvis-heal.timer >/dev/null 2>&1
   systemctl --user stop jarvis-backup.service jarvis-offsite.service jarvis-drill.service jarvis-watchdog.service jarvis-heal.service >/dev/null 2>&1
-  rm -f "$HOME"/.config/systemd/user/jarvis-*.service "$HOME"/.config/systemd/user/jarvis-*.timer
+  rm -f "$UNIT_DIR"/jarvis-*.service "$UNIT_DIR"/jarvis-*.timer
   systemctl --user daemon-reload >/dev/null 2>&1
+  # the images are removed by ID, and only those that this rehearsal's own (label-checked) containers run; never by tag
+  imgs="$(docker inspect -f '{{.Image}}' jarvis-db jarvis-app jarvis-migrate 2>/dev/null | sort -u | paste -sd' ' -)"
   docker compose -f "$SRC/deploy/mint/docker-compose.yml" down -v >/dev/null 2>&1
   docker rm -f "$PC" jarvis-db jarvis-app jarvis-migrate jarvis-drill-db >/dev/null 2>&1
   docker network rm jarvis-ledger_ledger jarvis-drill-net >/dev/null 2>&1
   docker volume rm -f jarvis-ledger_pgdata jarvis-ledger_appdata >/dev/null 2>&1
-  docker rmi -f "$PC" jarvis-ledger-app:local jarvis-ledger-db:16 >/dev/null 2>&1
+  # shellcheck disable=SC2086  # $imgs is a list of image ids
+  docker rmi -f "$PC" $imgs >/dev/null 2>&1
   rm -rf "$R"
   echo "rehearsal environment removed"
 }
+
+case "$PHASE" in phase-a|phase-b|teardown) require_isolated_engine "$PHASE" ;; esac
 
 case "$PHASE" in
   phase-a)  phase_a ;;

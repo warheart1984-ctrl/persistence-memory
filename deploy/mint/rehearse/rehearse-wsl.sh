@@ -10,6 +10,8 @@
 # Phase B  : the stack, the data and the timers must have come back by themselves; then rotation, a deliberate
 #            DESTROY of every volume, RESTORE from backup, and a final audit.
 # Everything lives under ~/jarvis-rehearsal in the distro and is removed at the end (KEEP=1 keeps it).
+# scenario.sh uses the real container/volume/timer names and refuses to run on an engine that has any trace of the ledger: run this only
+# in the dedicated distro, never against the box that serves the ledger.
 set -uo pipefail
 export MSYS_NO_PATHCONV=1
 
