@@ -76,7 +76,7 @@ def test_the_docs_and_the_sample_log_use_the_computed_count():
     assert f"{n} probes per round" in doc and f"{n * 100} probe runs" in doc, "docs/chaos/CL_CHAOS_100x.md does not state the computed count"
     for other in re.findall(r"(\d+) probes per round", doc):
         assert int(other) == n
-    sample = (DOCS / "sample-smoke-round.log").read_text().splitlines()
+    sample = (DOCS / "sample-smoke-round.txt").read_text().splitlines()
     assert f"{n} probes per round, 1 round(s) = {n} probe runs" in sample[0]
     lines = [l for l in sample if re.match(r"r001 [A-H]\d ", l)]
     assert len(lines) == n and [l.split()[1] for l in lines] == [p.id for p in chaos.PROBES]
@@ -255,8 +255,15 @@ def test_the_stack_script_refuses_the_live_port_and_a_directory_inside_the_repo_
     assert r.returncode != 0 and "live stack's port" in r.stderr and not (tmp_path / "s").exists()
     r = stack_sh("up", env={"JARVIS_CHAOS_DIR": str(ROOT / "deploy" / "chaos-x")}, bindir=bindir)
     assert r.returncode != 0 and "inside the repository" in r.stderr and not (ROOT / "deploy" / "chaos-x").exists()
-    r = stack_sh("up", env={"JARVIS_CHAOS_DIR": str(Path.home() / "jarvis-ledger" / "chaos")}, bindir=bindir)
-    assert r.returncode != 0 and "live ledger home" in r.stderr
+    fake_home = tmp_path / "home"          # no ~/jarvis-ledger here, as on a CI runner: the guard must not need the live directory to exist
+    fake_home.mkdir()
+    for target in (fake_home / "jarvis-ledger" / "chaos", fake_home / "jarvis-ledger", fake_home / "jarvis-ledger" / "a" / "b" / ".." / "c"):
+        r = stack_sh("up", env={"JARVIS_CHAOS_DIR": str(target), "HOME": str(fake_home)}, bindir=bindir)
+        assert r.returncode != 0 and "live ledger home" in r.stderr and not (fake_home / "jarvis-ledger").exists(), (target, r.stderr)
+    link = tmp_path / "linkhome"
+    link.symlink_to(ROOT)
+    r = stack_sh("up", env={"JARVIS_CHAOS_DIR": str(link / "chaos-y")}, bindir=bindir)
+    assert r.returncode != 0 and "inside the repository" in r.stderr   # a symlink into the repository does not get round the guard
     assert not log.exists() or log.read_text() == ""   # no docker command ran before the refusals
 
 

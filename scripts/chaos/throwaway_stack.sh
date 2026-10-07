@@ -25,8 +25,12 @@ die() { echo "throwaway_stack: $*" >&2; exit 1; }
 live_guard() {
   [ "$PORT" != 8011 ] || die "port 8011 is the live stack's port"
   case "$PORT" in ''|*[!0-9]*) die "bad port $PORT" ;; esac
-  case "$(cd "$(dirname "$CHAOS_DIR")" 2>/dev/null && pwd)/$(basename "$CHAOS_DIR")" in
-    "$REPO"/*|"$HOME/jarvis-ledger"|"$HOME/jarvis-ledger"/*) die "refusing a directory inside the repository or the live ledger home: $CHAOS_DIR" ;;
+  # the path is normalised WITHOUT needing it (or its parent) to exist: a guard that depends on the live directory being there is no guard
+  local dir; dir="$(python3 -c 'import os,sys; print(os.path.realpath(os.path.abspath(sys.argv[1])))' "$CHAOS_DIR")"
+  local home_ledger; home_ledger="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$HOME/jarvis-ledger")"
+  case "$dir" in
+    "$REPO"|"$REPO"/*) die "refusing a directory inside the repository: $CHAOS_DIR" ;;
+    "$home_ledger"|"$home_ledger"/*) die "refusing a directory inside the live ledger home: $CHAOS_DIR" ;;
   esac
 }
 
