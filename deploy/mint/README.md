@@ -293,3 +293,9 @@ host key), real systemd timers, a `docker kill` of the database and the self-hea
 policy, a `wsl --terminate` reboot, credential rotation, a deliberate destruction of every volume, and a restore
 that must reproduce every record, hash, anchor and file. The self-heal and crash checks were added after the last
 full rehearsal run; they were run on the real box, not re-run in WSL.
+
+**The rehearsal is destructive by design and uses the real names** (`jarvis-db`, `jarvis-app`, `jarvis-ledger_*`, the user's `jarvis-*.timer`
+units), so `rehearse/scenario.sh` refuses to start unless the Docker engine is blank (no ledger containers, volumes, networks or images, nothing
+on 8001/8011/18001, no `~/jarvis-ledger`, no ledger systemd units), and `phase-b` / `teardown` refuse unless the same engine stamped itself in
+`phase-a`. On a box that already runs the ledger it exits 2 before any docker command. To exercise a running box's build, use
+`scripts/chaos/throwaway_stack.sh` (own names, port and secrets) and `docs/chaos/CL_CHAOS_100x.md`.
