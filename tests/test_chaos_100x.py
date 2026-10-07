@@ -145,7 +145,7 @@ def test_the_flag_lifts_only_the_live_refusals_and_the_chaos_task_never_passes_i
     got = chaos.assess_target("http://127.0.0.1:8011", ready("jarvis-live"), allow_live=True, ports={8011})
     assert got["port"] == 8011
     # nothing in the repository's chaos tooling or docs runs the hammer with the flag
-    for path in [SCRIPT, STACK_SH, *DOCS.glob("*")]:
+    for path in [SCRIPT, STACK_SH, *(p for p in DOCS.rglob("*") if p.is_file())]:
         for line in path.read_text(errors="replace").splitlines():
             if "--i-know-this-is-live" in line:
                 assert not re.search(r"cl_chaos_100x\.py[^`]*--i-know-this-is-live", line) or "never" in line.lower() or "do not" in line.lower(), (path, line)
