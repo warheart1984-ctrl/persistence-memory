@@ -211,4 +211,110 @@ def test_the_guard_runs_before_any_other_command_in_the_script():
 def test_phase_a_writes_the_engine_stamp_only_after_it_has_wiped_its_own_directory():
     text = SCENARIO.read_text()
     body = text[text.index("prepare() {"):text.index("phase_a() {")]
-    assert body.index('rm -rf "$R"') < body.index('engine_id > "$R/engine.ok"')
+    assert body.index('rm -rf "$R"') < body.index('> "$R/engine.ok"')
+
+
+# --- review follow-ups: stale stamps, the XDG unit directory, a failed stamp write ----------------------------------------------------------
+
+def stamp_path(box):
+    return box.home / "jarvis-rehearsal" / "engine.ok"
+
+
+def write_stamp(box, engine="ENGINE-A", age_minutes=0):
+    stamp = stamp_path(box)
+    stamp.parent.mkdir(exist_ok=True)
+    stamp.write_text(engine + "\n")
+    if age_minutes:
+        old = stamp.stat().st_mtime - age_minutes * 60
+        os.utime(stamp, (old, old))
+    return stamp
+
+
+def test_a_refused_phase_a_removes_an_old_stamp_so_a_later_teardown_cannot_use_it(box):
+    """An engine that passed once, was left with KEEP=1 or after an interruption, and was then given to the live ledger: the next driver run's
+    phase-a refuses, and its EXIT cleanup (teardown) must not be authorized by the old stamp."""
+    stamp = write_stamp(box)
+    (box.state / "containers").write_text("jarvis-db\njarvis-app\n")          # the live ledger is on this engine now
+    refused(run(box, "phase-a"), "containers with the ledger's names")
+    assert not stamp.exists()
+    refused(run(box, "teardown"), "phase-a never passed on this engine")
+    assert_nothing_destructive_ran(box)
+
+
+@pytest.mark.parametrize("make_refuse", [
+    lambda b: (b.state / "ports").write_text("8011\n"),
+    lambda b: (b.home / "jarvis-ledger").mkdir(),
+    lambda b: (b.state / "fail").write_text("ps -a"),
+])
+def test_phase_a_removes_the_old_stamp_whatever_it_is_refused_for(box, make_refuse):
+    stamp = write_stamp(box)
+    make_refuse(box)
+    assert run(box, "phase-a").returncode == 2
+    assert not stamp.exists()
+
+
+def test_a_stamp_expires(box):
+    write_stamp(box, age_minutes=24 * 60 + 5)
+    for phase in ("phase-b", "teardown"):
+        refused(run(box, phase), "is older than")
+    write_stamp(box, age_minutes=60)
+    assert run(box, "teardown").returncode == 0
+
+
+@pytest.mark.parametrize("phase", ["phase-b", "teardown"])
+def test_a_valid_stamp_does_not_authorize_anything_on_an_engine_that_serves_the_live_ledger(box, phase):
+    write_stamp(box)
+    (box.home / "jarvis-ledger").mkdir()
+    refused(run(box, phase), "runs (or ran) the live ledger")
+    (box.home / "jarvis-ledger").rmdir()
+    (box.state / "ports").write_text("8011\n")
+    refused(run(box, phase), "something is listening on a ledger port")
+    (box.state / "ports").write_text("8001\n")
+    refused(run(box, phase), "something is listening on a ledger port")
+    (box.state / "ports").write_text("18001\n")                                # the rehearsal's own port is expected during a rehearsal
+    assert run(box, phase).returncode == 0
+    assert_nothing_destructive_ran(box)
+
+
+def test_later_phases_refuse_when_ss_fails(box):
+    write_stamp(box)
+    (box.state / "fail").write_text("ss")
+    refused(run(box, "teardown"), "ss failed")
+
+
+@pytest.mark.parametrize("unit", ["jarvis-backup.timer", "jarvis-seal.timer", "jarvis-sign.service"])
+def test_the_xdg_unit_directory_is_checked_where_install_units_puts_the_units(box, unit):
+    xdg = box.tmp / "xdgconfig"
+    (xdg / "systemd" / "user").mkdir(parents=True)
+    (xdg / "systemd" / "user" / unit).write_text("[Timer]\n")
+    refused(run(box, "phase-a", extra_env={"XDG_CONFIG_HOME": str(xdg)}), "already has the ledger's systemd units")
+    assert (xdg / "systemd" / "user" / unit).exists()
+    # and the default location is still checked when XDG_CONFIG_HOME points somewhere empty
+    empty = box.tmp / "emptyxdg"
+    empty.mkdir()
+    d = box.home / ".config" / "systemd" / "user"
+    d.mkdir(parents=True)
+    (d / unit).write_text("[Timer]\n")
+    refused(run(box, "phase-a", extra_env={"XDG_CONFIG_HOME": str(empty)}), "already has the ledger's systemd units")
+
+
+def test_teardown_removes_units_only_from_the_directory_install_units_used():
+    text = SCENARIO.read_text()
+    assert 'rm -f "$UNIT_DIR"/jarvis-*.service "$UNIT_DIR"/jarvis-*.timer' in text
+    assert 'UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"' in text
+    assert 'dest="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"' in (SCENARIO.parents[1] / "bin" / "install-units.sh").read_text()
+
+
+def test_the_stamp_records_the_id_the_guard_already_validated_and_a_failed_write_is_a_refusal(box):
+    text = SCENARIO.read_text()
+    assert "engine_id > " not in text                                           # no second question to the engine
+    assert 'ENGINE_ID_VALIDATED="$eid"' in text and 'printf \'%s\\n\' "$ENGINE_ID_VALIDATED" > "$R/engine.ok" || refuse' in text
+    if os.geteuid() == 0:
+        pytest.skip("root can write anywhere")
+    box.home.chmod(0o555)                                                       # prepare cannot create ~/jarvis-rehearsal
+    try:
+        r = run(box, "phase-a", guard_only=False)
+    finally:
+        box.home.chmod(0o755)
+    assert r.returncode == 2 and "cannot record the engine stamp" in r.stderr, (r.returncode, r.stderr)
+    assert_nothing_destructive_ran(box)

@@ -24,6 +24,8 @@ BIN="$SRC/deploy/mint/bin"
 SEC="$SRC/deploy/mint/secrets"
 BK="$JARVIS_HOME/backups"
 PC=jarvis-rehearsal-pc
+UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"    # where install-units.sh puts the units (the guard and teardown use the same place)
+STAMP_MAX_MIN=1440                                          # a phase-a stamp older than this no longer authorizes phase-b or teardown
 
 PASS=0; FAIL=0
 ok()      { PASS=$((PASS + 1)); printf '  ok    %s\n' "$*"; }
@@ -59,11 +61,24 @@ refuse() {
   exit 2
 }
 engine_id() { docker info --format '{{.ID}}' 2>/dev/null; }
+# nothing may be listening on the ledger's ports (8001, 8011) or the rehearsal's (18001), checked with the status of ss itself
+require_ports_free() {
+  local listening
+  command -v ss >/dev/null 2>&1 || refuse "ss is needed to prove the ledger's port is not in use"
+  listening="$(ss -ltn 2>/dev/null)" || refuse "ss failed, so the ledger's port cannot be proven free"
+  if printf '%s\n' "$listening" | awk '{print $4}' | grep -qE "$1"; then
+    refuse "something is listening on a ledger port ($2)"
+  fi
+}
 require_isolated_engine() {
   local phase="$1" stamp="$R/engine.ok" eid found
+  # A phase-a that is refused (or fails to prove anything) must not leave an OLD stamp behind to authorize a later teardown on an engine
+  # that has since been given to the live ledger: the stamp is removed before anything else is asked.
+  [ "$phase" != phase-a ] || rm -f "$stamp"
   command -v docker >/dev/null 2>&1 || refuse "docker is not installed here"
   eid="$(engine_id)"
   [ -n "$eid" ] || refuse "cannot read this Docker engine's identity (docker info failed), so it cannot be proven to be a dedicated engine"
+  ENGINE_ID_VALIDATED="$eid"          # the id the guard itself read; phase-a records THIS, it does not ask the engine a second time
   if [ "$phase" = phase-a ]; then
     # Every probe's exit status is checked BEFORE its output is filtered: a probe that fails (a daemon hiccup, a missing tool) says nothing about
     # the engine, and an empty answer from a failed probe must never be read as "blank".
@@ -80,17 +95,17 @@ require_isolated_engine() {
     out="$(docker image ls --format '{{.Repository}}:{{.Tag}}' 2>/dev/null)" || refuse "docker image ls failed, so this engine cannot be proven blank"
     found="$(printf '%s\n' "$out" | grep -E '^(jarvis-ledger-app|jarvis-ledger-db):' | paste -sd' ' -)"
     [ -z "$found" ] || refuse "images of a ledger build already exist on this engine: $found"
-    command -v ss >/dev/null 2>&1 || refuse "ss is needed to prove the ledger's port is not in use"
-    out="$(ss -ltn 2>/dev/null)" || refuse "ss failed, so the ledger's port cannot be proven free"
-    if printf '%s\n' "$out" | awk '{print $4}' | grep -qE ':(8001|8011|18001)$'; then
-      refuse "something is listening on 8001, 8011 or 18001 (a ledger, or the rehearsal's port)"
-    fi
+    require_ports_free ':(8001|8011|18001)$' "8001, 8011 or 18001"
     [ ! -e "$HOME/jarvis-ledger" ] || refuse "$HOME/jarvis-ledger exists: this account runs (or ran) the live ledger"
-    found="$(ls "$HOME"/.config/systemd/user/jarvis-*.timer "$HOME"/.config/systemd/user/jarvis-*.service 2>/dev/null | paste -sd' ' -)"
+    found="$(ls "$UNIT_DIR"/jarvis-*.timer "$UNIT_DIR"/jarvis-*.service "$HOME"/.config/systemd/user/jarvis-*.timer "$HOME"/.config/systemd/user/jarvis-*.service 2>/dev/null | sort -u | paste -sd' ' -)"
     [ -z "$found" ] || refuse "this account already has the ledger's systemd units: $found"
   else
     [ -f "$stamp" ] || refuse "no $stamp: phase-a never passed on this engine, so it is not proven to be a rehearsal engine"
     [ "$(cat "$stamp")" = "$eid" ] || refuse "this Docker engine is not the one that passed the blank-engine check in phase-a"
+    [ -z "$(find "$stamp" -mmin "+$STAMP_MAX_MIN" 2>/dev/null)" ] || refuse "$stamp is older than $STAMP_MAX_MIN minutes: a leftover from an old rehearsal (remove it only on an engine you know is the rehearsal's)"
+    # even with a valid stamp: an engine that is serving the live ledger is not a rehearsal engine, whatever it once was
+    [ ! -e "$HOME/jarvis-ledger" ] || refuse "$HOME/jarvis-ledger exists: this account runs (or ran) the live ledger"
+    require_ports_free ':(8001|8011)$' "8001 or 8011"
   fi
   [ "${REHEARSAL_GUARD_ONLY:-0}" != 1 ] || { echo "guard passed ($phase)"; exit 0; }   # for the guard's own tests
 }
@@ -98,7 +113,8 @@ require_isolated_engine() {
 # =================================================================================================================
 prepare() {
   rm -rf "$R"; mkdir -p "$SRC" "$JARVIS_HOME"
-  engine_id > "$R/engine.ok"                                 # the proof that this engine was blank when the rehearsal began
+  [ -n "${ENGINE_ID_VALIDATED:-}" ] || refuse "internal: the guard did not record an engine id"
+  printf '%s\n' "$ENGINE_ID_VALIDATED" > "$R/engine.ok" || refuse "cannot record the engine stamp in $R"   # the proof that this engine was blank when the rehearsal began
   # the working tree minus anything private: no data/, no .git, no secrets
   tar -C "$SRC_FROM" --exclude='__pycache__' --exclude='*.pyc' --exclude='deploy/mint/secrets' \
       -cf - app mcp_server agent-hooks pyproject.toml deploy | tar -xf - -C "$SRC"
@@ -477,7 +493,7 @@ teardown() {
   cd "$SRC/deploy/mint" 2>/dev/null || true
   systemctl --user disable --now jarvis-backup.timer jarvis-offsite.timer jarvis-drill.timer jarvis-watchdog.timer jarvis-heal.timer >/dev/null 2>&1
   systemctl --user stop jarvis-backup.service jarvis-offsite.service jarvis-drill.service jarvis-watchdog.service jarvis-heal.service >/dev/null 2>&1
-  rm -f "$HOME"/.config/systemd/user/jarvis-*.service "$HOME"/.config/systemd/user/jarvis-*.timer
+  rm -f "$UNIT_DIR"/jarvis-*.service "$UNIT_DIR"/jarvis-*.timer
   systemctl --user daemon-reload >/dev/null 2>&1
   docker compose -f "$SRC/deploy/mint/docker-compose.yml" down -v >/dev/null 2>&1
   docker rm -f "$PC" jarvis-db jarvis-app jarvis-migrate jarvis-drill-db >/dev/null 2>&1
