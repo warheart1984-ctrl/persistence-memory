@@ -1,0 +1,13 @@
+CL_CHAOS_100x: seed 4647e98a; 52 probes per round, 100 round(s) = 5200 probe runs; target http://127.0.0.1:18017 stack chaos-throwaway:jarvis-chaos100x; destructive probes ENABLED
+r001 I1  PASS     19094ms  kill -9 the application container mid-write: nothing is acknowledged while it is down; the self-heal restarts it; the gates hold
+r001 J1  PASS     24813ms  partition the application from the database mid-transaction: fails closed, heals, and the gates hold
+r001 K1  PASS     14302ms  fill the database volume until writes fail, then free it: fails closed, recovers, and the gates hold
+r002 I1  PASS     18263ms  kill -9 the application container mid-write: nothing is acknowledged while it is down; the self-heal restarts it; the gates hold
+r002 J1  PASS     27491ms  partition the application from the database mid-transaction: fails closed, heals, and the gates hold
+r002 K1  PASS     15996ms  fill the database volume until writes fail, then free it: fails closed, recovers, and the gates hold
+r003 I1  PASS     19684ms  kill -9 the application container mid-write: nothing is acknowledged while it is down; the self-heal restarts it; the gates hold
+r003 J1  PASS     25498ms  partition the application from the database mid-transaction: fails closed, heals, and the gates hold
+r003 K1  PASS     14021ms  fill the database volume until writes fail, then free it: fails closed, recovers, and the gates hold
+r004 I1  PASS     18806ms  kill -9 the application container mid-write: nothing is acknowledged while it is down; the self-heal restarts it; the gates hold
+r004 J1  PASS     23998ms  partition the application from the database mid-transaction: fails closed, heals, and the gates hold
+r004 K1  FAIL      7733ms  fill the database volume until writes fail, then free it: fails closed, recovers, and the gates hold  -- 2 write(s) begun after the fault were acknowledged with 200 while it was in force (first: k1w1n12)

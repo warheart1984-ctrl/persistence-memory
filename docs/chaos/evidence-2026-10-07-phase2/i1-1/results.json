@@ -1,0 +1,174 @@
+{
+  "name": "CL_CHAOS_100x",
+  "probes_per_round": 52,
+  "rounds_requested": 1,
+  "rounds_completed": 1,
+  "probe_runs": 1,
+  "expected_probe_runs": 52,
+  "capped": null,
+  "seconds": 26.6,
+  "status_counts": {
+    "PASS": 1
+  },
+  "failures": [],
+  "skips": [],
+  "per_probe": {
+    "I1": {
+      "PASS": 1
+    }
+  },
+  "requests": 1643,
+  "http_statuses": {
+    "0": 880,
+    "200": 763
+  },
+  "five_xx_total": 880,
+  "five_xx_expected": 880,
+  "five_xx_unexpected": [],
+  "five_xx_by_probe": {
+    "I1:0": 880
+  },
+  "latency_ms": {
+    "all": {
+      "p50": 2.0,
+      "p95": 27.2,
+      "p99": 77.7,
+      "max": 1052.8,
+      "mean": 15.3
+    },
+    "per_probe": {
+      "-": {
+        "n": 2,
+        "p50": 4.8,
+        "p95": 5.2,
+        "p99": 5.2,
+        "max": 5.2
+      },
+      "I1": {
+        "n": 1641,
+        "p50": 2.0,
+        "p95": 27.2,
+        "p99": 77.7,
+        "max": 1052.8
+      }
+    }
+  },
+  "writes": 744,
+  "metrics": {
+    "faults": {
+      "I1": [
+        {
+          "detect_s": 0.0,
+          "recover_s": 7.43,
+          "docker_restarted_it_itself": false,
+          "heal_run_after_s": 4.02,
+          "startup_after_heal_s": 3.41,
+          "worst_case_recover_s": 63.41,
+          "restarted_after_s": 4.37,
+          "ready_statuses": {
+            "0": 27,
+            "200": 3
+          },
+          "writes_during_fault": 427,
+          "statuses_during_fault": {
+            "0": 427
+          },
+          "longest_request_s": 1.05,
+          "attempts": 1595,
+          "acknowledged": 742,
+          "failed": 853,
+          "landed_but_unacknowledged": 1
+        }
+      ]
+    }
+  },
+  "fault_summary": {
+    "I1": {
+      "runs": 1,
+      "detect_s": {
+        "min": 0.0,
+        "median": 0.0,
+        "max": 0.0
+      },
+      "recover_s": {
+        "min": 7.43,
+        "median": 7.43,
+        "max": 7.43
+      },
+      "longest_request_s": {
+        "min": 1.05,
+        "median": 1.05,
+        "max": 1.05
+      },
+      "attempts": 1595,
+      "acknowledged": 742,
+      "failed": 853,
+      "landed_but_unacknowledged": 1,
+      "writes_during_fault": 427,
+      "no_space_errors_in_db_log": 0,
+      "panics": 0,
+      "db_restarts": 0,
+      "statuses_during_fault": {
+        "0": 427
+      }
+    }
+  },
+  "final": {
+    "history_verify": {
+      "ok": true,
+      "problems": []
+    },
+    "blocks_verify": {
+      "ok": true,
+      "problems": []
+    },
+    "attestations_verify": {
+      "ok": true,
+      "problems": [],
+      "warnings": [],
+      "notes": [
+        "signatures: signing is not set up (no key authorized, nothing signed)"
+      ],
+      "summary": {}
+    },
+    "blocks_head": {
+      "history_seq": 3136,
+      "sealed_seq": 102,
+      "tip_height": 21,
+      "unsealed_entries": 3034
+    },
+    "receipts": {
+      "count": 2,
+      "failing_rederivation": []
+    },
+    "jarvisctl_verify": {
+      "rc": 0,
+      "tail": [
+        "ok: history intact for 1 tenant(s); 2 evidence object(s) re-hashed; blocks intact: 21 block(s) sealed through seq 102, 3034 entries unsealed",
+        "signatures: signing is not set up (no key authorized, nothing signed)"
+      ]
+    },
+    "container_stats": [
+      "chaos100x-db cpu=0.02% mem=126.8MiB / 15.5GiB",
+      "chaos100x-app cpu=0.16% mem=68.6MiB / 15.5GiB",
+      "chaos100x-migrate cpu=0.00% mem=0B / 0B",
+      "chaos100x-keeper cpu=0.00% mem=464KiB / 15.5GiB"
+    ],
+    "database_size": "14 MB",
+    "scratch_databases_left": "0",
+    "scratch_hba_rules_left": "0",
+    "schema_version_after": "7",
+    "counts": {
+      "memories": "3136",
+      "record_history": "3136",
+      "blocks": "21",
+      "evidence_objects": "2",
+      "attestations": "0",
+      "trust_statements": "0"
+    },
+    "start_head": {
+      "history_seq": 2391,
+      "tip_height": 1
+    }
+  }
+}

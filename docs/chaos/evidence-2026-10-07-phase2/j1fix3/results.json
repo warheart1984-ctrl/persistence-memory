@@ -1,0 +1,180 @@
+{
+  "name": "CL_CHAOS_100x",
+  "probes_per_round": 52,
+  "rounds_requested": 1,
+  "rounds_completed": 1,
+  "probe_runs": 1,
+  "probes_selected_per_round": 1,
+  "expected_probe_runs": 1,
+  "capped": null,
+  "seconds": 153.2,
+  "status_counts": {
+    "FAIL": 1
+  },
+  "failures": [
+    {
+      "round": 1,
+      "probe": "J1",
+      "phase": "J",
+      "status": "FAIL",
+      "ms": 144161.3,
+      "detail": "11 database session(s) held for a client that is gone were still there 120 s after recovery (max_connections is small: repeated incidents would lock the application out)",
+      "destructive": true
+    }
+  ],
+  "skips": [],
+  "per_probe": {
+    "J1": {
+      "FAIL": 1
+    }
+  },
+  "requests": 2585,
+  "http_statuses": {
+    "200": 872,
+    "503": 1713
+  },
+  "five_xx_total": 1713,
+  "five_xx_expected": 1713,
+  "five_xx_unexpected": [],
+  "five_xx_by_probe": {
+    "J1:503": 1713
+  },
+  "latency_ms": {
+    "all": {
+      "p50": 1.7,
+      "p95": 7.9,
+      "p99": 33.9,
+      "max": 5495.8,
+      "mean": 17.1
+    },
+    "per_probe": {
+      "-": {
+        "n": 2,
+        "p50": 3.6,
+        "p95": 4.3,
+        "p99": 4.3,
+        "max": 4.3
+      },
+      "J1": {
+        "n": 2583,
+        "p50": 1.7,
+        "p95": 7.9,
+        "p99": 33.9,
+        "max": 5495.8
+      }
+    }
+  },
+  "writes": 47,
+  "metrics": {
+    "faults": {
+      "J1": [
+        {
+          "recover_s": 2.15,
+          "partition_s": 12.0,
+          "slowest_answer_s": 5.45,
+          "readiness_during": {
+            "503": 805
+          },
+          "reads_during": {
+            "503": 805
+          },
+          "writes_during_fault": 64,
+          "statuses_during_fault": {
+            "503": 64
+          },
+          "longest_request_s": 1.03
+        }
+      ]
+    }
+  },
+  "fault_summary": {
+    "J1": {
+      "runs": 1,
+      "recover_s": {
+        "min": 2.15,
+        "median": 2.15,
+        "max": 2.15
+      },
+      "partition_s": {
+        "min": 12.0,
+        "median": 12.0,
+        "max": 12.0
+      },
+      "longest_request_s": {
+        "min": 1.03,
+        "median": 1.03,
+        "max": 1.03
+      },
+      "attempts": 0,
+      "acknowledged": 0,
+      "failed": 0,
+      "landed_but_unacknowledged": 0,
+      "writes_during_fault": 64,
+      "no_space_errors_in_db_log": 0,
+      "panics": 0,
+      "db_restarts": 0,
+      "orphaned_sessions_at_recovery": 0,
+      "statuses_during_fault": {
+        "503": 64
+      }
+    }
+  },
+  "final": {
+    "history_verify": {
+      "ok": true,
+      "problems": []
+    },
+    "blocks_verify": {
+      "ok": true,
+      "problems": []
+    },
+    "attestations_verify": {
+      "ok": true,
+      "problems": [],
+      "warnings": [],
+      "notes": [
+        "signatures: signing is not set up (no key authorized, nothing signed)"
+      ],
+      "summary": {}
+    },
+    "blocks_head": {
+      "history_seq": 143,
+      "sealed_seq": 97,
+      "tip_height": 21,
+      "unsealed_entries": 46
+    },
+    "receipts": {
+      "count": 3,
+      "failing_rederivation": []
+    },
+    "jarvisctl_verify": {
+      "rc": 0,
+      "tail": [
+        "ok: history intact for 1 tenant(s); 3 evidence object(s) re-hashed; blocks intact: 21 block(s) sealed through seq 97, 46 entries unsealed",
+        "signatures: signing is not set up (no key authorized, nothing signed)"
+      ]
+    },
+    "container_stats": [
+      "chaos100x-db cpu=0.00% mem=152.6MiB / 15.5GiB",
+      "chaos100x-app cpu=0.20% mem=68.93MiB / 15.5GiB",
+      "chaos100x-migrate cpu=0.00% mem=0B / 0B",
+      "chaos100x-keeper cpu=0.00% mem=460KiB / 15.5GiB"
+    ],
+    "database_size": "8895 kB",
+    "scratch_databases_left": "0",
+    "scratch_hba_rules_left": "0",
+    "schema_version_after": "7",
+    "counts": {
+      "memories": "143",
+      "record_history": "143",
+      "blocks": "21",
+      "evidence_objects": "3",
+      "attestations": "0",
+      "trust_statements": "0"
+    },
+    "start_head": {
+      "history_seq": 96,
+      "tip_height": 11
+    }
+  }
+}

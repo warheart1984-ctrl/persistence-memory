@@ -1,0 +1,180 @@
+{
+  "name": "CL_CHAOS_100x",
+  "probes_per_round": 52,
+  "rounds_requested": 1,
+  "rounds_completed": 1,
+  "probe_runs": 1,
+  "expected_probe_runs": 52,
+  "capped": null,
+  "seconds": 20.1,
+  "status_counts": {
+    "FAIL": 1
+  },
+  "failures": [
+    {
+      "round": 1,
+      "probe": "I1",
+      "phase": "I",
+      "status": "FAIL",
+      "ms": 10770.8,
+      "detail": "a record exists that no request sent (a fabricated or corrupted record)",
+      "destructive": true
+    }
+  ],
+  "skips": [],
+  "per_probe": {
+    "I1": {
+      "FAIL": 1
+    }
+  },
+  "requests": 1319,
+  "http_statuses": {
+    "0": 569,
+    "200": 750
+  },
+  "five_xx_total": 569,
+  "five_xx_expected": 569,
+  "five_xx_unexpected": [],
+  "five_xx_by_probe": {
+    "I1:0": 569
+  },
+  "latency_ms": {
+    "all": {
+      "p50": 12.5,
+      "p95": 26.0,
+      "p99": 54.4,
+      "max": 1005.5,
+      "mean": 13.4
+    },
+    "per_probe": {
+      "-": {
+        "n": 2,
+        "p50": 4.4,
+        "p95": 5.4,
+        "p99": 5.4,
+        "max": 5.4
+      },
+      "I1": {
+        "n": 1317,
+        "p50": 12.5,
+        "p95": 26.0,
+        "p99": 54.4,
+        "max": 1005.5
+      }
+    }
+  },
+  "writes": 734,
+  "metrics": {
+    "faults": {
+      "I1": [
+        {
+          "detect_s": 0.0,
+          "recover_s": 7.18,
+          "docker_restarted_it_itself": false,
+          "heal_run_after_s": 4.02,
+          "startup_after_heal_s": 3.16,
+          "worst_case_recover_s": 63.16,
+          "restarted_after_s": 4.35,
+          "ready_statuses": {
+            "0": 27,
+            "200": 3
+          },
+          "writes_during_fault": 281,
+          "statuses_during_fault": {
+            "0": 281
+          },
+          "longest_request_s": 1.01
+        }
+      ]
+    }
+  },
+  "fault_summary": {
+    "I1": {
+      "runs": 1,
+      "detect_s": {
+        "min": 0.0,
+        "median": 0.0,
+        "max": 0.0
+      },
+      "recover_s": {
+        "min": 7.18,
+        "median": 7.18,
+        "max": 7.18
+      },
+      "longest_request_s": {
+        "min": 1.01,
+        "median": 1.01,
+        "max": 1.01
+      },
+      "attempts": 0,
+      "acknowledged": 0,
+      "failed": 0,
+      "landed_but_unacknowledged": 0,
+      "writes_during_fault": 281,
+      "no_space_errors_in_db_log": 0,
+      "panics": 0,
+      "db_restarts": 0,
+      "statuses_during_fault": {
+        "0": 281
+      }
+    }
+  },
+  "final": {
+    "history_verify": {
+      "ok": true,
+      "problems": []
+    },
+    "blocks_verify": {
+      "ok": true,
+      "problems": []
+    },
+    "attestations_verify": {
+      "ok": true,
+      "problems": [],
+      "warnings": [],
+      "notes": [
+        "signatures: signing is not set up (no key authorized, nothing signed)"
+      ],
+      "summary": {}
+    },
+    "blocks_head": {
+      "history_seq": 3873,
+      "sealed_seq": 202,
+      "tip_height": 41,
+      "unsealed_entries": 3671
+    },
+    "receipts": {
+      "count": 3,
+      "failing_rederivation": []
+    },
+    "jarvisctl_verify": {
+      "rc": 0,
+      "tail": [
+        "ok: history intact for 1 tenant(s); 3 evidence object(s) re-hashed; blocks intact: 41 block(s) sealed through seq 202, 3671 entries unsealed",
+        "signatures: signing is not set up (no key authorized, nothing signed)"
+      ]
+    },
+    "container_stats": [
+      "chaos100x-db cpu=0.03% mem=120.5MiB / 15.5GiB",
+      "chaos100x-app cpu=0.18% mem=68.85MiB / 15.5GiB",
+      "chaos100x-migrate cpu=0.00% mem=0B / 0B",
+      "chaos100x-keeper cpu=0.00% mem=464KiB / 15.5GiB"
+    ],
+    "database_size": "15 MB",
+    "scratch_databases_left": "0",
+    "scratch_hba_rules_left": "0",
+    "schema_version_after": "7",
+    "counts": {
+      "memories": "3873",
+      "record_history": "3873",
+      "blocks": "41",
+      "evidence_objects": "3",
+      "attestations": "0",
+      "trust_statements": "0"
+    },
+    "start_head": {
+      "history_seq": 3136,
+      "tip_height": 21
+    }
+  }
+}
