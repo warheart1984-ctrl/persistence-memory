@@ -70,26 +70,66 @@ require_ports_free() {
     refuse "something is listening on a ledger port ($2)"
   fi
 }
-# phase-b and teardown act on containers, volumes, networks and images by their real names.  Before they do, every ledger container on the engine must
-# have been created by THIS rehearsal's compose file (docker records the file's path in a label that survives a recreate), and a volume or network
-# of a ledger may exist only if such a container does.  An engine that was given to the live ledger since the stamp was written fails this.
+# phase-b and teardown act on containers, volumes, networks, images and systemd units by their real names.  Before they do, EACH of them must be proved to
+# belong to THIS rehearsal, not the engine as a whole:
+#   * every ledger container (jarvis-db, jarvis-app, jarvis-migrate) carries the label docker sets from the compose file that created it (the label survives a
+#     recreate), and it must be this rehearsal's compose file;
+#   * a data volume exists only if the container that owns it (pgdata: jarvis-db, appdata: jarvis-app) is authenticated AND mounts that very volume; the ledger
+#     network only if an authenticated container is attached to it; any other jarvis-ledger_* / jarvis-drill* volume is unknown and refused;
+#   * the drill's scratch container and network are created and removed by drill.sh itself and have no identity: teardown never removes them by name;
+#   * every jarvis-* systemd unit points at this rehearsal's checkout and home, and a timer needs such a service.
 require_rehearsal_owns_the_ledger() {
-  local names name cfg owned=0 out want="$SRC/deploy/mint/docker-compose.yml"
+  local names name cfg v nets mounts owner attached out want="$SRC/deploy/mint/docker-compose.yml"
+  local -A ok=()
   names="$(docker ps -a --format '{{.Names}}' 2>/dev/null)" || refuse "docker ps failed, so the containers cannot be tied to this rehearsal"
   for name in jarvis-db jarvis-app jarvis-migrate; do
     printf '%s\n' "$names" | grep -qx "$name" || continue
     cfg="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project.config_files"}}' "$name" 2>/dev/null)" || refuse "cannot inspect container $name"
     [ "$cfg" = "$want" ] || refuse "container $name was not created by this rehearsal's compose file (it says: ${cfg:-nothing}; expected $want)"
-    owned=1
+    ok[$name]=1
   done
   out="$(docker volume ls -q 2>/dev/null)" || refuse "docker volume ls failed, so the volumes cannot be tied to this rehearsal"
-  if printf '%s\n' "$out" | grep -qE '^jarvis-(ledger|drill)' && [ "$owned" = 0 ]; then
-    refuse "volumes of a ledger exist but no container of this rehearsal owns them"
-  fi
+  while IFS= read -r v; do
+    case "$v" in
+      jarvis-ledger_pgdata) owner=jarvis-db ;;
+      jarvis-ledger_appdata) owner=jarvis-app ;;
+      jarvis-ledger_*|jarvis-drill*) refuse "volume $v is not one this rehearsal creates" ;;
+      *) continue ;;
+    esac
+    [ "${ok[$owner]:-}" = 1 ] || refuse "volume $v exists but its container $owner is not an authenticated container of this rehearsal"
+    mounts="$(docker inspect -f '{{range .Mounts}}{{.Name}} {{end}}' "$owner" 2>/dev/null)" || refuse "cannot inspect the mounts of $owner"
+    case " $mounts " in *" $v "*) ;; *) refuse "volume $v is not mounted by $owner, so $owner cannot vouch for it" ;; esac
+  done <<< "$out"
   out="$(docker network ls --format '{{.Name}}' 2>/dev/null)" || refuse "docker network ls failed, so the networks cannot be tied to this rehearsal"
-  if printf '%s\n' "$out" | grep -qE '^(jarvis-ledger_|jarvis-drill)' && [ "$owned" = 0 ]; then
-    refuse "networks of a ledger exist but no container of this rehearsal owns them"
-  fi
+  while IFS= read -r v; do
+    case "$v" in
+      jarvis-ledger_ledger)
+        attached=0
+        for name in "${!ok[@]}"; do
+          nets="$(docker inspect -f '{{range $k, $c := .NetworkSettings.Networks}}{{$k}} {{end}}' "$name" 2>/dev/null)" || refuse "cannot inspect the networks of $name"
+          case " $nets " in *" $v "*) attached=1 ;; esac
+        done
+        [ "$attached" = 1 ] || refuse "network $v exists but no authenticated container of this rehearsal is attached to it" ;;
+      jarvis-ledger_*) refuse "network $v is not one this rehearsal creates" ;;
+    esac
+  done <<< "$out"
+}
+require_rehearsal_owns_the_units() {
+  local d f svc seen=""
+  for d in "$UNIT_DIR" "$HOME/.config/systemd/user"; do
+    case " $seen " in *" $d "*) continue ;; esac
+    seen="$seen $d"
+    for f in "$d"/jarvis-*.service; do
+      [ -e "$f" ] || continue
+      awk -v p="ExecStart=$SRC/deploy/mint/bin/" 'index($0, p) == 1 { found = 1 } END { exit !found }' "$f" || refuse "systemd unit $f does not run this rehearsal's checkout ($SRC)"
+      grep -qxF "Environment=JARVIS_HOME=$JARVIS_HOME" "$f" || refuse "systemd unit $f does not use this rehearsal's home ($JARVIS_HOME)"
+    done
+    for f in "$d"/jarvis-*.timer; do
+      [ -e "$f" ] || continue
+      svc="${f%.timer}.service"
+      [ -e "$svc" ] || refuse "systemd timer $f has no service of this rehearsal beside it"
+    done
+  done
 }
 require_isolated_engine() {
   local phase="$1" stamp="$R/engine.ok" eid found
@@ -128,6 +168,7 @@ require_isolated_engine() {
     [ ! -e "$HOME/jarvis-ledger" ] || refuse "$HOME/jarvis-ledger exists: this account runs (or ran) the live ledger"
     require_ports_free ':(8001|8011)$' "8001 or 8011"
     require_rehearsal_owns_the_ledger
+    require_rehearsal_owns_the_units
   fi
   [ "${REHEARSAL_GUARD_ONLY:-0}" != 1 ] || { echo "guard passed ($phase)"; exit 0; }   # for the guard's own tests
 }
@@ -293,9 +334,9 @@ payload, err = c.try_http_json('GET', '/health'); print(err); sys.exit(0 if payl
   s4="$(newest_set)"
 
   section "A8. offsite copy to the (stand-in) Windows PC"
-  docker build -q -t "$PC" "$SRC/deploy/mint/rehearse/pc" >/dev/null || bad "could not build the PC stand-in"
+  docker build -q --label "com.jarvis.rehearsal.dir=$R" -t "$PC" "$SRC/deploy/mint/rehearse/pc" >/dev/null || bad "could not build the PC stand-in"
   docker rm -f "$PC" >/dev/null 2>&1
-  docker run -d --name "$PC" -p 127.0.0.1:2222:22 "$PC" >/dev/null
+  docker run -d --name "$PC" --label "com.jarvis.rehearsal.dir=$R" -p 127.0.0.1:2222:22 "$PC" >/dev/null
   ssh-keygen -q -t ed25519 -N '' -f "$R/offsite-key" >/dev/null
   docker exec -i "$PC" sh -c 'cat > /home/pcuser/.ssh/authorized_keys && chown pcuser:pcuser /home/pcuser/.ssh/authorized_keys && chmod 600 /home/pcuser/.ssh/authorized_keys' < "$R/offsite-key.pub"
   sleep 2
@@ -519,12 +560,20 @@ teardown() {
   systemctl --user daemon-reload >/dev/null 2>&1
   # the images are removed by ID, and only those that this rehearsal's own (label-checked) containers run; never by tag
   imgs="$(docker inspect -f '{{.Image}}' jarvis-db jarvis-app jarvis-migrate 2>/dev/null | sort -u | paste -sd' ' -)"
+  pc_owned=""
+  [ "$(docker inspect -f '{{index .Config.Labels "com.jarvis.rehearsal.dir"}}' "$PC" 2>/dev/null)" = "$R" ] && pc_owned="$PC"
   docker compose -f "$SRC/deploy/mint/docker-compose.yml" down -v >/dev/null 2>&1
-  docker rm -f "$PC" jarvis-db jarvis-app jarvis-migrate jarvis-drill-db >/dev/null 2>&1
-  docker network rm jarvis-ledger_ledger jarvis-drill-net >/dev/null 2>&1
+  # shellcheck disable=SC2086  # $pc_owned is empty or one name
+  [ -z "$pc_owned" ] || docker rm -f $pc_owned >/dev/null 2>&1
+  docker rm -f jarvis-db jarvis-app jarvis-migrate >/dev/null 2>&1
+  docker network rm jarvis-ledger_ledger >/dev/null 2>&1
   docker volume rm -f jarvis-ledger_pgdata jarvis-ledger_appdata >/dev/null 2>&1
   # shellcheck disable=SC2086  # $imgs is a list of image ids
-  docker rmi -f "$PC" $imgs >/dev/null 2>&1
+  docker rmi -f $pc_owned $imgs >/dev/null 2>&1
+  # the drill's scratch container and network belong to drill.sh, which removes them itself; they have no identity to check, so they are never removed here
+  if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx jarvis-drill-db || docker network ls --format '{{.Name}}' 2>/dev/null | grep -qx jarvis-drill-net; then
+    echo "left in place (a drill's scratch resources; remove by hand if they are yours): jarvis-drill-db, jarvis-drill-net" >&2
+  fi
   rm -rf "$R"
   echo "rehearsal environment removed"
 }
