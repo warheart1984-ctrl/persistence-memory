@@ -78,7 +78,7 @@ def test_the_docs_and_the_sample_log_use_the_computed_count():
         assert int(other) == n
     sample = (DOCS / "sample-smoke-round.txt").read_text().splitlines()
     assert f"{n} probes per round, 1 round(s) = {n} probe runs" in sample[0]
-    lines = [l for l in sample if re.match(r"r001 [A-H]\d ", l)]
+    lines = [l for l in sample if re.match(r"r001 [A-K]\d ", l)]
     assert len(lines) == n and [l.split()[1] for l in lines] == [p.id for p in chaos.PROBES]
     summary = json.loads(sample[-1])
     assert summary["probes_per_round"] == n and summary["probe_runs"] == n
