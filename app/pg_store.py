@@ -567,6 +567,7 @@ class PostgresRowStore:
                                 (self._tenant_key,)).fetchone()
             tip = conn.execute("SELECT height, block_hash FROM blocks WHERE tenant_key = %s ORDER BY height DESC LIMIT 1", (self._tenant_key,)).fetchone()
         return {
+            "tenant": self._tenant_key,
             "head_seq": row[0] if row else 0, "head_hash": row[1] if row else attest.GENESIS,
             "next_signer_seq": (row[0] if row else 0) + 1, "prev_hash": row[1] if row else attest.GENESIS,
             "trust_head_seq": stmt[0] if stmt else 0, "trust_head_hash": stmt[1] if stmt else attest.GENESIS, "next_stmt_seq": (stmt[0] if stmt else 0) + 1,

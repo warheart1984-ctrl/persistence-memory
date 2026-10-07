@@ -16,6 +16,8 @@ export LOG_NAME=drill
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 # shellcheck source=anchors.sh
 source "$(dirname "${BASH_SOURCE[0]}")/anchors.sh"
+# shellcheck source=custody.sh
+source "$(dirname "${BASH_SOURCE[0]}")/custody.sh"
 umask 077
 
 single_instance drill
@@ -64,6 +66,7 @@ scratch_psql() { docker exec -i -u postgres "$name" psql -X -At -d jarvis "$@"; 
 count_tables="memories boards record_history chain_heads history_counters"
 if grep -q '^evidence_objects=' "$BACKUP_DIR/$base.counts"; then count_tables="$count_tables evidence_objects"; fi
 if grep -q '^blocks=' "$BACKUP_DIR/$base.counts"; then count_tables="$count_tables blocks"; fi
+if grep -q '^attestations=' "$BACKUP_DIR/$base.counts"; then count_tables="$count_tables attestations trust_statements"; fi
 count_re="^($(echo "$count_tables" | tr ' ' '|'))="
 restored="$(for t in $count_tables; do
   printf '%s=%s\n' "$t" "$(scratch_psql -c "select count(*) from jarvis.$t")"; done | LC_ALL=C sort)"
@@ -106,10 +109,55 @@ else
   log INFO "drill: replay at the last anchored block verifies ($(anchors_tip_blocks "$BACKUP_DIR/$base.anchors" | tr '\n' ' '| sed 's/|[0-9a-f]\{64\}//g'))"
 fi
 
+# Key custody: no private key material anywhere in the set or in the restored data (the backup refuses to publish one; this re-checks
+# what is actually on disk, including sets made before that guard existed).
+docker exec -i -u postgres "$name" pg_restore --data-only -f - -n jarvis < "$BACKUP_DIR/$base.dump" > "$STATE_DIR/drill-data.txt"
+custody_out="$(custody_check_data "$STATE_DIR/drill-data.txt")" || { rm -f "$STATE_DIR/drill-data.txt"; die "DRILL FAILED: $custody_out"; }
+rm -f "$STATE_DIR/drill-data.txt"
+[ -z "$custody_out" ] || log WARN "drill: $custody_out"
+if ! custody_problem="$(custody_check_set "$BACKUP_DIR" "$base")"; then die "DRILL FAILED: $custody_problem"; fi
+
+# Signatures (schema v7+). The set's own export is verified from OUTSIDE the database with nothing but the pinned root public keys
+# (the witness), and the restored database is verified too. Skipped, loudly, when the set predates v7, nothing is signed yet, no root
+# key is installed, or the app image predates the signing code.
+sig_checked=0
+sig_roots="$SECRETS_DIR/trust-roots.pub"
+repo_root="$(cd "$JARVIS_DEPLOY_DIR/../.." && pwd)"
+if ! grep -q '^attestations=' "$BACKUP_DIR/$base.counts"; then
+  log INFO "drill: signatures step skipped (the set predates schema v7)"
+elif [ "$(sed -n 's/^attestations=//p' "$BACKUP_DIR/$base.counts")" = "0" ] && [ "$(sed -n 's/^trust_statements=//p' "$BACKUP_DIR/$base.counts")" = "0" ]; then
+  log INFO "drill: signatures step skipped (signing is not set up: nothing is signed)"
+elif [ ! -f "$BACKUP_DIR/$base.signatures.json" ]; then
+  die "DRILL FAILED: the set holds signatures but has no signatures export"
+elif ! grep -Eq '^ssh-ed25519 ' "$sig_roots" 2>/dev/null; then
+  log WARN "drill: signatures step skipped (no root key is installed in $sig_roots, so nothing could be verified)"
+elif ! docker run --rm --entrypoint python "$APP_IMAGE" -c "import app.attest" >/dev/null 2>&1; then
+  log WARN "drill: signatures step skipped (the app image predates the signing code; rebuild with jarvisctl up)"
+else
+  ( cd "$repo_root" && python3 -m app.witness verify-export "$BACKUP_DIR/$base.signatures.json" --roots "$sig_roots" >/dev/null ) \
+    || die "DRILL FAILED: the set's signatures do not verify against the pinned roots"
+  for t in $(scratch_psql -c "select distinct tenant_key from jarvis.record_history order by 1"); do
+    docker run --rm --network "$net" -v "$sig_roots":/etc/jarvis/trust-roots.pub:ro -e JARVIS_TRUST_ROOTS_FILE=/etc/jarvis/trust-roots.pub \
+      -e "JARVIS_DATABASE_MIGRATE_URL=postgresql://jarvis_migrator:$mig_pw@$name:5432/jarvis" -e JARVIS_DATABASE_SCHEMA=jarvis \
+      "$APP_IMAGE" python -m app.attest verify --tenant "$t" >/dev/null 2>&1 || die "DRILL FAILED: the restored database's signatures do not verify (tenant $t)"
+  done
+  sig_checked=1
+  log INFO "drill: signatures verify (the set's export against the pinned roots, and the restored database)"
+fi
+
 entries="$(docker run --rm -i --entrypoint tar "$APP_IMAGE" -tf - < "$BACKUP_DIR/$base.data.tar" | wc -l)" \
   || die "DRILL FAILED: the appdata archive is unreadable"
 
 if [ "$prove" -eq 1 ]; then
+  if [ "$sig_checked" -eq 1 ]; then
+    # damage one signature in a COPY of the export and require the witness to refuse it
+    forged="$(mktemp)"
+    sed '0,/"signature": "-----BEGIN SSH SIGNATURE-----\\n/s//"signature": "-----BEGIN SSH SIGNATURE-----\\nAAAA/' "$BACKUP_DIR/$base.signatures.json" > "$forged"
+    if cmp -s "$forged" "$BACKUP_DIR/$base.signatures.json"; then rm -f "$forged"; die "DRILL FAILED: could not damage the signatures export for the proof"; fi
+    if ( cd "$repo_root" && python3 -m app.witness verify-export "$forged" --roots "$sig_roots" >/dev/null 2>&1 ); then rm -f "$forged"; die "DRILL FAILED: a damaged signature was NOT detected by the witness"; fi
+    rm -f "$forged"
+    log INFO "drill: a damaged signature in the export was detected by the witness, as it must be"
+  fi
   if [ "$replayed" -eq 1 ]; then
     # alter the newest entry of the last anchored block, require the replay to fail, then put it back exactly and require it to pass
     IFS='|' read -r pt ph pbh < <(anchors_tip_blocks "$BACKUP_DIR/$base.anchors" | head -1)
@@ -147,4 +195,4 @@ if [ "$prove" -eq 1 ]; then
 fi
 
 date +%s > "$STATE_DIR/drill.last_ok"
-log INFO "drill OK: $base restored, counts and anchors match, history verifies$([ "$replayed" -eq 1 ] && echo ", replay at the last anchored block verifies"), appdata archive has $entries entries"
+log INFO "drill OK: $base restored, counts and anchors match, history verifies$([ "$replayed" -eq 1 ] && echo ", replay at the last anchored block verifies")$([ "$sig_checked" -eq 1 ] && echo ", signatures verify"), appdata archive has $entries entries"

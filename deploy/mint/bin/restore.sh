@@ -80,6 +80,7 @@ pg_exec pg_restore --single-transaction --exit-on-error -d jarvis < "$BACKUP_DIR
 count_tables="memories boards record_history chain_heads history_counters"
 if grep -q '^evidence_objects=' "$BACKUP_DIR/$base.counts"; then count_tables="$count_tables evidence_objects"; fi
 if grep -q '^blocks=' "$BACKUP_DIR/$base.counts"; then count_tables="$count_tables blocks"; fi
+if grep -q '^attestations=' "$BACKUP_DIR/$base.counts"; then count_tables="$count_tables attestations trust_statements"; fi
 count_re="^($(echo "$count_tables" | tr ' ' '|'))="
 restored_counts="$(for t in $count_tables; do
   printf '%s=%s\n' "$t" "$(pg_exec psql -X -At -d jarvis -c "select count(*) from jarvis.$t")"; done | LC_ALL=C sort)"

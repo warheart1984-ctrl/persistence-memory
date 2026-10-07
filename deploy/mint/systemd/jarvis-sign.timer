@@ -1,0 +1,13 @@
+[Unit]
+Description=Jarvis ledger: sign hourly, a minute after the seal and before the backup takes its anchors
+
+[Timer]
+# the seal runs at :55, the backup at :00; signing at :56 puts the newest block's attestation into that backup's anchors
+OnCalendar=*:56:00
+RandomizedDelaySec=30
+Persistent=true
+
+# Installed by install-units.sh but NOT enabled automatically. Only after the key ceremony (docs/SIGNING_RUNBOOK.md) and your OK:
+#   systemctl --user enable --now jarvis-sign.timer
+[Install]
+WantedBy=timers.target

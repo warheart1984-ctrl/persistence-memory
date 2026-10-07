@@ -30,6 +30,7 @@ printf 'JARVIS_DATABASE_URL=postgresql://jarvis_app:%s@db:5432/jarvis\nJARVIS_AP
 printf 'JARVIS_DATABASE_MIGRATE_URL=postgresql://jarvis_migrator:%s@db:5432/jarvis\nJARVIS_DATABASE_SCHEMA=jarvis\nJARVIS_DATABASE_APP_ROLE=jarvis_app\n' "$mig_pw" > "$SECRETS_DIR/migrate.env"
 printf '%s\n' "$api_key" > "$SECRETS_DIR/api-key"
 chmod 600 "$SECRETS_DIR"/db.env "$SECRETS_DIR"/app.env "$SECRETS_DIR"/migrate.env "$SECRETS_DIR"/api-key
+ensure_trust_roots
 
 echo "created (mode 600, values not shown): db.env app.env migrate.env api-key in $SECRETS_DIR"
 echo "next: put your age PUBLIC key in $SECRETS_DIR/age_recipient.txt and fill in $SECRETS_DIR/offsite.conf"

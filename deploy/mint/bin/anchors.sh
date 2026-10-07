@@ -8,6 +8,8 @@
 #   head|<tenant>|<record id>|<last_seq>|<last_hash>|<deleted t/f>
 #   counter|<tenant>|<last_seq>
 #   block|<tenant>|<height>|<last_seq>|<block_hash>        (schema v6+: every sealed Continuity Block)
+#   att|<tenant>|<signer_seq>|<attestation_hash>           (schema v7+: every attestation in the signing log)
+#   trust|<tenant>|<stmt_seq>|<statement_hash>             (schema v7+: every root-signed trust statement, cosigns included)
 # shellcheck shell=bash
 
 # anchors_from_dump FILE : read straight out of a pg_dump -Fc file (so it always matches the dump).
@@ -16,12 +18,18 @@ anchors_from_dump() {
     /^COPY jarvis\.chain_heads / { mode = "head"; next }
     /^COPY jarvis\.history_counters / { mode = "counter"; next }
     /^COPY jarvis\.blocks / { mode = "block"; next }
+    /^COPY jarvis\.attestations / { mode = "att"; next }
+    /^COPY jarvis\.trust_statements / { mode = "trust"; next }
     /^COPY / { mode = ""; next }
     /^\\\.$/ { mode = ""; next }
     mode == "head" && NF >= 5    { print "head|" $1 "|" $2 "|" $3 "|" $4 "|" $5 }
     mode == "counter" && NF >= 2 { print "counter|" $1 "|" $2 }
     # blocks columns: tenant_key height first_seq last_seq entry_count prev_block_hash entries_root block_hash ...
     mode == "block" && NF >= 8   { print "block|" $1 "|" $2 "|" $4 "|" $8 }
+    # attestations columns: tenant_key signer_seq kind subject subject_hash prev_hash key_id signed_at signature attestation_hash ...
+    mode == "att" && NF >= 10    { print "att|" $1 "|" $2 "|" $10 }
+    # trust_statements columns: tenant_key stmt_seq kind key_id pubkey arg subject_hash prev_hash signed_by signature statement_hash ...
+    mode == "trust" && NF >= 11  { print "trust|" $1 "|" $2 "|" $11 }
   ' | LC_ALL=C sort
 }
 
@@ -35,6 +43,10 @@ anchors_collect() {
     "$run" -c "COPY (SELECT 'counter', tenant_key, last_seq FROM jarvis.history_counters) TO STDOUT WITH (FORMAT text, DELIMITER '|')"
     if [ "$("$run" -c "select to_regclass('jarvis.blocks') is not null")" = "t" ]; then
       "$run" -c "COPY (SELECT 'block', tenant_key, height, last_seq, block_hash FROM jarvis.blocks) TO STDOUT WITH (FORMAT text, DELIMITER '|')"
+    fi
+    if [ "$("$run" -c "select to_regclass('jarvis.attestations') is not null")" = "t" ]; then
+      "$run" -c "COPY (SELECT 'att', tenant_key, signer_seq, attestation_hash FROM jarvis.attestations) TO STDOUT WITH (FORMAT text, DELIMITER '|')"
+      "$run" -c "COPY (SELECT 'trust', tenant_key, stmt_seq, statement_hash FROM jarvis.trust_statements) TO STDOUT WITH (FORMAT text, DELIMITER '|')"
     fi
   } | LC_ALL=C sort
 }
@@ -56,17 +68,23 @@ anchors_tip_blocks() {
 # their hash without advancing. Counters may only grow. Every block that was anchored must still exist with the
 # very same hash: a block can be added, never removed and never re-sealed (that is what catches a removed newest
 # block, or a rewritten history whose blocks were all re-sealed consistently - neither is visible inside the database).
+# Every anchored attestation and trust statement is held to the same rule: a signing log that loses or rewrites an entry (say, one
+# re-signed with a taken key) no longer extends what an earlier backup, and the offsite copies, recorded.
 anchors_check() {
   awk -F'|' -v prev="$1" '
     FILENAME == prev {
       if ($1 == "head")    { ps[$2 "|" $3] = $4; ph[$2 "|" $3] = $5 }
       if ($1 == "counter") { pc[$2] = $3 }
       if ($1 == "block")   { pb[$2 "|" $3] = $5 }
+      if ($1 == "att")     { pa[$2 "|" $3] = $4 }
+      if ($1 == "trust")   { pt[$2 "|" $3] = $4 }
       next
     }
     $1 == "head"    { ns[$2 "|" $3] = $4; nh[$2 "|" $3] = $5 }
     $1 == "counter" { nc[$2] = $3 }
     $1 == "block"   { nb[$2 "|" $3] = $5 }
+    $1 == "att"     { na[$2 "|" $3] = $4 }
+    $1 == "trust"   { nt[$2 "|" $3] = $4 }
     END {
       bad = 0
       for (k in ps) {
@@ -81,6 +99,14 @@ anchors_check() {
       for (k in pb) {
         if (!(k in nb))          { print "anchor problem: block " k " vanished (a block was removed)"; bad = 1 }
         else if (nb[k] != pb[k]) { print "anchor problem: block " k " changed its hash (the blocks were re-sealed)"; bad = 1 }
+      }
+      for (k in pa) {
+        if (!(k in na))          { print "anchor problem: attestation " k " vanished (the signing log lost an entry)"; bad = 1 }
+        else if (na[k] != pa[k]) { print "anchor problem: attestation " k " changed its hash (the signing log was rewritten)"; bad = 1 }
+      }
+      for (k in pt) {
+        if (!(k in nt))          { print "anchor problem: trust statement " k " vanished (the trust log lost an entry)"; bad = 1 }
+        else if (nt[k] != pt[k]) { print "anchor problem: trust statement " k " changed its hash (the trust log was rewritten)"; bad = 1 }
       }
       exit bad
     }

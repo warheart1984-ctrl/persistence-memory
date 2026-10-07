@@ -133,6 +133,7 @@ Grok docs to say; the Grok CLI does, and `~/.grokbot/settings.json` has its own 
 | `jarvisctl verify [tenant]` | recompute the history hash chain and every sealed block |
 | `jarvisctl replay state\|receipt\|receipts\|check\|verify` | Replay Contracts (RC.Ledger.v1): replay the ledger at a point, issue receipts at **sealed** points, re-derive them (`check` asks the service, `verify` replays the raw rows in a one-off container). Needs the build that has Replay Contracts; see `docs/REPLAY_CONTRACTS.md` |
 | `jarvisctl seal [--force\|--status]` | seal new history into Continuity Blocks now (or show the unsealed tail); the hourly timer is **not enabled** by default, see below |
+| `jarvisctl attest status\|sign [--dry-run]\|init-key\|install-roots\|verify` | the host signer (schema v7 only): the signing key lives in `~/jarvis-ledger/keys/` and **never enters a backup, a volume or a container**; ceremony and routines in `docs/SIGNING_RUNBOOK.md`. `jarvis-sign.timer` is installed, **not enabled** |
 | `jarvisctl watchdog` / `heal` | run the health checks / the self-heal once |
 | `jarvisctl psql` | admin session inside the database container |
 | `jarvisctl rotate app\|migrator\|api-key` | new random credential, never shown; api-key then needs copying to the PC |
@@ -206,6 +207,16 @@ code and restoring the backup taken before the upgrade** (writes made after it a
 backup sets and anchors no longer fit the restored database (their blocks "vanished"), so move the newer `jarvis-*` sets and the
 newer `anchors/anchors-*.txt` files aside before the next backup, or it will quarantine its dump.
 
+### Signatures (schema v7)
+
+Backup sets carry `<set>.signatures.json` (the attestations, trust statements and blocks, for the PC witness) and the anchors carry
+`att|` and `trust|` lines: a signing log that loses or rewrites an entry is quarantined like a block would be. `backup.sh` refuses to
+publish a set containing the signing key (exact secret in any encoding, or a private-key header in a file); key-shaped text inside the
+database only warns. The drill re-checks restored signatures with the pinned roots (`secrets/trust-roots.pub`, public keys only,
+created empty by `jarvisctl up`) and, with `--prove-detection`, proves a damaged signature is caught. The watchdog watches
+`state/sign.last_ok` (once the signer has succeeded) and warns when no cosign has been posted for 72 hours. Rollback: v6 code refuses
+v7 and the reverse, so, as for v6, roll back by checking out the old code and restoring the backup taken before the upgrade.
+
 ### Restoring (destructive)
 ```bash
 bin/jarvisctl restore --yes-destroy-current-data            # newest set; or --backup jarvis-20261005T120000Z
@@ -246,7 +257,7 @@ Steps that need `sudo` are yours to run; nothing here asks for or stores a sudo 
    ```bash
    bin/jarvisctl up                  # db -> migrate -> app; builds the images the first time
    bin/jarvisctl smoke               # every line must say PASS
-   bin/install-units.sh              # the five timers (+ the seal timer, installed but not enabled); the offsite timer needs secrets/offsite.conf first
+   bin/install-units.sh              # the five timers (+ the seal and sign timers, installed but not enabled); the offsite timer needs secrets/offsite.conf first
    bin/jarvisctl backup && bin/jarvisctl drill --prove-detection
    bin/jarvisctl offsite
    ```

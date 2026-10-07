@@ -24,6 +24,7 @@ for unit in "$JARVIS_DEPLOY_DIR"/systemd/*.service "$JARVIS_DEPLOY_DIR"/systemd/
 done
 echo "units written to $dest"
 echo "jarvis-seal.timer is installed but NOT enabled; once the ledger is at schema v6 enable it with: systemctl --user enable --now jarvis-seal.timer"
+echo "jarvis-sign.timer is installed but NOT enabled; only after the key ceremony (docs/SIGNING_RUNBOOK.md) and your OK: systemctl --user enable --now jarvis-sign.timer"
 
 if [ "$enable" -eq 1 ]; then
   systemctl --user daemon-reload

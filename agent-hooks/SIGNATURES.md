@@ -1,8 +1,9 @@
 # Signatures
 
-**Status: planned; the verification side is built, nothing signs.** Schema v7 adds two append-only logs, the service can verify and
-store attestations, and `pg_verify` checks them. There is **no signer, no key ceremony and no off-box cosign tool yet**, the code is on
-`main` but **not deployed**, and nothing in the ledger is signed. Everything below says which part is built and which is planned.
+**Status: built, not deployed, not enabled.** The verification side (schema v7 logs, the checks, the API, the `pg_verify` section), the host
+signer, the backup, restore and drill handling, the custody guards and the PC-side witness are on `main`. **Nothing is deployed, no key
+exists, no root is pinned, the sign timer is not enabled, and nothing in the live ledger is signed.** Receipts are not signed yet (a later
+step). The key ceremony is in `SIGNING_RUNBOOK.md`.
 
 ## What a signature says, and what it does not
 
@@ -46,20 +47,37 @@ name. `JARVIS_SIGNATURES=off|warn|require` (default `warn`):
   Nothing is judged before a signing key has been authorized ("signing is not set up").
 * **No trust root configured** (`JARVIS_TRUST_ROOTS_FILE`) while signature rows exist: "signatures not verified", never success.
 
+`jarvisctl verify` (which runs `pg_verify` in the migrate service, now given the same public roots) and the restore drill check signatures too.
+
 Endpoints (operator key): `GET /api/jarvis/attestations[/head|/pending|/verify]`, `POST /api/jarvis/attestations`,
 `GET /api/jarvis/trust`, `GET|POST /api/jarvis/trust/statements`.
 
-## Key custody rules (these are rules for the ceremony and the signer; PR B enforces them)
+## Key custody (enforced; the ceremony is in `SIGNING_RUNBOOK.md`)
 
-1. **The Mint private key never enters a backup, a volume or a container.** It lives in a directory under the box user's home, mode
-   700 (the file 600), outside the repository, the deploy directory, the backup directory and every Docker volume. The signer runs on the
-   host as that user. The compose file mounts nothing from it and passes nothing derived from it.
-2. **The root private keys never touch the Mint box.** They live on the PC (software first, a hardware key later; either is enough).
-   Only their public keys are pinned here, in the repository, on the PC and in the service's configuration.
-3. The signer refuses to run if the key file or its directory is readable by anyone else, or if the path lies under a volume or the
-   backup directory. `backup.sh` refuses to publish a set whose archive or dump contains a private-key header, and the restore drill
-   scans every restored set for one. A test fails if the compose file ever mounts or passes the key.
+1. **The Mint private key never enters a backup, a volume or a container.** It lives in `~/jarvis-ledger/keys/` (directory 700, key 600,
+   owned by the box user), outside the repository, `deploy/`, the backups and `/var/lib/docker`. **The signer refuses to run** (exit 3) if the key
+   or its directory is readable by others, is a symlink, is passphrase-protected, lies in a forbidden place, or if any running container
+   mounts the key's directory or a parent or child of it. The compose project gives containers only a read-only file of PUBLIC keys, and a
+   test fails if it ever names a key.
+2. **`backup.sh` publishes nothing** if the set would contain this key (matched on the key's secret, in every base64 alignment and in hex, in the
+   database's data or in any file) or any private-key header in the appdata archive, globals or exports. Key-shaped text inside the database
+   is a warning only (the history is append-only and could never be cleaned). The restore drill repeats the scans on every restored set.
+3. **The root private keys never touch the Mint box.** They live on the PC (software first; a hardware root later; either is enough). Only
+   their public keys are pinned: `trust/roots.pub`, the PC, the service's read-only config.
 4. A signing key is rotated by a root-signed statement; the old key is revoked with a cutoff at the last checkpoint a root cosigned.
+
+## What is built where
+
+| | |
+|---|---|
+| `app/attest.py` | formats, trust and attestation checks, `python -m app.attest verify` |
+| `app/signer.py` | the host signer: custody checks, builds its own messages, pre-sign offline verification, self-check; `init-key`, `status`, `sign` |
+| `app/witness.py` | the PC side: `verify-export` (remembers what it saw), `cosign`, ceremony `statement`s; runs without the application's packages |
+| `deploy/mint/bin/attest.sh` | `jarvisctl attest status\|sign\|init-key\|install-roots\|verify` |
+| `deploy/mint/bin/sigexport.py` | the `<set>.signatures.json` export that rides with every backup set and every offsite bundle |
+| `deploy/mint/bin/custody.sh`, `keymarkers.py` | the custody scans |
+| `jarvis-sign.service` / `.timer` | hourly at :56 (after the seal, before the backup); installed, **not enabled** |
+| anchors | every attestation and trust statement is anchored like the blocks; a log that loses or rewrites one is refused |
 
 ## Limits, stated plainly
 
@@ -77,8 +95,7 @@ Endpoints (operator key): `GET /api/jarvis/attestations[/head|/pending|/verify]`
 
 ## Planned, not built
 
-PR B: the host-side signer (it re-verifies each block, receipt and the chain before signing, and never signs text the server hands it),
-`jarvisctl attest`, the sign timer (installed, not enabled), anchors lines for the attestation head and checkpoint, backup, restore and
-drill handling, watchdog ages, the key-custody checks above, the PC-side bundle verifier and cosign tool (with each daily offsite pull),
-and the ceremony and rotation runbooks. PR C: signing receipts in the pass, `replay verify` signature levels, the `require` switch after
-seven days in `warn` (longer if the watchdog is noisy).
+* Signing replay receipts in the signing pass, signature levels in `replay verify`, and the `require` switch after seven days in `warn`
+  (longer if the watchdog is noisy).
+* The hardware root and the statement flow to add it (the statement exists; the hardware-key signature format does not yet).
+* A scripted PC routine (decrypt the offsite bundle, verify, cosign). The commands are in the runbook, run by hand.
