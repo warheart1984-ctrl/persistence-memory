@@ -4,11 +4,12 @@ A governed, evidence-first memory ledger for AI agents, backed by PostgreSQL. It
 provenance, and proves it was not quietly changed. It does **not** decide what is true (`docs/CONTINUITY_LEDGER_SOC.md`).
 Continuity lives in ledger records, not in chat transcripts; the service itself is replaceable.
 
-## What is live (checked 2026-10-06)
+## What is live on 8011 (last deployed 2026-10-06; nothing has been deployed since)
 
 One ledger runs in Docker on a private Linux box at **`127.0.0.1:8011`** (PostgreSQL row store, schema **v6**). Nothing is
 reachable from the network; the PC and the agents reach it through an SSH tunnel. Deployment, operations and the rehearsed
-restore are in [`deploy/mint/README.md`](deploy/mint/README.md).
+restore are in [`deploy/mint/README.md`](deploy/mint/README.md). **This table describes the deployed build, not `main`**: `main` is ahead of the box
+(schema v7 and the signature code, below).
 
 | Capability | Status |
 |---|---|
@@ -16,9 +17,9 @@ restore are in [`deploy/mint/README.md`](deploy/mint/README.md).
 | **Clause V** at the API: only `decision`, `architecture`, `research`, `fact`; every record needs evidence; nothing becomes `verified` without it. Emotion / transient-state / transcript heuristics only **warn** | **live**, type + evidence enforced (`docs/CLAUSE_V_HYGIENE.md`) |
 | **Evidence Objects**: content-addressed (`eo:sha256:…`), immutable, hash only, operator key to create | **live**, **unsigned** (`docs/EVIDENCE_OBJECTS.md`) |
 | **Continuity Blocks**: sealed, Merkle-rooted, hash-chained ranges of the history; every block hash is also kept outside the database in the backup anchors | **live**, **unsigned** (`docs/CONTINUITY_BLOCKS.md`) |
-| **Replay Contracts, `RC.Ledger.v1`**: rebuild the ledger's state and ordered events as of any seq or sealed block, with a state root; receipts at sealed points (Evidence Objects); offline verifier `python -m app.replay verify`; `jarvisctl replay`; a restore-drill step | **implemented on `main`, not deployed yet**: the live ledger has no `/api/jarvis/replay/*` routes (`docs/REPLAY_CONTRACTS.md`) |
-| Domain Replay Contracts (`RC.AIKI`, `ARIS`, `SX`, `Lineage`, `Mandala`) | **declared only**: no schema, owner or algorithm exists |
-| **Signatures**, verification side: attestations of blocks, receipts and checkpoints by a key a root key authorized, a trust log, `pg_verify` section (schema v7, `docs/SIGNATURES.md`) | **on `main`, not deployed**: schema v7 logs and checks, the host signer (blocks and replay receipts), the PC witness/cosign tool, custody guards, backup/drill handling, signature levels L0/L1/L2 in replay verification and `JARVIS_SIGNATURES=require` (default `warn`) (`docs/SIGNING_RUNBOOK.md`). **No key exists, the sign timer is not enabled, nothing is signed** |
+| **Replay Contracts, `RC.Ledger.v1`**: rebuild the ledger's state and ordered events as of any seq or sealed block, with a state root; receipts at sealed points (Evidence Objects); offline verifier `python -m app.replay verify`; `jarvisctl replay`; a restore-drill step | **live** since 2026-10-06: the `/api/jarvis/replay/*` routes, receipts at sealed points, the offline verifier, `jarvisctl replay` and the restore-drill step run on the box (`docs/REPLAY_CONTRACTS.md`). A receipt is an unsigned claim until it is re-derived |
+| Domain Replay Contracts (`RC.AIKI`, `ARIS`, `SX`, `Lineage`, `Mandala`) | **on hold**: declared only (no schema, owner or algorithm exists) |
+| **Signatures**: attestations of blocks, receipts and checkpoints by a key a root key authorized, a trust log, the host signer, the PC witness/cosign tool, signature levels L0/L1/L2 in replay verification, `JARVIS_SIGNATURES=off\|warn\|require` (schema v7, `docs/SIGNATURES.md`, `docs/SIGNING_RUNBOOK.md`) | **built on `main`, shelved, not deployed**: no key has been made and no key ceremony done, the sign timer is off, nothing is signed, and the live database is schema v6 (deploying `main` would migrate it to v7; the way back is the backup taken before) |
 | CES registry, unified provenance chain, ESFR promotion | **not built** (`docs/CCS_CHARTER.md`) |
 
 Also enforced by tests: continuity across sessions, replay of a retrieve with why / where / when / session, conflicts surfaced
@@ -37,7 +38,7 @@ On the box, from `deploy/mint/`: `bin/jarvisctl <command>` (`help` lists all; th
 | `seal [--force\|--status]` | seal new history into blocks now (a block is made at 500 waiting entries or when the oldest is an hour old) |
 | `backup` | take a verified backup set; its anchors (chain heads, counters, block hashes) must be a legitimate successor of the last or the dump is quarantined |
 | `drill [--prove-detection]` | restore the newest set into a scratch database, verify it, and replay it at its last anchored block; with the flag it also proves tampering, a removed block and an altered entry are detected |
-| `replay state\|receipt\|receipts\|check\|verify` | Replay Contracts: replay the ledger at a point, issue and re-derive receipts at sealed points (needs the build with Replay Contracts deployed) |
+| `replay state\|receipt\|receipts\|check\|verify` | Replay Contracts: replay the ledger at a point, issue and re-derive receipts at sealed points |
 | `attest status\|sign\|init-key\|install-roots\|verify` | the host-side signer and its key ceremony steps (needs schema v7; nothing is signed until a key is authorized by a root) |
 | `offsite` | encrypt (age) and send the newest set to the Windows PC |
 | `restore --yes-destroy-current-data` | **destructive**; the app stays down unless counts, anchors and hash chains all match |
@@ -75,7 +76,7 @@ write, or one without checkable evidence, is refused with `422 clause_v_violatio
 | `POST /api/jarvis/memory/pipeline` | EMR → STM → LTM consolidation, draft-only (needs `JARVIS_MCP_WRITE_ENABLED`) |
 | `POST /api/jarvis/evidence`, `GET …/{id}`, `…/{id}/verify` | Evidence Objects (create: operator key only) |
 | `POST /api/jarvis/blocks/seal`, `GET …/blocks`, `…/head`, `…/verify`, `…/{height}` | Continuity Blocks (operator key only) |
-| `GET /api/jarvis/replay/contracts`, `…/state`, `…/events`, `POST …/receipts`, `GET …/receipts[/{id}[/verify]]` | `RC.Ledger.v1` and its receipts (operator key only; **on `main`, not live yet**) |
+| `GET /api/jarvis/replay/contracts`, `…/state`, `…/events`, `POST …/receipts`, `GET …/receipts[/{id}[/verify]]` | `RC.Ledger.v1` and its receipts (operator key only; live) |
 
 Blocks and replay answer 501 on the JSON store, which has no history.
 
@@ -95,13 +96,13 @@ database URL or that opt-in the service answers 503 rather than creating a ledge
 ## Honest limits
 
 * **Nothing is signed (yet).** Evidence Objects, blocks and receipts prove what was recorded and that it was not altered,
-  not who vouches for it. The signer (blocks and replay receipts) and the verification code are on `main` but not deployed, and no key exists. Once signing runs, a signature is the Mint key's word about a digest, not proof the content is true; `require` is off unless you turn it on. Authority is the recorded actor (the tenant key) plus the record's own `source_agent`.
+  not who vouches for it. The signer (blocks and replay receipts) and the verification code are on `main`, shelved and not deployed, and no key exists. Once signing runs, a signature is the Mint key's word about a digest, not proof the content is true; `require` is off unless you turn it on. Authority is the recorded actor (the tenant key) plus the record's own `source_agent`.
 * **Tamper evidence has an outside part.** Someone with full database control can rewrite history and re-seal every block; the
   database alone would pass. What exposes it is the anchors in the backups and in the encrypted offsite copies, so they matter.
   A block sealed after the last backup is not anchored yet; a receipt taken earlier also exposes a later rewrite.
-* **Domain Replay Contracts and CES schemas are not built.** Earlier docs claimed stubs under `schemas/rc/` and `schemas/ces/`;
+* **Domain Replay Contracts (on hold) and CES schemas are not built.** Earlier docs claimed stubs under `schemas/rc/` and `schemas/ces/`;
   they never existed (corrected). Only `RC.Ledger.v1` has files (`schemas/rc/`). Receipts are unsigned claims until re-derived.
-* **`RC.Ledger.v1` is not on the live box until it is deployed.**
+* **`main` is ahead of the box.** The live ledger is schema v6 and unsigned; the signature code (schema v7) is on `main` and shelved. Nothing on 8011 verifies or makes a signature.
 * **Soft Clause V rules only warn** (emotion, transient state, transcripts) until the operator flips `JARVIS_CLAUSE_V_SOFT`.
 * **One box.** Wi-Fi only, disk not encrypted, an hour's worth of data at risk between backups, no automatic security updates
   (`deploy/mint/README.md`, "Honest limits").
