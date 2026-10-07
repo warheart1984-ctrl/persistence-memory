@@ -873,7 +873,7 @@ def test_a_partial_fault_may_acknowledge_during_it_but_never_refuse_with_anythin
 def test_the_full_disk_probe_insists_that_something_was_refused():
     body = SCRIPT.read_text().split("def k1(")[1].split("# --- the runner")[0]
     assert 'check(closed["refused_while_full"] > 0, "nothing was refused while the volume was full")' in body
-    assert 'check(first_failure is not None, "no write failed within 25 s of filling the volume: the fault did not bite")' in body
+    assert "No space left" in body and 'check(no_space > 0, "the database never reported' in body        # the proof the fault bit is the database's own log
 
 
 # --- orphaned database sessions ---------------------------------------------------------------------------------------------------------------------

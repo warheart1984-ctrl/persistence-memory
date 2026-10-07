@@ -1516,11 +1516,14 @@ def k1(ctx: Ctx) -> None:
         fill = ctx.docker("exec", keeper, "sh", "-c", "dd if=/dev/zero of=/keep/chaos-filler bs=64k 2>/dev/null; df -B1 --output=avail /keep | tail -1", timeout=120)
         free_after_fill = int(fill.stdout.strip().splitlines()[-1] or -1) if fill.stdout.strip() else -1
         check(0 <= free_after_fill < 1024 * 1024, f"the volume was not filled (free: {free_after_fill} bytes)")
-        first_failure = None
-        while time.time() - t_fault < 25 and first_failure is None:        # until a write fails (or we give up)
-            first_failure = next((a for a in list(writers.attempts) if a.status != 200 and a.t0 > t_fault), None)
-            time.sleep(0.2)
-        check(first_failure is not None, "no write failed within 25 s of filling the volume: the fault did not bite")
+        t_filled = time.time()
+        fault_started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t_fault))
+        no_space = 0
+        while time.time() - t_filled < 25 and not no_space:                  # the proof that the fault bit is the database's own log, not "some request failed"
+            no_space = (ctx.docker("logs", "--since", fault_started, db, timeout=60).stderr + "").count("No space left")
+            time.sleep(0.3)
+        check(no_space > 0, "the database never reported 'No space left on device' within 25 s of filling the volume: the fault did not bite")
+        bite_s = round(time.time() - t_filled, 2)
         time.sleep(3.0)                                                      # the fault in force
         t_free = time.time()
         ctx.docker("exec", keeper, "rm", "-f", "/keep/chaos-filler", timeout=60)
@@ -1532,15 +1535,15 @@ def k1(ctx: Ctx) -> None:
         if not freed:
             ctx.docker("exec", keeper, "rm", "-f", "/keep/chaos-filler", timeout=60)
         attempts = writers.stop()
-    closed = fail_closed(attempts, first_failure.t0, t_free, allowed=(503,), settle=0.5, acks_allowed=True)
-    closed["acknowledged_while_full"] = sum(1 for a in attempts if a.status == 200 and first_failure.t0 + 0.5 < a.t0 and a.t1 < t_free - 0.5)
-    closed["refused_while_full"] = sum(1 for a in attempts if a.status == 503 and first_failure.t0 + 0.5 < a.t0 and a.t1 < t_free - 0.5)
+    closed = fail_closed(attempts, t_filled, t_free, allowed=(503,), settle=0.5, acks_allowed=True)
+    closed["acknowledged_while_full"] = sum(1 for a in attempts if a.status == 200 and a.t0 > t_filled and a.t1 < t_free - 0.5)
+    closed["refused_while_full"] = sum(1 for a in attempts if a.status == 503 and a.t0 >= t_filled - 0.1 and a.t1 < t_free)
     check(closed["refused_while_full"] > 0, "nothing was refused while the volume was full")
     gates = fault_gates(ctx, attempts, "k1")
     logs = ctx.docker("logs", "--since", since, db, timeout=60)
     text = logs.stdout + logs.stderr
     restarts_after = ctx.docker("inspect", "-f", "{{.RestartCount}}", db).stdout.strip()
-    _record_fault(ctx, "K1", {"recover_s": rec["recover_s"], "first_failure_s": round(first_failure.t0 - t_fault, 2), "volume_full_s": round(t_free - t_fault, 2),
+    _record_fault(ctx, "K1", {"recover_s": rec["recover_s"], "bite_after_fill_s": bite_s, "volume_full_s": round(t_free - t_fault, 2),
                               "no_space_errors_in_db_log": text.count("No space left"), "panics": text.count("PANIC"),
                               "db_restarts": int(restarts_after or 0) - int(restarts_before or 0), **closed, **gates})
 
@@ -1610,7 +1613,7 @@ def fault_summary(faults: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for probe_id, runs in sorted(faults.items()):
         entry: dict[str, Any] = {"runs": len(runs)}
-        for key in ("detect_s", "recover_s", "first_failure_s", "volume_full_s", "partition_s", "longest_request_s", "orphans_reaped_after_s"):
+        for key in ("detect_s", "recover_s", "bite_after_fill_s", "volume_full_s", "partition_s", "longest_request_s", "orphans_reaped_after_s"):
             values = sorted(r[key] for r in runs if isinstance(r.get(key), (int, float)))
             if values:
                 entry[key] = {"min": values[0], "median": values[len(values) // 2], "max": values[-1]}
