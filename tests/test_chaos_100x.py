@@ -27,6 +27,7 @@ spec = importlib.util.spec_from_file_location("cl_chaos_100x", SCRIPT)
 chaos = importlib.util.module_from_spec(spec)
 sys.modules["cl_chaos_100x"] = chaos
 spec.loader.exec_module(chaos)
+REAL_WAIT_NO_ORPHANS = chaos.wait_no_orphans     # the autouse fixture below replaces the module's own with a stub
 
 
 # --- the probe list and its count ----------------------------------------------------------------------------------------------------------
@@ -568,6 +569,11 @@ class GateCtx:
         return {"id": "mem-after"}
 
 
+@pytest.fixture(autouse=True)
+def no_orphans_unless_a_test_says_otherwise(monkeypatch):
+    monkeypatch.setattr(chaos, "wait_no_orphans", lambda ctx, seconds=120: {"orphaned_sessions_at_recovery": 0, "orphans_reaped_after_s": 0.0})
+
+
 def good_attempts():
     return [att("w0n1", 200, 0, 1, "mem-0"), att("w0n2", 200, 1, 2, "mem-1"), att("w1n1", 503, 2, 3)]
 
@@ -575,7 +581,7 @@ def good_attempts():
 def test_the_gates_pass_when_everything_acknowledged_is_whole_and_everything_verifies():
     ctx = GateCtx(good_attempts())
     out = chaos.fault_gates(ctx, ctx.attempts, "w")
-    assert out == {"attempts": 3, "acknowledged": 2, "failed": 1, "landed_but_unacknowledged": 0} and ctx.created == 1
+    assert out == {"attempts": 3, "acknowledged": 2, "failed": 1, "landed_but_unacknowledged": 0, "orphaned_sessions_at_recovery": 0, "orphans_reaped_after_s": 0.0} and ctx.created == 1
 
 
 def test_a_write_that_landed_without_being_acknowledged_is_counted_not_failed():
@@ -583,6 +589,15 @@ def test_a_write_that_landed_without_being_acknowledged_is_counted_not_failed():
     ctx = GateCtx(a, rows="\n".join(f"mem-{i}|{x.content}|create" for i, x in enumerate(a)))
     out = chaos.fault_gates(ctx, a, "w")
     assert out["landed_but_unacknowledged"] == 1
+
+
+def test_the_gates_fail_when_the_server_keeps_sessions_for_clients_that_are_gone(monkeypatch):
+    def stuck(ctx, seconds=120):
+        raise chaos.ProbeFail("3 database session(s) held for a client that is gone were still there 120 s after recovery")
+    monkeypatch.setattr(chaos, "wait_no_orphans", stuck)
+    a = good_attempts()
+    with pytest.raises(chaos.ProbeFail, match="held for a client that is gone"):
+        chaos.fault_gates(GateCtx(a), a, "w")
 
 
 @pytest.mark.parametrize("over,message", [
@@ -859,3 +874,51 @@ def test_the_full_disk_probe_insists_that_something_was_refused():
     body = SCRIPT.read_text().split("def k1(")[1].split("# --- the runner")[0]
     assert 'check(closed["refused_while_full"] > 0, "nothing was refused while the volume was full")' in body
     assert 'check(first_failure is not None, "no write failed within 25 s of filling the volume: the fault did not bite")' in body
+
+
+# --- orphaned database sessions ---------------------------------------------------------------------------------------------------------------------
+
+PROC_NET_TCP = """  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0300A8C0:9C40 0200A8C0:1538 01 00000000:00000000 00:00000000 00000000 10001        0 111 1 0000000000000000 20 4 30 10 -1
+   1: 0300A8C0:9C41 0200A8C0:1538 01 00000000:00000000 00:00000000 00000000 10001        0 112 1 0000000000000000 20 4 30 10 -1
+   2: 0300A8C0:9C42 0200A8C0:1538 06 00000000:00000000 00:00000000 00000000 10001        0 113 1 0000000000000000 20 4 30 10 -1
+   3: 0300A8C0:1F41 0100007F:1F90 01 00000000:00000000 00:00000000 00000000 10001        0 114 1 0000000000000000 20 4 30 10 -1
+"""
+
+
+class OrphanCtx:
+    def __init__(self, ports, tcp=PROC_NET_TCP):
+        self.ports, self.tcp = ports, tcp
+        self.stack = {"containers": {"app": "chaos100x-app"}}
+
+    def need_destructive(self):
+        return self.stack
+
+    def docker(self, *a, **k):
+        assert a[:3] == ("exec", "chaos100x-app", "cat") and a[3] == "/proc/net/tcp"
+        return SimpleNamespace(stdout=self.tcp, returncode=0)
+
+    def psql(self, sql, **k):
+        assert "usename = 'jarvis_app'" in sql and "client_addr <> '127.0.0.1'" in sql
+        return "\n".join(str(p) for p in self.ports)
+
+
+def test_a_session_is_an_orphan_only_if_the_application_container_has_no_socket_for_it():
+    # 0x9C40 = 40000, 0x9C41 = 40001 are established to port 5432 (0x1538); 40002 is not established (state 06); 0x1F41 goes to another port
+    assert chaos.orphaned_sessions(OrphanCtx([40000, 40001])) == []
+    assert chaos.orphaned_sessions(OrphanCtx([40000, 40001, 40002, 41000])) == [40002, 41000]
+    assert chaos.orphaned_sessions(OrphanCtx([])) == []
+    assert chaos.orphaned_sessions(OrphanCtx([8001])) == [8001]                  # a socket to a different remote port does not vouch for it
+
+
+def test_waiting_for_the_server_to_reap_orphans_reports_how_long_it_took_and_fails_if_it_never_does(monkeypatch):
+    clock = iter(x * 10.0 for x in range(1, 200))
+    monkeypatch.setattr(chaos.time, "time", lambda: next(clock))
+    monkeypatch.setattr(chaos.time, "sleep", lambda s: None)
+    answers = iter([[1, 2, 3], [1, 2], [], []])
+    monkeypatch.setattr(chaos, "orphaned_sessions", lambda ctx: next(answers))
+    out = REAL_WAIT_NO_ORPHANS(object(), seconds=120)
+    assert out["orphaned_sessions_at_recovery"] == 3 and out["orphans_reaped_after_s"] > 0
+    monkeypatch.setattr(chaos, "orphaned_sessions", lambda ctx: [7, 8])
+    with pytest.raises(chaos.ProbeFail, match="2 database session"):
+        REAL_WAIT_NO_ORPHANS(object(), seconds=60)

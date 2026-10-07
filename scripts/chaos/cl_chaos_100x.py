@@ -1319,6 +1319,36 @@ def _db_rows(ctx: "Ctx", sql: str) -> list[list[str]]:
     return [line.split("|") for line in out.splitlines() if line.strip()]
 
 
+def orphaned_sessions(ctx: "Ctx") -> list[int]:
+    """Client ports of the application's database sessions that have no matching established socket in the application container: sessions the
+    server is holding for a client that is gone."""
+    stack = ctx.need_destructive()
+    table = ctx.docker("exec", stack["containers"]["app"], "cat", "/proc/net/tcp", timeout=30).stdout.splitlines()[1:]
+    mine = set()
+    for line in table:
+        parts = line.split()
+        if len(parts) > 3 and parts[3] == "01" and int(parts[2].split(":")[1], 16) == 5432:
+            mine.add(int(parts[1].split(":")[1], 16))
+    rows = ctx.psql("SELECT client_port FROM pg_stat_activity WHERE backend_type = 'client backend' AND usename = 'jarvis_app' "
+                    "AND client_addr IS NOT NULL AND client_addr <> '127.0.0.1';")
+    return [int(r) for r in rows.splitlines() if r.strip().isdigit() and int(r) not in mine]
+
+
+def wait_no_orphans(ctx: "Ctx", seconds: float = 120) -> dict[str, Any]:
+    """After a fault the server must give back the slots of clients that are gone, on its own, within ``seconds``."""
+    t0 = time.time()
+    seen = None
+    while True:
+        orphans = orphaned_sessions(ctx)
+        seen = len(orphans) if seen is None else seen
+        if not orphans:
+            return {"orphaned_sessions_at_recovery": seen, "orphans_reaped_after_s": round(time.time() - t0, 1)}
+        if time.time() - t0 > seconds:
+            raise ProbeFail(f"{len(orphans)} database session(s) held for a client that is gone were still there {seconds:g} s after recovery "
+                            "(max_connections is small: repeated incidents would lock the application out)")
+        time.sleep(3)
+
+
 def fault_gates(ctx: "Ctx", attempts: list[Attempt], label: str) -> dict[str, Any]:
     """The gates after a fault (the API must be answering again).  Raises ProbeFail naming the first gate that does not hold."""
     receipt = ctx.ensure_receipt()
@@ -1353,7 +1383,8 @@ def fault_gates(ctx: "Ctx", attempts: list[Attempt], label: str) -> dict[str, An
     check(off.returncode == 0, f"the earlier receipt does not re-derive offline from the raw rows: {(off.stdout + off.stderr).strip()[-160:]}")
     after = ctx.create(content=ctx.content(f"{label} after the fault"))
     status_is(ctx.client.get(f"/api/jarvis/memory/{after['id']}"), 200, what="read back a write made after the fault")
-    return {"attempts": len(attempts), "acknowledged": len(acked), "failed": len(attempts) - len(acked), "landed_but_unacknowledged": landed_unacked}
+    reaped = wait_no_orphans(ctx)
+    return {"attempts": len(attempts), "acknowledged": len(acked), "failed": len(attempts) - len(acked), "landed_but_unacknowledged": landed_unacked, **reaped}
 
 
 def fail_closed(attempts: list[Attempt], t_fault: float, t_up: float | None, *, allowed: tuple[int, ...], settle: float = 0.5,
@@ -1579,11 +1610,11 @@ def fault_summary(faults: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for probe_id, runs in sorted(faults.items()):
         entry: dict[str, Any] = {"runs": len(runs)}
-        for key in ("detect_s", "recover_s", "first_failure_s", "volume_full_s", "partition_s", "longest_request_s"):
+        for key in ("detect_s", "recover_s", "first_failure_s", "volume_full_s", "partition_s", "longest_request_s", "orphans_reaped_after_s"):
             values = sorted(r[key] for r in runs if isinstance(r.get(key), (int, float)))
             if values:
                 entry[key] = {"min": values[0], "median": values[len(values) // 2], "max": values[-1]}
-        for key in ("attempts", "acknowledged", "failed", "landed_but_unacknowledged", "writes_during_fault", "no_space_errors_in_db_log", "panics", "db_restarts"):
+        for key in ("attempts", "acknowledged", "failed", "landed_but_unacknowledged", "writes_during_fault", "no_space_errors_in_db_log", "panics", "db_restarts", "orphaned_sessions_at_recovery"):
             entry[key] = sum(int(r.get(key) or 0) for r in runs)
         statuses: Counter = Counter()
         for r in runs:
