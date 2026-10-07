@@ -72,8 +72,17 @@ scripts/chaos/throwaway_stack.sh down                     # removes containers, 
    block verifiers report nothing. A write that committed but whose acknowledgement was lost (the client never saw a 200) is counted separately.
 2. **The history chain and the blocks verify** (the API's verifiers).
 3. **A replay receipt taken before the fault still re-derives**, through the service and offline from the raw rows in a one-off container.
-4. **The API failed closed during the fault and recovered after it**: nothing begun after the fault was acknowledged while it was in force, every
+4. **The API failed closed during the fault and recovered after it**: nothing begun after the fault was acknowledged while it was in force (except in
+   the full-disk fault, where a write that fits in space already allocated may succeed: each such write must then be whole and durable, gate 1), every
    refusal was a status the fault explains (connection refused or 503; 503 only for the full disk), and the application then took and returned a write.
+5. **The server gave back the slots of clients that are gone.** Database sessions with no matching socket in the application container (found by reading
+   `/proc/net/tcp` in the container and `pg_stat_activity`) must be reaped by the server within two minutes. `max_connections` is 30, and an unreaped
+   partition strands several sessions per incident.
+
+### Requests under a silent partition
+
+J1 also fails if any request, or `/ready`, takes longer than 15 s to be answered while the link is cut. Before `app/pg_store.py` bounded dead
+connections (libpq keepalives and `tcp_user_timeout`), requests and `/ready` hung for the whole partition plus the TCP recovery (52 s measured).
 
 ## The soak
 
@@ -81,7 +90,8 @@ scripts/chaos/throwaway_stack.sh down                     # removes containers, 
 retrieval slow down with the ledger? Four phases on one throwaway stack: **growth** (records written and sealed in batches while memory, a typical and a
 hostile retrieve, `blocks/verify`, `history/verify` and the database size are sampled), **reads** on the then-constant ledger (memory against *requests*:
 a slope there is a leak), **idle** (does memory come back?) and a **control** (restart the application container, same ledger, same load: does it return
-to the same level?). The verdict is computed from the samples (`verdict()` in the script; thresholds and synthetic leak/cache/accumulation cases are in
+to the same level?). An optional fifth, **concurrency** (`soak.py --concurrency`), restarts the application and reads at 1, 4, 16 and 40 callers at once,
+reading the process's high-water mark after each: a retrieve that materialises the ledger makes the peak follow callers x ledger size. The verdict is computed from the samples (`verdict()` in the script; thresholds and synthetic leak/cache/accumulation cases are in
 `tests/test_soak.py`) and printed with the numbers.
 
 ## What it reports
