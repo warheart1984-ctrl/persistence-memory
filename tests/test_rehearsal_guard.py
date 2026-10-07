@@ -73,6 +73,8 @@ exit 0
 def run(box, phase, *, guard_only=True, extra_env=None):
     env = dict(os.environ, HOME=str(box.home), PATH=f"{box.bindir}:{os.environ['PATH']}", REHEARSAL_GUARD_ONLY="1" if guard_only else "0",
                SRC_FROM=str(SCENARIO.parents[3]))
+    for name in ("XDG_CONFIG_HOME", "XDG_RUNTIME_DIR", "JARVIS_HOME", "JARVIS_APP_PORT"):      # nothing of the machine running the tests may leak into the script
+        env.pop(name, None)
     env.update(extra_env or {})
     return subprocess.run(["bash", str(SCENARIO), phase], capture_output=True, text=True, env=env, timeout=60, cwd=box.home)
 
@@ -591,3 +593,16 @@ def test_teardown_refuses_before_removing_anything_when_one_resource_is_not_the_
 
 def test_the_pc_ownership_test_is_in_the_script_verbatim():
     assert '[ "$(docker inspect -f \'{{index .Config.Labels "com.jarvis.rehearsal.dir"}}\' "$PC" 2>/dev/null)" = "$R" ] && pc_owned="$PC"' in SCENARIO.read_text()
+
+
+def test_the_machine_running_the_tests_cannot_leak_its_unit_directory_into_the_script(box, monkeypatch):
+    """CI sets XDG_CONFIG_HOME; a developer's machine may hold real jarvis units there.  The fake account must be the only one the script sees."""
+    elsewhere = box.tmp / "real-xdg" / "systemd" / "user"
+    elsewhere.mkdir(parents=True)
+    (elsewhere / "jarvis-backup.service").write_text("[Service]\nExecStart=/real/live/deploy/mint/bin/backup.sh\n")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(box.tmp / "real-xdg"))
+    full_rehearsal(box)
+    r = run(box, "teardown", guard_only=False)
+    assert r.returncode == 0, r.stderr
+    assert (elsewhere / "jarvis-backup.service").exists()                                  # untouched
+    assert not list((box.home / ".config" / "systemd" / "user").glob("jarvis-*"))          # the fake account's own units were the ones removed
