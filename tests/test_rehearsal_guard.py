@@ -123,13 +123,25 @@ def test_an_account_with_the_ledgers_systemd_units_is_refused(box, unit):
     assert (d / unit).exists()
 
 
-def test_a_missing_docker_or_an_unreadable_engine_is_refused(box):
+def test_an_unreadable_engine_is_refused(box):
     (box.bindir / "docker").write_text("#!/usr/bin/env bash\nexit 1\n")
     refused(run(box, "phase-a"), "cannot read this Docker engine's identity")
-    env_path = str(box.tmp / "emptybin")
-    (box.tmp / "emptybin").mkdir()
-    r = run(box, "phase-a", extra_env={"PATH": f"{env_path}:/usr/bin:/bin"})
-    assert r.returncode == 2 and "REFUSED" in r.stderr
+    assert_nothing_destructive_ran(box)
+
+
+def test_a_machine_with_no_docker_at_all_is_refused(box):
+    """A PATH that holds the shell tools the script needs and nothing else (a real docker on the test machine must not matter)."""
+    import shutil
+
+    tools = box.tmp / "tools"
+    tools.mkdir()
+    for name in ("bash", "env", "id", "cat", "grep", "awk", "paste", "ls", "dirname", "mkdir", "rm", "tr", "sed", "sort", "tail", "head", "date"):
+        found = shutil.which(name)
+        if found:
+            (tools / name).symlink_to(found)
+    assert not (tools / "docker").exists()
+    r = run(box, "phase-a", extra_env={"PATH": str(tools)})
+    refused(r, "docker is not installed here")
 
 
 @pytest.mark.parametrize("phase", ["phase-b", "teardown"])
