@@ -69,6 +69,23 @@ def _connect_timeout() -> float:
     return float(_env_int("JARVIS_DATABASE_CONNECT_TIMEOUT", 5))
 
 
+def _link_kwargs() -> dict[str, int]:
+    """Bound how long a silently dead link (a dropped network, a vanished peer) can hold a request.
+
+    statement_timeout is enforced by the SERVER, so it cannot help when the server is unreachable, and the pool timeout only bounds waiting for a free
+    connection.  A request that picks up an established connection whose peer has gone silent therefore hung for as long as TCP kept retrying (the
+    chaos partition fault measured 52 s, /ready included).  Keepalives find a peer that has gone quiet while we wait for its answer
+    (idle + interval x count = 7 s by default); tcp_user_timeout fails data that is sent and never acknowledged (5 s).  Either way the connection
+    errors, the request becomes a 503 (fail closed), and the pool replaces the connection."""
+    return {
+        "keepalives": 1,
+        "keepalives_idle": _env_int("JARVIS_DATABASE_KEEPALIVES_IDLE_S", 3),
+        "keepalives_interval": _env_int("JARVIS_DATABASE_KEEPALIVES_INTERVAL_S", 2),
+        "keepalives_count": _env_int("JARVIS_DATABASE_KEEPALIVES_COUNT", 2),
+        "tcp_user_timeout": _env_int("JARVIS_DATABASE_TCP_USER_TIMEOUT_MS", 5000),
+    }
+
+
 def _pool_for(dsn: str, schema: str | None) -> tuple[ConnectionPool, tuple[str, str]]:
     key = (dsn, schema or "")
     with _pools_lock:
@@ -91,7 +108,7 @@ def _pool_for(dsn: str, schema: str | None) -> tuple[ConnectionPool, tuple[str, 
                 # once (TooManyRequests).  Saturation is shed, never queued behind a slow database.
                 timeout=_env_int("JARVIS_DATABASE_POOL_TIMEOUT_MS", 1000) / 1000.0,
                 max_waiting=_env_int("JARVIS_DATABASE_POOL_MAX_WAITING", pool_max),
-                kwargs={"options": " ".join(options), "connect_timeout": int(_connect_timeout())},
+                kwargs={"options": " ".join(options), "connect_timeout": int(_connect_timeout()), **_link_kwargs()},
                 check=ConnectionPool.check_connection,
                 open=False,
             )
