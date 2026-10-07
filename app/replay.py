@@ -175,6 +175,9 @@ class BlockRef(BaseModel):
     first_seq: int
     last_seq: int
     block_hash: str
+    signed: bool = Field(default=False, description="true only when a valid attestation by an authorized Mint key was verified against the pinned roots "
+                                                    "(L1 or better); false when unsigned, unverifiable (no trust root) or checking is off")
+    signature_level: int | None = Field(default=None, description="0 unsigned, 1 Mint-signed, 2 root-cosigned; null when signatures are not checked (JARVIS_SIGNATURES=off)")
 
 
 class ReplayedRecord(BaseModel):
@@ -264,6 +267,8 @@ class ReceiptVerification(BaseModel):
     problems: list[dict[str, str]]
     receipt: ReplayReceiptPayload | None = None
     replayed: dict[str, Any] | None = Field(default=None, description="what the replay says now (root, counts, block)")
+    signatures: dict[str, Any] | None = Field(default=None, description="the receipt's and its block's signature levels (L0 unsigned, L1 Mint-signed, "
+                                                                         "L2 root-cosigned) and, in JARVIS_SIGNATURES=require, whether they are enough; null when checking is off")
 
 
 def receipt_payload(state: "ReplayState") -> dict[str, Any]:
@@ -448,9 +453,30 @@ def resolve_at_seq(conn: Any, tenant: str, at_seq: int | None, at_block: int | N
     return at_seq
 
 
+def add_signatures(conn: Any, tenant: str, result: dict[str, Any], *, receipt_id: str | None = None, mode: str | None = None) -> dict[str, Any]:
+    """Attach the signature levels of the sealed block (and the receipt) to a verification result, and fold what must fail into
+    ``problems`` / ``ok``.  Re-derivation (``ok`` before this) is a separate question from who vouches: in ``warn`` an unsigned block
+    only adds a warning; an attestation that does not verify, and anything unsigned in ``require``, make the result fail."""
+    from app import attest
+
+    block = result.get("block")
+    if (mode or attest.signatures_mode()) == "off" or (block is None and receipt_id is None):
+        result.setdefault("signatures", None)
+        return result
+    rep = attest.signature_report(conn, tenant, block_height=block["height"] if block else None, block_hash=block["block_hash"] if block else None,
+                                  receipt_id=receipt_id, mode=mode)
+    result["signatures"] = rep
+    if block is not None:
+        block["signed"] = bool(rep["verified"] and rep["block"] and rep["block"]["level"] >= 1)
+        block["signature_level"] = rep["block"]["level"] if rep["block"] else None
+    result["problems"] = list(result.get("problems", [])) + rep["problems"]
+    result["ok"] = not result["problems"]
+    return result
+
+
 def verify_replay(conn: Any, tenant: str, *, at_seq: int | None = None, at_block: int | None = None,
                   expect_root: str | None = None, expect_block_hash: str | None = None,
-                  expect_block_height: int | None = None) -> dict[str, Any]:
+                  expect_block_height: int | None = None, signatures: str | None = None) -> dict[str, Any]:
     """Replay the tenant's history up to a point from the raw entries and check everything that can be checked.
 
     ``conn`` is a psycopg connection with the ledger schema on its search path and the tenant (or a superuser) able to
@@ -474,12 +500,13 @@ def verify_replay(conn: Any, tenant: str, *, at_seq: int | None = None, at_block
     covering = conn.execute(
         "SELECT height, block_hash FROM blocks WHERE tenant_key = %s AND first_seq <= %s AND last_seq >= %s",
         (tenant, seq, seq)).fetchone()
-    return {
+    result = {
         "ok": not problems, "problems": problems, "tenant": tenant, "at_seq": seq, "history_seq": ctx.counter,
         "sealed_seq": ctx.sealed_seq, "sealed": bool(covering), "state_root": ctx.root,
         "record_count": len(ctx.folded.live), "deleted_count": ctx.folded.deleted, "entry_count": len(ctx.entries),
-        "block": {"height": covering[0], "block_hash": covering[1]} if covering else None,
+        "block": {"height": covering[0], "block_hash": covering[1]} if covering else None, "signatures": None,
     }
+    return add_signatures(conn, tenant, result, mode=signatures) if signatures != "off" else result
 
 
 def _load_receipt(conn: Any, tenant: str, receipt_id: str) -> "evidence_objects.EvidenceObject":
@@ -498,7 +525,7 @@ def _load_receipt(conn: Any, tenant: str, receipt_id: str) -> "evidence_objects.
     return obj
 
 
-def verify_receipt(conn: Any, tenant: str, receipt_id: str) -> dict[str, Any]:
+def verify_receipt(conn: Any, tenant: str, receipt_id: str, *, signatures: str | None = None) -> dict[str, Any]:
     """Re-derive a receipt from the raw history entries: the stored object must be intact, and replaying the ledger at the
     receipt's sealed point must give the receipt's state root, counts and covering block.  Returns a ``verify_replay``-style
     result with a ``receipt`` entry; ``ok`` is false if anything differs."""
@@ -514,7 +541,7 @@ def verify_receipt(conn: Any, tenant: str, receipt_id: str) -> dict[str, Any]:
         problems.append(_problem("receipt", receipt_id, f"the receipt is for tenant {p['tenant']}, not {tenant}"))
     try:
         result = verify_replay(conn, tenant, at_seq=p["at_seq"], expect_root=p["state_root"],
-                               expect_block_hash=p["block_hash"], expect_block_height=p["block_height"])
+                               expect_block_hash=p["block_hash"], expect_block_height=p["block_height"], signatures="off")  # signatures are added once, below
     except ReplayError as exc:
         problems.append(_problem("receipt", receipt_id, f"the receipt cannot be replayed: {exc.message}"))
         return {"ok": False, "problems": problems, "receipt": p, "tenant": tenant}
@@ -523,7 +550,7 @@ def verify_receipt(conn: Any, tenant: str, receipt_id: str) -> dict[str, Any]:
         if result[key] != p[key]:
             problems.append(_problem("receipt", receipt_id, f"{key} is {result[key]} on replay, the receipt says {p[key]}"))
     result.update(problems=problems, ok=not problems, receipt=p, receipt_id=receipt_id)
-    return result
+    return add_signatures(conn, tenant, result, receipt_id=receipt_id, mode=signatures) if signatures != "off" else result
 
 
 # --- command line -----------------------------------------------------------------------------------------------
@@ -556,6 +583,8 @@ def main(argv: list[str] | None = None) -> int:
     v.add_argument("--expect-root", help="fail unless the replayed state root equals this value")
     v.add_argument("--expect-block-hash", help="fail unless the sealed block covering the point has this hash (an anchor's, for example)")
     v.add_argument("--receipt", help="re-derive this replay receipt (an evidence object id) from the raw history instead")
+    v.add_argument("--signatures", choices=["off", "warn", "require"],
+                   help="override JARVIS_SIGNATURES for this run (the signer uses off: it asks only whether the receipt re-derives, not whether it is signed yet)")
     s = sub.add_parser("schemas", help="write or check the published schemas under schemas/rc/")
     sg = s.add_mutually_exclusive_group(required=True)
     sg.add_argument("--write", action="store_true")
@@ -584,24 +613,35 @@ def main(argv: list[str] | None = None) -> int:
                 if args.at_seq is not None or args.at_block is not None or args.expect_root or args.expect_block_hash:
                     print("--receipt carries its own point, root and block; do not combine it with those options", file=sys.stderr)
                     return 2
-                result = verify_receipt(conn, args.tenant, args.receipt)
+                result = verify_receipt(conn, args.tenant, args.receipt, signatures=args.signatures)
             else:
                 result = verify_replay(conn, args.tenant, at_seq=args.at_seq, at_block=args.at_block, expect_root=args.expect_root,
-                                       expect_block_hash=args.expect_block_hash)
+                                       expect_block_hash=args.expect_block_hash, signatures=args.signatures)
         except ReplayError as exc:
             print(f"{exc.code}: {exc.message}", file=sys.stderr)
             return 2
     for p in result["problems"]:
         print(f"PROBLEM tenant={args.tenant} {p['subject']} [{p['check']}]: {p['problem']}")
+    def report_signatures() -> None:
+        sig = result.get("signatures")
+        if not sig:
+            return
+        parts = ", ".join(f"{name} {sig[name].get('id') or sig[name].get('height')}: {sig[name]['label']}" for name in ("block", "receipt") if sig.get(name))
+        print(f"signatures ({sig['mode']}): {sig['label']}" + (f" [{parts}]" if parts else ""))
+        for w in sig["warnings"]:
+            print(f"WARNING: {w}")
+
     if result["problems"]:
+        report_signatures()
         return 1
     where = f"block {result['block']['height']} ({result['block']['block_hash'][:16]}...)" if result["block"] else "not covered by a sealed block"
     if args.receipt:
         print(f"ok: receipt {args.receipt} re-derived: seq {result['at_seq']}, {result['record_count']} record(s), "
               f"state root {result['state_root']}; {where}")
-        return 0
-    print(f"ok: replayed {result['entry_count']} entries to seq {result['at_seq']}: {result['record_count']} record(s), "
-          f"{result['deleted_count']} deleted, state root {result['state_root']}; {where}")
+    else:
+        print(f"ok: replayed {result['entry_count']} entries to seq {result['at_seq']}: {result['record_count']} record(s), "
+              f"{result['deleted_count']} deleted, state root {result['state_root']}; {where}")
+    report_signatures()
     return 0
 
 

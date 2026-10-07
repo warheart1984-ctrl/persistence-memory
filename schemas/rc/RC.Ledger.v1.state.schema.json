@@ -17,6 +17,25 @@
         "last_seq": {
           "title": "Last Seq",
           "type": "integer"
+        },
+        "signature_level": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "0 unsigned, 1 Mint-signed, 2 root-cosigned; null when signatures are not checked (JARVIS_SIGNATURES=off)",
+          "title": "Signature Level"
+        },
+        "signed": {
+          "default": false,
+          "description": "true only when a valid attestation by an authorized Mint key was verified against the pinned roots (L1 or better); false when unsigned, unverifiable (no trust root) or checking is off",
+          "title": "Signed",
+          "type": "boolean"
         }
       },
       "required": [

@@ -214,7 +214,7 @@ def test_a_dry_run_asks_what_is_pending_and_signs_and_stores_nothing(mint_dir, h
     led = ledger_factory()
     r = run_attest(mint_dir, home, led.port, "sign", "--dry-run", fake_bin=fake_bin)
     assert r.returncode == 0, text(r)
-    assert "would sign blocks [1, 2] and a checkpoint" in r.stdout
+    assert "would sign blocks [1, 2], 0 receipt(s) and a checkpoint" in r.stdout
     assert not [q for q in led.requests if q[0] == "POST"] and led.rows == [] and not state(home, "sign.last_ok").exists()
     assert APIKEY not in text(r)
 
@@ -224,7 +224,7 @@ def test_signing_stores_every_block_then_a_checkpoint_and_records_success(mint_d
     r = run_attest(mint_dir, home, led.port, "sign", fake_bin=fake_bin)
     assert r.returncode == 0, text(r)
     assert [(x["kind"], x["subject"], x["signer_seq"]) for x in led.rows][:2] == [("block", "block:1", 1), ("block", "block:2", 2)] and led.rows[2]["kind"] == "checkpoint"
-    assert "signed blocks 1,2; checkpoint 3 covers 2" in text(r)
+    assert "signed blocks 1,2, 0 receipt(s); checkpoint 3 covers 2" in text(r)
     assert state(home, "sign.last_ok").exists() and state(home, "sign.first_ok").exists()
     assert APIKEY not in text(r) + "".join(p.read_text() for p in (home / "logs").rglob("*.log"))
     # the offline verifier ran in a one-off container, once, on the newest block with its hash (compose run ... migrate ... replay verify)
@@ -496,3 +496,11 @@ def test_jarvisctl_routes_attest_and_lists_it_in_help(mint_dir, home, signing_ke
     r = subprocess.run([str(mint_dir / "bin" / "jarvisctl"), "attest", "status"], capture_output=True, text=True, env=env, timeout=60)
     assert r.returncode == 0 and json.loads(r.stdout)["key_id"] == signing_key.key_id
     assert "attest status|sign|init-key|install-roots|verify" in subprocess.run([str(mint_dir / "bin" / "jarvisctl"), "help"], capture_output=True, text=True, env=env).stdout
+
+
+def test_the_signatures_switch_defaults_to_warn_and_reaches_both_the_app_and_the_verifier():
+    t = compose_text()
+    assert t.count("JARVIS_SIGNATURES: ${JARVIS_SIGNATURES:-warn}") == 2  # app and migrate (jarvisctl verify, the restore gate, offline replay)
+    example = (ROOT / "deploy" / "mint" / ".env.example").read_text("utf-8")
+    assert "# JARVIS_SIGNATURES=warn" in example and "require" in example
+    assert "JARVIS_SIGNATURES=require" not in example.replace("# JARVIS_SIGNATURES=require", "")  # never shipped switched on

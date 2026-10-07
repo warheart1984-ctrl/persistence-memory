@@ -478,10 +478,13 @@ class PostgresRowStore:
                 images = {r["seq"]: r for r in conn.execute(
                     "SELECT seq, version, after FROM record_history WHERE tenant_key = %s AND seq = ANY(%s)",
                     (self._tenant_key, [h["seq"] for h in page])).fetchall()}
+        block_ref = replay.BlockRef(**block) if block else None
+        if block_ref is not None:
+            block_ref.signed, block_ref.signature_level = self._block_signature(block_ref.height, block_ref.block_hash)
         return replay.ReplayState(
             tenant=self._tenant_key, at_seq=seq, history_seq=counter["last_seq"] if counter else 0, sealed_seq=sealed_seq,
             sealed=block is not None, at_block_boundary=block is not None and block["last_seq"] == seq,
-            block=replay.BlockRef(**block) if block else None,
+            block=block_ref,
             record_count=len(live), deleted_count=len(heads) - len(live),
             state_root=replay.state_root([(h["memory_id"], h["row_hash"]) for h in live]),
             records=[replay.ReplayedRecord(id=h["memory_id"], seq=h["seq"], version=images[h["seq"]]["version"],
@@ -596,6 +599,23 @@ class PostgresRowStore:
             "voids": [{"signer_seq": k, "attestation_hash": v} for k, v in sorted(trust.voids.items())],
             "statements": trust.head_seq, "problems": trust.problems, "trust_roots_configured": bool(roots),
         }
+
+    def signature_report(self, *, block_height: int | None, block_hash: str | None, receipt_id: str | None = None) -> dict[str, Any]:
+        with self._tx() as conn:
+            conn.row_factory = tuple_row
+            return attest.signature_report(conn, self._tenant_key, block_height=block_height, block_hash=block_hash, receipt_id=receipt_id)
+
+    def _block_signature(self, height: int, block_hash: str) -> tuple[bool, int | None]:
+        """(signed, level) for a block: ``signed`` only when a valid attestation was verified against the pinned roots."""
+        try:
+            rep = self.signature_report(block_height=height, block_hash=block_hash)
+        except StoreUnavailableError:
+            raise
+        except Exception:  # a signature-checking fault must never break replay; the block is then reported as not signed
+            return False, None
+        if rep["level"] is None:
+            return False, None
+        return bool(rep["verified"] and rep["block"] and rep["block"]["level"] >= 1), rep["block"]["level"] if rep["block"] else None
 
     def pending_attestations(self) -> dict[str, Any]:
         """What has no attestation yet (what a signer would sign next), plus where the log ends."""
@@ -770,8 +790,12 @@ class PostgresRowStore:
                     problem(f"the covering block is {state.block.height}, the receipt says {p['block_height']}")
                 if state.block.block_hash != p["block_hash"]:
                     problem(f"the covering block's hash is {state.block.block_hash}, the receipt says {p['block_hash']}")
+        signatures = None
+        if attest.signatures_mode() != "off":
+            signatures = self.signature_report(block_height=p["block_height"], block_hash=p["block_hash"], receipt_id=receipt_id)
+            problems.extend({"check": x["check"], "subject": x["subject"], "problem": x["problem"]} for x in signatures["problems"])
         return replay.ReceiptVerification(ok=not problems, receipt_id=receipt_id, problems=problems,
-                                          receipt=replay.ReplayReceiptPayload(**p), replayed=replayed)
+                                          receipt=replay.ReplayReceiptPayload(**p), replayed=replayed, signatures=signatures)
 
     # -- writes -----------------------------------------------------------------
 

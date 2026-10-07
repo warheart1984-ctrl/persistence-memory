@@ -6,7 +6,7 @@
 #                                                           the newest sealed block); the same replay always gives the same receipt
 #   replay.sh receipts                                      list receipts
 #   replay.sh check RECEIPT_ID                              ask the ledger to re-derive a receipt (fast, uses the running service)
-#   replay.sh verify [--tenant T] [--receipt ID | --at-seq N | --at-block H] [--expect-root R] [--expect-block-hash H]
+#   replay.sh verify [--tenant T] [--receipt ID | --at-seq N | --at-block H] [--expect-root R] [--expect-block-hash H] [--signatures off|warn|require]
 #                                                           replay from the RAW history rows in a one-off container (independent of
 #                                                           the SQL the service uses); exit 0 only if everything agrees
 # The operator key is read from secrets/api-key and never printed or put on a command line.
@@ -24,7 +24,7 @@ if [ "$cmd" = verify ]; then
   while [ $# -gt 0 ]; do
     case "$1" in
       --tenant) tenant="$2"; shift ;;
-      --receipt|--at-seq|--at-block|--expect-root|--expect-block-hash) args+=("$1" "$2"); shift ;;
+      --receipt|--at-seq|--at-block|--expect-root|--expect-block-hash|--signatures) args+=("$1" "$2"); shift ;;
       *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
     shift
@@ -115,6 +115,11 @@ import json, sys
 v = json.load(sys.stdin)
 for p in v["problems"]:
     print("PROBLEM [%s]: %s" % (p["check"], p["problem"]))
+s = v.get("signatures")
+if s:
+    print("signatures (%s): %s" % (s["mode"], s["label"]))
+    for w in s["warnings"]:
+        print("WARNING: " + w)
 if v["ok"]:
     r = v["receipt"]
     print("ok: receipt %s re-derived: seq %d, %d record(s), state root %s, block %d" % (v["receipt_id"], r["at_seq"], r["record_count"], r["state_root"], r["block_height"]))

@@ -18,7 +18,7 @@ restore are in [`deploy/mint/README.md`](deploy/mint/README.md).
 | **Continuity Blocks**: sealed, Merkle-rooted, hash-chained ranges of the history; every block hash is also kept outside the database in the backup anchors | **live**, **unsigned** (`docs/CONTINUITY_BLOCKS.md`) |
 | **Replay Contracts, `RC.Ledger.v1`**: rebuild the ledger's state and ordered events as of any seq or sealed block, with a state root; receipts at sealed points (Evidence Objects); offline verifier `python -m app.replay verify`; `jarvisctl replay`; a restore-drill step | **implemented on `main`, not deployed yet**: the live ledger has no `/api/jarvis/replay/*` routes (`docs/REPLAY_CONTRACTS.md`) |
 | Domain Replay Contracts (`RC.AIKI`, `ARIS`, `SX`, `Lineage`, `Mandala`) | **declared only**: no schema, owner or algorithm exists |
-| **Signatures**, verification side: attestations of blocks, receipts and checkpoints by a key a root key authorized, a trust log, `pg_verify` section (schema v7, `docs/SIGNATURES.md`) | **on `main`, not deployed**: schema v7 logs and checks, the host signer, the PC witness/cosign tool, custody guards, backup/drill handling (`docs/SIGNING_RUNBOOK.md`). **No key exists, the sign timer is not enabled, nothing is signed** |
+| **Signatures**, verification side: attestations of blocks, receipts and checkpoints by a key a root key authorized, a trust log, `pg_verify` section (schema v7, `docs/SIGNATURES.md`) | **on `main`, not deployed**: schema v7 logs and checks, the host signer (blocks and replay receipts), the PC witness/cosign tool, custody guards, backup/drill handling, signature levels L0/L1/L2 in replay verification and `JARVIS_SIGNATURES=require` (default `warn`) (`docs/SIGNING_RUNBOOK.md`). **No key exists, the sign timer is not enabled, nothing is signed** |
 | CES registry, unified provenance chain, ESFR promotion | **not built** (`docs/CCS_CHARTER.md`) |
 
 Also enforced by tests: continuity across sessions, replay of a retrieve with why / where / when / session, conflicts surfaced
@@ -95,7 +95,7 @@ database URL or that opt-in the service answers 503 rather than creating a ledge
 ## Honest limits
 
 * **Nothing is signed (yet).** Evidence Objects, blocks and receipts prove what was recorded and that it was not altered,
-  not who vouches for it. The signer and the verification code are on `main` but not deployed, no key exists, and receipts are not signed even then. Authority is the recorded actor (the tenant key) plus the record's own `source_agent`.
+  not who vouches for it. The signer (blocks and replay receipts) and the verification code are on `main` but not deployed, and no key exists. Once signing runs, a signature is the Mint key's word about a digest, not proof the content is true; `require` is off unless you turn it on. Authority is the recorded actor (the tenant key) plus the record's own `source_agent`.
 * **Tamper evidence has an outside part.** Someone with full database control can rewrite history and re-seal every block; the
   database alone would pass. What exposes it is the anchors in the backups and in the encrypted offsite copies, so they matter.
   A block sealed after the last backup is not anchored yet; a receipt taken earlier also exposes a later rewrite.

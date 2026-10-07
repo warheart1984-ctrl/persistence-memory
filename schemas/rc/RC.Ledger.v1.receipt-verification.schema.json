@@ -108,6 +108,20 @@
       "default": null,
       "description": "what the replay says now (root, counts, block)",
       "title": "Replayed"
+    },
+    "signatures": {
+      "anyOf": [
+        {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "the receipt's and its block's signature levels (L0 unsigned, L1 Mint-signed, L2 root-cosigned) and, in JARVIS_SIGNATURES=require, whether they are enough; null when checking is off",
+      "title": "Signatures"
     }
   },
   "required": [
