@@ -71,6 +71,16 @@ notify() {
 # Run a command in the database container as the postgres OS user (peer auth over the local socket).
 pg_exec() { docker exec -i -u postgres "$DB_CONTAINER" "$@"; }
 
+# The compose project hands the service its trust roots (PUBLIC keys) as a read-only config file. It must exist before `up`; until the
+# key ceremony it holds only a comment, which means "nothing can be verified" (never "everything is fine").
+ensure_trust_roots() {
+  if [ ! -f "$SECRETS_DIR/trust-roots.pub" ]; then
+    mkdir -p "$SECRETS_DIR"
+    printf '# trust roots: public keys only, one OpenSSH line each. Empty until the key ceremony; see jarvisctl attest install-roots\n' > "$SECRETS_DIR/trust-roots.pub"
+    chmod 644 "$SECRETS_DIR/trust-roots.pub"
+  fi
+}
+
 require_db() {
   [ "$(docker inspect -f '{{.State.Running}}' "$DB_CONTAINER" 2>/dev/null)" = "true" ] \
     || die "database container $DB_CONTAINER is not running"

@@ -14,6 +14,8 @@ export LOG_NAME=backup
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 # shellcheck source=anchors.sh
 source "$(dirname "${BASH_SOURCE[0]}")/anchors.sh"
+# shellcheck source=custody.sh
+source "$(dirname "${BASH_SOURCE[0]}")/custody.sh"
 
 single_instance backup
 umask 077
@@ -39,7 +41,10 @@ evidence_table=""
 if grep -Eq "TABLE jarvis evidence_objects " "$tmp/toc.txt"; then evidence_table="evidence_objects"; fi
 blocks_table=""
 if grep -Eq "TABLE jarvis blocks " "$tmp/toc.txt"; then blocks_table="blocks"; fi
-for table in memories boards record_history chain_heads history_counters schema_version $evidence_table $blocks_table; do
+# and v7 or later the signing logs
+sig_tables=""
+if grep -Eq "TABLE jarvis attestations " "$tmp/toc.txt"; then sig_tables="attestations trust_statements"; fi
+for table in memories boards record_history chain_heads history_counters schema_version $evidence_table $blocks_table $sig_tables; do
   grep -Eq "TABLE DATA jarvis $table " "$tmp/toc.txt" || die "dump has no data section for jarvis.$table"
 done
 
@@ -49,9 +54,23 @@ pg_exec pg_restore --data-only -f - -n jarvis < "$tmp/$base.dump" | awk '
   /^\\\.$/        { inside = 0; next }
   inside          { rows[table]++ }
   END { for (t in rows) print t "=" rows[t] }' | LC_ALL=C sort > "$tmp/$base.counts"
-for table in memories boards record_history chain_heads history_counters $evidence_table $blocks_table; do
+for table in memories boards record_history chain_heads history_counters $evidence_table $blocks_table $sig_tables; do
   grep -q "^$table=" "$tmp/$base.counts" || die "could not count rows of $table in the dump"
 done
+
+# 3b. the data of every table as text, read once from the dump itself (used for the custody check and the signatures export)
+pg_exec pg_restore --data-only -f - -n jarvis < "$tmp/$base.dump" > "$tmp/data.txt" || die "could not read the dump's data back"
+
+# 3c. key custody: this box's signing key must not be in the database's data (a hit means the set is NOT published); other key-shaped
+#     text there is only a warning, because the history is append-only and could never be cleaned. Files are scanned in 6b.
+custody_out="$(custody_check_data "$tmp/data.txt")" || { notify "Jarvis ledger: SIGNING KEY IN THE DATABASE" "$custody_out" critical; die "CUSTODY: $custody_out; this backup is NOT published"; }
+[ -z "$custody_out" ] || { log WARN "$custody_out"; notify "Jarvis ledger: key-shaped text in the database" "$custody_out" normal; }
+
+# 3d. the signatures export (attestations, trust statements, block hashes, receipt ids), read from the dump's data so it matches it exactly
+if [ -n "$sig_tables" ]; then
+  python3 "$(dirname "${BASH_SOURCE[0]}")/sigexport.py" < "$tmp/data.txt" > "$tmp/$base.signatures.json" || die "could not build the signatures export"
+  [ -s "$tmp/$base.signatures.json" ] || die "the signatures export is empty"
+fi
 
 # 4. shrink alarm: a ledger that suddenly holds far fewer records than the last set deserves a human look
 prev_counts="$(ls -1 "$BACKUP_DIR"/jarvis-*.counts 2>/dev/null | LC_ALL=C sort | tail -1 || true)"
@@ -83,6 +102,12 @@ pg_exec pg_dumpall --globals-only > "$tmp/$base.globals.sql" || die "pg_dumpall 
 docker run --rm -v "$VOL_DATA":/data:ro --entrypoint tar "$APP_IMAGE" -cf - -C /data . > "$tmp/$base.data.tar" \
   || die "could not archive the appdata volume"
 
+# 6b. custody scan of the plain parts and the appdata archive (the dump's data was scanned in 3b)
+if ! custody_problem="$(custody_check_set "$tmp" "$base")"; then
+  notify "Jarvis ledger: PRIVATE KEY IN A BACKUP" "$custody_problem" critical
+  die "CUSTODY: $custody_problem; this backup is NOT published"
+fi
+
 # 7. long-lived anchors log (tiny, never pruned): only when something changed, each entry hash-chained to the last
 last_log="$(ls -1 "$BACKUP_DIR"/anchors/anchors-*.txt 2>/dev/null | LC_ALL=C sort | tail -1 || true)"
 if [ -z "$last_log" ] || ! diff -q <(grep -v '^#' "$last_log") "$tmp/$base.anchors" >/dev/null 2>&1; then
@@ -94,8 +119,10 @@ fi
 anchors_verify_chain "$BACKUP_DIR/anchors" || die "the anchors log chain is broken (an old anchors file was altered or removed)"
 
 # 8. publish: move the parts, then write the checksum file last - it marks the set complete
-( cd "$tmp" && sha256sum "$base.dump" "$base.globals.sql" "$base.data.tar" "$base.counts" "$base.anchors" > "$base.sha256" )
-for part in dump globals.sql data.tar counts anchors; do mv "$tmp/$base.$part" "$BACKUP_DIR/$base.$part"; done
+parts=(dump globals.sql data.tar counts anchors)
+[ ! -f "$tmp/$base.signatures.json" ] || parts+=(signatures.json)
+( cd "$tmp" && for p in "${parts[@]}"; do echo "$base.$p"; done | xargs sha256sum > "$base.sha256" )
+for part in "${parts[@]}"; do mv "$tmp/$base.$part" "$BACKUP_DIR/$base.$part"; done
 mv "$tmp/$base.sha256" "$BACKUP_DIR/$base.sha256"
 
 date +%s > "$STATE_DIR/backup.last_ok"

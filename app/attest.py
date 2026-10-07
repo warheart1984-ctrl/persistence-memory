@@ -2,8 +2,9 @@
 that say which keys may sign.  Nothing in this module signs anything, and nothing holds a private key.
 
 * A **signature** is an OpenSSH one (``ssh-keygen -Y sign -n jarvis-ledger-v1``, the SSHSIG format), Ed25519 only for now.  It is
-  verified here in pure Python (``cryptography`` Ed25519, already installed through PyJWT[crypto]); the tests cross-check it against
-  real ``ssh-keygen -Y verify``.  Hardware (``sk-``) keys are refused until their extra signed fields are supported.
+  verified here in Python (``cryptography`` Ed25519, already installed through PyJWT[crypto]); where that package is missing (the
+  signer on the host, the witness on the PC) the same check is delegated to ``ssh-keygen -Y verify``.  The tests cross-check both
+  against each other.  Hardware (``sk-``) keys are refused until their extra signed fields are supported.
 * An **attestation** signs a domain-separated message built from digests the ledger already has (a block hash, a receipt's evidence
   id, a checkpoint over the signing log), never from re-encoded JSON.  Attestations form a log: a gapless ``signer_seq`` and the hash
   of the previous attestation, so a removed or forked entry is visible.
@@ -30,8 +31,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
-from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+import subprocess
+import tempfile
 
 NAMESPACE = "jarvis-ledger-v1"
 GENESIS = "0" * 64
@@ -217,10 +218,31 @@ def verify_sshsig(armored: str, message: bytes, *, namespace: str = NAMESPACE) -
         raise SignatureInvalid(f"unsupported hash algorithm {parsed.hash_algorithm!r}")
     signed = b"SSHSIG" + _string(parsed.namespace.encode()) + _string(b"") + _string(parsed.hash_algorithm.encode()) + _string(digest)
     try:
+        from cryptography.exceptions import InvalidSignature
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    except ImportError:
+        _verify_with_ssh_keygen(armored, message, namespace, parsed.key)
+        return parsed.key
+    try:
         Ed25519PublicKey.from_public_bytes(parsed.key.raw).verify(parsed.signature, signed)
     except InvalidSignature as exc:
         raise SignatureInvalid("the signature does not match the message") from exc
     return parsed.key
+
+
+def _verify_with_ssh_keygen(armored: str, message: bytes, namespace: str, key: PublicKey) -> None:
+    """The fallback where ``cryptography`` is not installed: ask the real tool whether the signature is good for the key it names."""
+    with tempfile.TemporaryDirectory() as tmp:
+        t = Path(tmp)
+        (t / "allowed").write_text(f"signer {key.text()}\n")
+        (t / "sig").write_text(normalize_signature(armored) + "\n")
+        try:
+            r = subprocess.run(["ssh-keygen", "-Y", "verify", "-f", str(t / "allowed"), "-I", "signer", "-n", namespace, "-s", str(t / "sig")],
+                               input=message, capture_output=True, timeout=30)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise SignatureInvalid("cannot verify: the cryptography package is not installed and ssh-keygen could not be run") from exc
+    if r.returncode != 0:
+        raise SignatureInvalid("the signature does not match the message")
 
 
 # --- the messages and hashes -----------------------------------------------------------------------------------------------

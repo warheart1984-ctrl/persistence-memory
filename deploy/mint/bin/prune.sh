@@ -47,7 +47,7 @@ for base in "${sets[@]}"; do
   [ -n "${keep[$base]:-}" ] && continue
   if [ "$dry" -eq 1 ]; then echo "would delete $base"; else
     rm -f "$BACKUP_DIR/$base".dump "$BACKUP_DIR/$base".globals.sql "$BACKUP_DIR/$base".data.tar \
-          "$BACKUP_DIR/$base".counts "$BACKUP_DIR/$base".anchors "$BACKUP_DIR/$base".sha256
+          "$BACKUP_DIR/$base".counts "$BACKUP_DIR/$base".anchors "$BACKUP_DIR/$base".signatures.json "$BACKUP_DIR/$base".sha256
   fi
   removed=$((removed + 1))
 done

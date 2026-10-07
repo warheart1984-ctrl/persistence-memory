@@ -61,6 +61,13 @@ services:
     container_name: jarvis-migrate
     restart: "no"
     env_file: ./secrets/migrate.env       # JARVIS_DATABASE_MIGRATE_URL (DDL role), schema, app role
+    environment:
+      # `jarvisctl verify`, the restore gate and the offline replay verifier run in this service: they check signatures against the same
+      # PUBLIC root keys the app gets (read-only; still no private key anywhere near a container)
+      JARVIS_TRUST_ROOTS_FILE: /etc/jarvis/trust-roots.pub
+    configs:
+      - source: trust_roots
+        target: /etc/jarvis/trust-roots.pub
     command: ["python", "-m", "app.pg_migrate"]
     depends_on:
       db: { condition: service_healthy }
@@ -81,6 +88,9 @@ services:
       JARVIS_MCP_WRITE_ENABLED: "false"
       JARVIS_CORS_ORIGINS: "http://127.0.0.1:${JARVIS_APP_PORT:-8011},http://localhost:${JARVIS_APP_PORT:-8011}"
       # Everything the app writes outside Postgres goes to the appdata volume (the image root is read-only).
+      # The PUBLIC root keys the service verifies signatures against (read-only; empty until the key ceremony). No private key is ever
+      # given to this container.
+      JARVIS_TRUST_ROOTS_FILE: /etc/jarvis/trust-roots.pub
       JARVIS_STORE_PATH: /data/jarvis-store.json
       JARVIS_AMUL_PATH: /data/amul-field.jsonl
       JARVIS_AMUL_GC_PATH: /data/amul-checkpoints.jsonl
@@ -96,6 +106,9 @@ services:
       - "127.0.0.1:${JARVIS_APP_PORT:-8011}:8001"
     volumes:
       - appdata:/data
+    configs:
+      - source: trust_roots
+        target: /etc/jarvis/trust-roots.pub
     depends_on:
       db: { condition: service_healthy }
       migrate: { condition: service_completed_successfully }
@@ -111,6 +124,10 @@ services:
 
 networks:
   ledger: {}
+
+configs:
+  trust_roots:
+    file: ./secrets/trust-roots.pub   # public keys only; created by `jarvisctl up` / gen-secrets if missing
 
 volumes:
   pgdata: {}

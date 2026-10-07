@@ -37,7 +37,8 @@ if grep -qx "$base" "$STATE_DIR/offsite.sent" 2>/dev/null; then
 fi
 
 bundle="$base.bundle.tar.age"
-( cd "$BACKUP_DIR" && tar -cf - "$base.dump" "$base.globals.sql" "$base.data.tar" "$base.counts" "$base.anchors" "$base.sha256" anchors ) \
+sig_part=(); [ ! -f "$BACKUP_DIR/$base.signatures.json" ] || sig_part=("$base.signatures.json")  # sets from before schema v7 have none
+( cd "$BACKUP_DIR" && tar -cf - "$base.dump" "$base.globals.sql" "$base.data.tar" "$base.counts" "$base.anchors" "${sig_part[@]}" "$base.sha256" anchors ) \
   | age -r "$recipient" -o "$tmp/$bundle" || die "could not build the encrypted bundle"
 local_sha="$(sha256sum "$tmp/$bundle" | cut -d' ' -f1)"
 
