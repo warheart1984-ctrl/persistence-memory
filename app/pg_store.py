@@ -38,7 +38,7 @@ from app.models import (
 )
 from app.pg_schema import check_schema_version, validate_schema_name
 from app.store import _make_id, ledger_retrieve, memory_matches_query
-from app.store_errors import StoreUnavailableError, StoreVersionConflict
+from app.store_errors import InvalidInputError, StoreUnavailableError, StoreVersionConflict
 from app import attest
 from app import clause_v
 from app import evidence as evidence_objects
@@ -167,8 +167,13 @@ class PostgresRowStore:
                     _refuse_if_legacy_data_unimported(conn, self._tenant_key)
                     _legacy_ok.add((key, self._tenant_key))
                 yield conn
-        except StoreUnavailableError:
+        except (StoreUnavailableError, InvalidInputError):
             raise
+        except psycopg.DataError as exc:
+            if "NUL" in str(exc):  # PostgreSQL text cannot hold 0x00: the input is at fault, the ledger is fine
+                raise InvalidInputError("a text value contains a NUL (0x00) byte, which the ledger cannot store") from exc
+            _log.error("ledger database error (%s): %s", type(exc).__name__, exc)
+            raise StoreUnavailableError("Ledger database error") from exc
         except psycopg.Error as exc:
             _log.error("ledger database error (%s): %s", type(exc).__name__, exc)
             raise StoreUnavailableError("Ledger database error") from exc

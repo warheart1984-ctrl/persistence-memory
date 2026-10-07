@@ -94,6 +94,8 @@ services:
       # given to this container.
       JARVIS_TRUST_ROOTS_FILE: /etc/jarvis/trust-roots.pub
       JARVIS_SIGNATURES: ${JARVIS_SIGNATURES:-warn}
+      # Which deployment this is, shown as `stack` in /ready. scripts/chaos/ refuses a target that is not a throwaway (chaos-throwaway:...).
+      JARVIS_STACK_ID: ${JARVIS_STACK_ID:-jarvis-live}
       JARVIS_STORE_PATH: /data/jarvis-store.json
       JARVIS_AMUL_PATH: /data/amul-field.jsonl
       JARVIS_AMUL_GC_PATH: /data/amul-checkpoints.jsonl

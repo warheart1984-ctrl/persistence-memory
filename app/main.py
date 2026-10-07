@@ -92,6 +92,7 @@ from app import replay as replay_contracts
 from app import attest as attest_module
 from app.evidence import EvidenceError, EvidenceObjectCreate, require_operator_write
 from app.store import StoreUnavailableError, StoreVersionConflict, get_store
+from app.store_errors import InvalidInputError
 from app.graph import (
     BfsBody,
     ComponentsBody,
@@ -254,6 +255,11 @@ async def _evidence_error(request: Request, exc: EvidenceError):
     return JSONResponse(status_code=exc.status, content=exc.body())
 
 
+@app.exception_handler(InvalidInputError)
+async def _invalid_input(request: Request, exc: InvalidInputError):
+    return json_response(400, str(exc), code="invalid_input")
+
+
 @app.exception_handler(StoreVersionConflict)
 async def _version_conflict(request: Request, exc: StoreVersionConflict):
     return json_response(409, str(exc), code=VERSION_CONFLICT)
@@ -278,9 +284,10 @@ def ready():
     except StoreUnavailableError as exc:
         logging.getLogger("jarvis.store").error("not ready: %s", exc)
         checks = {"store": "failed"}
+    stack = (os.getenv("JARVIS_STACK_ID") or "").strip()  # which deployment this is; scripts/chaos/ refuses anything that is not a throwaway
     if all(state == "ok" for state in checks.values()):
-        return {"status": "ready", "checks": checks}
-    body = {"status": "unavailable", "code": LEDGER_UNAVAILABLE, "checks": checks}
+        return {"status": "ready", "checks": checks, **({"stack": stack} if stack else {})}
+    body = {"status": "unavailable", "code": LEDGER_UNAVAILABLE, "checks": checks, **({"stack": stack} if stack else {})}
     return JSONResponse(status_code=503, content=body, headers={"Retry-After": str(retry_after_seconds())})
 
 

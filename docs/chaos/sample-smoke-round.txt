@@ -1,0 +1,51 @@
+CL_CHAOS_100x: seed b144e55b; 49 probes per round, 1 round(s) = 49 probe runs; target http://127.0.0.1:18017 stack chaos-throwaway:jarvis-chaos100x; destructive probes ENABLED
+r001 A1  PASS        28ms  create a record, read it back, see its history
+r001 A2  PASS        27ms  an evidence object is content-addressed: the same content returns the same id, created once
+r001 A3  PASS        12ms  an evidence object verifies; an unknown id is a 404 and a malformed id a 422
+r001 A4  PASS        66ms  a fact may cite an evidence object; a dangling link and a fact with no evidence are refused
+r001 A5  PASS        54ms  Clause V refuses types the ledger does not accept (preference, task)
+r001 A6  PASS        15ms  the same evidence content in another key order and from another agent returns the same id
+r001 A7  PASS        34ms  optimistic locking: a current expected_version updates, a stale one is a 409
+r001 A8  PASS        39ms  delete leaves a delete entry in history; the record is gone; a second delete is a 404
+r001 A9  PASS        14ms  the record-history hash chain verifies
+r001 B1  PASS       138ms  seal a SMALL batch: five new records, force-seal at most five entries per block
+r001 B2  PASS        20ms  sealing again with the default rules seals nothing (idempotent)
+r001 B3  PASS       103ms  the blocks verify (database verifier and independent recomputation)
+r001 B4  PASS        26ms  the newest blocks chain correctly and each hash recomputes on this side
+r001 B5  PASS        34ms  block listing paginates consistently and a missing block is a 404
+r001 B6  PASS        18ms  sealing needs the operator key; a bad body is a 422
+r001 C1  PASS        40ms  no key and a wrong key are refused on the ledger routes
+r001 C2  PASS        34ms  malformed bodies are a 422 or 400, never a 5xx
+r001 C3  PASS       119ms  limits hold: 2001-character content and a 2 MB body are refused
+r001 C4  PASS       112ms  hostile ids are a 404 or 422 and never reach a 5xx
+r001 C5  PASS        12ms  unknown routes are a 404 and wrong methods a 405
+r001 C6  PASS        49ms  liveness is up; readiness is ready, names every check ok and reports the throwaway identity
+r001 C7  PASS       178ms  the schema is v7 and the signature, replay and blocks routes exist
+r001 D1  PASS        36ms  retrieve finds a record by a distinctive word
+r001 D2  PASS       363ms  hostile query strings match nothing, raise no error, and no SQL from the input runs
+r001 D3  PASS        54ms  retrieve filters accept valid values and refuse invalid ones with a 422, not a 5xx
+r001 D4  PASS        31ms  two records with one subject and different content surface as a conflict, never merged
+r001 F1  PASS        54ms  issue a receipt at a sealed point; it names the covering block and the replayed state
+r001 F2  PASS        42ms  issuing the same receipt again is idempotent: same id, not created twice
+r001 F3  PASS        61ms  a point no sealed block covers is refused, and no receipt appears
+r001 F4  PASS        43ms  the service re-derives the receipt: same root, same counts, same block
+r001 F5  PASS      5435ms  the offline verifier re-derives the receipt from the raw rows in a one-off container
+r001 F6  PASS     18540ms  a rewrite plus a full re-seal passes the database's own checks but re-derivation catches it (on a scratch copy)
+r001 G0  PASS        53ms  ceremony on the throwaway stack: a root authorizes the test signing key; the mode is warn
+r001 G1  PASS     11825ms  the real signer signs pending blocks and receipts (re-derived first) and the service verifies the log
+r001 G2  PASS        69ms  a forged signature (the signing key's name, someone else's signature) is rejected and stores nothing
+r001 G3  PASS        52ms  a signature by a key no root authorized is rejected; a signing key cannot authorize another key
+r001 G4  PASS       101ms  a key a root revoked cannot sign after the cutoff
+r001 G5  PASS       157ms  a valid signature over different content, or at a wrong position, is rejected
+r001 G6  PASS      6231ms  verify never reports success with no trust root: an unreadable file refuses, an empty one says 'not verified', and require fails
+r001 G7  PASS       107ms  a receipt and its block signed by the test key report L1 in warn mode, never more
+r001 E1  PASS        97ms  the application role is not a superuser and cannot bypass row-level security
+r001 E2  PASS       672ms  as the ordinary role with NO tenant set, the ledger tables look empty
+r001 E3  PASS       382ms  as the ordinary role with the operator tenant set it sees exactly the operator's rows and no one else's
+r001 E4  PASS      1296ms  as the ordinary role history, blocks, signatures and receipts cannot be changed or removed
+r001 E5  PASS       369ms  row-level security binds a non-superuser: a row for another tenant cannot be written even with a tenant set
+r001 H1  PASS      9662ms  database down: the service fails closed with 503 and Retry-After, liveness stays up, and it recovers with the data intact
+r001 H2  PASS       260ms  schema mismatch: readiness fails and names schema_version; removing the mismatch restores it
+r001 H3  PASS      1524ms  pool flood: 160 concurrent reads end in 200 or a 503 with Retry-After, never a 500, and readiness recovers
+r001 H4  PASS      1011ms  concurrent writers and force-seals: no write fails, blocks stay contiguous, chain and blocks verify
+{"probes_per_round": 49, "rounds_completed": 1, "probe_runs": 49, "status_counts": {"PASS": 49}, "requests": 474, "five_xx_total": 75, "five_xx_expected": 75}
