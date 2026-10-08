@@ -1585,15 +1585,55 @@ def run_round(rnd: int, ctx_args: dict[str, Any], only: set[str] | None, log: Ca
 def final_checks(client: Client, stack: dict[str, Any] | None, destructive_blocked: str | None) -> dict[str, Any]:
     """After the last round: everything the ledger can say about itself, plus the offline verifiers on the throwaway copy."""
     res: dict[str, Any] = {}
-    res["history_verify"] = client.get("/api/jarvis/memory/history/verify", timeout=120).json
-    res["blocks_verify"] = client.get("/api/jarvis/blocks/verify", timeout=120).json
-    res["attestations_verify"] = client.get("/api/jarvis/attestations/verify", timeout=120).json
-    head = client.get("/api/jarvis/blocks/head").json
-    res["blocks_head"] = {"history_seq": head["history_seq"], "sealed_seq": head["sealed_seq"], "tip_height": (head["tip"] or {}).get("height"),
-                          "unsealed_entries": head["unsealed_entries"]}
-    receipts = client.get("/api/jarvis/replay/receipts?limit=1000").json["receipts"]
-    bad = [r["id"] for r in receipts if not client.get(f"/api/jarvis/replay/receipts/{r['id']}/verify", timeout=120).json.get("ok")]
-    res["receipts"] = {"count": len(receipts), "failing_rederivation": bad}
+
+    def get_json(path: str, *, timeout: int = 120) -> dict[str, Any]:
+        try:
+            response = client.get(path, timeout=timeout)
+        except Exception as exc:
+            return {"status": "UNREACHABLE", "error": f"{type(exc).__name__}: {exc}"}
+        if response.status != 200:
+            status = "UNREACHABLE" if response.status <= 0 or response.status >= 500 else "FAILED"
+            return {"status": status, "http_status": response.status,
+                    "error": response.text or "final check did not return HTTP 200"}
+        if not isinstance(response.json, dict):
+            return {"status": "FAILED", "http_status": response.status,
+                    "error": "final check returned no JSON object"}
+        return response.json
+
+    res["history_verify"] = get_json("/api/jarvis/memory/history/verify")
+    res["blocks_verify"] = get_json("/api/jarvis/blocks/verify")
+    res["attestations_verify"] = get_json("/api/jarvis/attestations/verify")
+    head = get_json("/api/jarvis/blocks/head")
+    if head.get("status") in {"UNREACHABLE", "FAILED"}:
+        res["blocks_head"] = head
+    else:
+        try:
+            res["blocks_head"] = {"history_seq": head["history_seq"], "sealed_seq": head["sealed_seq"],
+                                  "tip_height": (head["tip"] or {}).get("height"),
+                                  "unsealed_entries": head["unsealed_entries"]}
+        except (KeyError, TypeError, AttributeError) as exc:
+            res["blocks_head"] = {"status": "FAILED", "error": f"malformed head response: {exc}"}
+
+    receipts_response = get_json("/api/jarvis/replay/receipts?limit=1000")
+    if receipts_response.get("status") in {"UNREACHABLE", "FAILED"}:
+        res["receipts"] = receipts_response
+    else:
+        receipts = receipts_response.get("receipts")
+        if not isinstance(receipts, list):
+            res["receipts"] = {"status": "FAILED", "error": "receipt response omitted its receipts list"}
+        else:
+            bad: list[str] = []
+            unreachable: list[str] = []
+            for receipt in receipts:
+                rid = str(receipt.get("id", "")) if isinstance(receipt, dict) else ""
+                check = get_json(f"/api/jarvis/replay/receipts/{rid}/verify") if rid else {"status": "FAILED", "error": "receipt omitted id"}
+                if check.get("status") == "UNREACHABLE":
+                    unreachable.append(rid)
+                elif check.get("status") == "FAILED" or check.get("ok") is not True:
+                    bad.append(rid)
+            res["receipts"] = {"count": len(receipts), "failing_rederivation": bad,
+                               "unreachable_verifications": unreachable,
+                               "status": "UNREACHABLE" if unreachable else "CHECKED"}
     if stack and not destructive_blocked:
         env = dict(os.environ, JARVIS_HOME=f"{stack['dir']}/home")
         v = run_cmd([f"{stack['dir']}/mint/bin/jarvisctl", "verify"], timeout=900, env=env)
@@ -1757,15 +1797,34 @@ def main(argv: list[str] | None = None) -> int:
             break
         results.extend(run_round(rnd, ctx_args, only, log, stats))
         rounds_done = rnd
-    final = final_checks(client, stack, destructive_blocked)
+    try:
+        final = final_checks(client, stack, destructive_blocked)
+    except Exception as exc:  # a broken final checker must still leave an honest artifact
+        marker = {"status": "UNREACHABLE", "error": f"final checks aborted: {type(exc).__name__}: {exc}"}
+        final = {name: dict(marker) for name in (
+            "history_verify", "blocks_verify", "attestations_verify", "blocks_head", "receipts")}
     final["start_head"] = {"history_seq": (start_head or {}).get("history_seq"), "tip_height": ((start_head or {}).get("tip") or {}).get("height")}
     summary = summarize(results, stats, rounds_done, started, final, state, args, capped)
     log(json.dumps({k: summary[k] for k in ("probes_per_round", "rounds_completed", "probe_runs", "status_counts", "requests", "five_xx_total", "five_xx_expected")}))
     if out_dir:
-        (out_dir / "results.json").write_text(json.dumps(summary, indent=2))
+        (out_dir / "results.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     bad = summary["status_counts"].get("FAIL", 0) + summary["status_counts"].get("ERROR", 0) + len(summary["five_xx_unexpected"])
-    verify_bad = (not final["history_verify"].get("ok") or not final["blocks_verify"].get("ok") or not final["attestations_verify"].get("ok")
-                  or final["receipts"]["failing_rederivation"] or final.get("jarvisctl_verify", {}).get("rc", 0) != 0)
+
+    def check_failed(result: Any) -> bool:
+        return (not isinstance(result, dict) or result.get("status") in {"UNREACHABLE", "FAILED"}
+                or result.get("ok") is not True)
+
+    head_check = final.get("blocks_head")
+    head_failed = (not isinstance(head_check, dict)
+                   or head_check.get("status") in {"UNREACHABLE", "FAILED"}
+                   or "history_seq" not in head_check)
+
+    receipts = final.get("receipts", {})
+    verify_bad = (check_failed(final.get("history_verify")) or check_failed(final.get("blocks_verify"))
+                  or check_failed(final.get("attestations_verify")) or head_failed
+                  or not isinstance(receipts, dict) or receipts.get("status") in {"UNREACHABLE", "FAILED"}
+                  or bool(receipts.get("failing_rederivation")) or bool(receipts.get("unreachable_verifications"))
+                  or final.get("jarvisctl_verify", {}).get("rc", 0) != 0)
     return EXIT_PROBE_FAILURES if (bad or verify_bad) else EXIT_OK
 
 
