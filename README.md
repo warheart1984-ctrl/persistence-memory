@@ -113,6 +113,11 @@ database URL or that opt-in the service answers 503 rather than creating a ledge
   `JARVIS_TWIN_NARRATOR_ENABLED`; model text is gated clause-by-clause against TwinState and
   falls back to a deterministic template; narration writes nothing. A read-only dashboard
   (`ui/twin/`) is served at `/ui/twin` behind `JARVIS_TWIN_ENABLED`.
+* A governed Twin Chat surface also exists (`app/twinchat/`, `docs/DIGITAL_TWIN_CHAT.md`) —
+  dark behind `JARVIS_TWIN_CHAT_ENABLED`; every model sentence must cite a recalled memory or
+  it is dropped, every turn writes a hash-chained receipt, and ledger writes are off unless
+  `JARVIS_TWIN_CHAT_PERSIST_ENABLED` — and even then only user-stated decisions land, as
+  drafts, with receipt evidence. Chat history is ephemeral; receipts are not.
 
 ## Docs
 
