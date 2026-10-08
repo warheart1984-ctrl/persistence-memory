@@ -396,11 +396,39 @@ def test_endpoint_read_only_writes_nothing(monkeypatch):
     assert len(get_store().list_memories(limit=9999)) == before
 
 
-# --- 19. tenant isolation (postgres marker; skips without DSN) ---
+# --- 19. tenant isolation (OAuth-mode per-tenant stores; works on file and pg backends) ---
 
-@pytest.mark.postgres
-def test_two_tenants_isolated(pg_schema):
-    pytest.skip("requires JARVIS_TEST_PG_DSN and OAuth-mode tenant wiring")
+def test_two_tenants_isolated(monkeypatch, tmp_path):
+    """Tenant A's brief never sees tenant B's records — or vice versa."""
+    from app.identity import Principal
+    import app.auth as auth
+    from app.store import reset_store_for_tests
+
+    reset_store_for_tests()
+    monkeypatch.setenv("JARVIS_AUTH_MODE", "oauth")
+    monkeypatch.setenv("JARVIS_MEMORY_WRITE_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_STORE_PATH", str(tmp_path / "operator.json"))
+    monkeypatch.setenv("JARVIS_TENANT_STORE_DIR", str(tmp_path / "tenants"))
+    monkeypatch.setenv("JARVIS_TWIN_ENABLED", "1")
+
+    def fake_validate(token: str, *, required_scope: str = "memory.read") -> Principal:
+        return Principal(subject=token, issuer="https://issuer.example",
+                         scopes=frozenset({"memory.read", "memory.write"}))
+
+    monkeypatch.setattr(auth, "validate_access_token", fake_validate)
+    with TestClient(app) as c:
+        assert c.post("/api/jarvis/memory",
+                      headers={"Authorization": "Bearer alice"},
+                      json={"content": "alice only", "source_agent": "devin",
+                            "session_id": "s", "type": "fact"}).status_code == 200
+        alice = c.get("/api/jarvis/twin/daily", headers={"Authorization": "Bearer alice"})
+        bob = c.get("/api/jarvis/twin/daily", headers={"Authorization": "Bearer bob"})
+    assert alice.status_code == 200 and bob.status_code == 200
+    assert alice.json()["twin"]["brief"][0].startswith("1 memory")
+    assert bob.json()["twin"]["brief"][0] == "No data on the ledger."
+    assert bob.json()["twin"]["coverage_index"] == 0.0
+    # Digests differ: they provably bound different inputs.
+    assert alice.json()["twin"]["twin_input_digest"] != bob.json()["twin"]["twin_input_digest"]
 
 
 def test_endpoint_reads_only_this_tenants_store(monkeypatch):

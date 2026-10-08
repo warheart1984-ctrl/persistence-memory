@@ -109,10 +109,10 @@ real `MemoryCreate` path (`test_persist_writes_one_record_through_memory_create`
 - `is_twin_authored` trusts `source_agent` — caller-supplied free text. Any
   caller with write access can spoof it. Verified writer identity (Wicket
   witness / principal stamping) is a later step.
-- Two-tenant isolation is proven only at the seam (the endpoint reads exactly
-  `get_store()`'s tenant-scoped records; the twin holds no store handle).
-  The Postgres/RLS two-tenant test is marked `postgres` and **skipped**
-  unless `JARVIS_TEST_PG_DSN` is set — it has not run in CI without a DSN.
+- Two-tenant isolation is proven at the API seam: `test_two_tenants_isolated`
+  runs OAuth-mode per-tenant stores and verifies A's brief never includes B's
+  records (and digests differ). On the Postgres backend the same test runs
+  through `PostgresRowStore`/RLS when `JARVIS_TEST_BACKEND=postgres`.
 - Persist is not yet behind a witness-signed caller identity.
 - Never run against live data or the 8011 service.
 - Weights are unvalidated heuristics; `explanations.payload` exposes them so
