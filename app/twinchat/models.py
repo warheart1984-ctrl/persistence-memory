@@ -101,6 +101,7 @@ class ChatPersistReceipt(BaseModel):
 
     schema: Literal["ChatPersistReceipt.v1"] = "ChatPersistReceipt.v1"
     persist_digest: str = ""
+    at: str = ""
     turn_receipt_digest: str = ""
     session_id: str = ""
     turn_index: int = 0

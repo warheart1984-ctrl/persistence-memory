@@ -78,6 +78,15 @@ def gate_reply(text: str, recalled: list[dict]) -> dict:
 
     for i, sentence in enumerate(split_sentences(text)):
         markers = _CITE_RE.findall(sentence)
+        # Cite markers are handles, not content. Strip them before lexical
+        # checks — otherwise the id's own characters (hex digits inside
+        # 'mem-a1b2c3…') feed the NUMBER and ENTITY checks and launder
+        # fabricated quantities. An id written as bare prose is still a
+        # state entity and must be inside a cited value to survive.
+        stripped = _CITE_RE.sub(" ", sentence).strip()
+        if not stripped:
+            dropped.append(DropFinding(index=i, reason="EMPTY_CLAUSE"))
+            continue
         indexes: list[int] = []
         bad = False
         for marker in markers:
@@ -92,23 +101,25 @@ def gate_reply(text: str, recalled: list[dict]) -> dict:
             continue
         cites: list[str] = []
         for idx in indexes:
-            # id is cited too: mentioning [m-x] must resolve to a cited value,
-            # and the entity check treats every recalled id as mentionable.
+            # content/subject carry the claim's support; status/confidence are
+            # citable so the model may restate shown metadata (a 'verified'
+            # claim on a draft record still dies CLAIM_WORD). The id itself is
+            # deliberately NOT cited — its digits are not evidence.
+            item = recalled[idx]
             cites += [
-                f"recalled[{idx}].id",
-                f"recalled[{idx}].content",
-                f"recalled[{idx}].subject",
+                f"recalled[{idx}].{f}"
+                for f in ("content", "subject", "status", "confidence")
+                if f in item
             ]
-        reason = _check_sentence(sentence, cites, state)
+        reason = _check_sentence(stripped, cites, state)
         if reason is None:
             kept.append(sentence)
         else:
             dropped.append(DropFinding(index=i, reason=reason))
 
-    sentences = split_sentences(text)
     return {
         "reply": " ".join(kept),
         "kept": kept,
         "dropped": dropped,
-        "all_dropped": bool(sentences) and not kept,
+        "all_dropped": not kept,
     }

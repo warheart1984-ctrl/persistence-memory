@@ -93,13 +93,17 @@ def run_turn(
 ) -> ChatResponse:
     """One governed turn. ReceiptStore failures propagate as ReceiptError."""
     receipts = receipt_store or get_receipt_store()
-    acquired, stale_takeover = receipts.acquire_lease(tenant_key, req.session_id)
+    acquired, stale_takeover, lease_token = receipts.acquire_lease(
+        tenant_key, req.session_id
+    )
     if not acquired:
         raise ReceiptError("SESSION_BUSY", "a turn is already in flight for this session")
     try:
         return _run(store, req, tenant_key, receipts, context_reset_hint=stale_takeover)
     finally:
-        receipts.release_lease(tenant_key, req.session_id)
+        # Ownership-bound release: if this turn outlived its lease and
+        # another turn took over, this release must not evict theirs.
+        receipts.release_lease(tenant_key, req.session_id, token=lease_token)
 
 
 def _run(
@@ -152,6 +156,7 @@ def _run(
     backend: ChatBackend | None = None
     raw = ""
     model = ""
+    usage: dict | None = None
     fallback_reason: str | None = None
     if mode == "off":
         fallback_reason = "GATE_OFF"
@@ -172,6 +177,7 @@ def _run(
                 )
                 raw = res.text
                 model = res.model
+                usage = res.usage
                 latency = res.latency_ms
             except NarratorError as exc:
                 fallback_reason = exc.code
@@ -183,7 +189,9 @@ def _run(
     if raw and not fallback_reason:
         gated = gate_reply(raw, recalled)
         dropped = gated["dropped"]
-        if gated["all_dropped"]:
+        if gated["all_dropped"] or not gated["reply"].strip():
+            # No citable content survived — whitespace-only and bare-cite
+            # output land here too; an empty reply is never an answer.
             fallback_reason = fallback_reason or "ALL_DROPPED"
             reply = none_reply(
                 recalled=recalled, conflict_subjects=conflict_subjects,
@@ -204,8 +212,13 @@ def _run(
     latency = int((time.monotonic() - t0) * 1000)
     backend_name = backend.name if backend is not None else "none"
 
-    # 7. Extraction — deterministic proposals, never writes.
-    proposals = extract(req.message, existing=store.list_memories(limit=100000, truth_scope="live"))
+    # 7. Extraction — deterministic proposals, never writes. The dedup scan
+    #    is lazy: a message with zero candidate patterns never triggers a
+    #    full-ledger read.
+    proposals = extract(
+        req.message,
+        existing=lambda: store.list_memories(limit=100000, truth_scope="live"),
+    )
 
     # 8. Immutable base turn receipt (allocated/inserted atomically).
     receipt_body = ChatTurnReceipt(
@@ -230,6 +243,7 @@ def _run(
         reply_digest=_sha(reply),
         proposed_claims=proposals,
         latency_ms=latency,
+        usage=usage,
     ).model_dump(mode="json")
     receipt_body = receipts.append_turn_receipt(tenant_key, receipt_body)
 
@@ -249,10 +263,13 @@ def _run(
             tenant_key, outcome.model_dump(mode="json")
         )
 
-    # 10. Window-append — the turn joins server-owned context.
+    # 10. Window-append — the turn joins server-owned context. Context is
+    #     bounded by the Turn contract: a reply longer than the bound is
+    #     truncated for the window ONLY — the receipt already digests the
+    #     full reply and this must never raise post-commit.
     _sessions.append(tenant_key, req.session_id, [
-        Turn(role="user", content=req.message),
-        Turn(role="assistant", content=reply,
+        Turn(role="user", content=req.message[:8000]),
+        Turn(role="assistant", content=reply[:8000],
              receipt_digest=receipt_body["receipt_digest"]),
     ])
 

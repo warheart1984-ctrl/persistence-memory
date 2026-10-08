@@ -12,6 +12,7 @@ proposals are never persistable in v1.
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from typing import Any
 
 from .models import ProposedClaim
@@ -87,8 +88,17 @@ def is_persistable(claim: ProposedClaim) -> bool:
     )
 
 
-def extract(message: str, *, existing: list[Any] | None = None) -> list[ProposedClaim]:
-    """Deterministic proposals from the user message. Order-stable."""
+def extract(
+    message: str,
+    *,
+    existing: list[Any] | Callable[[], list[Any]] | None = None,
+) -> list[ProposedClaim]:
+    """Deterministic proposals from the user message. Order-stable.
+
+    ``existing`` may be a list or a zero-arg callable returning one; the
+    callable is only invoked when candidate patterns actually matched, so a
+    message with nothing extractable never triggers a ledger scan.
+    """
     out: list[ProposedClaim] = []
     for i, rx in enumerate(_DECISION_RES):
         for m in rx.finditer(message):
@@ -129,4 +139,8 @@ def extract(message: str, *, existing: list[Any] | None = None) -> list[Proposed
                 evidence_kind="receipt",
                 extractor=f"rule:research_{i}",
             ))
+    if not out:
+        return out
+    if callable(existing):
+        existing = existing()
     return _dedup(out, existing or [])

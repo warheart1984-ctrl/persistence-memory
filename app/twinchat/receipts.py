@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import secrets
 import sqlite3
 import threading
 import time
@@ -72,6 +73,11 @@ class ReceiptStore:
         self._conn = sqlite3.connect(str(self._path), check_same_thread=False, timeout=10)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=10000")
+        # Reads run on their own connection: WAL snapshot isolation means
+        # they can never observe another transaction's uncommitted rows —
+        # no phantom receipts reachable through the API.
+        self._read = sqlite3.connect(str(self._path), check_same_thread=False, timeout=10)
+        self._read.execute("PRAGMA busy_timeout=10000")
         self._conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS receipts (
@@ -98,21 +104,37 @@ class ReceiptStore:
                 tenant_key  TEXT NOT NULL,
                 session_id  TEXT NOT NULL,
                 lease_until REAL NOT NULL,
+                owner       TEXT,
                 PRIMARY KEY (tenant_key, session_id)
             );
             """
         )
+        # owner column landed after the first deployments — add it to older
+        # files without touching rows (an owner-less row is treated as an
+        # abandoned lease and is releasable by the token-less legacy path).
+        lease_cols = {
+            r[1] for r in self._conn.execute("PRAGMA table_info(leases)").fetchall()
+        }
+        if "owner" not in lease_cols:
+            self._conn.execute("ALTER TABLE leases ADD COLUMN owner TEXT")
+            self._conn.commit()
 
     # --- leases ------------------------------------------------------------
+    # lease_until is WALL CLOCK — the row survives process restarts and is
+    # shared by every process on the host, so a process-relative monotonic
+    # reading is meaningless here (a crashed lease once read as live for the
+    # length of the dead process's uptime).
 
-    def acquire_lease(self, tenant_key: str, session_id: str) -> tuple[bool, bool]:
-        """Returns (acquired, stale_takeover).
+    def acquire_lease(self, tenant_key: str, session_id: str) -> tuple[bool, bool, str | None]:
+        """Returns (acquired, stale_takeover, owner_token).
 
         acquired=False when a live lease is held by another in-flight turn
         (caller → 409). An expired lease is taken over and reported stale so
-        the next turn is marked ``context_reset=True``.
+        the next turn is marked ``context_reset=True``. The owner token must
+        be handed back to ``release_lease`` — a stale owner's release must
+        never evict a takeover lease.
         """
-        now = time.monotonic()
+        now = time.time()
         with _DB_LOCK:
             cur = self._conn.execute(
                 "SELECT lease_until FROM leases WHERE tenant_key=? AND session_id=?",
@@ -120,22 +142,31 @@ class ReceiptStore:
             )
             row = cur.fetchone()
             if row is not None and row[0] > now:
-                return False, False
+                return False, False, None
             stale = row is not None
+            token = secrets.token_hex(8)
             self._conn.execute(
-                "INSERT OR REPLACE INTO leases (tenant_key, session_id, lease_until)"
-                " VALUES (?, ?, ?)",
-                (tenant_key, session_id, now + LEASE_TTL_S),
+                "INSERT OR REPLACE INTO leases (tenant_key, session_id, lease_until, owner)"
+                " VALUES (?, ?, ?, ?)",
+                (tenant_key, session_id, now + LEASE_TTL_S, token),
             )
             self._conn.commit()
-            return True, stale
+            return True, stale, token
 
-    def release_lease(self, tenant_key: str, session_id: str) -> None:
+    def release_lease(self, tenant_key: str, session_id: str, token: str | None = None) -> None:
+        """Only the acquiring token releases its lease. A token-less call can
+        only clear owner-less rows left by pre-owner deployments."""
         with _DB_LOCK:
-            self._conn.execute(
-                "DELETE FROM leases WHERE tenant_key=? AND session_id=?",
-                (tenant_key, session_id),
-            )
+            if token is None:
+                self._conn.execute(
+                    "DELETE FROM leases WHERE tenant_key=? AND session_id=? AND owner IS NULL",
+                    (tenant_key, session_id),
+                )
+            else:
+                self._conn.execute(
+                    "DELETE FROM leases WHERE tenant_key=? AND session_id=? AND owner=?",
+                    (tenant_key, session_id, token),
+                )
             self._conn.commit()
 
     # --- turn receipts -----------------------------------------------------
@@ -215,7 +246,7 @@ class ReceiptStore:
     # --- reads --------------------------------------------------------------
 
     def get_receipt(self, tenant_key: str, digest: str) -> dict | None:
-        cur = self._conn.execute(
+        cur = self._read.execute(
             "SELECT body_json FROM receipts WHERE tenant_key=? AND receipt_digest=?",
             (tenant_key, digest),
         )
@@ -223,7 +254,7 @@ class ReceiptStore:
         return json.loads(row[0]) if row else None
 
     def session_turns(self, tenant_key: str, session_id: str) -> list[dict]:
-        cur = self._conn.execute(
+        cur = self._read.execute(
             "SELECT turn_index, receipt_digest FROM receipts"
             " WHERE tenant_key=? AND session_id=? ORDER BY turn_index",
             (tenant_key, session_id),
@@ -232,7 +263,7 @@ class ReceiptStore:
 
     def verify_chain(self, tenant_key: str, session_id: str) -> bool:
         """Rehash every row and re-link the chain for one session."""
-        cur = self._conn.execute(
+        cur = self._read.execute(
             "SELECT turn_index, body_json FROM receipts"
             " WHERE tenant_key=? AND session_id=? ORDER BY turn_index",
             (tenant_key, session_id),

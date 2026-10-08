@@ -13,6 +13,7 @@ raw text is stored.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 from app.clause_v import ClauseVViolation
@@ -54,6 +55,7 @@ def persist_claims(
         or base.get("turn_index") != turn_index
     ):
         return ChatPersistReceipt(
+            at=datetime.now(timezone.utc).isoformat(),
             turn_receipt_digest=turn_receipt_digest,
             session_id=session_id,
             turn_index=turn_index,
@@ -96,6 +98,7 @@ def persist_claims(
             failures.append(PersistFailure(proposal_index=i, code="store_error"))
 
     return ChatPersistReceipt(
+        at=datetime.now(timezone.utc).isoformat(),
         turn_receipt_digest=turn_receipt_digest,
         session_id=session_id,
         turn_index=turn_index,
