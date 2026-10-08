@@ -27,6 +27,9 @@ import os
 import sqlite3
 import threading
 import time
+from pathlib import Path
+
+import pytest
 
 from app.twinchat.gate import gate_reply
 from app.twinchat.extract import extract
@@ -144,76 +147,63 @@ def test_stale_lease_takeover_after_expiry(tmp_path):
     assert acquired and stale
 
 
-def test_legacy_ownerless_lease_is_not_stolen_during_clock_migration(tmp_path):
-    """A pre-owner lease may contain a monotonic deadline from another process.
-
-    Until old workers have drained, the new wall-clock code cannot infer
-    whether that lease is active. It must fail closed instead of stealing it.
-    """
+def test_a_development_database_from_before_owner_tokens_still_works(tmp_path):
+    """The first merged table (PR #53) had no owner column and stored a
+    process-relative deadline. No deployment ran it, but a development file might
+    hold such a row: the column is added, the row reads as an abandoned lease
+    (a monotonic reading is far below the epoch), it is taken over as stale, and
+    the new owner's token releases it. There is no token-less release."""
     db = tmp_path / "legacy.sqlite3"
     conn = sqlite3.connect(str(db))
     conn.execute(
         "CREATE TABLE leases (tenant_key TEXT NOT NULL, session_id TEXT NOT NULL,"
         " lease_until REAL NOT NULL, PRIMARY KEY (tenant_key, session_id))"
     )
-    conn.execute(
-        "INSERT INTO leases VALUES ('t', 's', ?)", (time.monotonic() + 30,)
-    )
+    conn.execute("INSERT INTO leases VALUES ('t', 's', ?)", (time.monotonic() + 30,))
     conn.commit()
     conn.close()
 
     store = ReceiptStore(db)
     acquired, stale, token = store.acquire_lease("t", "s")
-    assert not acquired and not stale and token is None, (
-        "new wall-clock worker stole an owner-less lease from a pre-upgrade worker"
-    )
-
-    # After the deployment has drained old workers, their token-less cleanup
-    # remains compatible and allows the next worker to start a turn.
-    store.release_lease("t", "s")
-    acquired, _, token = store.acquire_lease("t", "s")
-    assert acquired and token
+    assert acquired and stale and token
+    assert not store.acquire_lease("t", "s")[0]          # now held by the new owner
+    store.release_lease("t", "s", token=token)
+    assert store.acquire_lease("t", "s")[0]
+    with pytest.raises(TypeError):
+        store.release_lease("t", "s")                    # the token-less path is gone
 
 
-def test_concurrent_legacy_lease_schema_migration_is_serialized(tmp_path):
-    """Two workers opening the same pre-owner database must both initialize."""
-    db = tmp_path / "legacy-concurrent.sqlite3"
-    conn = sqlite3.connect(str(db))
-    conn.execute(
-        "CREATE TABLE leases (tenant_key TEXT NOT NULL, session_id TEXT NOT NULL,"
-        " lease_until REAL NOT NULL, PRIMARY KEY (tenant_key, session_id))"
-    )
-    conn.commit()
-    conn.close()
+def _race_worker(db, barrier, n, out):
+    """One racing process: open its own store, then take session i's lease the instant the barrier opens."""
+    store = ReceiptStore(Path(db))
+    got = []
+    for i in range(n):
+        barrier.wait(timeout=60)
+        got.append(1 if store.acquire_lease("operator", f"s{i}")[0] else 0)
+    out.put(got)
 
-    start = threading.Barrier(3)
-    stores = []
-    errors = []
 
-    def initialize():
-        start.wait()
-        try:
-            stores.append(ReceiptStore(db))
-        except Exception as exc:  # pragma: no cover - asserted below
-            errors.append(exc)
+def test_lease_acquire_is_exclusive_across_processes(tmp_path):
+    """Four separate processes race for the same free lease, 100 sessions. The
+    in-process lock cannot help here; only the SQLite write lock can. When the
+    acquire was a plain SELECT then INSERT OR REPLACE, every session was won by
+    several processes (PR #57 review, reproduced 300 of 300)."""
+    import multiprocessing as mp
 
-    workers = [threading.Thread(target=initialize) for _ in range(2)]
-    for worker in workers:
-        worker.start()
-    start.wait()
-    for worker in workers:
-        worker.join(timeout=15)
-
-    assert not any(worker.is_alive() for worker in workers), "schema migration hung"
-    assert not errors, f"concurrent lease schema migration failed: {errors!r}"
-    assert len(stores) == 2
-    assert all(
-        "owner" in {row[1] for row in store._conn.execute("PRAGMA table_info(leases)")}
-        for store in stores
-    )
-    for store in stores:
-        store._conn.close()
-        store._read.close()
+    db = tmp_path / "race.sqlite3"
+    ReceiptStore(db)._conn.close()
+    n, procs = 100, 4
+    ctx = mp.get_context("spawn")                         # same on Linux CI and on Windows
+    barrier, out = ctx.Barrier(procs), ctx.Queue()
+    running = [ctx.Process(target=_race_worker, args=(str(db), barrier, n, out)) for _ in range(procs)]
+    for p in running:
+        p.start()
+    results = [out.get(timeout=120) for _ in running]
+    for p in running:
+        p.join(timeout=30)
+        assert p.exitcode == 0
+    winners = [sum(r[i] for r in results) for i in range(n)]
+    assert winners == [1] * n, f"sessions won by more than one process: {sum(w > 1 for w in winners)} of {n}"
 
 
 # --- F7: a stale owner's release cannot evict a takeover lease ---------------
