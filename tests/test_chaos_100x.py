@@ -934,3 +934,46 @@ def test_rebuild_refreshes_only_the_database_build_directory_from_the_checkout(e
     assert r.returncode == 0, r.stderr
     assert (db / "postgresql.conf").read_text() == (ROOT / "deploy" / "mint" / "db" / "postgresql.conf").read_text()       # the checkout's database config
     assert (existing_stack.dir / "mint" / "bin" / "lib.sh").read_text() == "# renamed copy: PROJECT=jarvis-chaos100x\n"   # the renamed scripts are left alone
+
+
+
+def test_the_median_of_an_even_number_of_runs_is_the_mean_of_the_two_middle_ones():
+    out = chaos.fault_summary({"J1": [{"recover_s": v} for v in (1.0, 2.0, 3.0, 4.0)]})["J1"]["recover_s"]
+    assert out == {"min": 1.0, "median": 2.5, "max": 4.0}
+    assert chaos.fault_summary({"J1": [{"recover_s": v} for v in (1.0, 2.0, 9.0)]})["J1"]["recover_s"]["median"] == 2.0
+    assert chaos.fault_summary({"J1": [{"recover_s": 1.48}, {"recover_s": 1.52}]})["J1"]["recover_s"]["median"] == 1.5
+
+
+@pytest.fixture
+def selection_env(monkeypatch, tmp_path):
+    monkeypatch.setattr(chaos, "fetch_ready", lambda url: (200, {"stack": GOOD}))
+    monkeypatch.setattr(chaos, "live_ports", lambda: {8011})
+    (tmp_path / "secrets").mkdir()
+    (tmp_path / "secrets" / "api-key").write_text("k")
+    (tmp_path / "stack.json").write_text(json.dumps({"url": "http://127.0.0.1:18017", "port": 18017, "project": "p", "secrets_dir": str(tmp_path / "secrets"), "containers": {},
+                                                     "keys_dir": str(tmp_path), "dir": str(tmp_path)}))
+    ran = []
+    monkeypatch.setattr(chaos, "run_round", lambda rnd, args, only, log, stats: ran.append(only) or [])
+    monkeypatch.setattr(chaos.Client, "request", lambda self, *a, **k: pytest.fail("a request was made for an invalid selection"))
+    return SimpleNamespace(dir=tmp_path, ran=ran)
+
+
+@pytest.mark.parametrize("flags", [["--phases", "L"], ["--phases", "I,Z"], ["--phases", ","], ["--phases", " , "], ["--only", "X9"], ["--only", "A1,NOPE"], ["--only", ","],
+                                   ["--phases", "I", "--only", "ZZ"]])
+def test_an_unknown_phase_or_probe_is_a_usage_error_not_a_run_of_everything(selection_env, capsys, flags):
+    rc = chaos.main(["--stack-dir", str(selection_env.dir), "--rounds", "100", *flags])
+    assert rc == chaos.EXIT_USAGE and selection_env.ran == []
+    assert "no such" in capsys.readouterr().err
+
+
+def test_valid_selections_still_work_and_an_empty_selection_selects_nothing(selection_env, monkeypatch):
+    monkeypatch.setattr(chaos.Client, "request", lambda self, *a, **k: chaos.Response(200, {"history_seq": 0, "tip": None}, {}, 1.0))
+    monkeypatch.setattr(chaos, "final_checks", lambda *a, **k: {"history_verify": {"ok": True}, "blocks_verify": {"ok": True}, "attestations_verify": {"ok": True}, "receipts": {"failing_rederivation": []}})
+    chaos.main(["--stack-dir", str(selection_env.dir), "--rounds", "1", "--phases", "k, j"])
+    chaos.main(["--stack-dir", str(selection_env.dir), "--rounds", "1", "--only", " A1 , A2 "])
+    assert selection_env.ran == [{"J1", "K1"}, {"A1", "A2"}]
+    ran = []
+    stats = chaos.Stats()
+    monkeypatch.undo()
+    out = chaos.run_round(1, dict(client=None, stats=stats, stack=None, target={}, destructive_ok="x", state={}, seed="s", max_history=1), set(), ran.append, stats)
+    assert out == []                                                              # a set with nothing in it runs nothing (it used to mean "no filter")

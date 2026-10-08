@@ -150,6 +150,7 @@ def test_a_short_real_soak(pg_schema, tmp_path_factory, tmp_path, monkeypatch):
         monkeypatch.setattr(chaos, "throwaway_proof", lambda *a, **k: None)
         calls = []
         monkeypatch.setattr(chaos, "run_cmd", lambda args, **kw: calls.append(args) or SimpleNamespace(returncode=0, stdout="", stderr=""))
+        monkeypatch.setattr(soak, "restart_and_wait", lambda stack, target, **kw: calls.append(["docker", "restart", stack["containers"]["app"]]) and None)
         ticks = iter(range(10_000))
         monkeypatch.setattr(soak, "process_memory", lambda c, runner=None: {"RssAnon": 60000 + next(ticks) * 10, "VmRSS": 90000})
         monkeypatch.setattr(soak, "database_mb", lambda *a, **k: 1.5)
@@ -209,3 +210,89 @@ def test_a_flat_high_water_mark_is_not_called_a_function_of_the_callers():
     assert "does not follow" in out["notes"][0]
     assert "does not follow" in soak.concurrency_note([{"callers": c, "hwm_mib": 100 + 0.01 * c, "anon_mib": 90} for c in (1, 4, 16, 40)])["notes"][0]     # a steep line over nothing
     assert soak.concurrency_note([{"callers": 1, "hwm_mib": 100, "anon_mib": 90}])["notes"] == []
+
+
+
+# --- the control must be a real restart --------------------------------------------------------------------------------------------------------------
+
+def restart_runner(*, restart_rc=0, started=("T1", "T2")):
+    seq = iter(started)
+    calls = []
+
+    def run(args, **kw):
+        calls.append(args)
+        if args[:3] == ["docker", "inspect", "-f"]:
+            return SimpleNamespace(returncode=0, stdout=next(seq) + "\n", stderr="")
+        return SimpleNamespace(returncode=restart_rc, stdout="", stderr="no such container" if restart_rc else "")
+    run.calls = calls
+    return run
+
+
+STACK_APP = {"containers": {"app": "chaos100x-app"}}
+TARGET_URL = {"url": "http://127.0.0.1:18017"}
+
+
+def test_a_restart_that_worked_is_a_new_process_that_answers_ready():
+    r = restart_runner()
+    assert soak.restart_and_wait(STACK_APP, TARGET_URL, runner=r, ready=lambda url: (200, {}), sleep=lambda s: None) is None
+    assert ["docker", "restart", "chaos100x-app"] in r.calls
+
+
+def test_a_failed_restart_is_reported_and_readiness_is_not_even_waited_for():
+    r = restart_runner(restart_rc=1)
+    why = soak.restart_and_wait(STACK_APP, TARGET_URL, runner=r, ready=lambda url: (_ for _ in ()).throw(AssertionError("readiness was polled")), sleep=lambda s: None)
+    assert why and "docker restart chaos100x-app failed" in why
+
+
+def test_a_restart_that_never_becomes_ready_is_reported():
+    polls = []
+    why = soak.restart_and_wait(STACK_APP, TARGET_URL, runner=restart_runner(), ready_timeout=5, ready=lambda url: polls.append(1) or (503, {}), sleep=lambda s: None)
+    assert why and "did not answer /ready within 5 s" in why and len(polls) == 5
+
+
+def test_an_unchanged_start_time_means_the_old_process_answered_and_is_not_a_control():
+    why = soak.restart_and_wait(STACK_APP, TARGET_URL, runner=restart_runner(started=("T1", "T1")), ready=lambda url: (200, {}), sleep=lambda s: None)
+    assert why and "start time did not change" in why
+    assert "start time did not change" in soak.restart_and_wait(STACK_APP, TARGET_URL, runner=restart_runner(started=("T1", "")), ready=lambda url: (200, {}), sleep=lambda s: None)
+
+
+def test_the_soak_aborts_with_a_failure_and_no_verdict_when_the_control_cannot_be_made(monkeypatch, tmp_path):
+    import threading
+    import time
+
+    monkeypatch.setattr(chaos, "live_ports", lambda: {8011})
+    monkeypatch.setattr(chaos, "throwaway_proof", lambda *a, **k: None)
+    monkeypatch.setattr(chaos, "fetch_ready", lambda url: (200, {"stack": "chaos-throwaway:jarvis-chaos100x"}))
+    (tmp_path / "secrets").mkdir()
+    (tmp_path / "secrets" / "api-key").write_text("k")
+    (tmp_path / "stack.json").write_text(json.dumps({"url": "http://127.0.0.1:18017", "port": 18017, "project": "p", "secrets_dir": str(tmp_path / "secrets"), "keys_dir": str(tmp_path),
+                                                     "containers": {"app": "chaos100x-app", "db": "chaos100x-db"}}))
+    monkeypatch.setattr(chaos.Client, "request", lambda self, *a, **k: chaos.Response(200, {"history_seq": 0, "tip": None, "memory": {"id": "mem-1"}}, {}, 1.0))
+    monkeypatch.setattr(soak, "process_memory", lambda c, runner=None: {"RssAnon": 60000, "VmRSS": 90000})
+    monkeypatch.setattr(soak, "database_mb", lambda *a, **k: 1.0)
+    monkeypatch.setattr(soak, "restart_and_wait", lambda stack, target, **k: "docker restart chaos100x-app failed: boom")
+    monkeypatch.setattr(soak.time, "sleep", lambda s: None)
+    out = tmp_path / "out"
+    rc = soak.main(["--stack-dir", str(tmp_path), "--out", str(out), "--growth-min", "0.001", "--reads-min", "0.001", "--idle-min", "0.001", "--control-min", "0.001",
+                    "--tick-s", "0.01", "--records-per-tick", "1", "--sample-s", "0.01"])
+    assert rc == chaos.EXIT_PROBE_FAILURES
+    result = json.loads((out / "soak.json").read_text())
+    assert result["aborted"].endswith("boom") and "verdict" not in result
+    assert "ABORTED" in (out / "soak.log").read_text()
+
+
+def test_the_concurrency_phase_aborts_too_when_it_cannot_get_a_restarted_process(monkeypatch, tmp_path):
+    monkeypatch.setattr(chaos, "live_ports", lambda: {8011})
+    monkeypatch.setattr(chaos, "throwaway_proof", lambda *a, **k: None)
+    monkeypatch.setattr(chaos, "fetch_ready", lambda url: (200, {"stack": "chaos-throwaway:jarvis-chaos100x"}))
+    (tmp_path / "secrets").mkdir()
+    (tmp_path / "secrets" / "api-key").write_text("k")
+    (tmp_path / "stack.json").write_text(json.dumps({"url": "http://127.0.0.1:18017", "port": 18017, "project": "p", "secrets_dir": str(tmp_path / "secrets"), "keys_dir": str(tmp_path),
+                                                     "containers": {"app": "chaos100x-app", "db": "chaos100x-db"}}))
+    monkeypatch.setattr(chaos.Client, "request", lambda self, *a, **k: chaos.Response(200, {"history_seq": 5, "tip": None, "memories": []}, {}, 1.0))
+    started = []
+    monkeypatch.setattr(soak, "Load", lambda *a, **k: started.append(1))
+    monkeypatch.setattr(soak, "restart_and_wait", lambda stack, target, **k: "the container's start time did not change")
+    out = tmp_path / "out"
+    rc = soak.main(["--stack-dir", str(tmp_path), "--concurrency", "--out", str(out)])
+    assert rc == chaos.EXIT_PROBE_FAILURES and started == [] and not (out / "concurrency.json").exists()

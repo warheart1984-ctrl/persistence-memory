@@ -64,6 +64,33 @@ def process_memory(container: str, runner=chaos.run_cmd) -> dict[str, int]:
     return out
 
 
+def restart_and_wait(stack: dict[str, Any], target: dict[str, Any], *, ready_timeout: float = 120, runner=None, ready=None, sleep=time.sleep) -> str | None:
+    """Restart the application container and wait until a NEW process answers /ready.  Returns None on success, else why it did not work: a restart that
+    failed, a container whose start time did not change (the old process is still the one answering), or a readiness that never came back.  A control
+    taken from the same process, or from none, would make the verdict meaningless."""
+    runner = runner or chaos.run_cmd
+    ready = ready or chaos.fetch_ready
+    name = stack["containers"]["app"]
+
+    def started() -> str:
+        return runner(["docker", "inspect", "-f", "{{.State.StartedAt}}", name], timeout=30).stdout.strip()
+
+    before = started()
+    done = runner(["docker", "restart", name], timeout=120)
+    if done.returncode != 0:
+        return f"docker restart {name} failed: {done.stderr.strip()[:100]}"
+    for _ in range(int(ready_timeout)):
+        if ready(target["url"])[0] == 200:
+            break
+        sleep(1)
+    else:
+        return f"the application did not answer /ready within {ready_timeout:g} s of the restart"
+    after = started()
+    if not after or after == before:
+        return f"the container's start time did not change ({before!r}): the process that answered is the old one"
+    return None
+
+
 def timed(fn) -> float:
     t0 = time.perf_counter()
     fn()
@@ -238,13 +265,10 @@ def run_concurrency(args, stack, target, client, stats, out_dir) -> int:
     first = client.get("/api/jarvis/memory/retrieve?query=chaos100x&limit=1").json
     record_id = (first["memories"][0]["id"] if first and first.get("memories") else "mem-none")
     log(f"concurrency: ledger at {head['history_seq']} entries; restarting the application container and reading at 1, 4, 16, 40 callers for {args.concurrency_seconds:g} s each")
-    run = chaos.run_cmd(["docker", "restart", stack["containers"]["app"]], timeout=120)
-    if run.returncode != 0:
-        log(f"could not restart the application: {run.stderr[:100]}")
-    for _ in range(120):
-        if chaos.fetch_ready(target["url"])[0] == 200:
-            break
-        time.sleep(1)
+    why = restart_and_wait(stack, target)
+    if why:
+        log(f"ABORTED: the concurrency phase needs a freshly restarted process and did not get one: {why}")
+        return chaos.EXIT_PROBE_FAILURES
     levels = [{"callers": 0, "hwm_mib": process_memory(stack["containers"]["app"]).get("VmHWM", 0) / 1024, "anon_mib": process_memory(stack["containers"]["app"]).get("RssAnon", 0) / 1024,
                "requests": 0, "p50_ms": None, "p99_ms": None, "unanswered": 0}]
     log(f"  after restart: high-water {levels[0]['hwm_mib']:.1f} MiB, anonymous {levels[0]['anon_mib']:.1f} MiB")
@@ -366,13 +390,12 @@ def main(argv: list[str] | None = None) -> int:
 
     # --- control: restart the application, same ledger, same load ---
     log("control: restarting the application container")
-    run = chaos.run_cmd(["docker", "restart", stack["containers"]["app"]], timeout=120)
-    if run.returncode != 0:
-        log(f"could not restart the application: {run.stderr[:100]}")
-    for _ in range(120):
-        if chaos.fetch_ready(target["url"])[0] == 200:
-            break
-        time.sleep(1)
+    why = restart_and_wait(stack, target)
+    if why:
+        log(f"ABORTED: the control needs a restarted process and did not get one: {why}")
+        if out_dir:
+            (out_dir / "soak.json").write_text(json.dumps({"aborted": why, "seconds": round(time.time() - t0), "samples": samples}, indent=2))
+        return chaos.EXIT_PROBE_FAILURES
     load2 = Load(client, last_id or "mem-none").start()
     take("control", 0)
     hold("control", args.control_min, load2)

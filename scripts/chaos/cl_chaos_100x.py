@@ -1558,7 +1558,7 @@ def run_round(rnd: int, ctx_args: dict[str, Any], only: set[str] | None, log: Ca
     ctx = Ctx(rnd=rnd, rng=rng, **{k: v for k, v in ctx_args.items() if k != "seed"})
     out = []
     for p in PROBES:
-        if only and p.id not in only:
+        if only is not None and p.id not in only:         # an empty selection selects nothing; it is rejected before it gets here
             continue
         stats.current.update(round=rnd, probe=p.id, expect=p.expect_5xx)
         t0 = time.perf_counter()
@@ -1616,7 +1616,7 @@ def fault_summary(faults: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
         for key in ("detect_s", "recover_s", "bite_after_fill_s", "volume_full_s", "partition_s", "longest_request_s", "orphans_reaped_after_s"):
             values = sorted(r[key] for r in runs if isinstance(r.get(key), (int, float)))
             if values:
-                entry[key] = {"min": values[0], "median": values[len(values) // 2], "max": values[-1]}
+                entry[key] = {"min": values[0], "median": round(statistics.median(values), 3), "max": values[-1]}
         for key in ("attempts", "acknowledged", "failed", "landed_but_unacknowledged", "writes_during_fault", "no_space_errors_in_db_log", "panics", "db_restarts", "orphaned_sessions_at_recovery"):
             entry[key] = sum(int(r.get(key) or 0) for r in runs)
         statuses: Counter = Counter()
@@ -1711,9 +1711,19 @@ def main(argv: list[str] | None = None) -> int:
             log_file.write(line + "\n")
             log_file.flush()
 
-    only = set(args.only.split(",")) if args.only else None
+    only = {x.strip() for x in args.only.split(",") if x.strip()} if args.only else None
+    if args.only:
+        unknown = sorted(only - {p.id for p in PROBES})
+        if unknown or not only:
+            print(f"--only names no such probe: {unknown or args.only!r} (probes: {', '.join(p.id for p in PROBES)})", file=sys.stderr)
+            return EXIT_USAGE
     if args.phases:
-        wanted = {p.id for p in PROBES if p.phase in set(args.phases.upper().split(","))}
+        letters = {x.strip().upper() for x in args.phases.split(",") if x.strip()}
+        unknown = sorted(letters - set(PHASES))
+        if unknown or not letters:
+            print(f"--phases names no such phase: {unknown or args.phases!r} (phases: {', '.join(sorted(PHASES))})", file=sys.stderr)
+            return EXIT_USAGE
+        wanted = {p.id for p in PROBES if p.phase in letters}
         only = wanted if only is None else (only | wanted)
     args.seed = args.seed or os.urandom(4).hex()
     selected = [p for p in PROBES if not only or p.id in only]
