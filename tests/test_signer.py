@@ -249,6 +249,63 @@ def run(api, keys, key="mint", **kw):
     return signer.run_sign(api, key_info(keys[key]), **kw)
 
 
+def test_signer_can_catch_up_when_require_mode_reports_only_unsigned_work(mint, monkeypatch):
+    monkeypatch.setenv("JARVIS_SIGNATURES", "require")
+    block_hash = "b" * 64
+    monkeypatch.setattr(signer.blocks, "block_hash", lambda **kwargs: block_hash)
+    block = {"height": 1, "first_seq": 1, "last_seq": 1, "entry_count": 1,
+             "prev_block_hash": "0" * 64, "entries_root": "1" * 64,
+             "block_hash": block_hash, "format": "jarvis-block-v1"}
+
+    class Api:
+        def get(self, path):
+            if path == "/api/jarvis/trust":
+                return {"keys": [{"key_id": mint.key_id, "revoked_after_signer_seq": None,
+                                  "from_signer_seq": 1}], "trust_roots_configured": True}
+            if path == "/api/jarvis/attestations/pending":
+                return {"blocks": [{"height": 1, "block_hash": block_hash}], "receipts": [],
+                        "head": {"head_seq": 0, "next_signer_seq": 1, "tenant": OP,
+                                 "prev_hash": "0" * 64}}
+            if path == "/api/jarvis/attestations/verify":
+                return {"ok": False, "problems": [{"check": "unsigned", "subject": "block 1",
+                                                      "problem": "block 1 is unsigned (3h old, grace 2h)"}],
+                        "warnings": []}
+            if path == "/api/jarvis/blocks/1":
+                return {"block": block}
+            if path == "/api/jarvis/attestations/head":
+                return {"tip_height": 1, "tip_block_hash": block_hash}
+            raise AssertionError(f"unexpected API path: {path}")
+
+        def request(self, method, path, body=None):
+            assert method == "POST" and path == "/api/jarvis/attestations"
+            return 200, {"signer_seq": body["signer_seq"], "attestation_hash": "a" * 64}
+
+    result = signer.run_sign(Api(), key_info(mint), verify_block=lambda height, digest: None)
+    assert [entry["height"] for entry in result["signed_blocks"]] == [1]
+    assert result["checkpoint"]["covers"] == 1
+
+
+def test_signer_still_refuses_other_verification_problems(mint):
+    class Api:
+        def get(self, path):
+            if path == "/api/jarvis/trust":
+                return {"keys": [{"key_id": mint.key_id, "revoked_after_signer_seq": None,
+                                  "from_signer_seq": 1}], "trust_roots_configured": True}
+            if path == "/api/jarvis/attestations/pending":
+                return {"blocks": [], "receipts": [],
+                        "head": {"head_seq": 0, "next_signer_seq": 1, "tenant": OP}}
+            if path == "/api/jarvis/attestations/verify":
+                return {"ok": False, "problems": [
+                    {"check": "unsigned", "subject": "block 1", "problem": "block 1 is unsigned"},
+                    {"check": "attestation", "subject": "attestation 1", "problem": "broken signer chain"}],
+                    "warnings": []}
+            raise AssertionError(f"unexpected API path: {path}")
+
+    with pytest.raises(signer.SignerError) as exc:
+        signer.run_sign(Api(), key_info(mint))
+    assert exc.value.code == "log_unhealthy" and "broken signer chain" in exc.value.message
+
+
 def ok(client):
     return client.get("/api/jarvis/attestations/verify", headers=HDR).json()
 

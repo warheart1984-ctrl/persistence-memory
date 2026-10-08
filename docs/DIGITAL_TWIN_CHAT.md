@@ -12,12 +12,13 @@ default like the rest of the twin surface.
   TTL'd session window (`session.py`): not durable, not shared across
   replicas, never seeded from client input. Restart → `context_reset=true`
   on the next receipt; turn numbering continues from the receipt store.
-- **The gate is a mechanical filter, not a fact-checker.** Every
+- **The gate is an extractive grounding filter, not a fact-checker.** Every
   model-authored sentence must carry a `[memory_id]` citation resolving to
   the recalled bundle (`recalled[i]` pseudo-state) or it is dropped —
-  `CITE_MISSING`, `ENTITY_UNSUPPORTED`, `HEDGE_CLAUSE`, `NUMBER_MISMATCH`.
-  A misleading-but-cited sentence can still pass; the receipt makes that
-  auditable rather than pretending otherwise.
+  `CITE_MISSING`, `ENTITY_UNSUPPORTED`, `UNSUPPORTED_TEXT`, `HEDGE_CLAUSE`, `NUMBER_MISMATCH`.
+  It accepts source-text extracts and a finite set of render forms; arbitrary
+  paraphrase cannot pass on vocabulary overlap alone. A citation still does
+  not prove that the stored record itself is true.
 - **Writes are extraction, not transcription.** Only user-attributed
   `decision` utterances become ledger proposals, always `status="draft"`,
   always carrying `turn-receipt:sha256:<digest>` evidence. A receipt proves

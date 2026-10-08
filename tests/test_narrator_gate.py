@@ -167,6 +167,29 @@ def test_cited_entity_passes(state):
     assert out["dropped"] == []
 
 
+def test_prose_not_supported_by_cited_values_drops(state):
+    raw = _wrap({"assessment": [
+        {"text": "The ledger has excellent security and no unresolved risks.",
+         "cites": ["record_count"]},
+    ]})
+    out = gate_narration(raw, state)
+    assert _dropped(out, "assessment", 0)[0]["reason"] == "UNSUPPORTED_TEXT"
+
+
+@pytest.mark.parametrize(("source", "claim"), [
+    ("Alice defeated Bob", "Bob defeated Alice."),
+    ("The service is not secure", "The service is secure."),
+])
+def test_reordered_or_polarity_changed_extract_drops(state, source, claim):
+    state["recent_accomplishments"][0]["summary"] = source
+    raw = _wrap({"assessment": [{
+        "text": claim,
+        "cites": ["recent_accomplishments[0].summary"],
+    }]})
+    out = gate_narration(raw, state)
+    assert _dropped(out, "assessment", 0)[0]["reason"] == "UNSUPPORTED_TEXT"
+
+
 # --- PINNED: whole-word entity matching — 'gate' must not back 'gateway' ---
 
 def test_whole_word_entity_matching_gate_vs_gateway(state):

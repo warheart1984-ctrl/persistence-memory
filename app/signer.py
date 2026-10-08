@@ -273,6 +273,31 @@ def status(api: Api, key: KeyInfo) -> dict[str, Any]:
             "pending_receipts": len(pending["receipts"]), "head_seq": pending["head"]["head_seq"], "next_signer_seq": pending["head"]["next_signer_seq"]}
 
 
+def require_signing_log_catchup_safe(api: Api) -> None:
+    """Reject integrity failures, but let the signer process overdue unsigned work.
+
+    In ``JARVIS_SIGNATURES=require`` the verify endpoint reports pending,
+    overdue signatures as problems. Those are precisely what this signer must
+    catch up; every other problem and every "not verified" warning remains a
+    hard stop.
+    """
+    check = api.get("/api/jarvis/attestations/verify")
+    if not isinstance(check, dict) or not isinstance(check.get("problems"), list):
+        raise SignerError("log_unhealthy", "the signing log verification response is malformed", EXIT_UNHEALTHY)
+    problems = check["problems"]
+    warnings = check.get("warnings", [])
+    if not isinstance(warnings, list):
+        raise SignerError("log_unhealthy", "the signing log verification warnings are malformed", EXIT_UNHEALTHY)
+    blockers = [p for p in problems if not isinstance(p, dict) or p.get("check") != "unsigned"]
+    not_verified = [w for w in warnings if isinstance(w, str) and "not verified" in w.lower()]
+    unsigned_only = bool(problems) and len(blockers) == 0
+    if blockers or not_verified or (check.get("ok") is not True and not unsigned_only):
+        details = blockers or problems
+        why = (details[0].get("problem", "signing log problem") if details and isinstance(details[0], dict)
+               else "; ".join(not_verified or ["verification did not succeed"]))
+        raise SignerError("log_unhealthy", f"the signing log does not verify, so it will not be extended: {why}", EXIT_UNHEALTHY)
+
+
 def run_sign(api: Api, key: KeyInfo, *, dry_run: bool = False, verify_block: Callable[[int, str], None] = default_verify_block,
              verify_receipt: Callable[[str], None] = default_verify_receipt, limit_receipts: int | None = None,
              now: Callable[[], str] = _now) -> dict[str, Any]:
@@ -286,10 +311,7 @@ def run_sign(api: Api, key: KeyInfo, *, dry_run: bool = False, verify_block: Cal
         raise SignerError("key_not_authorized", f"{key.public.key_id} is not authorized by a root; the key ceremony (docs/SIGNING_RUNBOOK.md) has not been done for this key", EXIT_UNHEALTHY)
     if auth["revoked_after_signer_seq"] is not None:
         raise SignerError("key_revoked", f"{key.public.key_id} has been revoked (cutoff {auth['revoked_after_signer_seq']}); rotate to a new key", EXIT_UNHEALTHY)
-    check = api.get("/api/jarvis/attestations/verify")
-    if not check["ok"] or any("not verified" in w for w in check.get("warnings", [])):
-        why = (check["problems"][0]["problem"] if check["problems"] else "; ".join(check.get("warnings", [])))
-        raise SignerError("log_unhealthy", f"the signing log does not verify, so it will not be extended: {why}", EXIT_UNHEALTHY)
+    require_signing_log_catchup_safe(api)
     pending = api.get("/api/jarvis/attestations/pending")
     head = pending["head"]
     tenant = head["tenant"]

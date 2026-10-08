@@ -3,14 +3,16 @@
 Reuse, don't fork: every reply sentence is checked by the SAME
 ``_check_sentence`` that gates narrator output (clause splitting,
 HEDGE_CLAUSE, NUMBER_MISMATCH, CLAIM_WORD, whole-word ENTITY_UNSUPPORTED,
-URL_UNSUPPORTED). The pseudo-state is a recall bundle shaped so
+UNSUPPORTED_TEXT, URL_UNSUPPORTED). The pseudo-state is a recall bundle shaped so
 ``_state_entities`` enumerates the whole mentionable surface; inline
 ``[id]`` markers cite ``recalled[i]`` paths (real ids contain '-', which
 cite-path tokens cannot express — list indexes can).
 
-What this is NOT: a cited but unrelated or misleading sentence can pass
-these lexical checks. Citations are evidence handles, not proof. If strict
-semantic safety is required, use extractive/template rendering only.
+What this is NOT: a general semantic entailment model. The shared gate now
+accepts cited source spans and a finite set of narrator render forms whose
+values are checked against their cited TwinState fields; free-form paraphrase
+is dropped. Citations remain evidence handles, not proof that a stored record
+is true.
 """
 
 from __future__ import annotations

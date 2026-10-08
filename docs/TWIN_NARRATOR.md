@@ -87,6 +87,7 @@ resolve. Drop reasons:
 | `CITE_MISSING` | cite path doesn't resolve in the state |
 | `NUMBER_MISMATCH` | a numeric literal isn't backed by a cited value (exact int, ±5e-3 float, `40%` ≡ `0.40`, or the state's own rounding) |
 | `ENTITY_UNSUPPORTED` | a state entity (record id / subject / tag / project) appears outside its cites; a sentence word merely *contains* a cited word (`gate` cited ≠ `gateway` written) |
+| `UNSUPPORTED_TEXT` | a domain word is absent from cited values/schema labels, or the sentence is not a cited extract or one of the closed render forms whose fields are checked against the state |
 | `HEDGE_CLAUSE` | a clause carries a hedge/speculation marker (`let's assume`, `suppose`, `probably`, `maybe`, `imagine`, `it seems`, …). Markers inside verbatim-cited record text are data and pass |
 | `CLAIM_WORD` | `proven / verified / complete / secure / guaranteed / merged / deployed / fixed` unless the word appears verbatim in a cited value |
 | `URL_UNSUPPORTED` | a URL that isn't inside a cited value |
@@ -94,6 +95,11 @@ resolve. Drop reasons:
 Clause rule (from cslm-genesis): a hypothetical marker scopes **rightward** —
 it can never rescue asserted text before it. Hedge words inside
 verbatim-cited record text are *data*, not model speculation, and pass.
+
+The gate is not a natural-language entailment model. It accepts source-text
+extracts and a finite set of narrator templates with values checked against
+their cited fields; it rejects open-ended paraphrases. Citations establish
+which stored values were used, not whether those values are true.
 
 Dropped sentences are logged `{section, index, reason}` in the receipt and
 never reach the response body. Any section the gate empties is filled by the
