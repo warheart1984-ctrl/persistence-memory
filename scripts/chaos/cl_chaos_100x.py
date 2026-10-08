@@ -1653,6 +1653,24 @@ def summarize(results: list[dict[str, Any]], stats: Stats, rounds_done: int, sta
     }
 
 
+def resolve_selection(only_arg: str | None, phases_arg: str | None) -> tuple[set[str] | None, str | None]:
+    """The probes asked for with --only / --phases: (a set, or None for all), or (None, why it is invalid).  An unknown id or phase, or a selection that
+    names nothing, is an error; it must never fall through to 'run everything' (which includes the destructive probes)."""
+    only = {x.strip() for x in only_arg.split(",") if x.strip()} if only_arg else None
+    if only_arg:
+        unknown = sorted(only - {p.id for p in PROBES}) if only else []
+        if unknown or not only:
+            return None, f"--only names no such probe: {unknown or only_arg!r} (probes: {', '.join(p.id for p in PROBES)})"
+    if phases_arg:
+        letters = {x.strip().upper() for x in phases_arg.split(",") if x.strip()}
+        unknown = sorted(letters - set(PHASES))
+        if unknown or not letters:
+            return None, f"--phases names no such phase: {unknown or phases_arg!r} (phases: {', '.join(sorted(PHASES))})"
+        wanted = {p.id for p in PROBES if p.phase in letters}
+        only = wanted if only is None else (only | wanted)
+    return only, None
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="cl_chaos_100x.py", description="CL_CHAOS_100x: repeated probe rounds against a throwaway stack only")
     ap.add_argument("--rounds", type=int, default=100)
@@ -1678,6 +1696,10 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_OK
     if args.rounds < 1:
         print("--rounds must be at least 1", file=sys.stderr)
+        return EXIT_USAGE
+    only, bad = resolve_selection(args.only, args.phases)       # before anything touches the target: a malformed selector is a usage error with no side effects
+    if bad:
+        print(bad, file=sys.stderr)
         return EXIT_USAGE
 
     try:
@@ -1711,22 +1733,8 @@ def main(argv: list[str] | None = None) -> int:
             log_file.write(line + "\n")
             log_file.flush()
 
-    only = {x.strip() for x in args.only.split(",") if x.strip()} if args.only else None
-    if args.only:
-        unknown = sorted(only - {p.id for p in PROBES})
-        if unknown or not only:
-            print(f"--only names no such probe: {unknown or args.only!r} (probes: {', '.join(p.id for p in PROBES)})", file=sys.stderr)
-            return EXIT_USAGE
-    if args.phases:
-        letters = {x.strip().upper() for x in args.phases.split(",") if x.strip()}
-        unknown = sorted(letters - set(PHASES))
-        if unknown or not letters:
-            print(f"--phases names no such phase: {unknown or args.phases!r} (phases: {', '.join(sorted(PHASES))})", file=sys.stderr)
-            return EXIT_USAGE
-        wanted = {p.id for p in PROBES if p.phase in letters}
-        only = wanted if only is None else (only | wanted)
     args.seed = args.seed or os.urandom(4).hex()
-    selected = [p for p in PROBES if not only or p.id in only]
+    selected = [p for p in PROBES if only is None or p.id in only]
     shown = f"{PROBES_PER_ROUND} probes per round" + (f" ({len(selected)} selected)" if len(selected) != PROBES_PER_ROUND else "")
     log(f"CL_CHAOS_100x: seed {args.seed}; {shown}, {args.rounds} round(s) = {len(selected) * args.rounds} probe runs; "
         f"target {target['url']} stack {target['stack']}; destructive probes {'ENABLED' if not destructive_blocked else 'SKIPPED (' + destructive_blocked + ')'}")

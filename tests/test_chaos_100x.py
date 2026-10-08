@@ -977,3 +977,28 @@ def test_valid_selections_still_work_and_an_empty_selection_selects_nothing(sele
     monkeypatch.undo()
     out = chaos.run_round(1, dict(client=None, stats=stats, stack=None, target={}, destructive_ok="x", state={}, seed="s", max_history=1), set(), ran.append, stats)
     assert out == []                                                              # a set with nothing in it runs nothing (it used to mean "no filter")
+
+
+@pytest.mark.parametrize("flags", [["--phases", "L"], ["--only", "NOPE"], ["--phases", ","], ["--phases", "I,Z"]])
+def test_a_malformed_selector_is_a_usage_error_before_the_target_is_even_looked_at(monkeypatch, capsys, tmp_path, flags):
+    """No stack on disk, a live port as the target, and every way of touching the world made to explode: the selector is rejected first, with exit 2."""
+    def boom(*a, **k):
+        raise AssertionError("the target or the machine was touched")
+    monkeypatch.setattr(chaos, "fetch_ready", boom)
+    monkeypatch.setattr(chaos, "load_stack", boom)
+    monkeypatch.setattr(chaos, "assess_target", boom)
+    monkeypatch.setattr(chaos, "throwaway_proof", boom)
+    monkeypatch.setattr(chaos, "run_cmd", boom)
+    monkeypatch.setattr(chaos, "live_ports", boom)
+    assert chaos.main(["--stack-dir", str(tmp_path / "nothing"), "--target", "http://127.0.0.1:8011", *flags]) == chaos.EXIT_USAGE
+    assert "no such" in capsys.readouterr().err
+
+
+def test_resolve_selection_returns_sets_none_or_a_reason():
+    assert chaos.resolve_selection(None, None) == (None, None)
+    assert chaos.resolve_selection("A1, A2", None) == ({"A1", "A2"}, None)
+    assert chaos.resolve_selection(None, "k,j") == ({"J1", "K1"}, None)
+    assert chaos.resolve_selection("A1", "I") == ({"A1", "I1"}, None)
+    for bad in (("X", None), (",", None), (None, "L"), (None, " , "), ("A1", "Q")):
+        only, why = chaos.resolve_selection(*bad)
+        assert only is None and why and "no such" in why
