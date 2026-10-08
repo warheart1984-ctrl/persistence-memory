@@ -23,6 +23,7 @@ F10 persist receipts carry no timestamp
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import threading
@@ -418,3 +419,59 @@ def test_backend_usage_is_receipted(tmp_path, monkeypatch):
     assert out.receipt.usage == {"prompt_tokens": 11, "completion_tokens": 7}, (
         "usage was captured by the backend but dropped before the receipt"
     )
+
+
+# --- review follow-ups on PR #57 ---------------------------------------------
+
+def test_provider_usage_is_reduced_to_known_integer_counters():
+    """A gateway can return any dict; it must not be stored verbatim in every receipt."""
+    huge = {"prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15,
+            "debug": "x" * 1_000_000, "nested": {"a": ["y" * 1000] * 1000},
+            "output_tokens": True, "input_tokens": -4}
+    out = svc._bounded_usage(huge)
+    assert out == {"prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15}
+    assert len(json.dumps(out)) < 200
+    assert svc._bounded_usage({"debug": "z"}) is None and svc._bounded_usage("nope") is None
+    assert svc._bounded_usage(None) is None
+
+
+def test_the_persona_contract_does_not_promise_a_numeric_confidence_extract():
+    """The gate drops a bare confidence number (UNSUPPORTED_TEXT), so the prompt must not
+    tell the model that confidence values survive as exact extracts."""
+    from app.twinchat.prompt import SYSTEM_PROMPT
+    recalled = [_rec(status="verified", confidence=0.9)]
+    assert gate_reply("0.9 [mem-abc123def456]", recalled)["dropped"]
+    assert "survive only as exact extracts" not in SYSTEM_PROMPT
+    assert "never state a record's confidence number" in SYSTEM_PROMPT
+
+
+def test_an_oversized_provider_usage_object_never_reaches_the_stored_receipt(tmp_path, monkeypatch):
+    """End to end: the receipt row a hostile or buggy gateway response produces stays small."""
+    os.environ["JARVIS_TWIN_CHAT_DIR"] = str(tmp_path)
+    monkeypatch.setenv("JARVIS_STORE_BOOTSTRAP", "1")
+    from app.store import get_store
+    from app.models import MemoryCreate, EvidenceLink
+    from app.twinchat.backends import BackendResult
+
+    store = get_store()
+    rec = store.create_memory(MemoryCreate(
+        type="fact", content="deploy uses postgres", source_agent="user:t",
+        subject="deploy", status="verified", session_id="seed",
+        evidence=[EvidenceLink(kind="receipt", ref="seed:r2")],
+    ))
+
+    class HostileUsage:
+        name = "metered"
+        def chat(self, messages, **kw):
+            return BackendResult(
+                text=f"deploy uses postgres [{rec.id}]", model="m1", latency_ms=3,
+                usage={"prompt_tokens": 5, "blob": "x" * 2_000_000},
+            )
+
+    receipts = ReceiptStore(tmp_path / "h.sqlite3")
+    monkeypatch.setattr(svc, "resolve_backend", lambda p: HostileUsage())
+    monkeypatch.setattr(svc, "get_receipt_store", lambda: receipts)
+    out = svc.run_turn(store, ChatRequest(session_id="s1", message="postgres deploy"), tenant_key="t")
+    assert out.receipt.usage == {"prompt_tokens": 5}
+    stored = receipts._conn.execute("SELECT length(body_json) FROM receipts").fetchone()[0]
+    assert stored < 20_000, f"a single receipt row grew to {stored} bytes"

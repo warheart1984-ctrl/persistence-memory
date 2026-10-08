@@ -54,6 +54,24 @@ def _gate_mode() -> str:
     return v if v in ("off", "shadow", "enforce") else "enforce"
 
 
+_USAGE_KEYS = ("prompt_tokens", "completion_tokens", "total_tokens", "input_tokens", "output_tokens")
+
+
+def _bounded_usage(usage: Any) -> dict | None:
+    """A provider-controlled ``usage`` object is stored in every receipt, so keep
+    only the known token counters as plain non-negative ints. Anything else —
+    extra keys, nested objects, huge strings — is dropped, which bounds the size a
+    single response can add to the receipt store."""
+    if not isinstance(usage, dict):
+        return None
+    out = {
+        k: usage[k] for k in _USAGE_KEYS
+        if isinstance(usage.get(k), int) and not isinstance(usage.get(k), bool)
+        and 0 <= usage[k] < 10**12
+    }
+    return out or None
+
+
 def _sha(text: str) -> str:
     return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -177,7 +195,7 @@ def _run(
                 )
                 raw = res.text
                 model = res.model
-                usage = res.usage
+                usage = _bounded_usage(res.usage)
                 latency = res.latency_ms
             except NarratorError as exc:
                 fallback_reason = exc.code
