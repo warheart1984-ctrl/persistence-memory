@@ -106,6 +106,9 @@ from app.twin import (
 from app.twin_state import build_twin_state
 import app.narrator as narrator
 from app.narrator.base import NarratorError
+import app.twinchat.service as twinchat_service
+from app.twinchat.models import ChatRequest
+from app.twinchat.receipts import ReceiptError, get_receipt_store
 from app.graph import (
     BfsBody,
     ComponentsBody,
@@ -615,6 +618,63 @@ def twin_narration(request: Request, provider: str = Query(default="none")):
     state = _twin_state_for_request(request)
     out = narrator.narrate_state(state, cfg, adapter)
     return {"state": state, "narration": out["sections"], "receipt": out["receipt"]}
+
+
+# --- TwinChat (governed conversation; flag-dark like the rest of twin) ---
+
+
+def _twin_chat_guard(request: Request) -> str:
+    """twin guard + chat flag + tenant key. Returns the internal tenant key."""
+    _twin_guard(request)
+    if not _env_flag("JARVIS_TWIN_CHAT_ENABLED"):
+        raise HTTPException(status_code=404, detail="Not found")
+    return current_tenant_key() or "operator"
+
+
+@app.post("/api/jarvis/twin/chat")
+def twin_chat(request: Request, body: ChatRequest):
+    """One governed turn: session window → recall → backend → gate → receipt.
+
+    Dark unless JARVIS_TWIN_CHAT_ENABLED. ``persist=1`` additionally needs
+    JARVIS_TWIN_CHAT_PERSIST_ENABLED (403 TWIN_CHAT_PERSIST_DISABLED) and the
+    same write auth as POST /api/jarvis/memory — checked before any model
+    call so a refused persist never spends a turn. A second concurrent turn
+    on the same session gets 409 SESSION_BUSY; an exhausted receipt store
+    gets 503 RECEIPT_STORE_FULL.
+    """
+    tenant = _twin_chat_guard(request)
+    if body.persist:
+        if not _env_flag("JARVIS_TWIN_CHAT_PERSIST_ENABLED"):
+            raise HTTPException(status_code=403, detail="TWIN_CHAT_PERSIST_DISABLED")
+        require_memory_write()
+    try:
+        return twinchat_service.run_turn(
+            get_store(), body, tenant_key=tenant
+        )
+    except NarratorError as exc:
+        raise HTTPException(status_code=400, detail=exc.code) from exc
+    except ReceiptError as exc:
+        status = 409 if exc.code == "SESSION_BUSY" else 503
+        raise HTTPException(status_code=status, detail=exc.code) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/jarvis/twin/chat/receipts/{digest}")
+def twin_chat_receipt(request: Request, digest: str):
+    """One tenant-scoped receipt by digest — 404 for unknown or cross-tenant."""
+    tenant = _twin_chat_guard(request)
+    body = get_receipt_store().get_receipt(tenant, digest)
+    if body is None:
+        raise HTTPException(status_code=404, detail="RECEIPT_UNKNOWN")
+    return {"receipt": body}
+
+
+@app.get("/api/jarvis/twin/chat/sessions/{session_id}/turns")
+def twin_chat_session_turns(request: Request, session_id: str):
+    """Ordered receipt digests for a session — tenant-scoped."""
+    tenant = _twin_chat_guard(request)
+    return {"turns": get_receipt_store().session_turns(tenant, session_id)}
 
 
 _TWIN_UI_DIR = Path(__file__).resolve().parent.parent / "ui" / "twin"
