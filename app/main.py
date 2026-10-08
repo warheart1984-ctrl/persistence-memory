@@ -677,6 +677,78 @@ def twin_chat_session_turns(request: Request, session_id: str):
     return {"turns": get_receipt_store().session_turns(tenant, session_id)}
 
 
+# --- Asset Twin (load-bearing diagram, simulation-only reference) ---
+
+
+def _asset_twin_guard(request: Request) -> str:
+    """Dark unless JARVIS_ASSET_TWIN_ENABLED; mirrors twin guard + tenant key."""
+    if not _env_flag("JARVIS_ASSET_TWIN_ENABLED"):
+        raise HTTPException(status_code=404, detail="Not found")
+    _twin_guard(request)
+    return current_tenant_key() or "operator"
+
+
+@app.post("/api/jarvis/asset-twin/cycle")
+def asset_twin_cycle(request: Request, body: dict):
+    """One simulated cycle: telemetry -> twin -> recommendation. Never executes.
+
+    Simulation-only: the asset is an in-process model. The response carries a
+    pending veto record; movement requires a separate human approve + execute.
+    """
+    import app.asset_twin.service as asset_service
+    from app.asset_twin.models import Telemetry
+
+    tenant = _asset_twin_guard(request)
+    try:
+        telemetry = Telemetry.model_validate(body)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"bad telemetry: {exc}") from exc
+    return asset_service.run_cycle(tenant, telemetry).model_dump(mode="json")
+
+
+@app.post("/api/jarvis/asset-twin/decide")
+def asset_twin_decide(request: Request, body: dict):
+    """Human veto gate: approve | veto | hold. Veto always wins; executed is final."""
+    import app.asset_twin.service as asset_service
+    from app.asset_twin.models import VetoDecision
+
+    tenant = _asset_twin_guard(request)
+    try:
+        verdict = VetoDecision.model_validate(body)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"bad verdict: {exc}") from exc
+    if verdict.verdict == "approve":
+        require_memory_write()
+    try:
+        return asset_service.decide_human(tenant, verdict, actor=tenant)
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=404 if "unknown" in str(exc) else 400, detail=str(exc)) from exc
+
+
+@app.post("/api/jarvis/asset-twin/execute")
+def asset_twin_execute(request: Request, body: dict):
+    """Simulated execution only: refuses anything not approved + unexpired."""
+    import app.asset_twin.service as asset_service
+
+    tenant = _asset_twin_guard(request)
+    require_memory_write()
+    decision_id = str(body.get("decision_id", ""))
+    asset_id = str(body.get("asset_id", ""))
+    if not decision_id or not asset_id:
+        raise HTTPException(status_code=400, detail="decision_id and asset_id required")
+    return asset_service.execute(tenant, decision_id, asset_id).model_dump(mode="json")
+
+
+@app.get("/api/jarvis/asset-twin/audit")
+def asset_twin_audit(request: Request):
+    """Tenant-scoped evidence chain validity (digests + problems, no raw bus)."""
+    from app.asset_twin.evidence import get_ledger
+
+    tenant = _asset_twin_guard(request)
+    ok, problems = get_ledger().verify(tenant)
+    return {"chain_valid": ok, "problems": problems}
+
+
 _TWIN_UI_DIR = Path(__file__).resolve().parent.parent / "ui" / "twin"
 _TWIN_UI_FILES = {
     "index.html": "text/html; charset=utf-8",
