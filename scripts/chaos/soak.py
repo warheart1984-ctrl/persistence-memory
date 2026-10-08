@@ -51,6 +51,42 @@ TYPICAL = "chaos100x"
 
 # --- measurements -----------------------------------------------------------------------------------------------------------------------------
 
+class SoakError(Exception):
+    """The run cannot produce a valid result (a measurement that cannot be made, a control that cannot be set up): it stops, it does not carry on."""
+
+
+class Failures:
+    """Every request the soak itself needed to succeed and did not (a growth write, a seal, a timed retrieve or verification, a read under load).  A soak
+    with any of these is a partial or invalid experiment and says so in its result and its exit status; it never quietly records them and goes on."""
+
+    def __init__(self) -> None:
+        self.items: list[dict[str, Any]] = []
+
+    def note(self, what: str, status: Any) -> None:
+        self.items.append({"what": what, "status": status})
+
+    def __bool__(self) -> bool:
+        return bool(self.items)
+
+    def summary(self) -> dict[str, Any]:
+        counts: dict[str, int] = {}
+        for i in self.items:
+            key = f"{i['what']}:{i['status']}"
+            counts[key] = counts.get(key, 0) + 1
+        return {"count": len(self.items), "by_kind": counts}
+
+
+def process_memory_checked(container: str, runner=chaos.run_cmd, attempts: int = 3, sleep=time.sleep) -> dict[str, int]:
+    """process_memory, retried; if the numbers still cannot be read the run stops: a missing measurement must never be read as 0 MiB."""
+    for i in range(attempts):
+        mem = process_memory(container, runner)
+        if "RssAnon" in mem and "VmRSS" in mem:
+            return mem
+        if i + 1 < attempts:
+            sleep(1)
+    raise SoakError(f"cannot read the application's memory from {container} (/proc/1/status) after {attempts} attempts")
+
+
 def process_memory(container: str, runner=chaos.run_cmd) -> dict[str, int]:
     """Anonymous and total resident memory of the application's main process (kB), from inside its own container."""
     r = runner(["docker", "exec", container, "cat", "/proc/1/status"], timeout=30)
@@ -91,14 +127,18 @@ def restart_and_wait(stack: dict[str, Any], target: dict[str, Any], *, ready_tim
     return None
 
 
-def timed(fn) -> float:
+def timed(fn, failures: "Failures | None" = None, what: str = "") -> float:
+    """Milliseconds for one call; if the call returns a response that is not a 200 it is noted as a failure (a timing of an error is not a timing)."""
     t0 = time.perf_counter()
-    fn()
-    return (time.perf_counter() - t0) * 1000
+    resp = fn()
+    ms = (time.perf_counter() - t0) * 1000
+    if failures is not None and getattr(resp, "status", 200) != 200:
+        failures.note(what or "timed request", getattr(resp, "status", None))
+    return ms
 
 
-def median_ms(fn, n: int = 3) -> float:
-    return statistics.median(timed(fn) for _ in range(n))
+def median_ms(fn, n: int = 3, failures: "Failures | None" = None, what: str = "") -> float:
+    return statistics.median(timed(fn, failures, what) for _ in range(n))
 
 
 def database_mb(stack: dict[str, Any], runner=chaos.run_cmd) -> float | None:
@@ -240,15 +280,15 @@ def verdict(growth: list[dict], reads: list[dict], idle: list[dict], control: li
 
 # --- the run ----------------------------------------------------------------------------------------------------------------------------------
 
-def sample(client, stack, phase: str, t0: float, requests: int, records: int) -> dict[str, Any]:
-    mem = process_memory(stack["containers"]["app"])
+def sample(client, stack, phase: str, t0: float, requests: int, records: int, failures: "Failures | None" = None) -> dict[str, Any]:
+    mem = process_memory_checked(stack["containers"]["app"])
     s = {"t": round(time.time() - t0, 1), "phase": phase, "requests": requests, "records": records, **mem}
     if phase in ("growth", "reads", "control"):
-        s["retrieve_typical_ms"] = round(median_ms(lambda: client.get(f"/api/jarvis/memory/retrieve?query={TYPICAL}&limit=50", timeout=120)), 1)
+        s["retrieve_typical_ms"] = round(median_ms(lambda: client.get(f"/api/jarvis/memory/retrieve?query={TYPICAL}&limit=50", timeout=120), failures=failures, what="retrieve"), 1)
     if phase == "growth":
-        s["retrieve_hostile_ms"] = round(median_ms(lambda: client.get(f"/api/jarvis/memory/retrieve?query={urllib.parse.quote(HOSTILE)}&limit=5", timeout=120)), 1)
-        s["blocks_verify_ms"] = round(timed(lambda: client.get("/api/jarvis/blocks/verify", timeout=300)), 1)
-        s["history_verify_ms"] = round(timed(lambda: client.get("/api/jarvis/memory/history/verify", timeout=300)), 1)
+        s["retrieve_hostile_ms"] = round(median_ms(lambda: client.get(f"/api/jarvis/memory/retrieve?query={urllib.parse.quote(HOSTILE)}&limit=5", timeout=120), failures=failures, what="hostile retrieve"), 1)
+        s["blocks_verify_ms"] = round(timed(lambda: client.get("/api/jarvis/blocks/verify", timeout=300), failures, "blocks/verify"), 1)
+        s["history_verify_ms"] = round(timed(lambda: client.get("/api/jarvis/memory/history/verify", timeout=300), failures, "history/verify"), 1)
         s["db_mb"] = database_mb(stack)
     return s
 
@@ -269,14 +309,16 @@ def run_concurrency(args, stack, target, client, stats, out_dir) -> int:
     if why:
         log(f"ABORTED: the concurrency phase needs a freshly restarted process and did not get one: {why}")
         return chaos.EXIT_PROBE_FAILURES
-    levels = [{"callers": 0, "hwm_mib": process_memory(stack["containers"]["app"]).get("VmHWM", 0) / 1024, "anon_mib": process_memory(stack["containers"]["app"]).get("RssAnon", 0) / 1024,
-               "requests": 0, "p50_ms": None, "p99_ms": None, "unanswered": 0}]
+    base = process_memory_checked(stack["containers"]["app"])
+    levels = [{"callers": 0, "hwm_mib": base.get("VmHWM", 0) / 1024, "anon_mib": base.get("RssAnon", 0) / 1024, "requests": 0, "p50_ms": None, "p99_ms": None, "unanswered": 0}]
     log(f"  after restart: high-water {levels[0]['hwm_mib']:.1f} MiB, anonymous {levels[0]['anon_mib']:.1f} MiB")
     for callers in (1, 4, 16, 40):
         load = Load(client, record_id, threads=callers).start()
         time.sleep(args.concurrency_seconds)
         load.stop()
-        mem = process_memory(stack["containers"]["app"])
+        mem = process_memory_checked(stack["containers"]["app"])
+        if load.count - load.errors <= 0:
+            raise SoakError(f"no request was answered with 200 at {callers} callers: this level measured nothing")
         lat = sorted(l for l in client.stats.latencies.get("-", [])[-max(load.count, 1):])
         levels.append({"callers": callers, "hwm_mib": round(mem.get("VmHWM", 0) / 1024, 1), "anon_mib": round(mem.get("RssAnon", 0) / 1024, 1), "requests": load.count,
                        "p50_ms": round(chaos.pct(lat, 0.5), 1) if lat else None, "p99_ms": round(chaos.pct(lat, 0.99), 1) if lat else None, "unanswered": load.errors})
@@ -334,81 +376,107 @@ def main(argv: list[str] | None = None) -> int:
             log_file.flush()
 
     if args.concurrency:
-        return run_concurrency(args, stack, target, client, stats, out_dir)
+        try:
+            return run_concurrency(args, stack, target, client, stats, out_dir)
+        except SoakError as exc:
+            print(f"ABORTED: {exc}", file=sys.stderr)
+            return chaos.EXIT_PROBE_FAILURES
     tag = os.urandom(3).hex()
     t0 = time.time()
     samples: dict[str, list[dict]] = {"growth": [], "reads": [], "idle": [], "control": []}
-    head = client.get("/api/jarvis/blocks/head").json
-    base_records = head["history_seq"]
-    records = 0
-    log(f"soak: target {target['url']} stack {target['stack']}; growth {args.growth_min:g} min, reads {args.reads_min:g}, idle {args.idle_min:g}, control {args.control_min:g}; "
-        f"{args.records_per_tick} records every {args.tick_s:g} s, a sample every {args.sample_s:g} s; ledger starts at {base_records} history entries")
-
-    def take(phase: str, requests: int) -> None:
-        s = sample(client, stack, phase, t0, requests, base_records + records)
-        samples[phase].append(s)
-        log(f"[{s['t']:7.0f}s] {phase:<7} entries {s['records']:>6} reqs {s['requests']:>7} anon {s.get('RssAnon', 0) / 1024:7.1f} MiB rss {s.get('VmRSS', 0) / 1024:7.1f} MiB"
-            + (f" retrieve {s['retrieve_typical_ms']:7.0f} ms" if "retrieve_typical_ms" in s else "")
-            + (f" hostile {s['retrieve_hostile_ms']:7.0f} ms verify b/h {s['blocks_verify_ms']:6.0f}/{s['history_verify_ms']:6.0f} ms db {s['db_mb']} MB" if "retrieve_hostile_ms" in s else ""))
-
-    # --- growth ---
-    take("growth", 0)
-    end = time.time() + args.growth_min * 60
-    next_sample = time.time() + args.sample_s
-    last_id = None
-    while time.time() < end and base_records + records < args.max_records:
-        tick = time.time()
-        for i in range(args.records_per_tick):
-            r = client.post("/api/jarvis/memory", {"content": f"chaos100x soak {tag} {records} {i}", "source_agent": "soak", "session_id": f"soak-{tag}", "type": "decision",
-                                                   "evidence": [{"kind": "user-request", "ref": "chaos100x:soak"}]}, timeout=60)
-            if r.status == 200:
-                records += 1
-                last_id = r.json["memory"]["id"]
-        client.post("/api/jarvis/blocks/seal", {"force": True, "min_entries": 1, "max_entries": 200}, timeout=120)
-        if time.time() >= next_sample:
-            take("growth", stats.requests)
-            next_sample = time.time() + args.sample_s
-        time.sleep(max(0.0, args.tick_s - (time.time() - tick)))
-    take("growth", stats.requests)
-    log(f"growth done: {records} records written, {stats.requests} requests, ledger at {base_records + records} entries")
-
-    # --- reads on a constant ledger ---
-    def hold(phase: str, minutes: float, load: Load | None) -> None:
-        end_ = time.time() + minutes * 60
-        while time.time() < end_:
-            time.sleep(min(30.0, max(0.0, end_ - time.time())))
-            take(phase, load.count if load else 0)
-
-    load = Load(client, last_id or "mem-none").start()
-    take("reads", 0)
-    hold("reads", args.reads_min, load)
-    load.stop()
-    log(f"reads done: {load.count} requests, {load.errors} not answered with 200")
-
-    # --- idle ---
-    hold("idle", args.idle_min, None)
-
-    # --- control: restart the application, same ledger, same load ---
-    log("control: restarting the application container")
-    why = restart_and_wait(stack, target)
-    if why:
-        log(f"ABORTED: the control needs a restarted process and did not get one: {why}")
-        if out_dir:
-            (out_dir / "soak.json").write_text(json.dumps({"aborted": why, "seconds": round(time.time() - t0), "samples": samples}, indent=2))
+    failures = Failures()
+    first = client.get("/api/jarvis/blocks/head")
+    if first.status != 200:
+        print(f"ABORTED: the ledger's blocks/head answered {first.status} before the soak began", file=sys.stderr)
         return chaos.EXIT_PROBE_FAILURES
-    load2 = Load(client, last_id or "mem-none").start()
-    take("control", 0)
-    hold("control", args.control_min, load2)
-    load2.stop()
+    head = first.json
+    base_records = head["history_seq"]
+    try:
+        records = 0
+        log(f"soak: target {target['url']} stack {target['stack']}; growth {args.growth_min:g} min, reads {args.reads_min:g}, idle {args.idle_min:g}, control {args.control_min:g}; "
+            f"{args.records_per_tick} records every {args.tick_s:g} s, a sample every {args.sample_s:g} s; ledger starts at {base_records} history entries")
 
-    result = {"args": vars(args), "seconds": round(time.time() - t0), "records_written": records, "ledger_entries": base_records + records, "samples": samples,
-              "verdict": verdict(samples["growth"], samples["reads"], samples["idle"], samples["control"]), "http_statuses": {str(k): v for k, v in sorted(stats.statuses.items())},
-              "five_xx": len(stats.five_xx), "requests": stats.requests}
-    log(json.dumps(result["verdict"], indent=1))
-    if out_dir:
-        (out_dir / "soak.json").write_text(json.dumps(result, indent=2))
-    return chaos.EXIT_OK
+        def take(phase: str, requests: int) -> None:
+            s = sample(client, stack, phase, t0, requests, base_records + records, failures)
+            samples[phase].append(s)
+            log(f"[{s['t']:7.0f}s] {phase:<7} entries {s['records']:>6} reqs {s['requests']:>7} anon {s.get('RssAnon', 0) / 1024:7.1f} MiB rss {s.get('VmRSS', 0) / 1024:7.1f} MiB"
+                + (f" retrieve {s['retrieve_typical_ms']:7.0f} ms" if "retrieve_typical_ms" in s else "")
+                + (f" hostile {s['retrieve_hostile_ms']:7.0f} ms verify b/h {s['blocks_verify_ms']:6.0f}/{s['history_verify_ms']:6.0f} ms db {s['db_mb']} MB" if "retrieve_hostile_ms" in s else ""))
 
+        # --- growth ---
+        take("growth", 0)
+        end = time.time() + args.growth_min * 60
+        next_sample = time.time() + args.sample_s
+        last_id = None
+        while time.time() < end and base_records + records < args.max_records:
+            tick = time.time()
+            for i in range(args.records_per_tick):
+                r = client.post("/api/jarvis/memory", {"content": f"chaos100x soak {tag} {records} {i}", "source_agent": "soak", "session_id": f"soak-{tag}", "type": "decision",
+                                                       "evidence": [{"kind": "user-request", "ref": "chaos100x:soak"}]}, timeout=60)
+                if r.status == 200:
+                    records += 1
+                    last_id = r.json["memory"]["id"]
+                else:
+                    failures.note("growth write", r.status)
+            sealed = client.post("/api/jarvis/blocks/seal", {"force": True, "min_entries": 1, "max_entries": 200}, timeout=120)
+            if sealed.status != 200:
+                failures.note("seal", sealed.status)
+            if time.time() >= next_sample:
+                take("growth", stats.requests)
+                next_sample = time.time() + args.sample_s
+            time.sleep(max(0.0, args.tick_s - (time.time() - tick)))
+        take("growth", stats.requests)
+        log(f"growth done: {records} records written, {stats.requests} requests, ledger at {base_records + records} entries")
+
+        # --- reads on a constant ledger ---
+        def hold(phase: str, minutes: float, load: Load | None) -> None:
+            end_ = time.time() + minutes * 60
+            while time.time() < end_:
+                time.sleep(min(30.0, max(0.0, end_ - time.time())))
+                take(phase, load.count if load else 0)
+
+        load = Load(client, last_id or "mem-none").start()
+        take("reads", 0)
+        hold("reads", args.reads_min, load)
+        load.stop()
+        log(f"reads done: {load.count} requests, {load.errors} not answered with 200")
+        if load.errors:
+            failures.note("read load", f"{load.errors} of {load.count} not 200")
+
+        # --- idle ---
+        hold("idle", args.idle_min, None)
+
+        # --- control: restart the application, same ledger, same load ---
+        log("control: restarting the application container")
+        why = restart_and_wait(stack, target)
+        if why:
+            log(f"ABORTED: the control needs a restarted process and did not get one: {why}")
+            if out_dir:
+                (out_dir / "soak.json").write_text(json.dumps({"aborted": why, "seconds": round(time.time() - t0), "samples": samples}, indent=2))
+            return chaos.EXIT_PROBE_FAILURES
+        load2 = Load(client, last_id or "mem-none").start()
+        take("control", 0)
+        hold("control", args.control_min, load2)
+        load2.stop()
+        if load2.errors:
+            failures.note("control read load", f"{load2.errors} of {load2.count} not 200")
+
+        result = {"args": vars(args), "seconds": round(time.time() - t0), "records_written": records, "ledger_entries": base_records + records, "samples": samples,
+                  "verdict": verdict(samples["growth"], samples["reads"], samples["idle"], samples["control"]), "http_statuses": {str(k): v for k, v in sorted(stats.statuses.items())},
+                  "five_xx": len(stats.five_xx), "requests": stats.requests}
+        if failures:
+            result["invalid"] = failures.summary()
+            log(f"INVALID RUN: {failures.summary()['count']} request(s) the soak needed to succeed did not: {failures.summary()['by_kind']}; the verdict below rests on a partial experiment")
+        log(json.dumps(result["verdict"], indent=1))
+        if out_dir:
+            (out_dir / "soak.json").write_text(json.dumps(result, indent=2))
+        return chaos.EXIT_PROBE_FAILURES if failures else chaos.EXIT_OK
+
+    except SoakError as exc:
+        log(f"ABORTED: {exc}")
+        if out_dir:
+            (out_dir / "soak.json").write_text(json.dumps({"aborted": str(exc), "seconds": round(time.time() - t0), "samples": samples, "invalid": failures.summary() if failures else None}, indent=2))
+        return chaos.EXIT_PROBE_FAILURES
 
 if __name__ == "__main__":
     raise SystemExit(main())

@@ -296,3 +296,140 @@ def test_the_concurrency_phase_aborts_too_when_it_cannot_get_a_restarted_process
     out = tmp_path / "out"
     rc = soak.main(["--stack-dir", str(tmp_path), "--concurrency", "--out", str(out)])
     assert rc == chaos.EXIT_PROBE_FAILURES and started == [] and not (out / "concurrency.json").exists()
+
+
+# --- a soak with failed requests or unreadable memory is not a valid soak -------------------------------------------------------------------------------
+
+def test_an_unreadable_memory_measurement_is_retried_and_then_stops_the_run_it_is_never_zero():
+    answers = iter([SimpleNamespace(returncode=1, stdout="", stderr="x"), SimpleNamespace(returncode=0, stdout="VmRSS:\t 1 kB\n", stderr=""),   # no RssAnon: unusable
+                    SimpleNamespace(returncode=0, stdout="VmRSS:\t 100000 kB\nRssAnon:\t 60000 kB\n", stderr="")])
+    slept = []
+    out = soak.process_memory_checked("c", runner=lambda a, **k: next(answers), sleep=slept.append)
+    assert out["RssAnon"] == 60000 and len(slept) == 2
+    with pytest.raises(soak.SoakError, match="cannot read the application's memory from c"):
+        soak.process_memory_checked("c", runner=lambda a, **k: SimpleNamespace(returncode=1, stdout="", stderr=""), sleep=lambda s: None)
+
+
+def test_a_timed_request_that_is_not_a_200_is_a_failure_not_a_timing():
+    f = soak.Failures()
+    soak.timed(lambda: chaos.Response(200, {}, {}, 1.0), f, "retrieve")
+    assert not f
+    soak.timed(lambda: chaos.Response(503, {}, {}, 1.0), f, "retrieve")
+    soak.median_ms(lambda: chaos.Response(0, None, {}, 1.0), n=2, failures=f, what="blocks/verify")
+    assert f and f.summary() == {"count": 3, "by_kind": {"retrieve:503": 1, "blocks/verify:0": 2}}
+    assert soak.timed(lambda: None) >= 0                                           # a call with no response object still times
+
+
+def soak_env(monkeypatch, tmp_path, request_fn, memory=None):
+    monkeypatch.setattr(chaos, "live_ports", lambda: {8011})
+    monkeypatch.setattr(chaos, "throwaway_proof", lambda *a, **k: None)
+    monkeypatch.setattr(chaos, "fetch_ready", lambda url: (200, {"stack": "chaos-throwaway:jarvis-chaos100x"}))
+    (tmp_path / "secrets").mkdir()
+    (tmp_path / "secrets" / "api-key").write_text("k")
+    (tmp_path / "stack.json").write_text(json.dumps({"url": "http://127.0.0.1:18017", "port": 18017, "project": "p", "secrets_dir": str(tmp_path / "secrets"), "keys_dir": str(tmp_path),
+                                                     "containers": {"app": "chaos100x-app", "db": "chaos100x-db"}}))
+    monkeypatch.setattr(chaos.Client, "request", request_fn)
+    monkeypatch.setattr(soak, "process_memory", memory or (lambda c, runner=None: {"RssAnon": 60000, "VmRSS": 90000}))
+    monkeypatch.setattr(soak, "database_mb", lambda *a, **k: 1.0)
+    monkeypatch.setattr(soak, "restart_and_wait", lambda stack, target, **k: None)
+    monkeypatch.setattr(soak.time, "sleep", lambda s: None)
+    return ["--stack-dir", str(tmp_path), "--growth-min", "0.001", "--reads-min", "0.001", "--idle-min", "0.001", "--control-min", "0.001", "--tick-s", "0.01",
+            "--records-per-tick", "2", "--sample-s", "0.01"]
+
+
+def ok_response(method, path, body):
+    return chaos.Response(200, {"history_seq": 0, "tip": None, "memory": {"id": "mem-1"}, "memories": [], "ok": True}, {}, 1.0)
+
+
+def test_a_clean_soak_exits_zero_and_has_no_invalid_marker(monkeypatch, tmp_path):
+    args = soak_env(monkeypatch, tmp_path, lambda self, method, path, body=None, **k: ok_response(method, path, body))
+    out = tmp_path / "out"
+    assert soak.main([*args, "--out", str(out)]) == 0
+    assert "invalid" not in json.loads((out / "soak.json").read_text())
+
+
+@pytest.mark.parametrize("failing,what", [("POST /api/jarvis/memory", "growth write"), ("POST /api/jarvis/blocks/seal", "seal"), ("GET /api/jarvis/blocks/verify", "blocks/verify"),
+                                          ("GET /api/jarvis/memory/history/verify", "history/verify"), ("GET /api/jarvis/memory/retrieve", "retrieve")])
+def test_a_request_the_soak_needed_that_failed_makes_the_run_invalid_and_the_exit_nonzero(monkeypatch, tmp_path, failing, what, capsys):
+    method, route = failing.split()
+
+    def request(self, m, path, body=None, **k):
+        if m == method and path.startswith(route):
+            return chaos.Response(503, None, {}, 1.0)
+        return ok_response(m, path, body)
+
+    out = tmp_path / "out"
+    rc = soak.main([*soak_env(monkeypatch, tmp_path, request), "--out", str(out)])
+    result = json.loads((out / "soak.json").read_text())
+    assert rc == chaos.EXIT_PROBE_FAILURES and result["invalid"]["count"] > 0
+    assert any(key.startswith(what) for key in result["invalid"]["by_kind"]), result["invalid"]
+    assert "INVALID RUN" in (out / "soak.log").read_text()
+
+
+def test_read_load_failures_make_the_run_invalid(monkeypatch, tmp_path):
+    def request(self, m, path, body=None, **k):
+        if m == "GET" and path.startswith("/api/jarvis/blocks/head") and getattr(request, "calls", 0) > 0:
+            return chaos.Response(503, None, {}, 1.0)
+        request.calls = getattr(request, "calls", 0) + 1
+        return ok_response(m, path, body)
+
+    out = tmp_path / "out"
+    rc = soak.main([*soak_env(monkeypatch, tmp_path, request), "--out", str(out)])
+    result = json.loads((out / "soak.json").read_text())
+    assert rc == chaos.EXIT_PROBE_FAILURES and any(k.startswith("read load") or k.startswith("control read load") for k in result["invalid"]["by_kind"])
+
+
+def test_unreadable_memory_aborts_the_soak_with_no_verdict(monkeypatch, tmp_path):
+    out = tmp_path / "out"
+    rc = soak.main([*soak_env(monkeypatch, tmp_path, lambda self, m, p, body=None, **k: ok_response(m, p, body), memory=lambda c, runner=None: {}), "--out", str(out)])
+    result = json.loads((out / "soak.json").read_text())
+    assert rc == chaos.EXIT_PROBE_FAILURES and "cannot read the application's memory" in result["aborted"] and "verdict" not in result
+
+
+def test_a_ledger_that_does_not_answer_before_the_soak_begins_is_refused(monkeypatch, tmp_path, capsys):
+    rc = soak.main([*soak_env(monkeypatch, tmp_path, lambda self, m, p, body=None, **k: chaos.Response(503, None, {}, 1.0))])
+    assert rc == chaos.EXIT_PROBE_FAILURES and "before the soak began" in capsys.readouterr().err
+
+
+def test_the_concurrency_phase_stops_when_memory_is_unreadable_or_a_level_answered_nothing(monkeypatch, tmp_path, capsys):
+    def request(self, m, p, body=None, **k):
+        return chaos.Response(200, {"history_seq": 3, "tip": None, "memories": [{"id": "mem-1"}]}, {}, 1.0)
+
+    args = soak_env(monkeypatch, tmp_path, request, memory=lambda c, runner=None: {})
+    assert soak.main([*args, "--concurrency"]) == chaos.EXIT_PROBE_FAILURES
+    assert "ABORTED" in capsys.readouterr().err
+
+
+class FakeLoad:
+    """A Load that has already 'run': counts and errors are set by the test, one instance per phase in the order the soak creates them."""
+
+    plan: list = []
+
+    def __init__(self, client, record_id, threads=4):
+        self.count, self.errors = FakeLoad.plan.pop(0)
+
+    def start(self):
+        return self
+
+    def stop(self):
+        pass
+
+
+@pytest.mark.parametrize("plan,expected", [([(100, 3), (100, 0)], "read load"), ([(100, 0), (100, 4)], "control read load")])
+def test_load_errors_in_either_phase_make_the_run_invalid_on_their_own(monkeypatch, tmp_path, plan, expected):
+    FakeLoad.plan = list(plan)
+    monkeypatch.setattr(soak, "Load", FakeLoad)
+    out = tmp_path / "out"
+    rc = soak.main([*soak_env(monkeypatch, tmp_path, lambda self, m, p, body=None, **k: ok_response(m, p, body)), "--out", str(out)])
+    result = json.loads((out / "soak.json").read_text())
+    assert rc == chaos.EXIT_PROBE_FAILURES
+    assert list(result["invalid"]["by_kind"]) == [f"{expected}:{plan[0][1] or plan[1][1]} of 100 not 200"], result["invalid"]
+
+
+def test_a_concurrency_level_where_nothing_was_answered_stops_the_run(monkeypatch, tmp_path, capsys):
+    FakeLoad.plan = [(5, 5)]
+    monkeypatch.setattr(soak, "Load", FakeLoad)
+    args = soak_env(monkeypatch, tmp_path, lambda self, m, p, body=None, **k: chaos.Response(200, {"history_seq": 3, "tip": None, "memories": [{"id": "mem-1"}]}, {}, 1.0))
+    out = tmp_path / "out"
+    assert soak.main([*args, "--concurrency", "--out", str(out)]) == chaos.EXIT_PROBE_FAILURES
+    assert "no request was answered with 200 at 1 callers" in capsys.readouterr().err and not (out / "concurrency.json").exists()
