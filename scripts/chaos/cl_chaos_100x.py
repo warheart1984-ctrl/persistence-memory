@@ -28,7 +28,9 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import dataclasses
+from datetime import datetime
 import hashlib
+import http.client
 import json
 import os
 import random
@@ -228,7 +230,7 @@ class Client:
             status, payload, rh = exc.code, exc.read(), dict(exc.headers)
         except TimeoutError:
             status = -1
-        except (urllib.error.URLError, OSError) as exc:
+        except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:    # includes a response cut off by a server that died mid-reply
             status = -1 if "timed out" in str(exc) else 0
         ms = (time.perf_counter() - t0) * 1000
         try:
@@ -290,6 +292,8 @@ def probe(pid: str, phase: str, title: str, *, destructive: bool = False, expect
 PHASES = {
     "A": "records and evidence objects", "B": "continuity blocks", "C": "auth and request guards", "D": "retrieval and hostile input",
     "F": "replay receipts", "G": "signatures (warn mode)", "E": "database role and row-level security", "H": "destructive: outages, floods, concurrent seals",
+    "I": "ugly conditions: the application is killed (kill -9) mid-write", "J": "ugly conditions: the application is partitioned from the database mid-transaction",
+    "K": "ugly conditions: the database volume is full",
 }
 
 
@@ -355,6 +359,18 @@ class Ctx:
                 return time.perf_counter() - t0
             time.sleep(step)
         raise ProbeFail(f"/ready did not become {want} within {seconds:g}s")
+
+    def ensure_receipt(self) -> dict[str, Any]:
+        """A replay receipt taken BEFORE a fault (the one phase F made this round, or one made now) for the gates to re-derive afterwards."""
+        if self.state.get("f1_round") != self.round:                          # a receipt of THIS round, taken before this round's faults
+            self.create(content=self.content("receipt anchor"))
+            self.seal(max_entries=5)
+            tip = self.head()["tip"]
+            r = self.client.post("/api/jarvis/replay/receipts", {"at_block": tip["height"]})
+            status_is(r, 200, what="issue the receipt the fault gates will re-derive")
+            self.state["f1"] = {"id": r.json["receipt"]["id"], "block": tip["height"], "at_seq": tip["last_seq"], "root": r.json["receipt"]["payload"]["state_root"]}
+            self.state["f1_round"] = self.round
+        return self.state["f1"]
 
     def mint_script(self, name: str, *args: str, timeout: float = 600) -> subprocess.CompletedProcess:
         stack = self.need_destructive()
@@ -674,6 +690,7 @@ def f1(ctx: Ctx) -> None:
     check(p["block_height"] == tip["height"] and p["block_hash"] == tip["block_hash"] and p["at_seq"] == tip["last_seq"], f"receipt payload {p}")
     check(r.json["receipt"]["schema_id"] == "CES.Local.ReplayReceipt.v1", "wrong schema id")
     ctx.state["f1"] = {"id": r.json["receipt"]["id"], "block": tip["height"], "at_seq": tip["last_seq"], "root": p["state_root"]}
+    ctx.state["f1_round"] = ctx.round
 
 
 @probe("F2", "F", "issuing the same receipt again is idempotent: same id, not created twice")
@@ -1147,32 +1164,47 @@ def h3(ctx: Ctx) -> None:
     ctx.wait_ready(200, 30)
 
 
-@probe("H4", "H", "concurrent writers and force-seals: no write fails, blocks stay contiguous, chain and blocks verify", destructive=True)
+@probe("H4", "H", "concurrent writers and force-seals (12 callers on a pool of 10): nothing is lost or corrupted, any refusal is a clean 503, blocks stay contiguous, chain and blocks verify", destructive=True, expect_5xx=(503,))
 def h4(ctx: Ctx) -> None:
+    """Twelve callers share a pool of ten connections with a one-second wait, so an occasional request is shed: that is the design (a 503 with Retry-After),
+    not a failure.  What must never happen is a refusal that is anything else, an acknowledged write that is not in the ledger, or a chain that does not verify."""
     ctx.need_destructive()
     first = ctx.head()
     first_height = (first["tip"] or {"height": 0})["height"]
-    errors: list[str] = []
+    results: list[tuple[str, int, dict[str, str], str | None]] = []
+    lock = threading.Lock()
 
     def writer(i: int) -> None:
         for j in range(3):
-            try:
-                ctx.create(content=ctx.content(f"h4-{i}-{j}"))
-            except ProbeFail as exc:
-                errors.append(str(exc))
+            body = {"content": ctx.content(f"h4-{i}-{j}"), "source_agent": "chaos100x", "session_id": f"chaos-{ctx.round:03d}", "type": "decision",
+                    "evidence": [{"kind": "user-request", "ref": f"chaos100x:round-{ctx.round}"}]}
+            r = ctx.client.post("/api/jarvis/memory", body)
+            with lock:
+                results.append(("write", r.status, r.headers, r.json["memory"]["id"] if r.status == 200 else None))
 
     def sealer(i: int) -> None:
         for _ in range(3):
             r = ctx.client.post("/api/jarvis/blocks/seal", {"force": True, "min_entries": 1, "max_entries": 4})
-            if r.status != 200:
-                errors.append(f"seal returned {r.status}")
+            with lock:
+                results.append(("seal", r.status, r.headers, None))
             time.sleep(0.05)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
         futures = [pool.submit(writer, i) for i in range(8)] + [pool.submit(sealer, i) for i in range(4)]
         for f in futures:
             f.result()
-    check(not errors, f"{len(errors)} request(s) failed: {errors[:2]}")
+    odd = sorted({(kind, status) for kind, status, _, _ in results if status not in (200, 503)})
+    check(not odd, f"concurrent callers got {odd}: only 200 and a clean 503 are acceptable")
+    unlabelled = [kind for kind, status, headers, _ in results if status == 503 and not (headers.get("Retry-After") or headers.get("retry-after"))]
+    check(not unlabelled, f"{len(unlabelled)} refusal(s) without Retry-After")
+    shed = sum(1 for _, status, _, _ in results if status == 503)
+    ctx.metrics.setdefault("h4_shed_503s", []).append(shed)
+    check(shed <= len(results) // 4, f"{shed} of {len(results)} concurrent calls were shed: the pool is not coping")
+    for kind, status, _, rid in results:
+        if kind == "write" and status == 200:
+            status_is(ctx.client.get(f"/api/jarvis/memory/{rid}"), 200, what="a write the API acknowledged")
+    with ctx.stats.lock:
+        ctx.state["writes"] = ctx.state.get("writes", 0) + sum(1 for k, st, _, _ in results if k == "write" and st == 200)
     ctx.seal(max_entries=4)
     rows = ctx.client.get(f"/api/jarvis/blocks?after_height={first_height}&limit=1000").json["blocks"]
     check(rows, "no block was sealed")
@@ -1186,6 +1218,341 @@ def h4(ctx: Ctx) -> None:
     check(ctx.client.get("/api/jarvis/memory/history/verify").json["ok"] is True, "history does not verify after concurrent writes")
 
 
+# === Phases I, J, K: ugly conditions (the application killed, the database cut off, the volume full) ===================================================
+# One probe per fault.  Every fault runs with concurrent writers, and afterwards the same gates:
+#   1. no half-writes: every write the API acknowledged exists whole; every record that exists is whole (one `create` in its history, the content
+#      it was sent); no memory row without history; the history counter equals the newest history seq
+#   2. the history chain and the blocks verify (the API's and the database's own verifiers)
+#   3. a replay receipt taken before the fault still re-derives (the service, and offline from the raw rows)
+#   4. the API failed closed during the fault (nothing acknowledged that could not have been stored; no 500) and recovered after it
+# and the recovery times are measured (fault to the first request that is answered, and to three consecutive good readiness answers).
+
+@dataclasses.dataclass
+class Attempt:
+    token: str
+    content: str
+    status: int
+    id: str | None
+    t0: float
+    t1: float
+
+
+def chaos_response_failed() -> "Response":
+    return Response(0, None, {}, 0.0)
+
+
+class Writers:
+    """Concurrent record writers that keep going through a fault and remember what each request was told."""
+
+    def __init__(self, ctx: "Ctx", label: str, n: int = 4, timeout: float = 20, pause: float = 0.25):
+        self.ctx, self.label, self.n, self.timeout, self.pause = ctx, label, n, timeout, pause
+        self.attempts: list[Attempt] = []
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._threads: list[threading.Thread] = []
+
+    def _run(self, i: int) -> None:
+        seq = 0
+        while not self._stop.is_set():
+            seq += 1
+            token = f"{self.label}w{i}n{seq}"
+            content = f"chaos100x {token} {self.ctx.tag}"
+            body = {"content": content, "source_agent": "chaos100x", "session_id": f"chaos-{self.ctx.round:03d}", "type": "decision",
+                    "evidence": [{"kind": "user-request", "ref": f"chaos100x:{self.label}", "note": "written while a fault is injected"}]}
+            t0 = time.time()
+            try:
+                r = self.ctx.client.post("/api/jarvis/memory", body, timeout=self.timeout)
+            except Exception:  # a writer that dies unnoticed would make a fault look quieter than it was: it is counted as a failed request
+                r = chaos_response_failed()
+            t1 = time.time()
+            rid = r.json["memory"]["id"] if r.status == 200 and isinstance(r.json, dict) and "memory" in r.json else None
+            with self._lock:
+                self.attempts.append(Attempt(token, content, r.status, rid, t0, t1))
+            time.sleep(self.pause if r.status == 200 else max(self.pause, 0.05))   # paced: a fault is about the moment, not about the volume
+
+    def start(self) -> "Writers":
+        for i in range(self.n):
+            t = threading.Thread(target=self._run, args=(i,), daemon=True)
+            t.start()
+            self._threads.append(t)
+        return self
+
+    def stop(self) -> list[Attempt]:
+        self._stop.set()
+        for t in self._threads:
+            t.join(self.timeout + 10)
+        with self.ctx.stats.lock:
+            self.ctx.state["writes"] = self.ctx.state.get("writes", 0) + sum(1 for a in self.attempts if a.status == 200)
+        return list(self.attempts)
+
+
+def watch_recovery(ctx: "Ctx", t_fault: float, *, max_s: float, give_up: Callable[[], None] | None = None, give_up_after: float | None = None,
+                   need_failure_by: float = 15.0) -> dict[str, Any]:
+    """Poll /ready from the moment of the fault: when did it first stop being 200, and when had it been 200 three times in a row?
+    ``give_up`` (called once) is the intervention to try when the outage has lasted ``give_up_after`` seconds (default: half of ``max_s``)."""
+    statuses: Counter = Counter()
+    first_fail = recovered = None
+    streak = 0
+    gave_up = False
+    while time.time() - t_fault < max_s:
+        r = ctx.client.get("/ready", key=False, timeout=3)
+        now = time.time()
+        statuses[r.status] += 1
+        if r.status != 200:
+            first_fail = first_fail or now
+            streak = 0
+        else:
+            streak += 1
+            if streak >= 3 and (first_fail or now - t_fault > need_failure_by):
+                recovered = now
+                break
+        if give_up and not gave_up and first_fail and now - first_fail > (give_up_after if give_up_after is not None else max_s / 2):
+            give_up()
+            gave_up = True
+        time.sleep(0.2)
+    return {"detect_s": round(first_fail - t_fault, 2) if first_fail else None, "recover_s": round(recovered - t_fault, 2) if recovered else None,
+            "ready_statuses": dict(statuses), "gave_up_and_intervened": gave_up, "t_up": recovered}
+
+
+def _db_rows(ctx: "Ctx", sql: str) -> list[list[str]]:
+    out = ctx.psql(sql)
+    return [line.split("|") for line in out.splitlines() if line.strip()]
+
+
+def orphaned_sessions(ctx: "Ctx") -> list[int]:
+    """Client ports of the application's database sessions that have no matching established socket in the application container: sessions the
+    server is holding for a client that is gone."""
+    stack = ctx.need_destructive()
+    table = ctx.docker("exec", stack["containers"]["app"], "cat", "/proc/net/tcp", timeout=30).stdout.splitlines()[1:]
+    mine = set()
+    for line in table:
+        parts = line.split()
+        if len(parts) > 3 and parts[3] == "01" and int(parts[2].split(":")[1], 16) == 5432:
+            mine.add(int(parts[1].split(":")[1], 16))
+    rows = ctx.psql("SELECT client_port FROM pg_stat_activity WHERE backend_type = 'client backend' AND usename = 'jarvis_app' "
+                    "AND client_addr IS NOT NULL AND client_addr <> '127.0.0.1';")
+    return [int(r) for r in rows.splitlines() if r.strip().isdigit() and int(r) not in mine]
+
+
+def wait_no_orphans(ctx: "Ctx", seconds: float = 120) -> dict[str, Any]:
+    """After a fault the server must give back the slots of clients that are gone, on its own, within ``seconds``."""
+    t0 = time.time()
+    seen = None
+    while True:
+        orphans = orphaned_sessions(ctx)
+        seen = len(orphans) if seen is None else seen
+        if not orphans:
+            return {"orphaned_sessions_at_recovery": seen, "orphans_reaped_after_s": round(time.time() - t0, 1)}
+        if time.time() - t0 > seconds:
+            raise ProbeFail(f"{len(orphans)} database session(s) held for a client that is gone were still there {seconds:g} s after recovery "
+                            "(max_connections is small: repeated incidents would lock the application out)")
+        time.sleep(3)
+
+
+def fault_gates(ctx: "Ctx", attempts: list[Attempt], label: str) -> dict[str, Any]:
+    """The gates after a fault (the API must be answering again).  Raises ProbeFail naming the first gate that does not hold."""
+    receipt = ctx.ensure_receipt()
+    acked = [a for a in attempts if a.status == 200]
+    rows = _db_rows(ctx, "SELECT m.id, m.content, (SELECT string_agg(h.op, ',' ORDER BY h.seq) FROM record_history h WHERE h.tenant_key = m.tenant_key AND h.memory_id = m.id) "
+                         f"FROM memories m WHERE m.content LIKE 'chaos100x {label}w%' AND m.content LIKE '%{ctx.tag}%';")
+    by_content: dict[str, list[list[str]]] = {}
+    for r in rows:
+        by_content.setdefault(r[1], []).append(r)
+    sent = {a.content for a in attempts}
+    check(all(c in sent for c in by_content), "a record exists that no request sent (a fabricated or corrupted record)")
+    check(all(len(v) == 1 for v in by_content.values()), "a request produced two records (a duplicated write)")
+    check(all(v[0][2] == "create" for v in by_content.values()), f"a record's history is not exactly one create: {sorted({v[0][2] for v in by_content.values()})}")
+    lost = [a.token for a in acked if a.content not in by_content or by_content[a.content][0][0] != a.id]
+    check(not lost, f"{len(lost)} write(s) the API acknowledged are not in the ledger (first: {lost[:3]})")
+    landed_unacked = sum(1 for a in attempts if a.status != 200 and a.content in by_content)
+    orphans = ctx.psql("SELECT count(*) FROM memories m WHERE NOT EXISTS (SELECT 1 FROM record_history h WHERE h.tenant_key = m.tenant_key AND h.memory_id = m.id);")
+    check(orphans == "0", f"{orphans} memory row(s) have no history (a half-write)")
+    gap = ctx.psql(f"SELECT ((SELECT last_seq FROM history_counters WHERE tenant_key = '{TENANT}') = (SELECT max(seq) FROM record_history WHERE tenant_key = '{TENANT}'))::text;")
+    check(gap == "true", "the history counter and the newest history entry disagree (a half-written entry)")
+    check(ctx.psql(f"SELECT count(*) FROM jarvis_verify_history('{TENANT}');") == "0", "the database's history verifier reports a problem")
+    check(ctx.psql(f"SELECT count(*) FROM jarvis_verify_blocks('{TENANT}');") == "0", "the database's block verifier reports a problem")
+    hv, bv = ctx.client.get("/api/jarvis/memory/history/verify", timeout=60), ctx.client.get("/api/jarvis/blocks/verify", timeout=60)
+    status_is(hv, 200, what="history verify")
+    status_is(bv, 200, what="blocks verify")
+    check(hv.json["ok"] is True, f"history does not verify: {hv.json['problems'][:2]}")
+    check(bv.json["ok"] is True, f"blocks do not verify: {bv.json['problems'][:2]}")
+    rv = ctx.client.get(f"/api/jarvis/replay/receipts/{receipt['id']}/verify", timeout=60)
+    status_is(rv, 200, what="receipt verify")
+    check(rv.json["ok"] is True, f"the earlier receipt no longer re-derives: {rv.json['problems'][:2]}")
+    off = ctx.mint_script("replay.sh", "verify", "--receipt", receipt["id"], "--signatures", "off")
+    check(off.returncode == 0, f"the earlier receipt does not re-derive offline from the raw rows: {(off.stdout + off.stderr).strip()[-160:]}")
+    after = ctx.create(content=ctx.content(f"{label} after the fault"))
+    status_is(ctx.client.get(f"/api/jarvis/memory/{after['id']}"), 200, what="read back a write made after the fault")
+    reaped = wait_no_orphans(ctx)
+    return {"attempts": len(attempts), "acknowledged": len(acked), "failed": len(attempts) - len(acked), "landed_but_unacknowledged": landed_unacked, **reaped}
+
+
+def fail_closed(attempts: list[Attempt], t_fault: float, t_up: float | None, *, allowed: tuple[int, ...], settle: float = 0.5,
+                acks_allowed: bool = False) -> dict[str, Any]:
+    """During the fault: no write started after it (plus a moment to settle) was acknowledged, and every refusal is one of the ``allowed`` statuses.
+    ``acks_allowed`` is for a fault that is partial by nature (a nearly full volume: a write that fits in a page that already exists succeeds, the next that
+    needs a new page is refused): acknowledgements are then permitted DURING it, and the gates afterwards must find each one whole and durable."""
+    end = t_up if t_up else float("inf")
+    window = [a for a in attempts if a.t0 > t_fault + settle and a.t1 < end - 0.5]
+    wrong = [a for a in window if a.status == 200]
+    odd = sorted({a.status for a in window if a.status != 200 and a.status not in allowed})
+    hang = max((a.t1 - a.t0 for a in attempts if a.t0 >= t_fault - 0.1), default=0.0)
+    if wrong and not acks_allowed:
+        raise ProbeFail(f"{len(wrong)} write(s) begun after the fault were acknowledged with 200 while it was in force (first: {wrong[0].token})")
+    check(not odd, f"during the fault the API answered {odd}, not only {list(allowed)}")
+    return {"writes_during_fault": len(window), "statuses_during_fault": dict(Counter(a.status for a in window)), "longest_request_s": round(hang, 2)}
+
+
+def _record_fault(ctx: "Ctx", probe_id: str, data: dict[str, Any]) -> None:
+    """Keep the run's numbers even if a later gate fails (a failed run's timings are evidence), but marked: only a run whose probe went on to pass every gate sets
+    ``passed``, and the summary is computed from those alone."""
+    data.setdefault("passed", False)
+    ctx.metrics.setdefault("faults", {}).setdefault(probe_id, []).append(data)
+
+
+HEAL_INTERVAL_S = 60       # jarvis-heal.timer runs every minute on the box
+PARTITION_PROMPT_S = 15    # a request caught by a silent partition must be answered (503) within this
+
+
+@probe("I1", "I", "kill -9 the application container mid-write: nothing is acknowledged while it is down; the self-heal restarts it; the gates hold", destructive=True, expect_5xx=(0, -1, 503))
+def i1(ctx: Ctx) -> None:
+    """`docker kill` is a stop through the API: Docker's restart policy deliberately ignores it (deploy/mint/bin/heal.sh says so), so the box's recovery
+    is the self-heal timer.  The probe kills, gives Docker a few seconds to restart it on its own (it should not), then runs the throwaway copy of
+    heal.sh exactly as the timer does and measures from the kill to a stable /ready.  The worst case on the box adds up to one timer interval."""
+    stack = ctx.need_destructive()
+    app = stack["containers"]["app"]
+    ctx.ensure_receipt()
+    writers = Writers(ctx, "i1").start()
+    data: dict[str, Any] = {}
+    heal_at: list[float] = []
+
+    def heal() -> None:
+        heal_at.append(time.time())
+        done = ctx.mint_script("heal.sh", timeout=120)
+        if done.returncode != 0:
+            raise ProbeFail(f"the self-heal failed: {(done.stdout + done.stderr).strip()[-160:]}")
+
+    try:
+        time.sleep(1.0)
+        killed = ctx.docker("kill", "-s", "KILL", app, timeout=30)
+        t_fault = time.time()                                                # the signal has been delivered: from here nothing may be acknowledged
+        check(killed.returncode == 0, f"could not kill the throwaway application container: {killed.stderr[:100]}")
+        # Docker's own restart policy gets four seconds of outage to restart it (it should not: an API kill is a manual stop); then the self-heal runs
+        rec = watch_recovery(ctx, t_fault, max_s=120, give_up=heal, give_up_after=4.0)
+        time.sleep(1.0)
+    finally:
+        attempts = writers.stop()
+    docker_restarted = not rec["gave_up_and_intervened"]
+    t_heal = heal_at[0] if heal_at else None
+    started = ctx.docker("inspect", "-f", "{{.State.StartedAt}}", app).stdout.strip()
+    t_started = datetime.fromisoformat(started[:26] + "+00:00").timestamp() if started[:4].isdigit() else None
+    data.update(detect_s=rec["detect_s"], recover_s=rec["recover_s"], docker_restarted_it_itself=docker_restarted,
+                heal_run_after_s=round(t_heal - t_fault, 2) if t_heal else None, startup_after_heal_s=round(rec["t_up"] - t_heal, 2) if (t_heal and rec["t_up"]) else None,
+                worst_case_recover_s=round(HEAL_INTERVAL_S + (rec["t_up"] - t_heal), 2) if (t_heal and rec["t_up"]) else None,
+                restarted_after_s=round(t_started - t_fault, 2) if t_started else None, ready_statuses=rec["ready_statuses"])
+    _record_fault(ctx, "I1", data)
+    check(rec["recover_s"] is not None, f"the application did not come back within 120 s ({rec['ready_statuses']})")
+    check(rec["detect_s"] is not None, "the outage was never observed: the kill did not take effect")
+    check(t_started is not None and t_started > t_fault, "Docker does not report a restart of the application after the kill")
+    data.update(fail_closed(attempts, t_fault, t_started, allowed=(0, -1, 503), settle=0.2))     # nothing acknowledged before the new process existed
+    data.update(fault_gates(ctx, attempts, "i1"))
+    data["passed"] = True
+
+
+@probe("J1", "J", "partition the application from the database mid-transaction: fails closed, heals, and the gates hold", destructive=True, expect_5xx=(0, -1, 503))
+def j1(ctx: Ctx) -> None:
+    stack = ctx.need_destructive()
+    db, net = stack["containers"]["db"], stack["network"]
+    ctx.ensure_receipt()
+    anchor = ctx.create(content=ctx.content("j1 read during the partition"))
+    writers = Writers(ctx, "j1", timeout=25).start()
+    healed = False
+    try:
+        time.sleep(1.0)
+        cut = ctx.docker("network", "disconnect", net, db, timeout=30)
+        t_fault = time.time()
+        check(cut.returncode == 0, f"could not cut the throwaway database off the network: {cut.stderr[:100]}")
+        reads, ready = [], []
+        while time.time() - t_fault < 12:                                    # hold the partition
+            reads.append(ctx.client.get(f"/api/jarvis/memory/{anchor['id']}", timeout=20))
+            ready.append(ctx.client.get("/ready", key=False, timeout=20))
+            health = ctx.client.get("/health", key=False, timeout=5)
+            check(health.status == 200, f"liveness during the partition was {health.status}")
+        t_heal = time.time()
+        joined = ctx.docker("network", "connect", "--alias", "db", net, db, timeout=30)
+        healed = joined.returncode == 0
+        check(healed, f"could not reconnect the throwaway database: {joined.stderr[:100]}")
+        rec = watch_recovery(ctx, t_heal, max_s=120, need_failure_by=0)
+        check(rec["recover_s"] is not None, f"the application did not recover within 120 s of the partition healing ({rec['ready_statuses']})")
+        time.sleep(1.0)
+    finally:
+        if not healed:
+            ctx.docker("network", "connect", "--alias", "db", net, db, timeout=30)
+        attempts = writers.stop()
+    check(all(r.status != 200 for r in reads), "a record was read through a severed link")
+    bad_reads = sorted({r.status for r in reads} - {0, -1, 503})
+    check(not bad_reads, f"reads during the partition answered {bad_reads}, not only 503 or no answer")
+    check(any(r.status in (0, -1, 503) for r in ready), "readiness never reported the partition")
+    closed = fail_closed(attempts, t_fault, t_heal, allowed=(0, -1, 503), settle=1.0)
+    slowest = max([r.ms for r in reads + ready] + [closed["longest_request_s"] * 1000]) / 1000
+    data = {"recover_s": rec["recover_s"], "partition_s": round(t_heal - t_fault, 2), "slowest_answer_s": round(slowest, 2),
+            "readiness_during": dict(Counter(r.status for r in ready)), "reads_during": dict(Counter(r.status for r in reads)), **closed}
+    _record_fault(ctx, "J1", data)
+    # a link that has gone silent must fail within seconds, not hang for as long as TCP keeps retrying (52 s measured before app/pg_store.py got keepalives)
+    check(slowest <= PARTITION_PROMPT_S, f"a request, or /ready, hung for {slowest:.0f} s during the partition (more than {PARTITION_PROMPT_S} s): the dead connection was not noticed")
+    data.update(fault_gates(ctx, attempts, "j1"))
+    data["passed"] = True
+
+
+@probe("K1", "K", "fill the database volume until writes fail, then free it: fails closed, recovers, and the gates hold", destructive=True, expect_5xx=(0, -1, 503))
+def k1(ctx: Ctx) -> None:
+    stack = ctx.need_destructive()
+    if not stack.get("pgdata_mb") or "keeper" not in stack.get("containers", {}):
+        raise Skip("needs the size-capped database volume: JARVIS_CHAOS_PGDATA_MB=256 scripts/chaos/throwaway_stack.sh up (a real disk is never filled)")
+    keeper, db = stack["containers"]["keeper"], stack["containers"]["db"]
+    ctx.ensure_receipt()
+    restarts_before = ctx.docker("inspect", "-f", "{{.RestartCount}}", db).stdout.strip()
+    since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    writers = Writers(ctx, "k1", timeout=25).start()
+    freed = False
+    try:
+        time.sleep(1.0)
+        t_fault = time.time()
+        fill = ctx.docker("exec", keeper, "sh", "-c", "dd if=/dev/zero of=/keep/chaos-filler bs=64k 2>/dev/null; df -B1 --output=avail /keep | tail -1", timeout=120)
+        free_after_fill = int(fill.stdout.strip().splitlines()[-1] or -1) if fill.stdout.strip() else -1
+        check(0 <= free_after_fill < 1024 * 1024, f"the volume was not filled (free: {free_after_fill} bytes)")
+        t_filled = time.time()
+        fault_started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t_fault))
+        no_space = 0
+        while time.time() - t_filled < 25 and not no_space:                  # the proof that the fault bit is the database's own log, not "some request failed"
+            no_space = (ctx.docker("logs", "--since", fault_started, db, timeout=60).stderr + "").count("No space left")
+            time.sleep(0.3)
+        check(no_space > 0, "the database never reported 'No space left on device' within 25 s of filling the volume: the fault did not bite")
+        bite_s = round(time.time() - t_filled, 2)
+        time.sleep(3.0)                                                      # the fault in force
+        t_free = time.time()
+        ctx.docker("exec", keeper, "rm", "-f", "/keep/chaos-filler", timeout=60)
+        freed = True
+        rec = watch_recovery(ctx, t_free, max_s=180, need_failure_by=0)
+        check(rec["recover_s"] is not None, f"the application did not recover within 180 s of freeing the space ({rec['ready_statuses']})")
+        time.sleep(1.0)
+    finally:
+        if not freed:
+            ctx.docker("exec", keeper, "rm", "-f", "/keep/chaos-filler", timeout=60)
+        attempts = writers.stop()
+    closed = fail_closed(attempts, t_filled, t_free, allowed=(503,), settle=0.5, acks_allowed=True)
+    closed["acknowledged_while_full"] = sum(1 for a in attempts if a.status == 200 and a.t0 > t_filled and a.t1 < t_free - 0.5)
+    closed["refused_while_full"] = sum(1 for a in attempts if a.status == 503 and a.t0 >= t_filled - 0.1 and a.t1 < t_free)
+    check(closed["refused_while_full"] > 0, "nothing was refused while the volume was full")
+    gates = fault_gates(ctx, attempts, "k1")
+    logs = ctx.docker("logs", "--since", since, db, timeout=60)
+    text = logs.stdout + logs.stderr
+    restarts_after = ctx.docker("inspect", "-f", "{{.RestartCount}}", db).stdout.strip()
+    _record_fault(ctx, "K1", {"passed": True, "recover_s": rec["recover_s"], "bite_after_fill_s": bite_s, "volume_full_s": round(t_free - t_fault, 2),
+                              "no_space_errors_in_db_log": text.count("No space left"), "panics": text.count("PANIC"),
+                              "db_restarts": int(restarts_after or 0) - int(restarts_before or 0), **closed, **gates})
+
+
 # --- the runner -----------------------------------------------------------------------------------------------------------------------------
 
 PROBES_PER_ROUND = len(PROBES)
@@ -1196,7 +1563,7 @@ def run_round(rnd: int, ctx_args: dict[str, Any], only: set[str] | None, log: Ca
     ctx = Ctx(rnd=rnd, rng=rng, **{k: v for k, v in ctx_args.items() if k != "seed"})
     out = []
     for p in PROBES:
-        if only and p.id not in only:
+        if only is not None and p.id not in only:         # an empty selection selects nothing; it is rejected before it gets here
             continue
         stats.current.update(round=rnd, probe=p.id, expect=p.expect_5xx)
         t0 = time.perf_counter()
@@ -1246,6 +1613,26 @@ def final_checks(client: Client, stack: dict[str, Any] | None, destructive_block
     return res
 
 
+def fault_summary(faults: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
+    """Per fault: how many times, and the min / median / max of each timing, plus what the writers saw."""
+    out: dict[str, Any] = {}
+    for probe_id, all_runs in sorted(faults.items()):
+        runs = [r for r in all_runs if r.get("passed", True)]          # runs recorded before the 'passed' marker existed were all passes
+        entry: dict[str, Any] = {"runs": len(runs), "failed_runs_excluded": len(all_runs) - len(runs)}
+        for key in ("detect_s", "recover_s", "bite_after_fill_s", "volume_full_s", "partition_s", "longest_request_s", "orphans_reaped_after_s"):
+            values = sorted(r[key] for r in runs if isinstance(r.get(key), (int, float)))
+            if values:
+                entry[key] = {"min": values[0], "median": round(statistics.median(values), 3), "max": values[-1]}
+        for key in ("attempts", "acknowledged", "failed", "landed_but_unacknowledged", "writes_during_fault", "no_space_errors_in_db_log", "panics", "db_restarts", "orphaned_sessions_at_recovery"):
+            entry[key] = sum(int(r.get(key) or 0) for r in runs)
+        statuses: Counter = Counter()
+        for r in runs:
+            statuses.update({str(k): v for k, v in r.get("statuses_during_fault", {}).items()})
+        entry["statuses_during_fault"] = dict(statuses)
+        out[probe_id] = entry
+    return out
+
+
 def summarize(results: list[dict[str, Any]], stats: Stats, rounds_done: int, started: float, final: dict[str, Any], state: dict[str, Any], args: argparse.Namespace,
               capped: str | None) -> dict[str, Any]:
     by_probe: dict[str, Counter] = {}
@@ -1256,7 +1643,8 @@ def summarize(results: list[dict[str, Any]], stats: Stats, rounds_done: int, sta
     unexpected = [e for e in stats.five_xx if not e["expected"]]
     return {
         "name": "CL_CHAOS_100x", "probes_per_round": PROBES_PER_ROUND, "rounds_requested": args.rounds, "rounds_completed": rounds_done,
-        "probe_runs": len(results), "expected_probe_runs": PROBES_PER_ROUND * rounds_done, "capped": capped,
+        "probe_runs": len(results), "probes_selected_per_round": len({r["probe"] for r in results if r["round"] == 1}) or PROBES_PER_ROUND,
+        "expected_probe_runs": (len({r["probe"] for r in results if r["round"] == 1}) or PROBES_PER_ROUND) * rounds_done, "capped": capped,
         "seconds": round(time.time() - started, 1),
         "status_counts": dict(Counter(r["status"] for r in results)),
         "failures": [r for r in results if r["status"] in ("FAIL", "ERROR")],
@@ -1267,8 +1655,26 @@ def summarize(results: list[dict[str, Any]], stats: Stats, rounds_done: int, sta
         "five_xx_by_probe": {f"{p}:{c}": n for (p, c), n in sorted(Counter((e["probe"], e["status"]) for e in stats.five_xx).items())},
         "latency_ms": {"all": {"p50": round(pct(allv, 0.5), 1), "p95": round(pct(allv, 0.95), 1), "p99": round(pct(allv, 0.99), 1), "max": round(max(allv or [0]), 1),
                                "mean": round(statistics.fmean(allv), 1) if allv else 0}, "per_probe": lat},
-        "writes": state.get("writes", 0), "metrics": state.get("metrics", {}), "final": final,
+        "writes": state.get("writes", 0), "metrics": state.get("metrics", {}), "fault_summary": fault_summary(state.get("metrics", {}).get("faults", {})), "final": final,
     }
+
+
+def resolve_selection(only_arg: str | None, phases_arg: str | None) -> tuple[set[str] | None, str | None]:
+    """The probes asked for with --only / --phases: (a set, or None for all), or (None, why it is invalid).  An unknown id or phase, or a selection that
+    names nothing, is an error; it must never fall through to 'run everything' (which includes the destructive probes)."""
+    only = {x.strip() for x in only_arg.split(",") if x.strip()} if only_arg else None
+    if only_arg:
+        unknown = sorted(only - {p.id for p in PROBES}) if only else []
+        if unknown or not only:
+            return None, f"--only names no such probe: {unknown or only_arg!r} (probes: {', '.join(p.id for p in PROBES)})"
+    if phases_arg:
+        letters = {x.strip().upper() for x in phases_arg.split(",") if x.strip()}
+        unknown = sorted(letters - set(PHASES))
+        if unknown or not letters:
+            return None, f"--phases names no such phase: {unknown or phases_arg!r} (phases: {', '.join(sorted(PHASES))})"
+        wanted = {p.id for p in PROBES if p.phase in letters}
+        only = wanted if only is None else (only | wanted)
+    return only, None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1279,6 +1685,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--seed", default=None, help="seeds the per-round content; default: a fresh random seed, printed in the header so a run can be repeated")
     ap.add_argument("--max-history", type=int, default=6000, help="stop before a round once the history counter reaches this (the ledger is bounded)")
     ap.add_argument("--only", help="comma-separated probe ids")
+    ap.add_argument("--phases", help="comma-separated phase letters (for example I,J,K for the ugly-conditions faults); combined with --only if both are given")
     ap.add_argument("--out", help="directory for results.json and rounds.log")
     ap.add_argument("--count", action="store_true", help="print the per-round probe count and exit")
     ap.add_argument("--list", action="store_true", help="print the probe list and exit")
@@ -1295,6 +1702,10 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_OK
     if args.rounds < 1:
         print("--rounds must be at least 1", file=sys.stderr)
+        return EXIT_USAGE
+    only, bad = resolve_selection(args.only, args.phases)       # before anything touches the target: a malformed selector is a usage error with no side effects
+    if bad:
+        print(bad, file=sys.stderr)
         return EXIT_USAGE
 
     try:
@@ -1328,9 +1739,10 @@ def main(argv: list[str] | None = None) -> int:
             log_file.write(line + "\n")
             log_file.flush()
 
-    only = set(args.only.split(",")) if args.only else None
     args.seed = args.seed or os.urandom(4).hex()
-    log(f"CL_CHAOS_100x: seed {args.seed}; {PROBES_PER_ROUND} probes per round, {args.rounds} round(s) = {PROBES_PER_ROUND * args.rounds} probe runs; "
+    selected = [p for p in PROBES if only is None or p.id in only]
+    shown = f"{PROBES_PER_ROUND} probes per round" + (f" ({len(selected)} selected)" if len(selected) != PROBES_PER_ROUND else "")
+    log(f"CL_CHAOS_100x: seed {args.seed}; {shown}, {args.rounds} round(s) = {len(selected) * args.rounds} probe runs; "
         f"target {target['url']} stack {target['stack']}; destructive probes {'ENABLED' if not destructive_blocked else 'SKIPPED (' + destructive_blocked + ')'}")
     state: dict[str, Any] = {}
     results: list[dict[str, Any]] = []

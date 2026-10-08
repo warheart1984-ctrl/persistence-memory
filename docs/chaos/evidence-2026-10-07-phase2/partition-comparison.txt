@@ -1,0 +1,18 @@
+== partition-before-old-pg_store.txt
+  database cut off at 2.0 s, reconnected at 42.4 s
+  4 requests begun during the partition: {503: 4}
+  answered before the link healed: 0
+  longest request: 52.6 s
+  caught in flight: ready began 2.0 s, answered 54.6 s with 503  (52.6 s)
+  caught in flight: read  began 2.1 s, answered 54.6 s with 503  (52.5 s)
+  caught in flight: read  began 2.1 s, answered 54.6 s with 503  (52.5 s)
+  caught in flight: read  began 2.1 s, answered 54.6 s with 503  (52.5 s)
+== partition-after-this-branch.txt
+  database cut off at 2.0 s, reconnected at 42.5 s
+  18145 requests begun during the partition: {503: 18145}
+  answered before the link healed: 18101
+  longest request: 5.5 s
+  caught in flight: read  began 2.1 s, answered 7.6 s with 503  (5.5 s)
+  caught in flight: read  began 2.1 s, answered 7.6 s with 503  (5.5 s)
+  caught in flight: read  began 2.1 s, answered 7.6 s with 503  (5.5 s)
+  caught in flight: ready began 2.1 s, answered 7.6 s with 503  (5.5 s)

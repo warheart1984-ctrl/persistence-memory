@@ -1,0 +1,187 @@
+{
+  "name": "CL_CHAOS_100x",
+  "probes_per_round": 52,
+  "rounds_requested": 1,
+  "rounds_completed": 1,
+  "probe_runs": 1,
+  "probes_selected_per_round": 1,
+  "expected_probe_runs": 1,
+  "capped": null,
+  "seconds": 23.5,
+  "status_counts": {
+    "PASS": 1
+  },
+  "failures": [],
+  "skips": [],
+  "per_probe": {
+    "K1": {
+      "PASS": 1
+    }
+  },
+  "requests": 138,
+  "http_statuses": {
+    "200": 88,
+    "503": 50
+  },
+  "five_xx_total": 50,
+  "five_xx_expected": 50,
+  "five_xx_unexpected": [],
+  "five_xx_by_probe": {
+    "K1:503": 50
+  },
+  "latency_ms": {
+    "all": {
+      "p50": 14.9,
+      "p95": 40.1,
+      "p99": 85.0,
+      "max": 86.1,
+      "mean": 20.7
+    },
+    "per_probe": {
+      "-": {
+        "n": 2,
+        "p50": 3.5,
+        "p95": 4.2,
+        "p99": 4.2,
+        "max": 4.2
+      },
+      "K1": {
+        "n": 136,
+        "p50": 15.4,
+        "p95": 40.1,
+        "p99": 85.0,
+        "max": 86.1
+      }
+    }
+  },
+  "writes": 57,
+  "metrics": {
+    "faults": {
+      "K1": [
+        {
+          "recover_s": 0.71,
+          "bite_after_fill_s": 0.73,
+          "volume_full_s": 4.22,
+          "no_space_errors_in_db_log": 50,
+          "panics": 0,
+          "db_restarts": 0,
+          "writes_during_fault": 40,
+          "statuses_during_fault": {
+            "200": 3,
+            "503": 37
+          },
+          "longest_request_s": 0.04,
+          "acknowledged_while_full": 7,
+          "refused_while_full": 49,
+          "attempts": 105,
+          "acknowledged": 55,
+          "failed": 50,
+          "landed_but_unacknowledged": 0,
+          "orphaned_sessions_at_recovery": 0,
+          "orphans_reaped_after_s": 0.2
+        }
+      ]
+    }
+  },
+  "fault_summary": {
+    "K1": {
+      "runs": 1,
+      "recover_s": {
+        "min": 0.71,
+        "median": 0.71,
+        "max": 0.71
+      },
+      "bite_after_fill_s": {
+        "min": 0.73,
+        "median": 0.73,
+        "max": 0.73
+      },
+      "volume_full_s": {
+        "min": 4.22,
+        "median": 4.22,
+        "max": 4.22
+      },
+      "longest_request_s": {
+        "min": 0.04,
+        "median": 0.04,
+        "max": 0.04
+      },
+      "orphans_reaped_after_s": {
+        "min": 0.2,
+        "median": 0.2,
+        "max": 0.2
+      },
+      "attempts": 105,
+      "acknowledged": 55,
+      "failed": 50,
+      "landed_but_unacknowledged": 0,
+      "writes_during_fault": 40,
+      "no_space_errors_in_db_log": 50,
+      "panics": 0,
+      "db_restarts": 0,
+      "orphaned_sessions_at_recovery": 0,
+      "statuses_during_fault": {
+        "200": 3,
+        "503": 37
+      }
+    }
+  },
+  "final": {
+    "history_verify": {
+      "ok": true,
+      "problems": []
+    },
+    "blocks_verify": {
+      "ok": true,
+      "problems": []
+    },
+    "attestations_verify": {
+      "ok": true,
+      "problems": [],
+      "warnings": [],
+      "notes": [
+        "signatures: signing is not set up (no key authorized, nothing signed)"
+      ],
+      "summary": {}
+    },
+    "blocks_head": {
+      "history_seq": 1574,
+      "sealed_seq": 1133,
+      "tip_height": 229,
+      "unsealed_entries": 441
+    },
+    "receipts": {
+      "count": 14,
+      "failing_rederivation": []
+    },
+    "jarvisctl_verify": {
+      "rc": 0,
+      "tail": [
+        "ok: history intact for 1 tenant(s); 14 evidence object(s) re-hashed; blocks intact: 229 block(s) sealed through seq 1133, 441 entries unsealed",
+        "signatures: signing is not set up (no key authorized, nothing signed)"
+      ]
+    },
+    "container_stats": [
+      "chaos100x-db cpu=0.03% mem=114.6MiB / 15.5GiB",
+      "chaos100x-app cpu=0.19% mem=69.4MiB / 15.5GiB",
+      "chaos100x-migrate cpu=0.00% mem=0B / 0B",
+      "chaos100x-keeper cpu=0.00% mem=880KiB / 15.5GiB"
+    ],
+    "database_size": "12 MB",
+    "scratch_databases_left": "0",
+    "scratch_hba_rules_left": "0",
+    "schema_version_after": "7",
+    "counts": {
+      "memories": "1574",
+      "record_history": "1574",
+      "blocks": "229",
+      "evidence_objects": "14",
+      "attestations": "0",
+      "trust_statements": "0"
+    },
+    "start_head": {
+      "history_seq": 1517,
+      "tip_height": 209
+    }
+  }
+}

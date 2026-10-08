@@ -1,0 +1,95 @@
+{
+  "ledger_entries": 6400,
+  "levels": [
+    {
+      "callers": 0,
+      "hwm_mib": 95.00390625,
+      "anon_mib": 64.58984375,
+      "requests": 0,
+      "p50_ms": null,
+      "p99_ms": null,
+      "unanswered": 0
+    },
+    {
+      "callers": 1,
+      "hwm_mib": 127.2,
+      "anon_mib": 92.9,
+      "requests": 275,
+      "p50_ms": 6.1,
+      "p99_ms": 359.1,
+      "unanswered": 0
+    },
+    {
+      "callers": 4,
+      "hwm_mib": 174.0,
+      "anon_mib": 119.2,
+      "requests": 281,
+      "p50_ms": 845.4,
+      "p99_ms": 1496.4,
+      "unanswered": 0
+    },
+    {
+      "callers": 16,
+      "hwm_mib": 233.6,
+      "anon_mib": 175.0,
+      "requests": 275,
+      "p50_ms": 1650.4,
+      "p99_ms": 5791.0,
+      "unanswered": 1
+    },
+    {
+      "callers": 40,
+      "hwm_mib": 269.3,
+      "anon_mib": 210.9,
+      "requests": 1273,
+      "p50_ms": 860.3,
+      "p99_ms": 6429.3,
+      "unanswered": 1030
+    }
+  ],
+  "analysis": {
+    "mib_per_caller": 3.26,
+    "r2": 0.84,
+    "levels": [
+      {
+        "callers": 1,
+        "hwm_mib": 127.2,
+        "anon_mib": 92.9,
+        "requests": 275,
+        "p50_ms": 6.1,
+        "p99_ms": 359.1,
+        "unanswered": 0
+      },
+      {
+        "callers": 4,
+        "hwm_mib": 174.0,
+        "anon_mib": 119.2,
+        "requests": 281,
+        "p50_ms": 845.4,
+        "p99_ms": 1496.4,
+        "unanswered": 0
+      },
+      {
+        "callers": 16,
+        "hwm_mib": 233.6,
+        "anon_mib": 175.0,
+        "requests": 275,
+        "p50_ms": 1650.4,
+        "p99_ms": 5791.0,
+        "unanswered": 1
+      },
+      {
+        "callers": 40,
+        "hwm_mib": 269.3,
+        "anon_mib": 210.9,
+        "requests": 1273,
+        "p50_ms": 860.3,
+        "p99_ms": 6429.3,
+        "unanswered": 1030
+      }
+    ],
+    "notes": [
+      "the high-water mark follows the number of simultaneous callers: about 3.3 MiB per extra caller on this ledger (127 MiB at 1 caller to 269 MiB at 40): each retrieve holds a copy of the ledger while it runs, so a burst of readers raises the peak without any request leaking"
+    ]
+  }
+}

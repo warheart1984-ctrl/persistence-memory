@@ -1,0 +1,181 @@
+{
+  "name": "CL_CHAOS_100x",
+  "probes_per_round": 52,
+  "rounds_requested": 1,
+  "rounds_completed": 1,
+  "probe_runs": 1,
+  "probes_selected_per_round": 1,
+  "expected_probe_runs": 1,
+  "capped": null,
+  "seconds": 40.5,
+  "status_counts": {
+    "PASS": 1
+  },
+  "failures": [],
+  "skips": [],
+  "per_probe": {
+    "J1": {
+      "PASS": 1
+    }
+  },
+  "requests": 2491,
+  "http_statuses": {
+    "200": 844,
+    "503": 1647
+  },
+  "five_xx_total": 1647,
+  "five_xx_expected": 1647,
+  "five_xx_unexpected": [],
+  "five_xx_by_probe": {
+    "J1:503": 1647
+  },
+  "latency_ms": {
+    "all": {
+      "p50": 1.7,
+      "p95": 7.5,
+      "p99": 43.5,
+      "max": 5487.7,
+      "mean": 18.1
+    },
+    "per_probe": {
+      "-": {
+        "n": 2,
+        "p50": 4.2,
+        "p95": 4.4,
+        "p99": 4.4,
+        "max": 4.4
+      },
+      "J1": {
+        "n": 2489,
+        "p50": 1.7,
+        "p95": 7.5,
+        "p99": 43.5,
+        "max": 5487.7
+      }
+    }
+  },
+  "writes": 42,
+  "metrics": {
+    "faults": {
+      "J1": [
+        {
+          "recover_s": 1.07,
+          "partition_s": 12.0,
+          "slowest_answer_s": 5.49,
+          "readiness_during": {
+            "503": 783
+          },
+          "reads_during": {
+            "503": 783
+          },
+          "writes_during_fault": 65,
+          "statuses_during_fault": {
+            "503": 65
+          },
+          "longest_request_s": 1.02,
+          "attempts": 120,
+          "acknowledged": 39,
+          "failed": 81,
+          "landed_but_unacknowledged": 0,
+          "orphaned_sessions_at_recovery": 1,
+          "orphans_reaped_after_s": 9.7
+        }
+      ]
+    }
+  },
+  "fault_summary": {
+    "J1": {
+      "runs": 1,
+      "recover_s": {
+        "min": 1.07,
+        "median": 1.07,
+        "max": 1.07
+      },
+      "partition_s": {
+        "min": 12.0,
+        "median": 12.0,
+        "max": 12.0
+      },
+      "longest_request_s": {
+        "min": 1.02,
+        "median": 1.02,
+        "max": 1.02
+      },
+      "orphans_reaped_after_s": {
+        "min": 9.7,
+        "median": 9.7,
+        "max": 9.7
+      },
+      "attempts": 120,
+      "acknowledged": 39,
+      "failed": 81,
+      "landed_but_unacknowledged": 0,
+      "writes_during_fault": 65,
+      "no_space_errors_in_db_log": 0,
+      "panics": 0,
+      "db_restarts": 0,
+      "orphaned_sessions_at_recovery": 1,
+      "statuses_during_fault": {
+        "503": 65
+      }
+    }
+  },
+  "final": {
+    "history_verify": {
+      "ok": true,
+      "problems": []
+    },
+    "blocks_verify": {
+      "ok": true,
+      "problems": []
+    },
+    "attestations_verify": {
+      "ok": true,
+      "problems": [],
+      "warnings": [],
+      "notes": [
+        "signatures: signing is not set up (no key authorized, nothing signed)"
+      ],
+      "summary": {}
+    },
+    "blocks_head": {
+      "history_seq": 85,
+      "sealed_seq": 44,
+      "tip_height": 10,
+      "unsealed_entries": 41
+    },
+    "receipts": {
+      "count": 2,
+      "failing_rederivation": []
+    },
+    "jarvisctl_verify": {
+      "rc": 0,
+      "tail": [
+        "ok: history intact for 1 tenant(s); 2 evidence object(s) re-hashed; blocks intact: 10 block(s) sealed through seq 44, 41 entries unsealed",
+        "signatures: signing is not set up (no key authorized, nothing signed)"
+      ]
+    },
+    "container_stats": [
+      "chaos100x-db cpu=0.04% mem=89.71MiB / 15.5GiB",
+      "chaos100x-app cpu=0.18% mem=68.8MiB / 15.5GiB",
+      "chaos100x-migrate cpu=0.00% mem=0B / 0B",
+      "chaos100x-keeper cpu=0.00% mem=460KiB / 15.5GiB"
+    ],
+    "database_size": "8663 kB",
+    "scratch_databases_left": "0",
+    "scratch_hba_rules_left": "0",
+    "schema_version_after": "7",
+    "counts": {
+      "memories": "85",
+      "record_history": "85",
+      "blocks": "10",
+      "evidence_objects": "2",
+      "attestations": "0",
+      "trust_statements": "0"
+    },
+    "start_head": {
+      "history_seq": 43,
+      "tip_height": 1
+    }
+  }
+}

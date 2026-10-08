@@ -4,10 +4,15 @@
 # ~/jarvis-ledger, deploy/mint/secrets).
 #
 #   throwaway_stack.sh up        copy deploy/mint, rename everything, make secrets and TEST keys, build, start
+#                                JARVIS_CHAOS_PGDATA_MB=256 throwaway_stack.sh up   puts the database on a size-capped tmpfs volume (held mounted by a
+#                                `chaos100x-keeper` container so the data survives a database restart): the full-disk fault fills THAT, never a real disk
+#   throwaway_stack.sh rebuild   rebuild and recreate the running throwaway from this checkout (`jarvisctl up` in its copy). REFUSES unless the stack's own
+#                                /ready answers and says chaos-throwaway:...; a missing /ready, or jarvis-live, is a refusal. Nothing else may run `jarvisctl up`.
 #   throwaway_stack.sh down      stop it, remove its volumes, network, images and its directory
 #   throwaway_stack.sh status    what exists
 #
-# Environment: JARVIS_CHAOS_DIR (default ${TMPDIR:-/tmp}/jarvis-chaos100x), JARVIS_CHAOS_PORT (default 18017; never 8011).
+# Environment: JARVIS_CHAOS_DIR (default ${TMPDIR:-/tmp}/jarvis-chaos100x), JARVIS_CHAOS_PORT (default 18017; never 8011),
+# JARVIS_CHAOS_PGDATA_MB (optional; 64..2048).
 set -Eeuo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -17,6 +22,8 @@ PROJECT=jarvis-chaos100x
 DB_C=chaos100x-db APP_C=chaos100x-app MIG_C=chaos100x-migrate
 DB_IMG=chaos100x-db:test APP_IMG=chaos100x-app:test
 STACK_ID="chaos-throwaway:$PROJECT"
+PGDATA_MB="${JARVIS_CHAOS_PGDATA_MB:-}"
+KEEPER_C=chaos100x-keeper
 MARKER=".jarvis-chaos100x"
 MINT="$CHAOS_DIR/mint"
 
@@ -41,15 +48,19 @@ up() {
   [ ! -e "$CHAOS_DIR" ] || die "$CHAOS_DIR already exists; run: $0 down"
   if ss -ltn 2>/dev/null | awk '{print $4}' | grep -q ":$PORT\$"; then die "port $PORT is already in use"; fi
   command -v ssh-keygen >/dev/null || die "ssh-keygen is needed for the test keys"
+  if [ -n "$PGDATA_MB" ]; then
+    case "$PGDATA_MB" in *[!0-9]*) die "JARVIS_CHAOS_PGDATA_MB must be a number of megabytes" ;; esac
+    [ "$PGDATA_MB" -ge 64 ] && [ "$PGDATA_MB" -le 2048 ] || die "JARVIS_CHAOS_PGDATA_MB must be between 64 and 2048"
+  fi
   mkdir -p "$CHAOS_DIR" && chmod 700 "$CHAOS_DIR" && : > "$CHAOS_DIR/$MARKER"
   mkdir -p "$MINT" "$CHAOS_DIR/home"
   # a copy of the deploy directory, without the live secrets, local env or state
   (cd "$REPO/deploy/mint" && tar --exclude=./secrets --exclude=./.env --exclude=./.env.example --exclude=./rehearse -cf - .) | tar -xf - -C "$MINT"
   # the rehearsal scripts name the live containers and kill them on purpose: they are never copied
-  python3 - "$MINT" "$REPO" "$PORT" "$PROJECT" "$DB_C" "$APP_C" "$MIG_C" "$DB_IMG" "$APP_IMG" <<'PY' || { rm -rf "$CHAOS_DIR"; die "the copy still names the live stack; nothing was created"; }
+  python3 - "$MINT" "$REPO" "$PORT" "$PROJECT" "$DB_C" "$APP_C" "$MIG_C" "$DB_IMG" "$APP_IMG" "$PGDATA_MB" "$KEEPER_C" <<'PY' || { rm -rf "$CHAOS_DIR"; die "the copy still names the live stack; nothing was created"; }
 import re, sys
 from pathlib import Path
-mint, repo, port, project, db_c, app_c, mig_c, db_img, app_img = sys.argv[1:]
+mint, repo, port, project, db_c, app_c, mig_c, db_img, app_img, pgdata_mb, keeper_c = sys.argv[1:]
 compose = Path(mint, "docker-compose.yml")
 s = compose.read_text()
 for old, new in (("name: jarvis-ledger\n", f"name: {project}\n"), ("container_name: jarvis-db", f"container_name: {db_c}"),
@@ -59,6 +70,14 @@ for old, new in (("name: jarvis-ledger\n", f"name: {project}\n"), ("container_na
                  ("${JARVIS_STACK_ID:-jarvis-live}", "${JARVIS_STACK_ID:-chaos-throwaway:" + project + "}")):
     assert old in s, f"compose: {old!r} not found"
     s = s.replace(old, new)
+if pgdata_mb:
+    # the database volume becomes a size-capped tmpfs (RAM, not the host disk).  A tmpfs volume vanishes when its last container stops, so a
+    # keeper container mounts it too and the data survives a restart of the database.
+    keeper = (f"  keeper:\n    <<: *common\n    image: {db_img}\n    container_name: {keeper_c}\n    entrypoint: [\"sleep\", \"infinity\"]\n"
+              "    user: root\n    volumes:\n      - pgdata:/keep\n    networks: [ledger]\n    depends_on:\n      db: { condition: service_healthy }\n\n")
+    assert "networks:\n  ledger: {}\n" in s and "\n  pgdata: {}\n" in s, "compose layout changed"
+    s = s.replace("networks:\n  ledger: {}\n", keeper + "networks:\n  ledger: {}\n", 1)
+    s = s.replace("\n  pgdata: {}\n", f"\n  pgdata:\n    driver: local\n    driver_opts:\n      type: tmpfs\n      device: tmpfs\n      o: size={pgdata_mb}m,uid=999,gid=999,mode=0700\n", 1)
 compose.write_text(s)
 lib = Path(mint, "bin", "lib.sh")
 t = lib.read_text()
@@ -90,16 +109,21 @@ PY
   # test keys (never the live custody directory): a root, a signing key and a stranger
   mkdir -p "$CHAOS_DIR/keys" && chmod 700 "$CHAOS_DIR/keys"
   for k in root mint stranger; do ssh-keygen -q -t ed25519 -N "" -C "chaos100x-$k" -f "$CHAOS_DIR/keys/$k"; done
+  grep -q '^JARVIS_STACK_ID=chaos-throwaway:' "$MINT/.env" || die "the copy's .env does not carry a throwaway stack identity; refusing to run jarvisctl up"
   "$MINT/bin/jarvisctl" secrets >/dev/null
   mkdir -p "$MINT/secrets"
   { echo "# TEST root for the CL_CHAOS_100x throwaway stack only"; cat "$CHAOS_DIR/keys/root.pub"; } > "$MINT/secrets/trust-roots.pub"
   chmod 644 "$MINT/secrets/trust-roots.pub"
   "$MINT/bin/jarvisctl" up
-  python3 - "$CHAOS_DIR" "$PORT" "$PROJECT" "$STACK_ID" "$DB_C" "$APP_C" "$MIG_C" "$DB_IMG" "$APP_IMG" <<'PY'
+  python3 - "$CHAOS_DIR" "$PORT" "$PROJECT" "$STACK_ID" "$DB_C" "$APP_C" "$MIG_C" "$DB_IMG" "$APP_IMG" "$PGDATA_MB" "$KEEPER_C" <<'PY'
 import json, sys
-d, port, project, sid, db_c, app_c, mig_c, db_img, app_img = sys.argv[1:]
+d, port, project, sid, db_c, app_c, mig_c, db_img, app_img, pgdata_mb, keeper_c = sys.argv[1:]
+containers = {"db": db_c, "app": app_c, "migrate": mig_c}
+if pgdata_mb:
+    containers["keeper"] = keeper_c
 json.dump({"dir": d, "url": f"http://127.0.0.1:{port}", "port": int(port), "project": project, "stack_id": sid,
-           "containers": {"db": db_c, "app": app_c, "migrate": mig_c}, "images": [db_img, app_img],
+           "pgdata_mb": int(pgdata_mb) if pgdata_mb else None,
+           "containers": containers, "images": [db_img, app_img],
            "compose_file": f"{d}/mint/docker-compose.yml", "secrets_dir": f"{d}/mint/secrets", "keys_dir": f"{d}/keys",
            "network": f"{project}_ledger", "volumes": [f"{project}_pgdata", f"{project}_appdata"]},
           open(f"{d}/stack.json", "w"), indent=2)
@@ -108,13 +132,30 @@ PY
   echo "throwaway stack is up: http://127.0.0.1:$PORT (project $PROJECT, directory $CHAOS_DIR)"
 }
 
+rebuild() {
+  live_guard
+  [ -f "$CHAOS_DIR/$MARKER" ] || die "$CHAOS_DIR is not a throwaway stack directory (no $MARKER)"
+  grep -q "^name: $PROJECT\$" "$MINT/docker-compose.yml" 2>/dev/null || die "$MINT/docker-compose.yml is not the throwaway project; not touching it"
+  local port ready
+  port="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["port"])' "$CHAOS_DIR/stack.json" 2>/dev/null)" || die "no readable $CHAOS_DIR/stack.json"
+  [ "$port" != 8011 ] || die "the stack's port is 8011, the live stack's"
+  ready="$(curl -s -m 5 "http://127.0.0.1:$port/ready" 2>/dev/null || true)"
+  python3 -c 'import json,sys; sys.exit(0 if str(json.loads(sys.argv[1]).get("stack","")).startswith("chaos-throwaway:") else 1)' "${ready:-null}" 2>/dev/null \
+    || die "refusing to run jarvisctl up: http://127.0.0.1:$port/ready is missing, or does not report a chaos-throwaway: identity (jarvis-live and unlabelled stacks are refused)"
+  # The application image is built from this checkout, but the database image is built from the copy made when the stack was created: refresh just that
+  # directory (nothing in it names the stack), so a change to postgresql.conf or the init scripts reaches the throwaway. bin/ and the compose file are NOT
+  # refreshed: the copy's lib.sh and compose carry the rename.
+  rm -rf "$MINT/db" && cp -a "$REPO/deploy/mint/db" "$MINT/db"
+  JARVIS_HOME="$CHAOS_DIR/home" "$MINT/bin/jarvisctl" up
+}
+
 down() {
   live_guard
   if [ -f "$MINT/docker-compose.yml" ]; then
     grep -q "^name: $PROJECT\$" "$MINT/docker-compose.yml" || die "$MINT/docker-compose.yml is not the throwaway project; not touching it"
     compose down -v --remove-orphans 2>&1 | tail -3 || true
   fi
-  docker rm -f "$DB_C" "$APP_C" "$MIG_C" >/dev/null 2>&1 || true
+  docker rm -f "$DB_C" "$APP_C" "$MIG_C" "$KEEPER_C" >/dev/null 2>&1 || true
   docker volume rm "${PROJECT}_pgdata" "${PROJECT}_appdata" >/dev/null 2>&1 || true
   docker network rm "${PROJECT}_ledger" >/dev/null 2>&1 || true
   docker image rm "$DB_IMG" "$APP_IMG" >/dev/null 2>&1 || true
@@ -132,6 +173,6 @@ status() {
 }
 
 case "${1:-}" in
-  up) up ;; down) down ;; status) status ;;
+  up) up ;; rebuild) rebuild ;; down) down ;; status) status ;;
   *) sed -n '2,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2; exit 2 ;;
 esac

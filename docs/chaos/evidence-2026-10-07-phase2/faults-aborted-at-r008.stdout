@@ -1,0 +1,26 @@
+CL_CHAOS_100x: seed b43463bb; 52 probes per round (3 selected), 100 round(s) = 300 probe runs; target http://127.0.0.1:18017 stack chaos-throwaway:jarvis-chaos100x; destructive probes ENABLED
+r001 I1  PASS     17802ms  kill -9 the application container mid-write: nothing is acknowledged while it is down; the self-heal restarts it; the gates hold
+r001 J1  PASS     32286ms  partition the application from the database mid-transaction: fails closed, heals, and the gates hold
+r001 K1  PASS     14161ms  fill the database volume until writes fail, then free it: fails closed, recovers, and the gates hold
+r002 I1  PASS     17903ms  kill -9 the application container mid-write: nothing is acknowledged while it is down; the self-heal restarts it; the gates hold
+r002 J1  PASS     32436ms  partition the application from the database mid-transaction: fails closed, heals, and the gates hold
+r002 K1  PASS     13588ms  fill the database volume until writes fail, then free it: fails closed, recovers, and the gates hold
+r003 I1  PASS     17910ms  kill -9 the application container mid-write: nothing is acknowledged while it is down; the self-heal restarts it; the gates hold
+r003 J1  PASS     32381ms  partition the application from the database mid-transaction: fails closed, heals, and the gates hold
+r003 K1  PASS     13286ms  fill the database volume until writes fail, then free it: fails closed, recovers, and the gates hold
+r004 I1  PASS     18587ms  kill -9 the application container mid-write: nothing is acknowledged while it is down; the self-heal restarts it; the gates hold
+r004 J1  PASS     23148ms  partition the application from the database mid-transaction: fails closed, heals, and the gates hold
+r004 K1  PASS     14468ms  fill the database volume until writes fail, then free it: fails closed, recovers, and the gates hold
+r005 I1  PASS     18604ms  kill -9 the application container mid-write: nothing is acknowledged while it is down; the self-heal restarts it; the gates hold
+r005 J1  PASS     32817ms  partition the application from the database mid-transaction: fails closed, heals, and the gates hold
+r005 K1  PASS     13486ms  fill the database volume until writes fail, then free it: fails closed, recovers, and the gates hold
+r006 I1  PASS     18209ms  kill -9 the application container mid-write: nothing is acknowledged while it is down; the self-heal restarts it; the gates hold
+r006 J1  PASS     32396ms  partition the application from the database mid-transaction: fails closed, heals, and the gates hold
+r006 K1  PASS     13911ms  fill the database volume until writes fail, then free it: fails closed, recovers, and the gates hold
+r007 I1  PASS     17792ms  kill -9 the application container mid-write: nothing is acknowledged while it is down; the self-heal restarts it; the gates hold
+r007 J1  PASS     31566ms  partition the application from the database mid-transaction: fails closed, heals, and the gates hold
+r007 K1  PASS     14511ms  fill the database volume until writes fail, then free it: fails closed, recovers, and the gates hold
+r008 I1  PASS     17619ms  kill -9 the application container mid-write: nothing is acknowledged while it is down; the self-heal restarts it; the gates hold
+r008 J1  PASS     32736ms  partition the application from the database mid-transaction: fails closed, heals, and the gates hold
+r008 K1  FAIL      8552ms  fill the database volume until writes fail, then free it: fails closed, recovers, and the gates hold  -- nothing was refused while the volume was full
+r009 I1  PASS     18008ms  kill -9 the application container mid-write: nothing is acknowledged while it is down; the self-heal restarts it; the gates hold

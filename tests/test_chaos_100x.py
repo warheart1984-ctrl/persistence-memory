@@ -27,6 +27,7 @@ spec = importlib.util.spec_from_file_location("cl_chaos_100x", SCRIPT)
 chaos = importlib.util.module_from_spec(spec)
 sys.modules["cl_chaos_100x"] = chaos
 spec.loader.exec_module(chaos)
+REAL_WAIT_NO_ORPHANS = chaos.wait_no_orphans     # the autouse fixture below replaces the module's own with a stub
 
 
 # --- the probe list and its count ----------------------------------------------------------------------------------------------------------
@@ -45,7 +46,7 @@ def test_probe_ids_are_unique_and_every_phase_is_described():
     assert len(ids) == len(set(ids))
     assert {p.phase for p in chaos.PROBES} <= set(chaos.PHASES) and set(chaos.PHASES) == {p.phase for p in chaos.PROBES}
     for p in chaos.PROBES:
-        assert re.fullmatch(r"[A-H]\d", p.id) and p.id[0] == p.phase and p.title and callable(p.fn)
+        assert re.fullmatch(r"[A-K]\d", p.id) and p.id[0] == p.phase and p.title and callable(p.fn)
 
 
 def test_the_probes_the_task_names_are_there_and_say_what_was_asked():
@@ -78,7 +79,7 @@ def test_the_docs_and_the_sample_log_use_the_computed_count():
         assert int(other) == n
     sample = (DOCS / "sample-smoke-round.txt").read_text().splitlines()
     assert f"{n} probes per round, 1 round(s) = {n} probe runs" in sample[0]
-    lines = [l for l in sample if re.match(r"r001 [A-H]\d ", l)]
+    lines = [l for l in sample if re.match(r"r001 [A-K]\d ", l)]
     assert len(lines) == n and [l.split()[1] for l in lines] == [p.id for p in chaos.PROBES]
     summary = json.loads(sample[-1])
     assert summary["probes_per_round"] == n and summary["probe_runs"] == n
@@ -144,7 +145,7 @@ def test_the_flag_lifts_only_the_live_refusals_and_the_chaos_task_never_passes_i
     got = chaos.assess_target("http://127.0.0.1:8011", ready("jarvis-live"), allow_live=True, ports={8011})
     assert got["port"] == 8011
     # nothing in the repository's chaos tooling or docs runs the hammer with the flag
-    for path in [SCRIPT, STACK_SH, *DOCS.glob("*")]:
+    for path in [SCRIPT, STACK_SH, *(p for p in DOCS.rglob("*") if p.is_file())]:
         for line in path.read_text(errors="replace").splitlines():
             if "--i-know-this-is-live" in line:
                 assert not re.search(r"cl_chaos_100x\.py[^`]*--i-know-this-is-live", line) or "never" in line.lower() or "do not" in line.lower(), (path, line)
@@ -437,3 +438,587 @@ def test_the_summary_breaks_every_5xx_down_by_probe_and_status_and_lists_the_une
     out = chaos.summarize([], stats, 0, time.time(), {}, {}, SimpleNamespace(rounds=1), None)
     assert out["five_xx_by_probe"] == {"C4:0": 1, "C4:500": 1, "H1:503": 2, "H3:503": 1}
     assert out["five_xx_total"] == 5 and out["five_xx_expected"] == 3 and [e["probe"] for e in out["five_xx_unexpected"]] == ["C4", "C4"]
+
+
+# --- phase 2: the ugly-conditions faults (I, J, K) -----------------------------------------------------------------------------------------------------
+
+def test_the_fault_phases_exist_and_are_destructive_and_expect_only_failures_a_fault_causes():
+    by_id = {p.id: p for p in chaos.PROBES}
+    for pid, phase in (("I1", "I"), ("J1", "J"), ("K1", "K")):
+        assert by_id[pid].phase == phase and by_id[pid].destructive and set(by_id[pid].expect_5xx) <= {0, -1, 503}
+    assert "kill -9" in by_id["I1"].title and "partition" in by_id["J1"].title and "fill" in by_id["K1"].title
+    assert set("IJK") <= set(chaos.PHASES)
+
+
+def test_the_full_disk_fault_is_skipped_without_the_size_capped_volume_and_never_fills_a_real_disk(monkeypatch):
+    def boom(*a, **kw):
+        raise AssertionError("a command was run")
+    monkeypatch.setattr(chaos, "run_cmd", boom)
+    stack = dict(STACK, containers={"db": "chaos100x-db", "app": "chaos100x-app", "migrate": "chaos100x-migrate"})      # no keeper, no pgdata_mb
+    ctx = chaos.Ctx(client=None, stats=chaos.Stats(), stack=stack, target=TARGET, destructive_ok=None, state={}, rnd=1, rng=__import__("random").Random(1), max_history=100)
+    with pytest.raises(chaos.Skip, match="size-capped database volume"):
+        chaos.k1(ctx)
+    src = SCRIPT.read_text()
+    k1_body = src[src.index("def k1("):src.index("# --- the runner")]
+    assert "/keep/chaos-filler" in k1_body and "/var/lib/docker" not in k1_body and "fallocate" not in k1_body   # it fills the keeper's mount of the capped volume only
+
+
+def att(token, status, t0, t1, rid=None):
+    return chaos.Attempt(token, f"chaos100x {token} T", status, rid, t0, t1)
+
+
+def test_fail_closed_passes_when_everything_after_the_fault_was_refused():
+    attempts = [att("a", 200, 0.0, 0.2, "mem-1"), att("b", 0, 1.6, 1.7), att("c", 503, 2.0, 2.5), att("d", -1, 2.1, 3.0), att("long", -1, 2.2, 21.0),
+                att("e", 200, 9.0, 9.1, "mem-2")]
+    out = chaos.fail_closed(attempts, t_fault=1.0, t_up=8.0, allowed=(0, -1, 503))
+    # "long" began during the fault but was answered only after the application was back: it is neither counted nor held against it
+    assert out["writes_during_fault"] == 3 and out["statuses_during_fault"] == {0: 1, 503: 1, -1: 1} and out["longest_request_s"] == 18.8
+
+
+def test_fail_closed_trips_on_an_acknowledged_write_during_the_fault_and_on_an_unexpected_status():
+    ok_then_wrong = [att("a", 200, 1.8, 2.0, "mem-9")]
+    with pytest.raises(chaos.ProbeFail, match="acknowledged with 200 while it was in force"):
+        chaos.fail_closed(ok_then_wrong, t_fault=1.0, t_up=8.0, allowed=(0, -1, 503))
+    with pytest.raises(chaos.ProbeFail, match=r"answered \[500\]"):
+        chaos.fail_closed([att("a", 500, 2.0, 2.1)], t_fault=1.0, t_up=8.0, allowed=(0, -1, 503))
+    with pytest.raises(chaos.ProbeFail, match=r"answered \[0\]"):
+        chaos.fail_closed([att("a", 0, 2.0, 2.1)], t_fault=1.0, t_up=8.0, allowed=(503,))       # a refused connection is not a 503 when only 503 is acceptable
+    # a request begun before the fault, or answered just before the application was back, is not held against it
+    chaos.fail_closed([att("a", 200, 0.5, 1.2, "m"), att("b", 200, 7.8, 8.1, "n")], t_fault=1.0, t_up=8.0, allowed=(503,))
+
+
+class FakeReady:
+    def __init__(self, script):
+        self.script, self.calls = list(script), 0
+
+    def get(self, path, **kw):
+        self.calls += 1
+        status = self.script.pop(0) if self.script else 200
+        return chaos.Response(status, {}, {}, 1.0)
+
+
+def fake_ctx(client):
+    return SimpleNamespace(client=client, stats=chaos.Stats(), state={}, metrics={})
+
+
+def test_watch_recovery_reports_detection_and_the_third_consecutive_good_answer(monkeypatch):
+    monkeypatch.setattr(chaos.time, "sleep", lambda s: None)
+    clock = iter(x * 0.2 for x in range(1, 1000))
+    monkeypatch.setattr(chaos.time, "time", lambda: next(clock))
+    out = chaos.watch_recovery(fake_ctx(FakeReady([200, 0, 0, 503, 200, 503, 200, 200, 200])), t_fault=0.0, max_s=60)
+    assert out["detect_s"] is not None and out["recover_s"] is not None and out["recover_s"] > out["detect_s"]
+    assert out["ready_statuses"] == {200: 5, 0: 2, 503: 2} and out["gave_up_and_intervened"] is False       # a single 200 between failures is not a recovery
+
+
+def test_watch_recovery_never_recovers_when_the_answers_never_settle_and_it_steps_in_once(monkeypatch):
+    monkeypatch.setattr(chaos.time, "sleep", lambda s: None)
+    clock = iter(x * 1.0 for x in range(1, 5000))
+    monkeypatch.setattr(chaos.time, "time", lambda: next(clock))
+    helped = []
+    out = chaos.watch_recovery(fake_ctx(FakeReady([503] * 500)), t_fault=0.0, max_s=60, give_up=lambda: helped.append(1))
+    assert out["recover_s"] is None and out["detect_s"] is not None and helped == [1] and out["gave_up_and_intervened"] is True
+
+
+class GateCtx:
+    """Just enough of a Ctx for fault_gates: rows the database returns, what the API says, and what the offline verifier does."""
+
+    def __init__(self, attempts, **over):
+        self.round, self.tag, self.state, self.metrics, self.stats = 1, "TAG", {"f1": {"id": "eo:sha256:" + "a" * 64}}, {}, chaos.Stats()
+        self.attempts = attempts
+        self.over = over
+        self.client = self
+        self.created = 0
+
+    # the database
+    def psql(self, sql, **kw):
+        if "FROM memories m WHERE m.content LIKE" in sql:
+            if "rows" in self.over:
+                return self.over["rows"]
+            return "\n".join(f"mem-{i}|{a.content}|create" for i, a in enumerate(self.attempts) if a.status == 200)
+        if "NOT EXISTS" in sql:
+            return self.over.get("orphans", "0")
+        if "last_seq FROM history_counters" in sql:
+            return self.over.get("counter_ok", "true")
+        if "jarvis_verify_history" in sql:
+            return self.over.get("hist_problems", "0")
+        if "jarvis_verify_blocks" in sql:
+            return self.over.get("block_problems", "0")
+        raise AssertionError(sql)
+
+    # the API
+    def get(self, path, **kw):
+        if path.endswith("/history/verify"):
+            return chaos.Response(200, {"ok": self.over.get("history_ok", True), "problems": ["x"]}, {}, 1)
+        if path.endswith("/blocks/verify"):
+            return chaos.Response(200, {"ok": self.over.get("blocks_ok", True), "problems": ["x"]}, {}, 1)
+        if "/replay/receipts/" in path:
+            return chaos.Response(200, {"ok": self.over.get("receipt_ok", True), "problems": [{"problem": "x"}]}, {}, 1)
+        return chaos.Response(200, {"memory": {}}, {}, 1)
+
+    def ensure_receipt(self):
+        return self.state["f1"]
+
+    def content(self, what="probe"):
+        return f"chaos100x {what} TAG"
+
+    def mint_script(self, *a, **kw):
+        return SimpleNamespace(returncode=self.over.get("offline_rc", 0), stdout="", stderr="no")
+
+    def create(self, **kw):
+        self.created += 1
+        return {"id": "mem-after"}
+
+
+@pytest.fixture(autouse=True)
+def no_orphans_unless_a_test_says_otherwise(monkeypatch):
+    monkeypatch.setattr(chaos, "wait_no_orphans", lambda ctx, seconds=120: {"orphaned_sessions_at_recovery": 0, "orphans_reaped_after_s": 0.0})
+
+
+def good_attempts():
+    return [att("w0n1", 200, 0, 1, "mem-0"), att("w0n2", 200, 1, 2, "mem-1"), att("w1n1", 503, 2, 3)]
+
+
+def test_the_gates_pass_when_everything_acknowledged_is_whole_and_everything_verifies():
+    ctx = GateCtx(good_attempts())
+    out = chaos.fault_gates(ctx, ctx.attempts, "w")
+    assert out == {"attempts": 3, "acknowledged": 2, "failed": 1, "landed_but_unacknowledged": 0, "orphaned_sessions_at_recovery": 0, "orphans_reaped_after_s": 0.0} and ctx.created == 1
+
+
+def test_a_write_that_landed_without_being_acknowledged_is_counted_not_failed():
+    a = good_attempts()
+    ctx = GateCtx(a, rows="\n".join(f"mem-{i}|{x.content}|create" for i, x in enumerate(a)))
+    out = chaos.fault_gates(ctx, a, "w")
+    assert out["landed_but_unacknowledged"] == 1
+
+
+def test_the_gates_fail_when_the_server_keeps_sessions_for_clients_that_are_gone(monkeypatch):
+    def stuck(ctx, seconds=120):
+        raise chaos.ProbeFail("3 database session(s) held for a client that is gone were still there 120 s after recovery")
+    monkeypatch.setattr(chaos, "wait_no_orphans", stuck)
+    a = good_attempts()
+    with pytest.raises(chaos.ProbeFail, match="held for a client that is gone"):
+        chaos.fault_gates(GateCtx(a), a, "w")
+
+
+@pytest.mark.parametrize("over,message", [
+    ({"rows": "mem-0|someone elses content|create"}, "no request sent"),
+    ({"rows": "mem-0|{c0}|create\nmem-0b|{c0}|create"}, "two records"),
+    ({"rows": "mem-0|{c0}|create,update"}, "not exactly one create"),
+    ({"rows": "mem-0|{c0}|"}, "not exactly one create"),
+    ({"rows": ""}, "acknowledged are not in the ledger"),
+    ({"rows": "mem-WRONG|{c0}|create\nmem-1|{c1}|create"}, "acknowledged are not in the ledger"),
+    ({"orphans": "2"}, r"no history \(a half-write\)"),
+    ({"counter_ok": "false"}, "counter and the newest history entry disagree"),
+    ({"hist_problems": "1"}, "history verifier"),
+    ({"block_problems": "3"}, "block verifier"),
+    ({"history_ok": False}, "history does not verify"),
+    ({"blocks_ok": False}, "blocks do not verify"),
+    ({"receipt_ok": False}, "no longer re-derives"),
+    ({"offline_rc": 1}, "offline from the raw rows"),
+])
+def test_every_gate_trips_on_its_own_failure(over, message):
+    a = good_attempts()
+    over = dict(over)
+    if "rows" in over:
+        over["rows"] = over["rows"].replace("{c0}", a[0].content).replace("{c1}", a[1].content)
+    with pytest.raises(chaos.ProbeFail, match=message):
+        chaos.fault_gates(GateCtx(a, **over), a, "w")
+
+
+@pytest.mark.postgres
+def test_writers_run_concurrently_and_remember_what_each_request_was_told(served):
+    stats, args = make_ctx_args(served)
+    ctx = chaos.Ctx(rnd=1, rng=__import__("random").Random(1), **{k: v for k, v in args.items() if k != "seed"})
+    writers = chaos.Writers(ctx, "t1", n=4).start()
+    time.sleep(1.0)
+    attempts = writers.stop()
+    assert len(attempts) >= 4 and all(a.status == 200 and a.id and a.t1 >= a.t0 for a in attempts)
+    assert len({a.content for a in attempts}) == len(attempts)                       # every request carries a distinct, recognisable payload
+    assert ctx.state["writes"] == len(attempts)
+    rows = {r["id"] for r in ctx.client.get("/api/jarvis/memory?limit=200").json["memories"]}
+    assert {a.id for a in attempts if a.id} <= rows or len(attempts) > 200
+
+
+def test_the_fault_summary_gives_min_median_max_and_totals():
+    faults = {"I1": [{"recover_s": 3.0, "detect_s": 0.4, "attempts": 10, "acknowledged": 6, "failed": 4, "statuses_during_fault": {0: 3, 503: 1}},
+                     {"recover_s": 9.0, "detect_s": 0.2, "attempts": 12, "acknowledged": 7, "failed": 5, "statuses_during_fault": {0: 4}},
+                     {"recover_s": 5.0, "detect_s": 0.3, "attempts": 8, "acknowledged": 5, "failed": 3, "statuses_during_fault": {}}]}
+    out = chaos.fault_summary(faults)["I1"]
+    assert out["runs"] == 3 and out["recover_s"] == {"min": 3.0, "median": 5.0, "max": 9.0} and out["detect_s"] == {"min": 0.2, "median": 0.3, "max": 0.4}
+    assert out["attempts"] == 30 and out["acknowledged"] == 18 and out["failed"] == 12 and out["statuses_during_fault"] == {"0": 7, "503": 1}
+
+
+def test_the_phases_option_selects_whole_phases(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(chaos, "fetch_ready", lambda url: (200, {"stack": GOOD}))
+    monkeypatch.setattr(chaos, "live_ports", lambda: {8011})
+    (tmp_path / "secrets").mkdir()
+    (tmp_path / "secrets" / "api-key").write_text("k")
+    (tmp_path / "stack.json").write_text(json.dumps({"url": "http://127.0.0.1:18017", "port": 18017, "project": "p", "secrets_dir": str(tmp_path / "secrets"),
+                                                     "containers": {}, "keys_dir": str(tmp_path), "dir": str(tmp_path)}))
+    seen = []
+    monkeypatch.setattr(chaos, "run_round", lambda rnd, args, only, log, stats: seen.append(only) or [])
+    monkeypatch.setattr(chaos.Client, "request", lambda self, *a, **k: chaos.Response(200, {"history_seq": 0, "tip": None}, {}, 1.0))
+    monkeypatch.setattr(chaos, "final_checks", lambda *a, **k: {"history_verify": {"ok": True}, "blocks_verify": {"ok": True}, "attestations_verify": {"ok": True}, "receipts": {"failing_rederivation": []}})
+    chaos.main(["--stack-dir", str(tmp_path), "--rounds", "1", "--phases", "i,J,K"])
+    assert seen == [{"I1", "J1", "K1"}]
+    seen.clear()
+    chaos.main(["--stack-dir", str(tmp_path), "--rounds", "1", "--phases", "I", "--only", "A1"])
+    assert seen == [{"I1", "A1"}]
+
+
+def test_the_stack_script_can_put_the_database_on_a_size_capped_tmpfs_volume_held_by_a_keeper():
+    yaml = pytest.importorskip("yaml")
+    text = STACK_SH.read_text()
+    start = text.index("python3 - \"$MINT\"")
+    code = text[text.index("\n", start) + 1:text.index("\nPY\n", start)]
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        mint = Path(tmp) / "mint"
+        (mint / "bin").mkdir(parents=True)
+        for name in ("docker-compose.yml",):
+            (mint / name).write_text((ROOT / "deploy" / "mint" / name).read_text())
+        (mint / "bin" / "lib.sh").write_text((ROOT / "deploy" / "mint" / "bin" / "lib.sh").read_text())
+        for size in ("", "256"):
+            shutil_target = Path(tmp) / f"run{size or 'plain'}"
+            shutil_target.mkdir()
+            (shutil_target / "bin").mkdir()
+            (shutil_target / "docker-compose.yml").write_text((mint / "docker-compose.yml").read_text())
+            (shutil_target / "bin" / "lib.sh").write_text((mint / "bin" / "lib.sh").read_text())
+            r = subprocess.run([sys.executable, "-c", code, str(shutil_target), str(ROOT), "18017", "jarvis-chaos100x", "chaos100x-db", "chaos100x-app", "chaos100x-migrate",
+                                "chaos100x-db:test", "chaos100x-app:test", size, "chaos100x-keeper"], capture_output=True, text=True)
+            assert r.returncode == 0, r.stderr
+            compose = yaml.safe_load((shutil_target / "docker-compose.yml").read_text())
+            if not size:
+                assert "keeper" not in compose["services"] and compose["volumes"]["pgdata"] in ({}, None)
+            else:
+                keeper = compose["services"]["keeper"]
+                assert keeper["container_name"] == "chaos100x-keeper" and keeper["volumes"] == ["pgdata:/keep"] and keeper["image"] == "chaos100x-db:test"
+                opts = compose["volumes"]["pgdata"]["driver_opts"]
+                assert opts["type"] == "tmpfs" and opts["o"].startswith("size=256m,")
+                assert compose["services"]["db"]["volumes"] == ["pgdata:/var/lib/postgresql/data"]
+
+
+def test_a_response_cut_off_by_a_dying_server_is_a_failed_request_not_a_crash(monkeypatch):
+    import http.client
+
+    class Dying:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        status, headers = 200, {}
+
+        def read(self):
+            raise http.client.IncompleteRead(b"", 522)
+
+    monkeypatch.setattr(chaos.urllib.request, "urlopen", lambda *a, **k: Dying())
+    stats = chaos.Stats()
+    r = chaos.Client("http://127.0.0.1:1", "k", stats).get("/x")
+    assert r.status == 0 and stats.five_xx and stats.five_xx[0]["status"] == 0
+
+
+def test_a_writer_never_dies_silently(monkeypatch):
+    class Boom:
+        def post(self, *a, **k):
+            raise RuntimeError("unexpected")
+
+    ctx = SimpleNamespace(client=Boom(), round=1, tag="T", stats=chaos.Stats(), state={})
+    w = chaos.Writers(ctx, "z", n=1, timeout=1).start()
+    time.sleep(0.4)
+    attempts = w.stop()
+    assert attempts and all(a.status == 0 for a in attempts)
+
+
+# --- `rebuild` is the only way to run `jarvisctl up`, and only on a stack that says it is a throwaway -----------------------------------------------------
+
+@pytest.fixture
+def existing_stack(tmp_path, fake_docker):
+    bindir, log = fake_docker
+    d = tmp_path / "stack"
+    (d / "mint" / "bin").mkdir(parents=True)
+    (d / ".jarvis-chaos100x").write_text("")
+    (d / "mint" / "docker-compose.yml").write_text("name: jarvis-chaos100x\n")
+    (d / "stack.json").write_text(json.dumps({"port": 18017}))
+    ctl_log = tmp_path / "jarvisctl.log"
+    ctl = d / "mint" / "bin" / "jarvisctl"
+    ctl.write_text(f"#!/usr/bin/env bash\necho \"jarvisctl $* HOME=$JARVIS_HOME\" >> {ctl_log}\n")
+    ctl.chmod(ctl.stat().st_mode | stat.S_IEXEC)
+    curl = bindir / "curl"
+    curl.write_text(f"#!/usr/bin/env bash\necho \"curl $*\" >> {tmp_path / 'curl.log'}\ncat {tmp_path / 'ready.txt'} 2>/dev/null\n")
+    curl.chmod(curl.stat().st_mode | stat.S_IEXEC)
+    return SimpleNamespace(dir=d, bindir=bindir, ctl_log=ctl_log, ready=tmp_path / "ready.txt", tmp=tmp_path)
+
+
+def rebuild(box):
+    return stack_sh("rebuild", env={"JARVIS_CHAOS_DIR": str(box.dir)}, bindir=box.bindir)
+
+
+def test_rebuild_runs_jarvisctl_up_only_when_the_stacks_own_ready_says_throwaway(existing_stack):
+    existing_stack.ready.write_text('{"status":"ready","checks":{},"stack":"chaos-throwaway:jarvis-chaos100x"}')
+    r = rebuild(existing_stack)
+    assert r.returncode == 0, r.stderr
+    assert existing_stack.ctl_log.read_text().strip() == f"jarvisctl up HOME={existing_stack.dir}/home"      # in the throwaway's own copy, with its own home
+
+
+@pytest.mark.parametrize("ready", ["", "not json", "{}", '{"status":"ready","checks":{}}', '{"status":"ready","stack":"jarvis-live"}', '{"stack":""}',
+                                   '{"stack":"production"}', '{"stack":"chaos-throwaway"}', "null", '{"stack":["chaos-throwaway:x"]}'])
+def test_rebuild_refuses_a_missing_ready_a_ready_with_no_identity_and_jarvis_live(existing_stack, ready):
+    existing_stack.ready.write_text(ready)
+    r = rebuild(existing_stack)
+    assert r.returncode != 0 and "refusing to run jarvisctl up" in r.stderr
+    assert not existing_stack.ctl_log.exists()
+
+
+def test_rebuild_refuses_when_the_stack_does_not_answer_at_all(existing_stack):
+    r = rebuild(existing_stack)                                      # no ready.txt: curl prints nothing, as for a connection that is refused
+    assert r.returncode != 0 and "refusing to run jarvisctl up" in r.stderr and not existing_stack.ctl_log.exists()
+
+
+def test_rebuild_refuses_the_live_port_a_foreign_compose_project_and_a_directory_without_the_marker(existing_stack):
+    existing_stack.ready.write_text('{"stack":"chaos-throwaway:jarvis-chaos100x"}')
+    (existing_stack.dir / "stack.json").write_text(json.dumps({"port": 8011}))
+    assert "the live stack's" in rebuild(existing_stack).stderr
+    (existing_stack.dir / "stack.json").write_text(json.dumps({"port": 18017}))
+    (existing_stack.dir / "mint" / "docker-compose.yml").write_text("name: jarvis-ledger\n")
+    assert "not the throwaway project" in rebuild(existing_stack).stderr
+    (existing_stack.dir / "mint" / "docker-compose.yml").write_text("name: jarvis-chaos100x\n")
+    (existing_stack.dir / ".jarvis-chaos100x").unlink()
+    assert "not a throwaway stack directory" in rebuild(existing_stack).stderr
+    assert not existing_stack.ctl_log.exists()
+
+
+def test_the_only_jarvisctl_up_in_the_chaos_tooling_is_guarded():
+    text = STACK_SH.read_text()
+    ups = [l.strip() for l in text.splitlines() if re.search(r'jarvisctl"\s+up\b', l)]
+    assert len(ups) == 2                                                # the creation of a new stack, and rebuild
+    new_stack = text[:text.index("rebuild() {")]
+    assert new_stack.index("JARVIS_STACK_ID=chaos-throwaway:") < new_stack.index('"$MINT/bin/jarvisctl" up')   # a new stack's identity is verified first
+    for path in [SCRIPT, ROOT / "scripts" / "chaos" / "soak.py"]:
+        assert "jarvisctl" not in path.read_text() or "jarvisctl\", \"verify\"" in path.read_text() or '/jarvisctl"' in path.read_text()
+        assert not re.search(r"jarvisctl.{0,12}\bup\b", path.read_text())      # the hammer and the soak never bring a stack up
+
+
+def test_the_chaos_tooling_leaves_signatures_in_warn_mode_and_never_touches_the_sign_timer():
+    for path in [SCRIPT, STACK_SH, ROOT / "scripts" / "chaos" / "soak.py"]:
+        text = path.read_text()
+        assert "JARVIS_SIGNATURES=require" not in text and "JARVIS_SIGNATURES: require" not in text, path
+        assert "jarvis-sign.timer" not in text and "enable --now" not in text and "install-units" not in text, path
+    assert "mode is warn" in next(p.title for p in chaos.PROBES if p.id == "G0")
+    assert "expected warn" in SCRIPT.read_text()                       # G0 fails if the throwaway ever runs in another mode
+
+
+def test_each_round_gets_its_own_receipt_taken_before_its_faults_and_a_full_round_reuses_phase_fs():
+    class Fake:
+        def __init__(self, rnd, state):
+            self.round, self.state, self.made = rnd, state, 0
+            self.client = self
+
+        def create(self, **kw):
+            self.made += 1
+            return {"id": "mem-x"}
+
+        def content(self, w="p"):
+            return w
+
+        def seal(self, max_entries=5):
+            return {}
+
+        def head(self):
+            return {"tip": {"height": 7 + self.made, "last_seq": 40 + self.made}}
+
+        def post(self, path, body):
+            return chaos.Response(200, {"receipt": {"id": f"eo:sha256:{self.round * 100 + self.made:064d}", "payload": {"state_root": "r" * 64}}}, {}, 1.0)
+
+    state = {}
+    one = chaos.Ctx.ensure_receipt(Fake(1, state))
+    again = chaos.Ctx.ensure_receipt(Fake(1, state))
+    two = chaos.Ctx.ensure_receipt(Fake(2, state))
+    assert one is again and one["id"] != two["id"] and state["f1_round"] == 2
+    state2 = {"f1": {"id": "from-phase-f"}, "f1_round": 3}                                       # phase F made this round's receipt: the faults use it
+    assert chaos.Ctx.ensure_receipt(Fake(3, state2))["id"] == "from-phase-f"
+
+
+def test_the_header_counts_only_the_selected_probes_and_a_full_run_says_the_plain_count(monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(chaos, "fetch_ready", lambda url: (200, {"stack": GOOD}))
+    monkeypatch.setattr(chaos, "live_ports", lambda: {8011})
+    (tmp_path / "secrets").mkdir()
+    (tmp_path / "secrets" / "api-key").write_text("k")
+    (tmp_path / "stack.json").write_text(json.dumps({"url": "http://127.0.0.1:18017", "port": 18017, "project": "p", "secrets_dir": str(tmp_path / "secrets"), "containers": {},
+                                                     "keys_dir": str(tmp_path), "dir": str(tmp_path)}))
+    monkeypatch.setattr(chaos, "run_round", lambda *a, **k: [])
+    monkeypatch.setattr(chaos.Client, "request", lambda self, *a, **k: chaos.Response(200, {"history_seq": 0, "tip": None}, {}, 1.0))
+    monkeypatch.setattr(chaos, "final_checks", lambda *a, **k: {"history_verify": {"ok": True}, "blocks_verify": {"ok": True}, "attestations_verify": {"ok": True}, "receipts": {"failing_rederivation": []}})
+    chaos.main(["--stack-dir", str(tmp_path), "--rounds", "10", "--phases", "I,J,K"])
+    assert f"{chaos.PROBES_PER_ROUND} probes per round (3 selected), 10 round(s) = 30 probe runs" in capsys.readouterr().out
+    chaos.main(["--stack-dir", str(tmp_path), "--rounds", "2"])
+    assert f"{chaos.PROBES_PER_ROUND} probes per round, 2 round(s) = {2 * chaos.PROBES_PER_ROUND} probe runs" in capsys.readouterr().out
+
+
+def test_a_partial_fault_may_acknowledge_during_it_but_never_refuse_with_anything_but_the_allowed_status():
+    attempts = [att("a", 503, 2.0, 2.1), att("b", 200, 2.5, 2.6, "mem-1"), att("c", 503, 3.0, 3.1)]
+    with pytest.raises(chaos.ProbeFail, match="acknowledged with 200 while it was in force"):
+        chaos.fail_closed(attempts, t_fault=1.0, t_up=8.0, allowed=(503,))                                      # the strict default (a severed link, a dead process)
+    out = chaos.fail_closed(attempts, t_fault=1.0, t_up=8.0, allowed=(503,), acks_allowed=True)
+    assert out["statuses_during_fault"] == {503: 2, 200: 1}
+    with pytest.raises(chaos.ProbeFail, match=r"answered \[500\]"):
+        chaos.fail_closed(attempts + [att("d", 500, 3.2, 3.3)], t_fault=1.0, t_up=8.0, allowed=(503,), acks_allowed=True)     # a 500 is never acceptable
+    assert "acks_allowed=True" in SCRIPT.read_text().split("def k1(")[1].split("# --- the runner")[0]                       # only the full-disk fault uses it
+    for pid in ("i1", "j1"):
+        body = SCRIPT.read_text().split(f"def {pid}(")[1].split("@probe(")[0]
+        assert "acks_allowed" not in body
+
+
+def test_the_full_disk_probe_insists_that_something_was_refused():
+    body = SCRIPT.read_text().split("def k1(")[1].split("# --- the runner")[0]
+    assert 'check(closed["refused_while_full"] > 0, "nothing was refused while the volume was full")' in body
+    assert "No space left" in body and 'check(no_space > 0, "the database never reported' in body        # the proof the fault bit is the database's own log
+
+
+# --- orphaned database sessions ---------------------------------------------------------------------------------------------------------------------
+
+PROC_NET_TCP = """  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0300A8C0:9C40 0200A8C0:1538 01 00000000:00000000 00:00000000 00000000 10001        0 111 1 0000000000000000 20 4 30 10 -1
+   1: 0300A8C0:9C41 0200A8C0:1538 01 00000000:00000000 00:00000000 00000000 10001        0 112 1 0000000000000000 20 4 30 10 -1
+   2: 0300A8C0:9C42 0200A8C0:1538 06 00000000:00000000 00:00000000 00000000 10001        0 113 1 0000000000000000 20 4 30 10 -1
+   3: 0300A8C0:1F41 0100007F:1F90 01 00000000:00000000 00:00000000 00000000 10001        0 114 1 0000000000000000 20 4 30 10 -1
+"""
+
+
+class OrphanCtx:
+    def __init__(self, ports, tcp=PROC_NET_TCP):
+        self.ports, self.tcp = ports, tcp
+        self.stack = {"containers": {"app": "chaos100x-app"}}
+
+    def need_destructive(self):
+        return self.stack
+
+    def docker(self, *a, **k):
+        assert a[:3] == ("exec", "chaos100x-app", "cat") and a[3] == "/proc/net/tcp"
+        return SimpleNamespace(stdout=self.tcp, returncode=0)
+
+    def psql(self, sql, **k):
+        assert "usename = 'jarvis_app'" in sql and "client_addr <> '127.0.0.1'" in sql
+        return "\n".join(str(p) for p in self.ports)
+
+
+def test_a_session_is_an_orphan_only_if_the_application_container_has_no_socket_for_it():
+    # 0x9C40 = 40000, 0x9C41 = 40001 are established to port 5432 (0x1538); 40002 is not established (state 06); 0x1F41 goes to another port
+    assert chaos.orphaned_sessions(OrphanCtx([40000, 40001])) == []
+    assert chaos.orphaned_sessions(OrphanCtx([40000, 40001, 40002, 41000])) == [40002, 41000]
+    assert chaos.orphaned_sessions(OrphanCtx([])) == []
+    assert chaos.orphaned_sessions(OrphanCtx([8001])) == [8001]                  # a socket to a different remote port does not vouch for it
+
+
+def test_waiting_for_the_server_to_reap_orphans_reports_how_long_it_took_and_fails_if_it_never_does(monkeypatch):
+    clock = iter(x * 10.0 for x in range(1, 200))
+    monkeypatch.setattr(chaos.time, "time", lambda: next(clock))
+    monkeypatch.setattr(chaos.time, "sleep", lambda s: None)
+    answers = iter([[1, 2, 3], [1, 2], [], []])
+    monkeypatch.setattr(chaos, "orphaned_sessions", lambda ctx: next(answers))
+    out = REAL_WAIT_NO_ORPHANS(object(), seconds=120)
+    assert out["orphaned_sessions_at_recovery"] == 3 and out["orphans_reaped_after_s"] > 0
+    monkeypatch.setattr(chaos, "orphaned_sessions", lambda ctx: [7, 8])
+    with pytest.raises(chaos.ProbeFail, match="2 database session"):
+        REAL_WAIT_NO_ORPHANS(object(), seconds=60)
+
+
+def test_rebuild_refreshes_only_the_database_build_directory_from_the_checkout(existing_stack):
+    existing_stack.ready.write_text('{"stack":"chaos-throwaway:jarvis-chaos100x"}')
+    db = existing_stack.dir / "mint" / "db"
+    db.mkdir()
+    (db / "postgresql.conf").write_text("# stale copy\n")
+    (existing_stack.dir / "mint" / "bin" / "lib.sh").write_text("# renamed copy: PROJECT=jarvis-chaos100x\n")
+    r = rebuild(existing_stack)
+    assert r.returncode == 0, r.stderr
+    assert (db / "postgresql.conf").read_text() == (ROOT / "deploy" / "mint" / "db" / "postgresql.conf").read_text()       # the checkout's database config
+    assert (existing_stack.dir / "mint" / "bin" / "lib.sh").read_text() == "# renamed copy: PROJECT=jarvis-chaos100x\n"   # the renamed scripts are left alone
+
+
+
+def test_the_median_of_an_even_number_of_runs_is_the_mean_of_the_two_middle_ones():
+    out = chaos.fault_summary({"J1": [{"recover_s": v} for v in (1.0, 2.0, 3.0, 4.0)]})["J1"]["recover_s"]
+    assert out == {"min": 1.0, "median": 2.5, "max": 4.0}
+    assert chaos.fault_summary({"J1": [{"recover_s": v} for v in (1.0, 2.0, 9.0)]})["J1"]["recover_s"]["median"] == 2.0
+    assert chaos.fault_summary({"J1": [{"recover_s": 1.48}, {"recover_s": 1.52}]})["J1"]["recover_s"]["median"] == 1.5
+
+
+@pytest.fixture
+def selection_env(monkeypatch, tmp_path):
+    monkeypatch.setattr(chaos, "fetch_ready", lambda url: (200, {"stack": GOOD}))
+    monkeypatch.setattr(chaos, "live_ports", lambda: {8011})
+    (tmp_path / "secrets").mkdir()
+    (tmp_path / "secrets" / "api-key").write_text("k")
+    (tmp_path / "stack.json").write_text(json.dumps({"url": "http://127.0.0.1:18017", "port": 18017, "project": "p", "secrets_dir": str(tmp_path / "secrets"), "containers": {},
+                                                     "keys_dir": str(tmp_path), "dir": str(tmp_path)}))
+    ran = []
+    monkeypatch.setattr(chaos, "run_round", lambda rnd, args, only, log, stats: ran.append(only) or [])
+    monkeypatch.setattr(chaos.Client, "request", lambda self, *a, **k: pytest.fail("a request was made for an invalid selection"))
+    return SimpleNamespace(dir=tmp_path, ran=ran)
+
+
+@pytest.mark.parametrize("flags", [["--phases", "L"], ["--phases", "I,Z"], ["--phases", ","], ["--phases", " , "], ["--only", "X9"], ["--only", "A1,NOPE"], ["--only", ","],
+                                   ["--phases", "I", "--only", "ZZ"]])
+def test_an_unknown_phase_or_probe_is_a_usage_error_not_a_run_of_everything(selection_env, capsys, flags):
+    rc = chaos.main(["--stack-dir", str(selection_env.dir), "--rounds", "100", *flags])
+    assert rc == chaos.EXIT_USAGE and selection_env.ran == []
+    assert "no such" in capsys.readouterr().err
+
+
+def test_valid_selections_still_work_and_an_empty_selection_selects_nothing(selection_env, monkeypatch):
+    monkeypatch.setattr(chaos.Client, "request", lambda self, *a, **k: chaos.Response(200, {"history_seq": 0, "tip": None}, {}, 1.0))
+    monkeypatch.setattr(chaos, "final_checks", lambda *a, **k: {"history_verify": {"ok": True}, "blocks_verify": {"ok": True}, "attestations_verify": {"ok": True}, "receipts": {"failing_rederivation": []}})
+    chaos.main(["--stack-dir", str(selection_env.dir), "--rounds", "1", "--phases", "k, j"])
+    chaos.main(["--stack-dir", str(selection_env.dir), "--rounds", "1", "--only", " A1 , A2 "])
+    assert selection_env.ran == [{"J1", "K1"}, {"A1", "A2"}]
+    ran = []
+    stats = chaos.Stats()
+    monkeypatch.undo()
+    out = chaos.run_round(1, dict(client=None, stats=stats, stack=None, target={}, destructive_ok="x", state={}, seed="s", max_history=1), set(), ran.append, stats)
+    assert out == []                                                              # a set with nothing in it runs nothing (it used to mean "no filter")
+
+
+@pytest.mark.parametrize("flags", [["--phases", "L"], ["--only", "NOPE"], ["--phases", ","], ["--phases", "I,Z"]])
+def test_a_malformed_selector_is_a_usage_error_before_the_target_is_even_looked_at(monkeypatch, capsys, tmp_path, flags):
+    """No stack on disk, a live port as the target, and every way of touching the world made to explode: the selector is rejected first, with exit 2."""
+    def boom(*a, **k):
+        raise AssertionError("the target or the machine was touched")
+    monkeypatch.setattr(chaos, "fetch_ready", boom)
+    monkeypatch.setattr(chaos, "load_stack", boom)
+    monkeypatch.setattr(chaos, "assess_target", boom)
+    monkeypatch.setattr(chaos, "throwaway_proof", boom)
+    monkeypatch.setattr(chaos, "run_cmd", boom)
+    monkeypatch.setattr(chaos, "live_ports", boom)
+    assert chaos.main(["--stack-dir", str(tmp_path / "nothing"), "--target", "http://127.0.0.1:8011", *flags]) == chaos.EXIT_USAGE
+    assert "no such" in capsys.readouterr().err
+
+
+def test_resolve_selection_returns_sets_none_or_a_reason():
+    assert chaos.resolve_selection(None, None) == (None, None)
+    assert chaos.resolve_selection("A1, A2", None) == ({"A1", "A2"}, None)
+    assert chaos.resolve_selection(None, "k,j") == ({"J1", "K1"}, None)
+    assert chaos.resolve_selection("A1", "I") == ({"A1", "I1"}, None)
+    for bad in (("X", None), (",", None), (None, "L"), (None, " , "), ("A1", "Q")):
+        only, why = chaos.resolve_selection(*bad)
+        assert only is None and why and "no such" in why
+
+
+def test_a_failed_fault_run_keeps_its_numbers_in_the_metrics_but_not_in_the_summary():
+    runs = [{"passed": True, "recover_s": 2.0, "attempts": 10}, {"passed": False, "recover_s": 90.0, "attempts": 500}, {"passed": True, "recover_s": 4.0, "attempts": 20},
+            {"recover_s": 6.0, "attempts": 30}]                                                    # no marker: recorded before the marker existed, counted as a pass
+    out = chaos.fault_summary({"J1": runs})["J1"]
+    assert out["runs"] == 3 and out["failed_runs_excluded"] == 1
+    assert out["recover_s"] == {"min": 2.0, "median": 4.0, "max": 6.0} and out["attempts"] == 60          # the 90 s and the 500 attempts are not in it
+
+
+def test_every_fault_probe_marks_its_run_passed_only_after_its_last_gate():
+    body = SCRIPT.read_text().split("def i1(")[1].split("@probe(")[0]
+    assert body.rindex('data["passed"] = True') > body.rindex('fault_gates(ctx, attempts, "i1")')
+    body = SCRIPT.read_text().split("def j1(")[1].split("@probe(")[0]
+    assert body.rindex('data["passed"] = True') > body.rindex('fault_gates(ctx, attempts, "j1")')
+    body = SCRIPT.read_text().split("def k1(")[1].split("# --- the runner")[0]
+    assert body.index('gates = fault_gates(ctx, attempts, "k1")') < body.index('_record_fault(ctx, "K1", {"passed": True')
+    ctx = SimpleNamespace(metrics={})
+    chaos._record_fault(ctx, "X", {"recover_s": 1.0})
+    assert ctx.metrics["faults"]["X"][0]["passed"] is False                                     # recorded, and not yet a pass

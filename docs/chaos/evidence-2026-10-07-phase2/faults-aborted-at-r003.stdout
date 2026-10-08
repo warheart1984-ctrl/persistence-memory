@@ -1,0 +1,11 @@
+CL_CHAOS_100x: seed 97b4e3e4; 52 probes per round (3 selected), 100 round(s) = 300 probe runs; target http://127.0.0.1:18017 stack chaos-throwaway:jarvis-chaos100x; destructive probes ENABLED
+r001 I1  PASS     19893ms  kill -9 the application container mid-write: nothing is acknowledged while it is down; the self-heal restarts it; the gates hold
+r001 J1  PASS     23909ms  partition the application from the database mid-transaction: fails closed, heals, and the gates hold
+r001 K1  PASS     14321ms  fill the database volume until writes fail, then free it: fails closed, recovers, and the gates hold
+r002 I1  PASS     19175ms  kill -9 the application container mid-write: nothing is acknowledged while it is down; the self-heal restarts it; the gates hold
+r002 J1  PASS     24287ms  partition the application from the database mid-transaction: fails closed, heals, and the gates hold
+r002 K1  PASS     14177ms  fill the database volume until writes fail, then free it: fails closed, recovers, and the gates hold
+r003 I1  PASS     18785ms  kill -9 the application container mid-write: nothing is acknowledged while it is down; the self-heal restarts it; the gates hold
+r003 J1  FAIL     23139ms  partition the application from the database mid-transaction: fails closed, heals, and the gates hold  -- the earlier receipt does not re-derive offline from the raw rows: onnection failed: connection to server at "172.19.0.2", port 5432 failed: FATAL:  remaining connection slots are reserved for roles with the SUPERUSER attribute
+r003 K1  FAIL     13808ms  fill the database volume until writes fail, then free it: fails closed, recovers, and the gates hold  -- the earlier receipt does not re-derive offline from the raw rows: onnection failed: connection to server at "172.19.0.2", port 5432 failed: FATAL:  remaining connection slots are reserved for roles with the SUPERUSER attribute
+r004 I1  FAIL     19095ms  kill -9 the application container mid-write: nothing is acknowledged while it is down; the self-heal restarts it; the gates hold  -- the earlier receipt does not re-derive offline from the raw rows: onnection failed: connection to server at "172.19.0.2", port 5432 failed: FATAL:  remaining connection slots are reserved for roles with the SUPERUSER attribute
