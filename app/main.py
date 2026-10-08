@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import secrets
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
@@ -79,9 +80,11 @@ from app.auth import (
     require_mcp_write_scope,
     require_memory_write,
     require_operator_read,
+    verify_operator_api_key,
     identity_middleware,
     oauth_enabled,
 )
+from app.identity import current_tenant_key
 from app.oauth import protected_resource_metadata
 from app.public_security import cors_origins, public_security_middleware
 from app.refusal import DENIED, LEDGER_UNAVAILABLE, VERSION_CONFLICT, json_response, retry_after_seconds
@@ -93,6 +96,13 @@ from app import attest as attest_module
 from app.evidence import EvidenceError, EvidenceObjectCreate, require_operator_write
 from app.store import StoreUnavailableError, StoreVersionConflict, get_store
 from app.store_errors import InvalidInputError
+from app.twin import (
+    DIGEST_TAG_PREFIX,
+    FilteredRecords,
+    generate_twin_intelligence,
+    is_twin_authored,
+    twin_memory_payload,
+)
 from app.graph import (
     BfsBody,
     ComponentsBody,
@@ -476,6 +486,73 @@ def create_memory(body: MemoryCreate, _: None = Depends(require_memory_write)):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return _with_clause_v_warnings({"memory": rec.model_dump()})
+
+
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in ("1", "true", "yes")
+
+
+@app.get("/api/jarvis/twin/daily")
+def twin_daily(
+    request: Request,
+    persist: bool = Query(default=False),
+):
+    """AI Twin coverage index — read-only by default, dark until JARVIS_TWIN_ENABLED.
+
+    Disabled -> 404: the surface stays invisible rather than advertising a
+    disabled feature.  ``persist=1`` writes the brief back through the normal
+    MemoryCreate path and additionally requires JARVIS_TWIN_PERSIST_ENABLED
+    (403 TWIN_PERSIST_DISABLED) and the same write auth as a manual write.
+    This route is outside LEDGER_READ_PREFIX, so the read-protection check is
+    mirrored here explicitly.
+    """
+    if not _env_flag("JARVIS_TWIN_ENABLED"):
+        raise HTTPException(status_code=404, detail="Not found")
+    if not oauth_enabled() and ledger_read_protected():
+        verify_operator_api_key(
+            request.headers.get("authorization"),
+            request.headers.get("x-emr-recall-key"),
+        )
+    store = get_store()  # already tenant-scoped (RLS / tenant key)
+    now = datetime.now(timezone.utc)
+    records = FilteredRecords.from_records(
+        store.list_memories(limit=100000, truth_scope="live")
+    )
+    tenant = current_tenant_key() or "operator"
+    packet = generate_twin_intelligence(records, identity_id=tenant, now=now)
+    digest = packet["twin_input_digest"]
+    result: dict = {"twin": packet}
+    if not persist:
+        return result
+    if not _env_flag("JARVIS_TWIN_PERSIST_ENABLED"):
+        raise HTTPException(status_code=403, detail="TWIN_PERSIST_DISABLED")
+    require_memory_write()  # identical gate to POST /api/jarvis/memory
+
+    day = now.date().isoformat()
+    subject = f"twin:daily:{tenant}:{day}"
+    todays = [
+        m for m in store.list_memories(limit=200, subject=subject)
+        if is_twin_authored(m)
+    ]
+    digest_tag = f"{DIGEST_TAG_PREFIX}{digest}"
+    for m in todays:
+        if digest_tag in (m.tags or []):
+            result["persisted"] = "existing"
+            result["memory_id"] = m.id
+            return result
+    payload = twin_memory_payload(
+        packet,
+        session_id=f"twin-{day}",
+        day=day,
+        supersedes=todays[0].id if todays else None,
+    )
+    try:
+        rec = store.create_memory(MemoryCreate(**payload))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    result["persisted"] = "created"
+    result["memory_id"] = rec.id
+    return _with_clause_v_warnings(result)
 
 
 @app.post("/api/jarvis/memory/external-search", dependencies=[Depends(require_emr_recall_api_key)])
