@@ -362,16 +362,16 @@ def test_receipt_cross_tenant_invisible():
 
 def test_lease_busy_and_stale_takeover():
     s = receipts.ReceiptStore()
-    ok, stale = s.acquire_lease("t", "s")
+    ok, stale, _tok = s.acquire_lease("t", "s")
     assert ok and not stale
-    ok2, _ = s.acquire_lease("t", "s")
+    ok2, _, _ = s.acquire_lease("t", "s")
     assert not ok2  # busy
     s._conn.execute(
         "UPDATE leases SET lease_until=? WHERE tenant_key=? AND session_id=?",
-        (time.monotonic() - 1, "t", "s"),
+        (time.time() - 1, "t", "s"),
     )
     s._conn.commit()
-    ok3, stale3 = s.acquire_lease("t", "s")
+    ok3, stale3, _t3 = s.acquire_lease("t", "s")
     assert ok3 and stale3  # stale takeover reported
 
 
