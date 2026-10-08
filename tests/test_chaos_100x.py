@@ -1002,3 +1002,23 @@ def test_resolve_selection_returns_sets_none_or_a_reason():
     for bad in (("X", None), (",", None), (None, "L"), (None, " , "), ("A1", "Q")):
         only, why = chaos.resolve_selection(*bad)
         assert only is None and why and "no such" in why
+
+
+def test_a_failed_fault_run_keeps_its_numbers_in_the_metrics_but_not_in_the_summary():
+    runs = [{"passed": True, "recover_s": 2.0, "attempts": 10}, {"passed": False, "recover_s": 90.0, "attempts": 500}, {"passed": True, "recover_s": 4.0, "attempts": 20},
+            {"recover_s": 6.0, "attempts": 30}]                                                    # no marker: recorded before the marker existed, counted as a pass
+    out = chaos.fault_summary({"J1": runs})["J1"]
+    assert out["runs"] == 3 and out["failed_runs_excluded"] == 1
+    assert out["recover_s"] == {"min": 2.0, "median": 4.0, "max": 6.0} and out["attempts"] == 60          # the 90 s and the 500 attempts are not in it
+
+
+def test_every_fault_probe_marks_its_run_passed_only_after_its_last_gate():
+    body = SCRIPT.read_text().split("def i1(")[1].split("@probe(")[0]
+    assert body.rindex('data["passed"] = True') > body.rindex('fault_gates(ctx, attempts, "i1")')
+    body = SCRIPT.read_text().split("def j1(")[1].split("@probe(")[0]
+    assert body.rindex('data["passed"] = True') > body.rindex('fault_gates(ctx, attempts, "j1")')
+    body = SCRIPT.read_text().split("def k1(")[1].split("# --- the runner")[0]
+    assert body.index('gates = fault_gates(ctx, attempts, "k1")') < body.index('_record_fault(ctx, "K1", {"passed": True')
+    ctx = SimpleNamespace(metrics={})
+    chaos._record_fault(ctx, "X", {"recover_s": 1.0})
+    assert ctx.metrics["faults"]["X"][0]["passed"] is False                                     # recorded, and not yet a pass

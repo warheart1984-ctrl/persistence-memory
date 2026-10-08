@@ -433,3 +433,21 @@ def test_a_concurrency_level_where_nothing_was_answered_stops_the_run(monkeypatc
     out = tmp_path / "out"
     assert soak.main([*args, "--concurrency", "--out", str(out)]) == chaos.EXIT_PROBE_FAILURES
     assert "no request was answered with 200 at 1 callers" in capsys.readouterr().err and not (out / "concurrency.json").exists()
+
+
+@pytest.mark.parametrize("head,retrieve,why", [
+    (chaos.Response(503, None, {}, 1.0), chaos.Response(200, {"memories": [{"id": "mem-1"}]}, {}, 1.0), "blocks/head answered 503"),
+    (chaos.Response(200, {}, {}, 1.0), chaos.Response(200, {"memories": [{"id": "mem-1"}]}, {}, 1.0), "blocks/head answered 200"),
+    (chaos.Response(200, {"history_seq": 3}, {}, 1.0), chaos.Response(503, None, {}, 1.0), "no record to read: retrieve answered 503"),
+    (chaos.Response(200, {"history_seq": 3}, {}, 1.0), chaos.Response(200, {"memories": []}, {}, 1.0), "no record to read: retrieve answered 200 with no records"),
+])
+def test_the_concurrency_phase_checks_its_setup_responses_and_never_substitutes_a_fake_record(monkeypatch, tmp_path, capsys, head, retrieve, why):
+    started = []
+    monkeypatch.setattr(soak, "Load", lambda *a, **k: started.append(1))
+
+    def request(self, m, path, body=None, **k):
+        return head if "/blocks/head" in path else retrieve
+
+    args = soak_env(monkeypatch, tmp_path, request)
+    assert soak.main([*args, "--concurrency"]) == chaos.EXIT_PROBE_FAILURES
+    assert why in capsys.readouterr().err and started == []

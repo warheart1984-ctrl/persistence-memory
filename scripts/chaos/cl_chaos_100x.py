@@ -1404,6 +1404,9 @@ def fail_closed(attempts: list[Attempt], t_fault: float, t_up: float | None, *, 
 
 
 def _record_fault(ctx: "Ctx", probe_id: str, data: dict[str, Any]) -> None:
+    """Keep the run's numbers even if a later gate fails (a failed run's timings are evidence), but marked: only a run whose probe went on to pass every gate sets
+    ``passed``, and the summary is computed from those alone."""
+    data.setdefault("passed", False)
     ctx.metrics.setdefault("faults", {}).setdefault(probe_id, []).append(data)
 
 
@@ -1453,6 +1456,7 @@ def i1(ctx: Ctx) -> None:
     check(t_started is not None and t_started > t_fault, "Docker does not report a restart of the application after the kill")
     data.update(fail_closed(attempts, t_fault, t_started, allowed=(0, -1, 503), settle=0.2))     # nothing acknowledged before the new process existed
     data.update(fault_gates(ctx, attempts, "i1"))
+    data["passed"] = True
 
 
 @probe("J1", "J", "partition the application from the database mid-transaction: fails closed, heals, and the gates hold", destructive=True, expect_5xx=(0, -1, 503))
@@ -1497,6 +1501,7 @@ def j1(ctx: Ctx) -> None:
     # a link that has gone silent must fail within seconds, not hang for as long as TCP keeps retrying (52 s measured before app/pg_store.py got keepalives)
     check(slowest <= PARTITION_PROMPT_S, f"a request, or /ready, hung for {slowest:.0f} s during the partition (more than {PARTITION_PROMPT_S} s): the dead connection was not noticed")
     data.update(fault_gates(ctx, attempts, "j1"))
+    data["passed"] = True
 
 
 @probe("K1", "K", "fill the database volume until writes fail, then free it: fails closed, recovers, and the gates hold", destructive=True, expect_5xx=(0, -1, 503))
@@ -1543,7 +1548,7 @@ def k1(ctx: Ctx) -> None:
     logs = ctx.docker("logs", "--since", since, db, timeout=60)
     text = logs.stdout + logs.stderr
     restarts_after = ctx.docker("inspect", "-f", "{{.RestartCount}}", db).stdout.strip()
-    _record_fault(ctx, "K1", {"recover_s": rec["recover_s"], "bite_after_fill_s": bite_s, "volume_full_s": round(t_free - t_fault, 2),
+    _record_fault(ctx, "K1", {"passed": True, "recover_s": rec["recover_s"], "bite_after_fill_s": bite_s, "volume_full_s": round(t_free - t_fault, 2),
                               "no_space_errors_in_db_log": text.count("No space left"), "panics": text.count("PANIC"),
                               "db_restarts": int(restarts_after or 0) - int(restarts_before or 0), **closed, **gates})
 
@@ -1611,8 +1616,9 @@ def final_checks(client: Client, stack: dict[str, Any] | None, destructive_block
 def fault_summary(faults: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
     """Per fault: how many times, and the min / median / max of each timing, plus what the writers saw."""
     out: dict[str, Any] = {}
-    for probe_id, runs in sorted(faults.items()):
-        entry: dict[str, Any] = {"runs": len(runs)}
+    for probe_id, all_runs in sorted(faults.items()):
+        runs = [r for r in all_runs if r.get("passed", True)]          # runs recorded before the 'passed' marker existed were all passes
+        entry: dict[str, Any] = {"runs": len(runs), "failed_runs_excluded": len(all_runs) - len(runs)}
         for key in ("detect_s", "recover_s", "bite_after_fill_s", "volume_full_s", "partition_s", "longest_request_s", "orphans_reaped_after_s"):
             values = sorted(r[key] for r in runs if isinstance(r.get(key), (int, float)))
             if values:

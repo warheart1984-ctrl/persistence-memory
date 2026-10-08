@@ -301,9 +301,15 @@ def run_concurrency(args, stack, target, client, stats, out_dir) -> int:
         print(line, flush=True)
         lines.append(line)
 
-    head = client.get("/api/jarvis/blocks/head").json
-    first = client.get("/api/jarvis/memory/retrieve?query=chaos100x&limit=1").json
-    record_id = (first["memories"][0]["id"] if first and first.get("memories") else "mem-none")
+    head_resp = client.get("/api/jarvis/blocks/head")
+    if head_resp.status != 200 or not isinstance(head_resp.json, dict) or "history_seq" not in head_resp.json:
+        raise SoakError(f"the ledger's blocks/head answered {head_resp.status} before the concurrency phase: nothing to measure against")
+    head = head_resp.json
+    first = client.get("/api/jarvis/memory/retrieve?query=chaos100x&limit=1")
+    memories = first.json.get("memories") if first.status == 200 and isinstance(first.json, dict) else None
+    if not memories:
+        raise SoakError(f"no record to read: retrieve answered {first.status} with {'no records' if first.status == 200 else 'an error'}; the load would be cheap 404s, not reads")
+    record_id = memories[0]["id"]
     log(f"concurrency: ledger at {head['history_seq']} entries; restarting the application container and reading at 1, 4, 16, 40 callers for {args.concurrency_seconds:g} s each")
     why = restart_and_wait(stack, target)
     if why:
