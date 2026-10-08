@@ -6,8 +6,9 @@ words, URLs — and its clauses — against only what those cites contain.
 Anything unsupported is dropped with a reason and never displayed.
 
 Drop reasons: BAD_JSON, CITE_MISSING, NUMBER_MISMATCH, ENTITY_UNSUPPORTED,
-CLAIM_WORD, URL_UNSUPPORTED.  An ungroundable clause (hedged/speculative tail)
-is recorded as ENTITY_UNSUPPORTED — speculation is an unsupported claim.
+CLAIM_WORD, URL_UNSUPPORTED, HEDGE_CLAUSE.  An ungroundable clause
+(hedged/speculative tail) is HEDGE_CLAUSE — a first-class reason, not an
+entity mismatch in disguise.
 
 Clause rule (ported from cslm-genesis): a hypothetical marker scopes rightward
 — it can never rescue the asserted text before it.  A sentence is therefore
@@ -190,7 +191,7 @@ def _check_sentence(text: str, cites: list[str], state: dict) -> str | None:
         for t in cited_texts:
             remainder = remainder.replace(t, " ")
         if _HEDGE_RE.search(remainder):
-            return "ENTITY_UNSUPPORTED"
+            return "HEDGE_CLAUSE"
 
     cited_nums = _cited_numbers(cited_values)
     for tok in _NUM_RE.findall(clean):

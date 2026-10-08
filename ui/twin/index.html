@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI Twin — Continuity Ledger</title>
+  <link rel="stylesheet" href="/ui/twin/styles.css">
+</head>
+<body>
+  <header class="page-header">
+    <h1>AI Twin</h1>
+    <p class="disclaimer" id="disclaimer">
+      The coverage index measures how well-structured and evidenced the ledger
+      is. It does not say whether any memory is true.
+    </p>
+    <div class="controls">
+      <label for="provider">Narrator provider</label>
+      <select id="provider" disabled>
+        <option value="none">none (template)</option>
+      </select>
+      <button id="refresh" type="button">Refresh</button>
+      <span id="status" role="status" aria-live="polite"></span>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="panel state-panel" aria-labelledby="state-h">
+      <h2 id="state-h">Twin State</h2>
+      <div id="state-empty" class="empty" hidden>
+        No data on the ledger. The index is 0 and there is nothing to narrate.
+      </div>
+      <div id="state-body">
+        <div class="index-line">
+          <span class="index-label">Coverage index</span>
+          <span class="index-value" id="coverage-index">—</span>
+          <span class="weakest" id="weakest"></span>
+        </div>
+        <h3>Components</h3>
+        <ul id="components" class="components"></ul>
+
+        <h3>Active projects</h3>
+        <ul id="active-projects" class="chips"></ul>
+        <p id="projects-empty" class="muted" hidden>None in the last 14 days.</p>
+
+        <h3>Recent accomplishments</h3>
+        <ul id="accomplishments"></ul>
+        <p id="accomplishments-empty" class="muted" hidden>No verified records yet.</p>
+
+        <h3>Open risks</h3>
+        <ul id="risks"></ul>
+        <p id="risks-empty" class="muted" hidden>No unresolved conflicts or tagged risks.</p>
+
+        <h3>Stale commitments</h3>
+        <ul id="stale"></ul>
+        <p id="stale-empty" class="muted" hidden>No stale tasks.</p>
+      </div>
+    </section>
+
+    <div class="right-col">
+      <section class="panel narration-panel" aria-labelledby="narr-h">
+        <h2 id="narr-h">Narration</h2>
+        <div id="narration" aria-live="polite"></div>
+      </section>
+
+      <details class="panel receipt-panel" id="receipt-panel">
+        <summary><h2 class="inline-h">Receipt</h2></summary>
+        <dl id="receipt"></dl>
+        <h3>Dropped by the gate</h3>
+        <table id="dropped" hidden>
+          <thead>
+            <tr><th scope="col">Section</th><th scope="col">Reason</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+        <p id="dropped-empty" class="muted">Nothing dropped.</p>
+      </details>
+    </div>
+  </main>
+
+  <div id="error" class="error-panel" role="alert" hidden></div>
+
+  <noscript>
+    <p class="error-panel">This page needs JavaScript to call the read-only
+    twin endpoints. Nothing can be written from here.</p>
+  </noscript>
+
+  <script src="/ui/twin/app.js" defer></script>
+</body>
+</html>

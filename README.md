@@ -111,7 +111,8 @@ database URL or that opt-in the service answers 503 rather than creating a ledge
   (`JARVIS_TWIN_ENABLED`), read-only, and it measures ledger structure, not truth.
 * A governed Twin Narrator also exists (`app/narrator/`, `docs/TWIN_NARRATOR.md`) — dark behind
   `JARVIS_TWIN_NARRATOR_ENABLED`; model text is gated clause-by-clause against TwinState and
-  falls back to a deterministic template; narration writes nothing.
+  falls back to a deterministic template; narration writes nothing. A read-only dashboard
+  (`ui/twin/`) is served at `/ui/twin` behind `JARVIS_TWIN_ENABLED`.
 
 ## Docs
 

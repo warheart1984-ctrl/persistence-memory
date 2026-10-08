@@ -28,6 +28,25 @@ OAuth is off, the operator key is required for all three routes.
 | `GET /api/jarvis/twin/state` | `JARVIS_TWIN_ENABLED` | `{state: TwinState.v1}` for the caller's tenant only. |
 | `GET /api/jarvis/twin/providers` | `JARVIS_TWIN_ENABLED` | `[{name, adapter, model}]` — **names and models only**, never URLs or key names. |
 | `GET /api/jarvis/twin/narration?provider=<name>` | both flags | `{state, narration, receipt}`. Unknown provider → `400 NARRATOR_UNKNOWN`. |
+| `GET /ui/twin` (+ `index.html` `app.js` `styles.css`) | `JARVIS_TWIN_ENABLED` | Read-only dashboard. Filename allowlist — anything else → 404. |
+
+## UI (`ui/twin/`)
+
+A zero-dependency static dashboard: left column renders every TwinState
+field (index, component meters with `role="meter"` and numeric labels —
+color never the only signal — projects, accomplishments, risks, stale
+commitments); right column renders the five gated narration sections with
+their cite paths and a `<details>` receipt panel listing digests,
+`fallback_used`, and the drop table (`{section, reason}` — receipts carry
+no dropped text, so the page cannot accidentally render it).
+
+- No write controls, no API-key handling; all DOM writes are `textContent`.
+- Loading / error (404 → "endpoints disabled") / empty-ledger states.
+- Accessible: real headings, `<main>`/`<section>` landmarks, native
+  `<select>`/`<button>`/`<details>`, `aria-live` status region, visible
+  `:focus-visible`, AA contrast palette.
+- Serve the folder any way you like; the app serves it at `/ui/twin`
+  behind `JARVIS_TWIN_ENABLED` (404 when dark).
 
 ## Provider configuration (environment only — never request params)
 
@@ -67,7 +86,8 @@ resolve. Drop reasons:
 | `BAD_JSON` | output isn't the `{sections: {...}}` contract |
 | `CITE_MISSING` | cite path doesn't resolve in the state |
 | `NUMBER_MISMATCH` | a numeric literal isn't backed by a cited value (exact int, ±5e-3 float, `40%` ≡ `0.40`, or the state's own rounding) |
-| `ENTITY_UNSUPPORTED` | a state entity (record id / subject / tag / project) appears outside its cites; a sentence word merely *contains* a cited word (`gate` cited ≠ `gateway` written); or a clause carries a hedge marker (`let's assume`, `suppose`, `probably`, `maybe`, …) |
+| `ENTITY_UNSUPPORTED` | a state entity (record id / subject / tag / project) appears outside its cites; a sentence word merely *contains* a cited word (`gate` cited ≠ `gateway` written) |
+| `HEDGE_CLAUSE` | a clause carries a hedge/speculation marker (`let's assume`, `suppose`, `probably`, `maybe`, `imagine`, `it seems`, …). Markers inside verbatim-cited record text are data and pass |
 | `CLAIM_WORD` | `proven / verified / complete / secure / guaranteed / merged / deployed / fixed` unless the word appears verbatim in a cited value |
 | `URL_UNSUPPORTED` | a URL that isn't inside a cited value |
 

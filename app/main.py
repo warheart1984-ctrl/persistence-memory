@@ -10,7 +10,7 @@ from pathlib import Path
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi import Path as PathParam
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from pydantic import BaseModel, Field
 
@@ -615,6 +615,31 @@ def twin_narration(request: Request, provider: str = Query(default="none")):
     state = _twin_state_for_request(request)
     out = narrator.narrate_state(state, cfg, adapter)
     return {"state": state, "narration": out["sections"], "receipt": out["receipt"]}
+
+
+_TWIN_UI_DIR = Path(__file__).resolve().parent.parent / "ui" / "twin"
+_TWIN_UI_FILES = {
+    "index.html": "text/html; charset=utf-8",
+    "app.js": "text/javascript; charset=utf-8",
+    "styles.css": "text/css; charset=utf-8",
+}
+
+
+@app.get("/ui/twin", include_in_schema=False)
+def twin_ui_index(request: Request):
+    """Read-only Twin dashboard — dark (404) when JARVIS_TWIN_ENABLED is off."""
+    _twin_guard(request)
+    return FileResponse(_TWIN_UI_DIR / "index.html", media_type="text/html")
+
+
+@app.get("/ui/twin/{asset}", include_in_schema=False)
+def twin_ui_asset(request: Request, asset: str):
+    """Static twin UI assets. Filename allowlist — no traversal, no data files."""
+    _twin_guard(request)
+    media = _TWIN_UI_FILES.get(asset)
+    if media is None:
+        raise HTTPException(status_code=404, detail="Not found")
+    return FileResponse(_TWIN_UI_DIR / asset, media_type=media)
 
 
 @app.post("/api/jarvis/memory/external-search", dependencies=[Depends(require_emr_recall_api_key)])
