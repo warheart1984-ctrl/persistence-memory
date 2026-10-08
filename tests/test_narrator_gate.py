@@ -199,7 +199,7 @@ def test_hedged_tail_does_not_rescue_unsupported_head(state):
          "cites": ["coverage_index"]},
     ]})
     out = gate_narration(raw, state)
-    assert len(_dropped(out, "assessment", 0)) == 1
+    assert _dropped(out, "assessment", 0)[0]["reason"] == "HEDGE_CLAUSE"
 
 
 def test_hedged_tail_drops_even_supported_head(state):
@@ -209,7 +209,7 @@ def test_hedged_tail_drops_even_supported_head(state):
          "cites": ["coverage_index"]},
     ]})
     out = gate_narration(raw, state)
-    assert len(_dropped(out, "assessment", 0)) == 1
+    assert _dropped(out, "assessment", 0)[0]["reason"] == "HEDGE_CLAUSE"
 
 
 @pytest.mark.parametrize("marker", [
@@ -222,7 +222,7 @@ def test_hedge_marker_variants_drop(state, marker):
          "cites": ["coverage_index"]},
     ]})
     out = gate_narration(raw, state)
-    assert len(_dropped(out, "assessment", 0)) == 1
+    assert _dropped(out, "assessment", 0)[0]["reason"] == "HEDGE_CLAUSE"
 
 
 def test_hedge_words_inside_quoted_record_are_data(state):

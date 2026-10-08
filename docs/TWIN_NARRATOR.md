@@ -67,7 +67,8 @@ resolve. Drop reasons:
 | `BAD_JSON` | output isn't the `{sections: {...}}` contract |
 | `CITE_MISSING` | cite path doesn't resolve in the state |
 | `NUMBER_MISMATCH` | a numeric literal isn't backed by a cited value (exact int, ±5e-3 float, `40%` ≡ `0.40`, or the state's own rounding) |
-| `ENTITY_UNSUPPORTED` | a state entity (record id / subject / tag / project) appears outside its cites; a sentence word merely *contains* a cited word (`gate` cited ≠ `gateway` written); or a clause carries a hedge marker (`let's assume`, `suppose`, `probably`, `maybe`, …) |
+| `ENTITY_UNSUPPORTED` | a state entity (record id / subject / tag / project) appears outside its cites; a sentence word merely *contains* a cited word (`gate` cited ≠ `gateway` written) |
+| `HEDGE_CLAUSE` | a clause carries a hedge/speculation marker (`let's assume`, `suppose`, `probably`, `maybe`, `imagine`, `it seems`, …). Markers inside verbatim-cited record text are data and pass |
 | `CLAIM_WORD` | `proven / verified / complete / secure / guaranteed / merged / deployed / fixed` unless the word appears verbatim in a cited value |
 | `URL_UNSUPPORTED` | a URL that isn't inside a cited value |
 
