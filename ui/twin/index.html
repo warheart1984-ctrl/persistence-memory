@@ -1,89 +1,84 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>AI Twin — Continuity Ledger</title>
+  <meta name="theme-color" content="#101411">
+  <title>AI Twin — Persistence Memory</title>
   <link rel="stylesheet" href="/ui/twin/styles.css">
 </head>
 <body>
-  <header class="page-header">
-    <h1>AI Twin</h1>
-    <p class="disclaimer" id="disclaimer">
-      The coverage index measures how well-structured and evidenced the ledger
-      is. It does not say whether any memory is true.
-    </p>
+  <header class="topbar">
+    <a class="brand" href="/ui/twin" aria-label="Twin home"><span class="brand-mark" aria-hidden="true">T</span><span><strong>Twin</strong><small>CONTINUITY LEDGER</small></span></a>
+    <div class="top-meta"><span id="tenant-label">Tenant · —</span><span class="dot" aria-hidden="true"></span><time id="as-of">As of —</time></div>
     <div class="controls">
-      <label for="provider">Narrator provider</label>
-      <select id="provider" disabled>
-        <option value="none">none (template)</option>
-      </select>
-      <button id="refresh" type="button">Refresh</button>
-      <span id="status" role="status" aria-live="polite"></span>
+      <label class="sr-only" for="provider">Narrator provider</label>
+      <select id="provider" aria-label="Narrator provider" disabled><option value="none">none · template</option></select>
+      <button id="refresh" class="refresh" type="button"><span aria-hidden="true">↻</span> Refresh</button>
+      <span id="status" class="status-pill" role="status" aria-live="polite">Loading</span>
     </div>
   </header>
 
-  <main class="layout">
-    <section class="panel state-panel" aria-labelledby="state-h">
-      <h2 id="state-h">Twin State</h2>
-      <div id="state-empty" class="empty" hidden>
-        No data on the ledger. The index is 0 and there is nothing to narrate.
-      </div>
-      <div id="state-body">
-        <div class="index-line">
-          <span class="index-label">Coverage index</span>
-          <span class="index-value" id="coverage-index">—</span>
-          <span class="weakest" id="weakest"></span>
-        </div>
-        <h3>Components</h3>
-        <ul id="components" class="components"></ul>
+  <main class="shell">
+    <div id="loading" class="loading" role="status"><span class="spinner" aria-hidden="true"></span> Gathering the latest facts…</div>
+    <div id="disabled" class="empty-state" hidden><span class="empty-icon" aria-hidden="true">◌</span><h1>Twin is turned off on this server</h1><p>The read-only twin endpoints are not enabled.</p></div>
+    <div id="error" class="error-panel" role="alert" hidden></div>
 
-        <h3>Active projects</h3>
-        <ul id="active-projects" class="chips"></ul>
-        <p id="projects-empty" class="muted" hidden>None in the last 14 days.</p>
+    <div id="dashboard" class="layout" hidden>
+      <section class="facts-column" aria-labelledby="facts-title">
+        <div class="section-heading"><div><span class="eyebrow">THE EVIDENCE</span><h1 id="facts-title">Twin facts</h1></div><span class="read-only">◉ &nbsp;Read only</span></div>
+        <p class="disclaimer" id="disclaimer">Measures how well-structured and evidenced the ledger is. It does not say whether any memory is true.</p>
 
-        <h3>Recent accomplishments</h3>
-        <ul id="accomplishments"></ul>
-        <p id="accomplishments-empty" class="muted" hidden>No verified records yet.</p>
+        <article class="card coverage-card" data-fact="coverage_index">
+          <div class="card-top"><div><span class="eyebrow">COVERAGE INDEX</span><p class="coverage-caption">Structure and evidence</p></div><strong id="coverage-index" class="coverage-number">—</strong></div>
+          <div class="gauge" role="meter" aria-label="Coverage index" aria-valuemin="0" aria-valuemax="1" aria-valuenow="0"><span id="coverage-fill"></span></div>
+          <p class="microcopy">This measures ledger structure. It is not a truth score.</p>
+        </article>
 
-        <h3>Open risks</h3>
-        <ul id="risks"></ul>
-        <p id="risks-empty" class="muted" hidden>No unresolved conflicts or tagged risks.</p>
+        <article class="card" data-fact="components">
+          <div class="card-heading"><div><span class="eyebrow">SIGNALS</span><h2>Components</h2></div><span id="weakest" class="weakest" hidden></span></div>
+          <ul id="components" class="components"></ul>
+        </article>
 
-        <h3>Stale commitments</h3>
-        <ul id="stale"></ul>
-        <p id="stale-empty" class="muted" hidden>No stale tasks.</p>
-      </div>
-    </section>
+        <article class="card" data-fact="active_projects">
+          <div class="card-heading"><div><span class="eyebrow">IN MOTION</span><h2>Active projects</h2></div><span id="project-count" class="count">0</span></div>
+          <ul id="active-projects" class="chips"></ul><p id="projects-empty" class="muted">No active projects in the last 14 days.</p>
+        </article>
 
-    <div class="right-col">
-      <section class="panel narration-panel" aria-labelledby="narr-h">
-        <h2 id="narr-h">Narration</h2>
-        <div id="narration" aria-live="polite"></div>
+        <article class="card" data-fact="recent_accomplishments">
+          <div class="card-heading"><div><span class="eyebrow">RECENT SIGNAL</span><h2>Accomplishments</h2></div></div>
+          <ul id="accomplishments" class="record-list"></ul><p id="accomplishments-empty" class="muted">No verified records yet.</p>
+        </article>
+
+        <article class="card" data-fact="open_risks">
+          <div class="card-heading"><div><span class="eyebrow">NEEDS ATTENTION</span><h2>Open risks</h2></div></div>
+          <ul id="risks" class="record-list"></ul><p id="risks-empty" class="muted">No unresolved conflicts or tagged risks.</p>
+        </article>
+
+        <article class="card" data-fact="stale_commitments">
+          <div class="card-heading"><div><span class="eyebrow">TIME CHECK</span><h2>Stale commitments</h2></div></div>
+          <ul id="stale" class="record-list"></ul><p id="stale-empty" class="muted">No stale tasks.</p>
+        </article>
       </section>
 
-      <details class="panel receipt-panel" id="receipt-panel">
-        <summary><h2 class="inline-h">Receipt</h2></summary>
-        <dl id="receipt"></dl>
-        <h3>Dropped by the gate</h3>
-        <table id="dropped" hidden>
-          <thead>
-            <tr><th scope="col">Section</th><th scope="col">Reason</th></tr>
-          </thead>
-          <tbody></tbody>
-        </table>
-        <p id="dropped-empty" class="muted">Nothing dropped.</p>
-      </details>
+      <section class="narration-column" aria-labelledby="narration-title">
+        <div class="section-heading"><div><span class="eyebrow">THE NARRATION</span><h1 id="narration-title">A grounded read</h1></div><span class="gate-indicator">✓ &nbsp;Gate checked</span></div>
+        <div id="empty-ledger" class="empty-state compact" hidden><span class="empty-icon" aria-hidden="true">✳</span><h2>No evidence yet.</h2><p>Write your first evidenced memory.</p></div>
+        <div id="narration"></div>
+        <details id="dropped-panel" class="card dropped-panel" hidden>
+          <summary><span>Dropped by gate</span><span id="dropped-count" class="count">0</span></summary>
+          <p class="microcopy">Unchecked sentence text is never shown here.</p>
+          <ul id="dropped-list" class="drop-list"></ul>
+        </details>
+        <details id="receipt-panel" class="card receipt-panel">
+          <summary><span>Receipt &amp; provenance</span><span class="summary-hint">View digests and copy JSON</span></summary>
+          <div class="receipt-actions"><p class="microcopy">A reproducible record of this narration. Prompt content stays on the server; the receipt exposes its digest.</p><button id="copy-receipt" class="copy-button" type="button">Copy receipt JSON</button></div>
+          <dl id="receipt" class="receipt-grid"></dl>
+          <p id="copy-status" class="sr-only" role="status" aria-live="polite"></p>
+        </details>
+      </section>
     </div>
   </main>
-
-  <div id="error" class="error-panel" role="alert" hidden></div>
-
-  <noscript>
-    <p class="error-panel">This page needs JavaScript to call the read-only
-    twin endpoints. Nothing can be written from here.</p>
-  </noscript>
-
   <script src="/ui/twin/app.js" defer></script>
 </body>
 </html>
