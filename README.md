@@ -107,6 +107,8 @@ database URL or that opt-in the service answers 503 rather than creating a ledge
 * **One box.** Wi-Fi only, disk not encrypted, an hour's worth of data at risk between backups, no automatic security updates
   (`deploy/mint/README.md`, "Honest limits").
 * The ledger records claims; it does not evaluate them.
+* An AI Twin coverage index exists on `main` (`app/twin.py`, `docs/AI_TWIN.md`) — **off by default**
+  (`JARVIS_TWIN_ENABLED`), read-only, and it measures ledger structure, not truth.
 
 ## Docs
 
