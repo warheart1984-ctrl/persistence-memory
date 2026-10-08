@@ -451,3 +451,38 @@ def test_the_concurrency_phase_checks_its_setup_responses_and_never_substitutes_
     args = soak_env(monkeypatch, tmp_path, request)
     assert soak.main([*args, "--concurrency"]) == chaos.EXIT_PROBE_FAILURES
     assert why in capsys.readouterr().err and started == []
+
+
+def test_every_concurrency_level_gets_its_own_restarted_process(monkeypatch, tmp_path):
+    FakeLoad.plan = [(100, 0)] * 4
+    monkeypatch.setattr(soak, "Load", FakeLoad)
+    args = soak_env(monkeypatch, tmp_path, lambda self, m, p, body=None, **k: chaos.Response(200, {"history_seq": 3, "tip": None, "memories": [{"id": "mem-1"}]}, {}, 1.0))
+    restarts, order = [], []
+    monkeypatch.setattr(soak, "restart_and_wait", lambda stack, target, **k: restarts.append(1))
+    monkeypatch.setattr(soak, "process_memory_checked", lambda c: order.append(len(restarts)) or {"VmHWM": 100000, "RssAnon": 60000})
+    assert soak.main([*args, "--concurrency"]) == chaos.EXIT_OK
+    assert len(restarts) == 5                                 # the baseline and each of 1, 4, 16, 40 callers
+    assert order == [1, 2, 3, 4, 5]                           # memory is read on the process that level was run on
+
+
+def test_a_mostly_refused_level_is_marked_invalid_and_kept_out_of_the_analysis(monkeypatch, tmp_path, capsys):
+    FakeLoad.plan = [(100, 0), (100, 0), (100, 0), (1273, 1030)]
+    monkeypatch.setattr(soak, "Load", FakeLoad)
+    args = soak_env(monkeypatch, tmp_path, lambda self, m, p, body=None, **k: chaos.Response(200, {"history_seq": 3, "tip": None, "memories": [{"id": "mem-1"}]}, {}, 1.0))
+    out = tmp_path / "out"
+    rc = soak.main([*args, "--concurrency", "--out", str(out)])
+    result = json.loads((out / "concurrency.json").read_text())
+    by = {l["callers"]: l for l in result["levels"]}
+    assert rc == chaos.EXIT_OK and by[40]["valid"] is False and by[16]["valid"] is True
+    assert result["analysis"]["invalid_levels_excluded"] == [40] and 40 not in [l["callers"] for l in result["analysis"]["levels"]]
+    assert "INVALID" in capsys.readouterr().out
+
+
+def test_fewer_than_three_valid_levels_claims_nothing_and_fails(monkeypatch, tmp_path):
+    FakeLoad.plan = [(100, 0), (100, 0), (100, 90), (100, 90)]
+    monkeypatch.setattr(soak, "Load", FakeLoad)
+    args = soak_env(monkeypatch, tmp_path, lambda self, m, p, body=None, **k: chaos.Response(200, {"history_seq": 3, "tip": None, "memories": [{"id": "mem-1"}]}, {}, 1.0))
+    out = tmp_path / "out"
+    assert soak.main([*args, "--concurrency", "--out", str(out)]) == chaos.EXIT_PROBE_FAILURES
+    notes = json.loads((out / "concurrency.json").read_text())["analysis"]["notes"]
+    assert "fewer than three valid levels" in notes[0]

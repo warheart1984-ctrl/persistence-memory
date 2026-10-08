@@ -90,8 +90,9 @@ connections (libpq keepalives and `tcp_user_timeout`), requests and `/ready` hun
 retrieval slow down with the ledger? Four phases on one throwaway stack: **growth** (records written and sealed in batches while memory, a typical and a
 hostile retrieve, `blocks/verify`, `history/verify` and the database size are sampled), **reads** on the then-constant ledger (memory against *requests*:
 a slope there is a leak), **idle** (does memory come back?) and a **control** (restart the application container, same ledger, same load: does it return
-to the same level?). An optional fifth, **concurrency** (`soak.py --concurrency`), restarts the application and reads at 1, 4, 16 and 40 callers at once,
-reading the process's high-water mark after each: a retrieve that materialises the ledger makes the peak follow callers x ledger size. The verdict is computed from the samples (`verdict()` in the script; thresholds and synthetic leak/cache/accumulation cases are in
+to the same level?). An optional fifth, **concurrency** (`soak.py --concurrency`), restarts the application **before each level** and reads at 1, 4, 16 and 40 callers at once,
+reading the process's high-water mark after each (it is a process-lifetime maximum, so a shared process would carry earlier peaks): a retrieve that materialises the
+ledger should make the peak follow callers x ledger size. A level where under 95 % of requests were answered 200 is marked invalid and left out; with fewer than three valid levels the run claims nothing and exits 1. The verdict is computed from the samples (`verdict()` in the script; thresholds and synthetic leak/cache/accumulation cases are in
 `tests/test_soak.py`) and printed with the numbers.
 
 ## What it reports

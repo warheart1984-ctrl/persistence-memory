@@ -209,11 +209,14 @@ def power_law_exponent(xs: list[float], ys: list[float]) -> dict[str, float]:
 
 
 def concurrency_note(levels: list[dict]) -> dict[str, Any]:
-    """levels: [{"callers", "hwm_mib", "anon_mib"}] in ascending order of callers, one restarted process.  Does the high-water mark follow the callers?"""
+    """levels: [{"callers", "hwm_mib", "anon_mib"}] in ascending order of callers, each measured on its own freshly restarted process.  Does the high-water mark
+    follow the callers?  Levels marked ``valid: False`` (the load was mostly refused, so it was not that many concurrent readers) are left out."""
+    skipped = [l["callers"] for l in levels if l.get("valid") is False]
+    levels = [l for l in levels if l.get("valid") is not False]
     if len(levels) < 3:
-        return {"notes": []}
+        return {"notes": [f"fewer than three valid levels (invalid: {skipped}): no caller-count relationship can be claimed"] if skipped else []}
     f = linear_fit([l["callers"] for l in levels], [l["hwm_mib"] for l in levels])
-    out = {"mib_per_caller": round(f["slope"], 2), "r2": round(f["r2"], 3), "levels": levels}
+    out = {"mib_per_caller": round(f["slope"], 2), "r2": round(f["r2"], 3), "levels": levels, "invalid_levels_excluded": skipped}
     first, last = levels[0], levels[-1]
     rise = last["hwm_mib"] - first["hwm_mib"]
     if f["r2"] >= 0.8 and f["slope"] > 0.5 and rise > 10:
@@ -293,8 +296,12 @@ def sample(client, stack, phase: str, t0: float, requests: int, records: int, fa
     return s
 
 
+LEVEL_MIN_ANSWERED = 0.95        # a level is a measurement of N concurrent readers only if nearly all of them were actually answered
+
+
 def run_concurrency(args, stack, target, client, stats, out_dir) -> int:
-    """Restart the application, then read at 1, 4, 16 and 40 callers at once (ascending: the high-water mark only rises), and read the mark after each."""
+    """Read at 1, 4, 16 and 40 callers at once, each level on its own freshly restarted application process (VmHWM is a process-lifetime maximum, so a shared
+    process would carry every earlier level's peak), and read the mark after each.  A level where under 95% of requests were answered 200 is marked invalid."""
     lines = []
 
     def log(line: str) -> None:
@@ -310,15 +317,19 @@ def run_concurrency(args, stack, target, client, stats, out_dir) -> int:
     if not memories:
         raise SoakError(f"no record to read: retrieve answered {first.status} with {'no records' if first.status == 200 else 'an error'}; the load would be cheap 404s, not reads")
     record_id = memories[0]["id"]
-    log(f"concurrency: ledger at {head['history_seq']} entries; restarting the application container and reading at 1, 4, 16, 40 callers for {args.concurrency_seconds:g} s each")
-    why = restart_and_wait(stack, target)
-    if why:
-        log(f"ABORTED: the concurrency phase needs a freshly restarted process and did not get one: {why}")
-        return chaos.EXIT_PROBE_FAILURES
-    base = process_memory_checked(stack["containers"]["app"])
-    levels = [{"callers": 0, "hwm_mib": base.get("VmHWM", 0) / 1024, "anon_mib": base.get("RssAnon", 0) / 1024, "requests": 0, "p50_ms": None, "p99_ms": None, "unanswered": 0}]
-    log(f"  after restart: high-water {levels[0]['hwm_mib']:.1f} MiB, anonymous {levels[0]['anon_mib']:.1f} MiB")
-    for callers in (1, 4, 16, 40):
+    log(f"concurrency: ledger at {head['history_seq']} entries; restarting the application container before each of 1, 4, 16, 40 callers for {args.concurrency_seconds:g} s each")
+    levels = []
+    for callers in (0, 1, 4, 16, 40):
+        why = restart_and_wait(stack, target)
+        if why:
+            log(f"ABORTED: the concurrency phase needs a freshly restarted process for each level and did not get one: {why}")
+            return chaos.EXIT_PROBE_FAILURES
+        if callers == 0:
+            base = process_memory_checked(stack["containers"]["app"])
+            levels.append({"callers": 0, "hwm_mib": base.get("VmHWM", 0) / 1024, "anon_mib": base.get("RssAnon", 0) / 1024, "requests": 0, "p50_ms": None, "p99_ms": None,
+                           "unanswered": 0, "valid": True})
+            log(f"  after restart: high-water {levels[0]['hwm_mib']:.1f} MiB, anonymous {levels[0]['anon_mib']:.1f} MiB")
+            continue
         load = Load(client, record_id, threads=callers).start()
         time.sleep(args.concurrency_seconds)
         load.stop()
@@ -327,14 +338,15 @@ def run_concurrency(args, stack, target, client, stats, out_dir) -> int:
             raise SoakError(f"no request was answered with 200 at {callers} callers: this level measured nothing")
         lat = sorted(l for l in client.stats.latencies.get("-", [])[-max(load.count, 1):])
         levels.append({"callers": callers, "hwm_mib": round(mem.get("VmHWM", 0) / 1024, 1), "anon_mib": round(mem.get("RssAnon", 0) / 1024, 1), "requests": load.count,
-                       "p50_ms": round(chaos.pct(lat, 0.5), 1) if lat else None, "p99_ms": round(chaos.pct(lat, 0.99), 1) if lat else None, "unanswered": load.errors})
-        log(f"  {callers:>2} callers: {load.count:>5} requests ({load.errors} not 200), high-water {levels[-1]['hwm_mib']:.1f} MiB, anonymous {levels[-1]['anon_mib']:.1f} MiB, "
+                       "p50_ms": round(chaos.pct(lat, 0.5), 1) if lat else None, "p99_ms": round(chaos.pct(lat, 0.99), 1) if lat else None, "unanswered": load.errors,
+                       "valid": (load.count - load.errors) >= LEVEL_MIN_ANSWERED * load.count})
+        log(f"  {callers:>2} callers: {load.count:>5} requests ({load.errors} not 200){'' if levels[-1]['valid'] else ' INVALID: mostly refused, not a measurement of that many readers'}, high-water {levels[-1]['hwm_mib']:.1f} MiB, anonymous {levels[-1]['anon_mib']:.1f} MiB, "
             f"p50 {levels[-1]['p50_ms']} ms p99 {levels[-1]['p99_ms']} ms")
     result = {"ledger_entries": head["history_seq"], "levels": levels, "analysis": concurrency_note([l for l in levels if l["callers"] > 0])}
     log(json.dumps(result["analysis"]["notes"], indent=1))
     if out_dir:
         (out_dir / "concurrency.json").write_text(json.dumps(result, indent=2))
-    return chaos.EXIT_OK
+    return chaos.EXIT_OK if sum(1 for l in levels if l["callers"] > 0 and l["valid"]) >= 3 else chaos.EXIT_PROBE_FAILURES
 
 
 def main(argv: list[str] | None = None) -> int:

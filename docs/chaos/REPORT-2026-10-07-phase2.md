@@ -69,9 +69,14 @@ None of these was a ledger failure; each was found by the run or by the tests be
 * **Memory is not a leak.** Anonymous memory grows 64.6 → 82.1 MiB with the ledger (3.2 MiB per 1 000 records, r² 0.93). On the then-constant ledger it
   warmed to about 128 MiB within a few hundred requests and then stayed flat for the remaining ≈4 700 (no trend; the computed slope has r² 0.19); idle released
   nothing (125.7 MiB: Python does not hand arenas back); **a restarted process under the same load reached 128.9 MiB, 2 % from where the old one ended.**
-* **The 76 → 279 MiB of the first report is the high-water mark of concurrent retrievals.** A retrieve materialises the whole ledger, so the peak follows
-  callers × ledger size. After a restart, on 6 400 entries: 1 caller 127 MiB, 4 callers 174, 16 callers 234, **40 callers 269 MiB** (about 3.3 MiB per extra caller);
-  the first run's pool-flood probe ran 40 callers. At 40 callers 1 030 of 1 273 requests were shed (503).
+* **The 76 → 279 MiB of the first report is most likely the high-water mark of concurrent retrievals, but the concurrency run does not prove a per-caller figure.**
+  A retrieve materialises the whole ledger, so the peak should follow callers × ledger size. The committed run (6 400 entries, 1 caller 127 MiB, 4 callers 174,
+  16 callers 234, 40 callers 269) has two defects found in review: it restarted the application **once** and then ran the levels in ascending order, and `VmHWM` is a
+  process-lifetime maximum, so each figure carries every earlier level's peak (it cannot separate caller count from elapsed load); and at 40 callers 1 030 of 1 273
+  requests were shed (503), so that level was not 40 concurrent readers. `soak.py --concurrency` now restarts the application before every level and marks a level
+  with under 95 % of requests answered as invalid and leaves it out of the analysis. **That corrected run has not been done** (the throwaway stack was torn down); the
+  "about 3.3 MiB per extra caller" figure is withdrawn. What stands without it: memory is flat against requests on a constant ledger, returns to the same level after a
+  restart, and the pool-flood probe's 40 callers is a plausible source of the first report's peak.
 * **Retrieval cost follows ledger size.** A typical retrieve 5 ms → 357 ms and a hostile-string one 4 ms → 309 ms over 6 400 entries (log-log exponents
   0.93 and 0.99: linear); `history/verify` 6 → 360 ms (0.93); `blocks/verify` 8 → 121 ms (0.70).
 * Nothing was changed for this: it is how retrieval is built (every record is read and scored in Python, then limited), not a fault. It is the limit to plan
