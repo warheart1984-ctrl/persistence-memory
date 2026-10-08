@@ -440,6 +440,39 @@ def test_the_summary_breaks_every_5xx_down_by_probe_and_status_and_lists_the_une
     assert out["five_xx_total"] == 5 and out["five_xx_expected"] == 3 and [e["probe"] for e in out["five_xx_unexpected"]] == ["C4", "C4"]
 
 
+def test_unreachable_final_checks_still_write_results_and_fail(tmp_path, monkeypatch):
+    (tmp_path / "secrets").mkdir()
+    (tmp_path / "secrets" / "api-key").write_text("test-key")
+    (tmp_path / "stack.json").write_text(json.dumps({
+        "url": "http://127.0.0.1:18017", "port": 18017, "project": "p",
+        "secrets_dir": str(tmp_path / "secrets"), "containers": {},
+        "keys_dir": str(tmp_path), "dir": str(tmp_path),
+    }))
+    monkeypatch.setattr(chaos, "fetch_ready", lambda url: (200, {"stack": GOOD}))
+    monkeypatch.setattr(chaos, "live_ports", lambda: {8011})
+    monkeypatch.setattr(chaos, "throwaway_proof", lambda *a: "proof skipped")
+    monkeypatch.setattr(chaos, "run_round", lambda *a, **k: [])
+    calls = 0
+
+    def request(self, method, path, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if path == "/api/jarvis/blocks/head" and calls <= 2:
+            return chaos.Response(200, {"history_seq": 0, "sealed_seq": 0,
+                                        "tip": None, "unsealed_entries": 0}, {}, 1.0)
+        return chaos.Response(0, None, {}, 1.0)
+
+    monkeypatch.setattr(chaos.Client, "request", request)
+    out = tmp_path / "results"
+    rc = chaos.main(["--stack-dir", str(tmp_path), "--rounds", "1", "--out", str(out)])
+
+    summary = json.loads((out / "results.json").read_text(encoding="utf-8"))
+    assert rc == chaos.EXIT_PROBE_FAILURES
+    assert summary["final"]["history_verify"]["status"] == "UNREACHABLE"
+    assert summary["final"]["blocks_head"]["status"] == "UNREACHABLE"
+    assert summary["final"]["receipts"]["status"] == "UNREACHABLE"
+
+
 # --- phase 2: the ugly-conditions faults (I, J, K) -----------------------------------------------------------------------------------------------------
 
 def test_the_fault_phases_exist_and_are_destructive_and_expect_only_failures_a_fault_causes():
