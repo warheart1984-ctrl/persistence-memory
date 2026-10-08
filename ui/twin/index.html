@@ -78,6 +78,27 @@
         </details>
       </section>
     </div>
+
+    <section class="chat-section" id="chat-section" aria-labelledby="chat-title" hidden>
+      <div class="section-heading"><div><span class="eyebrow">THE CONVERSATION</span><h1 id="chat-title">Talk to the twin</h1></div><span class="gate-indicator">✓ &nbsp;Gate enforced</span></div>
+      <p class="disclaimer">Replies cite ledger memories. Citations are evidence handles, not proof — the gate is a mechanical filter, not a fact-checker.</p>
+      <div id="chat-stream" class="chat-stream" role="log" aria-live="polite" aria-label="Conversation"></div>
+      <p id="chat-reset" class="microcopy chat-reset" hidden>Context reset — the server lost this session's window. Turn receipts still chain.</p>
+      <form id="chat-form" class="chat-form">
+        <label class="sr-only" for="chat-input">Message the twin</label>
+        <textarea id="chat-input" rows="2" maxlength="8000" placeholder="Ask what the ledger holds… (try “I decided …” to save a draft decision)" required></textarea>
+        <div class="chat-actions">
+          <label class="persist-toggle"><input type="checkbox" id="chat-persist"> <span>Save my decisions as draft memories</span></label>
+          <button id="chat-send" type="submit" class="refresh">Send</button>
+        </div>
+      </form>
+      <p class="microcopy">Session <code id="chat-session"></code> · every turn is receipted · extracted claims land as drafts, never verified</p>
+    </section>
+    <div id="chat-disabled" class="empty-state compact" hidden>
+      <span class="empty-icon" aria-hidden="true">◌</span>
+      <h2>Chat is dark on this server</h2>
+      <p>Set JARVIS_TWIN_CHAT_ENABLED to light it. Turns are receipted; nothing is written unless persist is on.</p>
+    </div>
   </main>
   <script src="/ui/twin/app.js" defer></script>
 </body>

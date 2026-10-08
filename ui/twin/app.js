@@ -173,4 +173,121 @@ $("copy-receipt").addEventListener("click",async()=>{
   try{await navigator.clipboard.writeText(JSON.stringify(currentReceipt,null,2));live.textContent="Receipt JSON copied.";$("copy-receipt").textContent="Copied";setTimeout(()=>$("copy-receipt").textContent="Copy receipt JSON",1600);}
   catch(_){live.textContent="Clipboard access is unavailable in this browser.";}
 });
-document.addEventListener("DOMContentLoaded",()=>loadProviders().then(load));
+/* --- Chat pane: governed turns, receipts visible, raw model text never shown --- */
+const chatSession = (() => {
+  try {
+    let id = sessionStorage.getItem("twin-chat-session");
+    if (!id) { id = crypto.randomUUID ? crypto.randomUUID() : `s-${Date.now()}`; sessionStorage.setItem("twin-chat-session", id); }
+    return id;
+  } catch (_) { return `s-${Date.now()}`; }
+})();
+let chatBusy = false;
+
+async function apiPost(path, body) {
+  const response = await fetch(path, {
+    method: "POST",
+    headers: {Accept: "application/json", "Content-Type": "application/json"},
+    body: JSON.stringify(body), cache: "no-store",
+  });
+  if (!response.ok) {
+    let detail = response.statusText;
+    try { const b = await response.json(); detail = b.detail || detail; } catch (_) { /* status is enough */ }
+    const error = new Error(`HTTP ${response.status}: ${detail}`); error.status = response.status; throw error;
+  }
+  return response.json();
+}
+
+function turnNode(role, text, metaNodes) {
+  const li = el("li", undefined, `chat-turn ${role}`);
+  const bubble = el("div", undefined, "bubble");
+  bubble.append(el("span", text));
+  if (metaNodes && metaNodes.length) {
+    const meta = el("div", undefined, "chat-meta");
+    metaNodes.forEach((n) => meta.append(n));
+    bubble.append(meta);
+  }
+  li.append(bubble);
+  return li;
+}
+
+function renderTurnReceipt(data) {
+  const r = data.receipt;
+  const meta = [];
+  meta.push(el("span", `${r.backend}${r.model && r.model !== "none" ? ` · ${r.model}` : ""}`));
+  meta.push(el("span", `${r.latency_ms} ms`));
+  meta.push(el("span", `gate:${r.gate_mode}`, r.gate_dropped.length ? "warn-text" : ""));
+  if (r.fallback_used) meta.push(el("span", "FALLBACK", "kind-badge"));
+  if (data.degraded) meta.push(el("span", "DEGRADED", "kind-badge"));
+  (r.recalled_ids || []).forEach((id) => meta.push(recordLink(id)));
+  if (r.proposed_claims && r.proposed_claims.length) {
+    const det = el("details", undefined, "turn-receipt");
+    const sum = el("summary", undefined, "microcopy");
+    sum.textContent = `${r.proposed_claims.length} proposed claim${r.proposed_claims.length === 1 ? "" : "s"}`;
+    det.append(sum);
+    const ul = document.createElement("ul");
+    r.proposed_claims.forEach((p) => {
+      const li = el("li");
+      li.append(el("span", `${p.claim_type.toUpperCase()} `, "kind-badge"), el("span", p.content, "record-copy"));
+      if (p.claim_type !== "decision" || p.attribution !== "user") li.append(el("span", " · not persisted", "muted"));
+      ul.append(li);
+    });
+    det.append(ul);
+    meta.push(det);
+  }
+  if (data.persist_receipt) {
+    const pr = data.persist_receipt;
+    const span = el("span", `persisted ${pr.persisted_ids.length}${pr.failures.length ? ` · ${pr.failures.length} refused` : ""}`, "microcopy");
+    meta.push(span);
+    (pr.persisted_ids || []).forEach((id) => meta.push(recordLink(id)));
+  }
+  const rc = el("details", undefined, "turn-receipt");
+  const s = el("summary", undefined, "microcopy");
+  s.textContent = `receipt ${shortId(r.receipt_digest)}`;
+  const pre = el("pre", JSON.stringify({receipt: r, persist_receipt: data.persist_receipt}, null, 2), "receipt-json");
+  rc.append(s, pre);
+  meta.push(rc);
+  return meta;
+}
+
+async function sendChat(evt) {
+  evt.preventDefault();
+  const input = $("chat-input"), msg = input.value.trim();
+  if (!msg || chatBusy) return;
+  chatBusy = true; $("chat-send").disabled = true;
+  const stream = $("chat-stream");
+  stream.append(turnNode("user", msg));
+  input.value = "";
+  const thinking = turnNode("assistant", "…");
+  stream.append(thinking); stream.scrollTop = stream.scrollHeight;
+  try {
+    const data = await apiPost("/api/jarvis/twin/chat", {
+      session_id: chatSession, message: msg,
+      persist: $("chat-persist").checked,
+    });
+    thinking.replaceWith(turnNode("assistant", data.reply, renderTurnReceipt(data)));
+    if (data.receipt.context_reset) $("chat-reset").hidden = false;
+  } catch (error) {
+    thinking.replaceWith(turnNode("assistant",
+      error.status === 404 ? "Chat is dark on this server." :
+      error.status === 409 ? "A turn is already in flight — wait and retry." :
+      error.status === 403 ? "Persist is disabled on this server." :
+      `Turn failed: ${error.message}`));
+    if (error.status === 404) { $("chat-section").hidden = true; $("chat-disabled").hidden = false; }
+  } finally {
+    chatBusy = false; $("chat-send").disabled = false; stream.scrollTop = stream.scrollHeight;
+    input.focus();
+  }
+}
+
+async function probeChat() {
+  const sessionEl = $("chat-session"); sessionEl.textContent = chatSession;
+  try {
+    await api(`/api/jarvis/twin/chat/sessions/${encodeURIComponent(chatSession)}/turns`);
+    $("chat-section").hidden = false;
+    $("chat-form").addEventListener("submit", sendChat);
+  } catch (error) {
+    if (error.status === 404) $("chat-disabled").hidden = false;
+  }
+}
+
+document.addEventListener("DOMContentLoaded",()=>{ loadProviders().then(load); probeChat(); });
