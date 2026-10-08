@@ -306,14 +306,13 @@ def test_gate_cite_only_fragment_merges():
     assert len(sents) == 1
 
 
-def test_gate_demo_unrelated_cite_passes_mechanical_check():
-    """Honest-limit test: a misleading sentence with a syntactically valid
-    cite can pass. The gate is lexical, not an entailment checker."""
+def test_gate_drops_unrelated_citation_prose():
+    """A syntactically valid cite cannot authorize unrelated domain prose."""
     r = gate.gate_reply(
         "Postgres is a database engine. [m-abc]", _recalled()
     )
-    # passes lexical checks despite weak relevance — documented limitation
-    assert r["kept"]
+    assert r["kept"] == []
+    assert r["dropped"][0].reason == "UNSUPPORTED_TEXT"
 
 
 # --- receipts ----------------------------------------------------------------
