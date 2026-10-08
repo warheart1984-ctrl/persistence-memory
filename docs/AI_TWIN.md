@@ -97,6 +97,41 @@ digest = sha256("\n".join(lines))
 wire — it lives in pg `record_history` — so the digest binds `content_sha256`
 today; upgrading to `row_hash` when exposed is a documented future change.
 
+## TwinState.v1 (`app/twin_state.py`)
+
+The deterministic fact sheet a narrator may describe. Built from a
+`FilteredRecords` (non-archived subset of the twin's filtered view) with
+injected `now`; pure, no I/O. `GET /api/jarvis/twin/state` (behind
+`JARVIS_TWIN_ENABLED`) serves it for the caller's tenant only.
+
+| Field | Rule |
+|---|---|
+| `schema` | literal `"TwinState.v1"` |
+| `as_of` | injected `now`, ISO-8601 UTC |
+| `identity` | caller's tenant key (`"operator"` when unauthenticated) |
+| `twin_input_digest` | the hardened twin's input digest |
+| `coverage_index`, `components`, `weakest_component` | the hardened twin's vector — `weakest_component` ties break by fixed component order |
+| `active_projects` | distinct **tags** with ≥1 live non-twin record created within `now − 14d` (tags are the shared axis; subjects are phrases) |
+| `recent_accomplishments` | `status=="verified"` records, newest first, top 5 → `{record_id, subject, summary}` — `summary` is record content **verbatim** |
+| `open_risks` | unresolved conflict sets (`{kind:"conflict", subject, record_ids}` — sorted ids) **plus** records tagged **exactly `risk`** (`{kind:"tag", record_id, text}` verbatim). `security`, `todo`, `Risk` etc. do NOT widen it — pinned by `test_risk_tag_is_exactly_risk_not_security_or_todo` |
+| `stale_commitments` | `type=="task"`, not archived, not superseded, whose subject has seen no newer non-twin record within `now − 14d` → `{record_id, subject, summary, days_since_update}` |
+| `recommended_mission` | the twin's weakest-component mission |
+| `record_count`, `skipped_records` | filtered-set size and validation drops |
+| `state_digest` | SHA-256 over canonical JSON (sorted keys, compact separators) of every field **except itself** |
+
+`confidence` is deliberately absent — `coverage_index` is the only scalar; a
+second number would be undefended.
+
+Determinism: identical inputs (any order) → identical `state_digest`
+(`test_state_deterministic_under_shuffle_and_digest_stable`). Twin-authored
+records are byte-invisible to every field.
+
+## Narrator
+
+See `docs/TWIN_NARRATOR.md` — adapters, the clause-level gate, the template
+fallback, receipts, and the flag split (`/twin/state`+`/twin/providers` under
+`JARVIS_TWIN_ENABLED`; `/twin/narration` under both flags).
+
 ## Proven
 
 Everything in the invariants table above, on `tests/test_twin.py`

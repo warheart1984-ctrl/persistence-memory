@@ -103,6 +103,9 @@ from app.twin import (
     is_twin_authored,
     twin_memory_payload,
 )
+from app.twin_state import build_twin_state
+import app.narrator as narrator
+from app.narrator.base import NarratorError
 from app.graph import (
     BfsBody,
     ComponentsBody,
@@ -553,6 +556,65 @@ def twin_daily(
     result["persisted"] = "created"
     result["memory_id"] = rec.id
     return _with_clause_v_warnings(result)
+
+
+def _twin_guard(request: Request) -> None:
+    """404 when the twin is dark; mirrors the ledger-read operator-key check."""
+    if not _env_flag("JARVIS_TWIN_ENABLED"):
+        raise HTTPException(status_code=404, detail="Not found")
+    if not oauth_enabled() and ledger_read_protected():
+        verify_operator_api_key(
+            request.headers.get("authorization"),
+            request.headers.get("x-emr-recall-key"),
+        )
+
+
+def _twin_state_for_request(request: Request):
+    """Tenant-scoped state for the caller — the twin never sees other tenants."""
+    _twin_guard(request)
+    store = get_store()
+    now = datetime.now(timezone.utc)
+    records = FilteredRecords.from_records(
+        store.list_memories(limit=100000, truth_scope="live")
+    )
+    tenant = current_tenant_key() or "operator"
+    return build_twin_state(records, identity_id=tenant, now=now)
+
+
+@app.get("/api/jarvis/twin/state")
+def twin_state(request: Request):
+    """TwinState.v1 — read-only. JARVIS_TWIN_ENABLED off -> 404."""
+    return {"state": _twin_state_for_request(request)}
+
+
+@app.get("/api/jarvis/twin/providers")
+def twin_providers(request: Request):
+    """Configured narrator providers — names and models only, never URLs/keys."""
+    _twin_guard(request)
+    try:
+        return {"providers": narrator.provider_catalog()}
+    except NarratorError as exc:
+        raise HTTPException(status_code=400, detail=exc.code) from exc
+
+
+@app.get("/api/jarvis/twin/narration")
+def twin_narration(request: Request, provider: str = Query(default="none")):
+    """Gated narration over TwinState — model text never ships unchecked.
+
+    Requires BOTH JARVIS_TWIN_ENABLED and JARVIS_TWIN_NARRATOR_ENABLED
+    (404 otherwise). Unknown provider -> 400 NARRATOR_UNKNOWN. Any model
+    failure falls back to the deterministic template; the receipt records it.
+    """
+    _twin_guard(request)
+    if not _env_flag("JARVIS_TWIN_NARRATOR_ENABLED"):
+        raise HTTPException(status_code=404, detail="Not found")
+    try:
+        cfg, adapter = narrator.get_adapter(provider)
+    except NarratorError as exc:
+        raise HTTPException(status_code=400, detail=exc.code) from exc
+    state = _twin_state_for_request(request)
+    out = narrator.narrate_state(state, cfg, adapter)
+    return {"state": state, "narration": out["sections"], "receipt": out["receipt"]}
 
 
 @app.post("/api/jarvis/memory/external-search", dependencies=[Depends(require_emr_recall_api_key)])
