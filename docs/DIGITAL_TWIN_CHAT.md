@@ -44,7 +44,7 @@ default like the rest of the twin surface.
 refused persist never spends a turn.
 
 Error codes: `404` when dark · `403 TWIN_CHAT_PERSIST_DISABLED` ·
-`409 SESSION_BUSY` (lease held; stale leases recover after 120 s) ·
+`409 SESSION_BUSY` (lease held; current-format stale leases recover after 120 s) ·
 `503 RECEIPT_STORE_FULL`.
 
 ## Configuration
@@ -80,7 +80,13 @@ do not — by design.
   `JARVIS_TWIN_CHAT_DIR`; writes take `BEGIN IMMEDIATE` and sessions are
   leased. Two replicas pointed at one file will serialize on the file lock
   — run one chat replica per file, or keep chat on the same instance as
-  the ledger.
+  the ledger. During an upgrade, owner-less leases from older workers are
+  treated as busy because their monotonic deadlines cannot be compared with
+  wall time safely. Let old workers finish and release them. If an old worker
+  died, first stop all old workers and drain in-flight requests, then remove
+  only the confirmed orphaned `(tenant_key, session_id)` row from the
+  `leases` table; do not clear owner-less leases while old workers can still
+  be serving turns.
 - **Backups.** Receipts are evidence. Include `JARVIS_TWIN_CHAT_DIR` in
   whatever backup covers the ledger.
 - **Persistence path.** Draft writes go through `store.create_memory`, so

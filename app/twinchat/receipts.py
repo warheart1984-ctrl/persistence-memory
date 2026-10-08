@@ -64,6 +64,21 @@ def _max_bytes() -> int:
 _DB_LOCK = threading.Lock()
 
 
+def _enable_wal(conn: sqlite3.Connection) -> None:
+    """Set WAL mode, retrying the transient lock from concurrent startup."""
+    deadline = time.monotonic() + 10
+    while True:
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            return
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                raise
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
+
+
 class ReceiptStore:
     """One SQLite database per host; safe across threads and processes."""
 
@@ -71,7 +86,7 @@ class ReceiptStore:
         self._path = path or (_dir() / "receipts.sqlite3")
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self._path), check_same_thread=False, timeout=10)
-        self._conn.execute("PRAGMA journal_mode=WAL")
+        _enable_wal(self._conn)
         self._conn.execute("PRAGMA busy_timeout=10000")
         # Reads run on their own connection: WAL snapshot isolation means
         # they can never observe another transaction's uncommitted rows —
@@ -112,12 +127,21 @@ class ReceiptStore:
         # owner column landed after the first deployments — add it to older
         # files without touching rows (an owner-less row is treated as an
         # abandoned lease and is releasable by the token-less legacy path).
-        lease_cols = {
-            r[1] for r in self._conn.execute("PRAGMA table_info(leases)").fetchall()
-        }
-        if "owner" not in lease_cols:
-            self._conn.execute("ALTER TABLE leases ADD COLUMN owner TEXT")
+        # Serialize the check and ALTER across processes. Re-read the schema
+        # only after BEGIN IMMEDIATE: another worker may have completed the
+        # same migration while this connection was waiting for the write lock.
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            lease_cols = {
+                r[1]
+                for r in self._conn.execute("PRAGMA table_info(leases)").fetchall()
+            }
+            if "owner" not in lease_cols:
+                self._conn.execute("ALTER TABLE leases ADD COLUMN owner TEXT")
             self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
 
     # --- leases ------------------------------------------------------------
     # lease_until is WALL CLOCK — the row survives process restarts and is
@@ -137,10 +161,16 @@ class ReceiptStore:
         now = time.time()
         with _DB_LOCK:
             cur = self._conn.execute(
-                "SELECT lease_until FROM leases WHERE tenant_key=? AND session_id=?",
+                "SELECT lease_until, owner FROM leases WHERE tenant_key=? AND session_id=?",
                 (tenant_key, session_id),
             )
             row = cur.fetchone()
+            # Owner-less rows predate owner tokens and may store a monotonic
+            # deadline. A wall-clock comparison cannot establish that such a
+            # lease is stale. Keep it busy until the old worker releases it or
+            # an operator drains old workers and removes the orphaned row.
+            if row is not None and row[1] is None:
+                return False, False, None
             if row is not None and row[0] > now:
                 return False, False, None
             stale = row is not None
