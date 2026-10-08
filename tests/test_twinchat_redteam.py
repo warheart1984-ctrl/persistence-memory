@@ -83,14 +83,21 @@ def test_a_lone_cite_marker_is_not_a_reply():
 
 # --- F5: shown metadata is citable -------------------------------------------
 
-def test_confidence_and_status_are_citable_when_true():
-    """The persona contract permits discussing shown metadata — the gate must
-    not kill an accurate restatement of it."""
-    out = gate_reply(
+def test_metadata_prose_dies_but_verbatim_extract_survives():
+    """F5, updated for the cited-value-support gate (PR #54): shown metadata
+    is citable, but free-form restatement drops UNSUPPORTED_TEXT — only an
+    exact extract of the cited value survives. The persona contract was
+    updated to match (it previously promised prose discussion of status and
+    confidence that the gate could never allow)."""
+    recalled = [_rec(status="verified", confidence=0.9)]
+    prose = gate_reply(
         "Its confidence is 0.9 and the record is verified [mem-abc123def456].",
-        [_rec(status="verified", confidence=0.9)],
+        recalled,
     )
-    assert out["dropped"] == []
+    assert prose["dropped"], "paraphrased metadata must not pass the grounding check"
+    assert prose["dropped"][0].reason == "UNSUPPORTED_TEXT"
+    extract = gate_reply("verified [mem-abc123def456].", recalled)
+    assert extract["kept"], "an exact extract of the cited status value should survive"
 
 
 def test_status_claim_word_still_dies_when_the_record_disagrees():
@@ -204,7 +211,10 @@ def test_oversized_reply_does_not_raise_after_receipt_commits(tmp_path, monkeypa
         subject="deploy", status="verified", session_id="seed",
         evidence=[EvidenceLink(kind="receipt", ref="seed:r1")],
     ))
-    big = ("deploy uses postgres " * 600 + f"[{rec.id}]")
+    # Verbatim-extract sentences are the only form that survives the gate —
+    # 350 of them exceed the 8000-char Turn bound.
+    big = ". ".join([f"deploy uses postgres [{rec.id}]"] * 350)
+    assert len(big) > 8000
 
     class BigBackend:
         name = "big"
