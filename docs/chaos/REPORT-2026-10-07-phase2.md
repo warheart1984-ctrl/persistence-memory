@@ -80,7 +80,7 @@ None of these was a ledger failure; each was found by the run or by the tests be
 * **Retrieval cost follows ledger size.** A typical retrieve 5 ms → 357 ms and a hostile-string one 4 ms → 309 ms over 6 400 entries (log-log exponents
   0.93 and 0.99: linear); `history/verify` 6 → 360 ms (0.93); `blocks/verify` 8 → 121 ms (0.70).
 * Nothing was changed for this: it is how retrieval is built (every record is read and scored in Python, then limited), not a fault. It is the limit to plan
-  around (40 simultaneous retrievals on 6 400 entries is 270 MiB), and the candidates are in the next section.
+  around. Latency is measured and linear; what 40 simultaneous retrievals cost in memory is **not** measured (the only 40-caller level was invalid, above), and the candidates are in the next section.
 
 ## Anything unexpected
 
@@ -95,7 +95,7 @@ None of these was a ledger failure; each was found by the run or by the tests be
 4. The first fault run stopped at round 1 against the 6 000-entry cap: the cap works, and my writers were too fast.
 
 Candidates if retrieval ever has to scale (not done, not proven necessary at today's size): do the type/status/session/subject filters and the `limit` in SQL
-before scoring, cap concurrent retrievals below the pool size so a burst cannot hold 40 copies, and stream rather than materialise.
+before scoring, cap concurrent retrievals below the pool size so a burst cannot hold many copies at once, and stream rather than materialise.
 
 ## What this run could not test
 
