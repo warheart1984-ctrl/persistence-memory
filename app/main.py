@@ -5,6 +5,7 @@ import logging
 import os
 import secrets
 import subprocess
+import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -145,6 +146,7 @@ async def lifespan(app: FastAPI):
     """Application lifespan: track and cleanup background nx-search processes."""
     # Store for background processes
     app.state.nx_background = {"watch": None, "serve": None}
+    app.state.nx_background_lock = threading.Lock()
     yield
     # Cleanup on shutdown
     for name, proc in app.state.nx_background.items():
@@ -829,20 +831,25 @@ def external_ask(body: NxAskRequest):
     return result
 
 
+def _nx_pref_key(key: str) -> str:
+    """nx-search keeps one local preference store; namespace non-operator tenants so keys cannot collide across tenants."""
+    tenant = current_tenant_key()
+    return key if not tenant or tenant == "operator" else f"{tenant}/{key}"
+
+
 @app.post("/api/jarvis/memory/external/remember", dependencies=[Depends(require_nx_enabled), Depends(require_nx_write), Depends(require_memory_write)])
 def external_remember(body: NxRememberRequest, request: Request):
     """Store a persistent preference — written to BOTH nx-search AND the Continuity Ledger as evidenced record."""
     client = NxSearchClient()
     
     # 1. Write to nx-search local memory
-    result = client.remember(body.key, body.value)
+    result = client.remember(_nx_pref_key(body.key), body.value)
     if "error" in result:
         raise HTTPException(status_code=502, detail=result["error"])
     
     # 2. Also write to ledger as evidenced memory record
     store = get_store()
     try:
-        tenant = current_tenant_key() or "operator"
         ledger_data = {
             "content": f"nx-search preference: {body.key} = {body.value}",
             "source_agent": "nx-search-bridge",
@@ -850,7 +857,7 @@ def external_remember(body: NxRememberRequest, request: Request):
             "type": "external_context",
             "confidence": 1.0,
             "evidence": [
-                {"kind": "nx_memory", "ref": f"nx:{body.key}", "note": "nx-search persistent preference"}
+                {"kind": "nx_memory", "ref": f"nx:{_nx_pref_key(body.key)}", "note": "nx-search persistent preference"}
             ],
             "subject": f"nx-preference:{body.key}",
             "tags": ["nx-search", "preference", "user-configured"],
@@ -872,21 +879,23 @@ def external_forget(body: NxForgetRequest, request: Request):
     client = NxSearchClient()
     
     # 1. Forget from nx-search
-    result = client.forget(body.key)
+    result = client.forget(_nx_pref_key(body.key))
     if "error" in result:
         raise HTTPException(status_code=502, detail=result["error"])
     
     # 2. Archive in ledger
     store = get_store()
     try:
-        tenant = current_tenant_key() or "operator"
-        # Find and archive the ledger record
-        memories = store.list_memories(limit=100, subject=f"nx-preference:{body.key}")
-        for mem in memories:
-            if mem.type == "external_context" and f"nx-preference:{body.key}" in (mem.subject or ""):
+        # Every live record for this key (repeated remembers each wrote one); the store is already tenant-scoped.
+        subject = f"nx-preference:{body.key}"
+        archived = []
+        for mem in store.list_memories(limit=1_000_000, truth_scope="live", subject=subject):
+            if mem.type == "external_context":
                 store.update_memory(mem.id, MemoryUpdate(status="archived"))
-                result["ledger_archived"] = mem.id
-                break
+                archived.append(mem.id)
+        if archived:
+            result["ledger_archived"] = archived[0]
+            result["ledger_archived_ids"] = archived
     except Exception as e:
         result["ledger_status"] = f"archive_failed: {e}"
     
@@ -1010,18 +1019,16 @@ def external_prune(paths: list[str] = Query(..., min_length=1, max_length=10), r
 @app.post("/api/jarvis/memory/external/watch", dependencies=[Depends(require_nx_enabled), Depends(require_nx_write), Depends(require_memory_write)])
 def external_watch(body: NxWatchRequest, request: Request):
     """Start file watcher for incremental index maintenance. One instance max, capped by feature flag."""
-    # Check if already running
-    existing = request.app.state.nx_background.get("watch")
-    if existing and existing.poll() is None:
-        raise HTTPException(status_code=409, detail="Watch already running (stop it first or wait for shutdown)")
-    
     validated_paths = [str(validate_nx_path(p)) for p in body.paths]
-    
-    client = NxSearchClient()
-    proc = client.watch(validated_paths, debounce_ms=body.debounce_ms, no_reconcile=body.no_reconcile)
-    
-    request.app.state.nx_background["watch"] = proc
-    
+
+    # Check, spawn and store as one step: two concurrent starts must not both see "not running".
+    with request.app.state.nx_background_lock:
+        existing = request.app.state.nx_background.get("watch")
+        if existing and existing.poll() is None:
+            raise HTTPException(status_code=409, detail="Watch already running (stop it first or wait for shutdown)")
+        proc = NxSearchClient().watch(validated_paths, debounce_ms=body.debounce_ms, no_reconcile=body.no_reconcile)
+        request.app.state.nx_background["watch"] = proc
+
     _audit_log("nx_watch_start", request, {"paths": validated_paths, "debounce_ms": body.debounce_ms, "pid": proc.pid})
     return {"status": "started", "pid": proc.pid, "paths": validated_paths, "debounce_ms": body.debounce_ms}
 
@@ -1029,19 +1036,20 @@ def external_watch(body: NxWatchRequest, request: Request):
 @app.post("/api/jarvis/memory/external/watch/stop", dependencies=[Depends(require_nx_enabled), Depends(require_nx_write), Depends(require_memory_write)])
 def external_watch_stop(request: Request):
     """Stop the file watcher."""
-    existing = request.app.state.nx_background.get("watch")
-    if not existing or existing.poll() is not None:
-        return {"status": "not_running"}
+    with request.app.state.nx_background_lock:
+        existing = request.app.state.nx_background.get("watch")
+        if not existing or existing.poll() is not None:
+            return {"status": "not_running"}
     
-    existing.terminate()
-    try:
-        existing.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        existing.kill()
-        existing.wait()
+        existing.terminate()
+        try:
+            existing.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            existing.kill()
+            existing.wait()
     
-    request.app.state.nx_background["watch"] = None
-    
+        request.app.state.nx_background["watch"] = None
+
     _audit_log("nx_watch_stop", request, {})
     return {"status": "stopped"}
 
@@ -1049,15 +1057,13 @@ def external_watch_stop(request: Request):
 @app.post("/api/jarvis/memory/external/serve", dependencies=[Depends(require_nx_enabled), Depends(require_nx_write), Depends(require_memory_write)])
 def external_serve(port: int = Query(default=7788, ge=1024, le=65535), request: Request = None):
     """Start web UI server on specified port. One instance max, capped by feature flag."""
-    existing = request.app.state.nx_background.get("serve")
-    if existing and existing.poll() is None:
-        raise HTTPException(status_code=409, detail="Serve already running on another port (stop it first)")
-    
-    client = NxSearchClient()
-    proc = client.serve(port)
-    
-    request.app.state.nx_background["serve"] = proc
-    
+    with request.app.state.nx_background_lock:
+        existing = request.app.state.nx_background.get("serve")
+        if existing and existing.poll() is None:
+            raise HTTPException(status_code=409, detail="Serve already running on another port (stop it first)")
+        proc = NxSearchClient().serve(port)
+        request.app.state.nx_background["serve"] = proc
+
     _audit_log("nx_serve_start", request, {"port": port, "pid": proc.pid})
     return {"status": "started", "pid": proc.pid, "port": port, "url": f"http://127.0.0.1:{port}"}
 
@@ -1065,19 +1071,20 @@ def external_serve(port: int = Query(default=7788, ge=1024, le=65535), request: 
 @app.post("/api/jarvis/memory/external/serve/stop", dependencies=[Depends(require_nx_enabled), Depends(require_nx_write), Depends(require_memory_write)])
 def external_serve_stop(request: Request):
     """Stop the web UI server."""
-    existing = request.app.state.nx_background.get("serve")
-    if not existing or existing.poll() is not None:
-        return {"status": "not_running"}
+    with request.app.state.nx_background_lock:
+        existing = request.app.state.nx_background.get("serve")
+        if not existing or existing.poll() is not None:
+            return {"status": "not_running"}
     
-    existing.terminate()
-    try:
-        existing.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        existing.kill()
-        existing.wait()
+        existing.terminate()
+        try:
+            existing.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            existing.kill()
+            existing.wait()
     
-    request.app.state.nx_background["serve"] = None
-    
+        request.app.state.nx_background["serve"] = None
+
     _audit_log("nx_serve_stop", request, {})
     return {"status": "stopped"}
 

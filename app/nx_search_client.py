@@ -335,9 +335,9 @@ class NxSearchClient:
             args.append("--no-reconcile")
         return subprocess.Popen(
             [self._node, self._get_nx_bin()] + args,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+            # Nothing reads these long-running children; an undrained PIPE fills and silently stalls them.
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
 
     def scan(self, paths: list[str] | None = None, rebuild: bool = False) -> dict[str, Any]:
@@ -368,9 +368,9 @@ class NxSearchClient:
             args += ["--port", str(port)]
         return subprocess.Popen(
             [self._node, self._get_nx_bin()] + args,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
+            # Nothing reads these long-running children; an undrained PIPE fills and silently stalls them.
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
 
     def _cli_cmd(self, *args: str) -> dict[str, Any]:

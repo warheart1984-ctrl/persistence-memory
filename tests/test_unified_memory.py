@@ -454,3 +454,141 @@ def test_the_client_alone_refuses_while_the_master_switch_is_off(monkeypatch):
     client = NxSearchClient(nx_path="/nowhere", require_available=False)
     assert "disabled" in client.search("x")["error"]
     assert "disabled" in client.stats()["error"]
+
+
+# --- remember/forget: tenant namespace, and forget archives every live record ------------------------------------
+
+class _PrefClient:
+    def __init__(self, *a, **k):
+        self.remembered, self.forgotten = [], []
+
+    def remember(self, key, value):
+        self.remembered.append((key, value))
+        return {"ok": True}
+
+    def forget(self, key):
+        self.forgotten.append(key)
+        return {"ok": True}
+
+    def close(self):
+        pass
+
+
+@pytest.fixture()
+def pref_env(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    import app.main as main
+
+    monkeypatch.setenv("JARVIS_NX_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_NX_WRITE_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_MEMORY_WRITE_ENABLED", "true")
+    client = _PrefClient()
+    monkeypatch.setattr(main, "NxSearchClient", lambda *a, **k: client)
+    return TestClient(main.app), client, main
+
+
+def test_nx_preference_keys_are_namespaced_for_non_operator_tenants(pref_env, monkeypatch):
+    http, client, main = pref_env
+    monkeypatch.setattr(main, "current_tenant_key", lambda: "tenant-a")
+    http.post("/api/jarvis/memory/external/remember", json={"key": "theme", "value": "dark"})
+    http.post("/api/jarvis/memory/external/forget", json={"key": "theme"})
+    assert client.remembered == [("tenant-a/theme", "dark")]
+    assert client.forgotten == ["tenant-a/theme"]
+
+
+def test_nx_preference_keys_stay_plain_for_the_operator(pref_env, monkeypatch):
+    http, client, main = pref_env
+    monkeypatch.setattr(main, "current_tenant_key", lambda: None)
+    http.post("/api/jarvis/memory/external/remember", json={"key": "theme", "value": "dark"})
+    assert client.remembered == [("theme", "dark")]
+
+
+def test_forget_archives_every_live_record_for_the_key_beyond_100(pref_env):
+    http, client, main = pref_env
+    archived = []
+
+    def mem(i):
+        return type("M", (), {"id": f"m{i}", "type": "external_context", "subject": "nx-preference:theme"})()
+
+    class Store:
+        def list_memories(self, **kw):
+            assert kw.get("truth_scope") == "live" and kw["limit"] > 100
+            return [mem(i) for i in range(150)]
+
+        def update_memory(self, mid, upd):
+            archived.append((mid, upd.status))
+
+    main_store = main.get_store
+    try:
+        main.get_store = lambda: Store()
+        response = http.post("/api/jarvis/memory/external/forget", json={"key": "theme"})
+    finally:
+        main.get_store = main_store
+    assert response.status_code == 200, response.text
+    assert len(archived) == 150 and {s for _, s in archived} == {"archived"}
+
+
+# --- watch/serve: one process even under concurrent starts; children never get undrained pipes -------------------
+
+class _FakeProc:
+    pid = 4242
+
+    def poll(self):
+        return None
+
+    def terminate(self):
+        pass
+
+    def wait(self, timeout=None):
+        pass
+
+
+def test_concurrent_watch_starts_spawn_exactly_one_process(monkeypatch, tmp_path):
+    import threading
+    import time
+
+    from fastapi.testclient import TestClient
+
+    import app.main as main
+
+    monkeypatch.setenv("NX_SCAN_ROOTS", str(tmp_path))
+    monkeypatch.setenv("JARVIS_NX_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_NX_WRITE_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_MEMORY_WRITE_ENABLED", "true")
+    spawned = []
+
+    class Client:
+        def watch(self, *a, **k):
+            time.sleep(0.2)  # widen the check-then-store window
+            spawned.append(1)
+            return _FakeProc()
+
+    monkeypatch.setattr(main, "NxSearchClient", lambda *a, **k: Client())
+    with TestClient(main.app) as http:
+        http.app.state.nx_background["watch"] = None
+        codes = []
+        threads = [
+            threading.Thread(target=lambda: codes.append(http.post("/api/jarvis/memory/external/watch", json={"paths": [str(tmp_path)]}).status_code))
+            for _ in range(4)
+        ]
+        [t.start() for t in threads]
+        [t.join() for t in threads]
+        http.app.state.nx_background["watch"] = None
+    assert len(spawned) == 1 and sorted(codes) == [200, 409, 409, 409]
+
+
+def test_background_children_do_not_use_undrained_pipes(monkeypatch):
+    import app.nx_search_client as nxc
+
+    seen = []
+    monkeypatch.setattr(nxc, "_master_switch_on", lambda: True)
+    monkeypatch.setattr(nxc.subprocess, "Popen", lambda cmd, **kw: seen.append(kw) or _FakeProc())
+    client = nxc.NxSearchClient.__new__(nxc.NxSearchClient)
+    client._available, client._node = True, "node"
+    client._get_nx_bin = lambda: "nx.js"
+    client.watch(["/x"])
+    client.serve(7788)
+    assert len(seen) == 2
+    for kw in seen:
+        assert kw["stdout"] == nxc.subprocess.DEVNULL and kw["stderr"] == nxc.subprocess.DEVNULL
