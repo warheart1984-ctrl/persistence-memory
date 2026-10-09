@@ -1,16 +1,37 @@
-"""Append-only, digest-chained turn receipts — transactional SQLite on one host.
+"""Digest-chained turn receipts and session leases in one SQLite file on one host.
 
-Tables enforce unique ``(tenant_key, session_id, turn_index)`` and
-``(tenant_key, receipt_digest)``; a ``BEGIN IMMEDIATE`` transaction reads
-the session head, allocates the next index/previous digest, and inserts
-the immutable row atomically across processes on one host. A tenant/session
-lease allows only one in-flight request per session (409 when busy,
-abandoned leases expire after 120s and the next turn is marked
-``context_reset=True``). WAL + busy timeout are on.
+What the tests prove (tests/test_twinchat.py, tests/test_twinchat_redteam.py):
 
-No deletion or rotation in v1: a configured byte cap stops new turns
-(503) before the store is exhausted. SQLite on a shared network
-filesystem or multi-host deployment is unsupported.
+* a turn receipt is inserted with its turn index and previous digest allocated
+  inside one ``BEGIN IMMEDIATE`` transaction, so concurrent writers, in threads
+  or in separate processes, cannot fork or skip a session's chain;
+* acquiring a session lease is one ``BEGIN IMMEDIATE`` transaction too: of
+  several processes racing for the same free lease, exactly one gets it
+  (``test_lease_acquire_is_exclusive_across_processes``);
+* an expired lease is taken over and the next turn is marked
+  ``context_reset=True``; a stale owner's release cannot evict the new owner's
+  lease (the release is bound to the owner token).
+
+What it does NOT give you:
+
+* the chain is tamper-EVIDENT against editing one row, not tamper-PROOF: the
+  head is not anchored in the ledger or signed, so someone who can write the
+  file can rewrite a whole session consistently or delete its last turns
+  undetected;
+* a lease is not renewed: a turn that outlives the 120 s expiry loses its
+  exclusivity (its receipt append is still serialised, so the chain stays
+  linear, but two turns can then run on one session);
+* lease expiry uses the wall clock, so a clock step can shorten or stretch it;
+* ``JARVIS_TWIN_CHAT_MAX_BYTES`` caps the main database file only (not the WAL),
+  is shared by every tenant, and nothing is ever deleted or rotated: one chatty
+  tenant can fill it and stop every tenant's turns (503);
+* the draft-record write to the ledger and the outcome receipt here are two
+  stores with no shared transaction;
+* SQLite on a network filesystem, or one file shared by several hosts, is
+  unsupported.
+
+Open issues for the items above: #58 persist atomicity, #59 quotas and the WAL-aware
+cap, #60 session cache, #61 anchoring heads, #62 lease renewal and clock, #63 session ids.
 """
 
 from __future__ import annotations
@@ -124,12 +145,14 @@ class ReceiptStore:
             );
             """
         )
-        # owner column landed after the first deployments — add it to older
-        # files without touching rows (an owner-less row is treated as an
-        # abandoned lease and is releasable by the token-less legacy path).
-        # Serialize the check and ALTER across processes. Re-read the schema
-        # only after BEGIN IMMEDIATE: another worker may have completed the
-        # same migration while this connection was waiting for the write lock.
+        # The first merged version of this table (PR #53) had no owner column.
+        # No deployment ever ran that version (checked 2026-10-08: the live
+        # image predates twinchat), but a development database created by it
+        # would fail on its first INSERT, so the column is still added, once,
+        # without touching rows. Serialize the check and ALTER across
+        # processes; re-read the schema only after BEGIN IMMEDIATE, because
+        # another worker may have completed the migration while this one
+        # waited for the write lock.
         self._conn.execute("BEGIN IMMEDIATE")
         try:
             lease_cols = {
@@ -157,46 +180,45 @@ class ReceiptStore:
         the next turn is marked ``context_reset=True``. The owner token must
         be handed back to ``release_lease`` — a stale owner's release must
         never evict a takeover lease.
+
+        The read and the write are one ``BEGIN IMMEDIATE`` transaction: the
+        in-process ``_DB_LOCK`` only orders threads, and without the SQLite
+        write lock several processes could each see "free" and each take the
+        lease. A row with no owner (a development database from before owner
+        tokens, holding a process-relative deadline far below the epoch) reads
+        as expired and is taken over like any other abandoned lease.
         """
         now = time.time()
         with _DB_LOCK:
-            cur = self._conn.execute(
-                "SELECT lease_until, owner FROM leases WHERE tenant_key=? AND session_id=?",
-                (tenant_key, session_id),
-            )
-            row = cur.fetchone()
-            # Owner-less rows predate owner tokens and may store a monotonic
-            # deadline. A wall-clock comparison cannot establish that such a
-            # lease is stale. Keep it busy until the old worker releases it or
-            # an operator drains old workers and removes the orphaned row.
-            if row is not None and row[1] is None:
-                return False, False, None
-            if row is not None and row[0] > now:
-                return False, False, None
-            stale = row is not None
-            token = secrets.token_hex(8)
-            self._conn.execute(
-                "INSERT OR REPLACE INTO leases (tenant_key, session_id, lease_until, owner)"
-                " VALUES (?, ?, ?, ?)",
-                (tenant_key, session_id, now + LEASE_TTL_S, token),
-            )
-            self._conn.commit()
-            return True, stale, token
-
-    def release_lease(self, tenant_key: str, session_id: str, token: str | None = None) -> None:
-        """Only the acquiring token releases its lease. A token-less call can
-        only clear owner-less rows left by pre-owner deployments."""
-        with _DB_LOCK:
-            if token is None:
-                self._conn.execute(
-                    "DELETE FROM leases WHERE tenant_key=? AND session_id=? AND owner IS NULL",
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT lease_until FROM leases WHERE tenant_key=? AND session_id=?",
                     (tenant_key, session_id),
-                )
-            else:
-                self._conn.execute(
-                    "DELETE FROM leases WHERE tenant_key=? AND session_id=? AND owner=?",
-                    (tenant_key, session_id, token),
-                )
+                ).fetchone()
+                held = row is not None and row[0] > now
+                token = secrets.token_hex(8)
+                if not held:
+                    self._conn.execute(
+                        "INSERT OR REPLACE INTO leases (tenant_key, session_id, lease_until, owner)"
+                        " VALUES (?, ?, ?, ?)",
+                        (tenant_key, session_id, now + LEASE_TTL_S, token),
+                    )
+                self._conn.execute("COMMIT" if not held else "ROLLBACK")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+        if held:
+            return False, False, None
+        return True, row is not None, token
+
+    def release_lease(self, tenant_key: str, session_id: str, token: str) -> None:
+        """Release a lease, only if ``token`` still owns it."""
+        with _DB_LOCK:
+            self._conn.execute(
+                "DELETE FROM leases WHERE tenant_key=? AND session_id=? AND owner=?",
+                (tenant_key, session_id, token),
+            )
             self._conn.commit()
 
     # --- turn receipts -----------------------------------------------------

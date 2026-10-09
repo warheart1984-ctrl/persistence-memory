@@ -44,7 +44,7 @@ default like the rest of the twin surface.
 refused persist never spends a turn.
 
 Error codes: `404` when dark · `403 TWIN_CHAT_PERSIST_DISABLED` ·
-`409 SESSION_BUSY` (lease held; current-format stale leases recover after 120 s) ·
+`409 SESSION_BUSY` (lease held; an abandoned lease is taken over after 120 s) ·
 `503 RECEIPT_STORE_FULL`.
 
 ## Configuration
@@ -80,13 +80,23 @@ do not — by design.
   `JARVIS_TWIN_CHAT_DIR`; writes take `BEGIN IMMEDIATE` and sessions are
   leased. Two replicas pointed at one file will serialize on the file lock
   — run one chat replica per file, or keep chat on the same instance as
-  the ledger. During an upgrade, owner-less leases from older workers are
-  treated as busy because their monotonic deadlines cannot be compared with
-  wall time safely. Let old workers finish and release them. If an old worker
-  died, first stop all old workers and drain in-flight requests, then remove
-  only the confirmed orphaned `(tenant_key, session_id)` row from the
-  `leases` table; do not clear owner-less leases while old workers can still
-  be serving turns.
+  the ledger. Lease acquisition and receipt append are each one
+  `BEGIN IMMEDIATE` transaction, so they hold across worker processes
+  (`tests/test_twinchat_redteam.py::test_lease_acquire_is_exclusive_across_processes`).
+  An early development database that predates owner tokens gets the `owner`
+  column added on open, and its leftover rows read as abandoned leases; no
+  deployment ever ran that version (the live image predates TwinChat), so
+  there is no upgrade procedure and no manual cleanup.
+- **What the receipts do not give you.** The chain is tamper-evident against
+  editing a row, not tamper-proof: heads are not anchored in the ledger or
+  signed, so someone who can write the file can rewrite a session or drop its
+  last turns without detection. Leases are not renewed (a turn longer than 120 s
+  can overlap the next), expiry uses the wall clock, and the byte cap is one
+  shared limit on the main file only, so one tenant can use it all. The draft
+  write to the ledger and the outcome receipt are two stores with no shared
+  transaction. Tracked: persist atomicity and idempotency #58, per-tenant quotas
+  and a WAL-aware cap #59, session cache size #60, anchoring receipt heads in the
+  ledger #61, lease renewal and the clock #62, server-issued session ids #63.
 - **Backups.** Receipts are evidence. Include `JARVIS_TWIN_CHAT_DIR` in
   whatever backup covers the ledger.
 - **Persistence path.** Draft writes go through `store.create_memory`, so

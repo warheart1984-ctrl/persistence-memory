@@ -23,10 +23,14 @@ F10 persist receipts carry no timestamp
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import threading
 import time
+from pathlib import Path
+
+import pytest
 
 from app.twinchat.gate import gate_reply
 from app.twinchat.extract import extract
@@ -144,35 +148,63 @@ def test_stale_lease_takeover_after_expiry(tmp_path):
     assert acquired and stale
 
 
-def test_legacy_ownerless_lease_is_not_stolen_during_clock_migration(tmp_path):
-    """A pre-owner lease may contain a monotonic deadline from another process.
-
-    Until old workers have drained, the new wall-clock code cannot infer
-    whether that lease is active. It must fail closed instead of stealing it.
-    """
+def test_a_development_database_from_before_owner_tokens_still_works(tmp_path):
+    """The first merged table (PR #53) had no owner column and stored a
+    process-relative deadline. No deployment ran it, but a development file might
+    hold such a row: the column is added, the row reads as an abandoned lease
+    (a monotonic reading is far below the epoch), it is taken over as stale, and
+    the new owner's token releases it. There is no token-less release."""
     db = tmp_path / "legacy.sqlite3"
     conn = sqlite3.connect(str(db))
     conn.execute(
         "CREATE TABLE leases (tenant_key TEXT NOT NULL, session_id TEXT NOT NULL,"
         " lease_until REAL NOT NULL, PRIMARY KEY (tenant_key, session_id))"
     )
-    conn.execute(
-        "INSERT INTO leases VALUES ('t', 's', ?)", (time.monotonic() + 30,)
-    )
+    conn.execute("INSERT INTO leases VALUES ('t', 's', ?)", (time.monotonic() + 30,))
     conn.commit()
     conn.close()
 
     store = ReceiptStore(db)
     acquired, stale, token = store.acquire_lease("t", "s")
-    assert not acquired and not stale and token is None, (
-        "new wall-clock worker stole an owner-less lease from a pre-upgrade worker"
-    )
+    assert acquired and stale and token
+    assert not store.acquire_lease("t", "s")[0]          # now held by the new owner
+    store.release_lease("t", "s", token=token)
+    assert store.acquire_lease("t", "s")[0]
+    with pytest.raises(TypeError):
+        store.release_lease("t", "s")                    # the token-less path is gone
 
-    # After the deployment has drained old workers, their token-less cleanup
-    # remains compatible and allows the next worker to start a turn.
-    store.release_lease("t", "s")
-    acquired, _, token = store.acquire_lease("t", "s")
-    assert acquired and token
+
+def _race_worker(db, barrier, n, out):
+    """One racing process: open its own store, then take session i's lease the instant the barrier opens."""
+    store = ReceiptStore(Path(db))
+    got = []
+    for i in range(n):
+        barrier.wait(timeout=60)
+        got.append(1 if store.acquire_lease("operator", f"s{i}")[0] else 0)
+    out.put(got)
+
+
+def test_lease_acquire_is_exclusive_across_processes(tmp_path):
+    """Four separate processes race for the same free lease, 100 sessions. The
+    in-process lock cannot help here; only the SQLite write lock can. When the
+    acquire was a plain SELECT then INSERT OR REPLACE, every session was won by
+    several processes (PR #57 review, reproduced 300 of 300)."""
+    import multiprocessing as mp
+
+    db = tmp_path / "race.sqlite3"
+    ReceiptStore(db)._conn.close()
+    n, procs = 100, 4
+    ctx = mp.get_context("spawn")                         # same on Linux CI and on Windows
+    barrier, out = ctx.Barrier(procs), ctx.Queue()
+    running = [ctx.Process(target=_race_worker, args=(str(db), barrier, n, out)) for _ in range(procs)]
+    for p in running:
+        p.start()
+    results = [out.get(timeout=120) for _ in running]
+    for p in running:
+        p.join(timeout=30)
+        assert p.exitcode == 0
+    winners = [sum(r[i] for r in results) for i in range(n)]
+    assert winners == [1] * n, f"sessions won by more than one process: {sum(w > 1 for w in winners)} of {n}"
 
 
 def test_concurrent_legacy_lease_schema_migration_is_serialized(tmp_path):
@@ -387,3 +419,59 @@ def test_backend_usage_is_receipted(tmp_path, monkeypatch):
     assert out.receipt.usage == {"prompt_tokens": 11, "completion_tokens": 7}, (
         "usage was captured by the backend but dropped before the receipt"
     )
+
+
+# --- review follow-ups on PR #57 ---------------------------------------------
+
+def test_provider_usage_is_reduced_to_known_integer_counters():
+    """A gateway can return any dict; it must not be stored verbatim in every receipt."""
+    huge = {"prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15,
+            "debug": "x" * 1_000_000, "nested": {"a": ["y" * 1000] * 1000},
+            "output_tokens": True, "input_tokens": -4}
+    out = svc._bounded_usage(huge)
+    assert out == {"prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15}
+    assert len(json.dumps(out)) < 200
+    assert svc._bounded_usage({"debug": "z"}) is None and svc._bounded_usage("nope") is None
+    assert svc._bounded_usage(None) is None
+
+
+def test_the_persona_contract_does_not_promise_a_numeric_confidence_extract():
+    """The gate drops a bare confidence number (UNSUPPORTED_TEXT), so the prompt must not
+    tell the model that confidence values survive as exact extracts."""
+    from app.twinchat.prompt import SYSTEM_PROMPT
+    recalled = [_rec(status="verified", confidence=0.9)]
+    assert gate_reply("0.9 [mem-abc123def456]", recalled)["dropped"]
+    assert "survive only as exact extracts" not in SYSTEM_PROMPT
+    assert "never state a record's confidence number" in SYSTEM_PROMPT
+
+
+def test_an_oversized_provider_usage_object_never_reaches_the_stored_receipt(tmp_path, monkeypatch):
+    """End to end: the receipt row a hostile or buggy gateway response produces stays small."""
+    os.environ["JARVIS_TWIN_CHAT_DIR"] = str(tmp_path)
+    monkeypatch.setenv("JARVIS_STORE_BOOTSTRAP", "1")
+    from app.store import get_store
+    from app.models import MemoryCreate, EvidenceLink
+    from app.twinchat.backends import BackendResult
+
+    store = get_store()
+    rec = store.create_memory(MemoryCreate(
+        type="fact", content="deploy uses postgres", source_agent="user:t",
+        subject="deploy", status="verified", session_id="seed",
+        evidence=[EvidenceLink(kind="receipt", ref="seed:r2")],
+    ))
+
+    class HostileUsage:
+        name = "metered"
+        def chat(self, messages, **kw):
+            return BackendResult(
+                text=f"deploy uses postgres [{rec.id}]", model="m1", latency_ms=3,
+                usage={"prompt_tokens": 5, "blob": "x" * 2_000_000},
+            )
+
+    receipts = ReceiptStore(tmp_path / "h.sqlite3")
+    monkeypatch.setattr(svc, "resolve_backend", lambda p: HostileUsage())
+    monkeypatch.setattr(svc, "get_receipt_store", lambda: receipts)
+    out = svc.run_turn(store, ChatRequest(session_id="s1", message="postgres deploy"), tenant_key="t")
+    assert out.receipt.usage == {"prompt_tokens": 5}
+    stored = receipts._conn.execute("SELECT length(body_json) FROM receipts").fetchone()[0]
+    assert stored < 20_000, f"a single receipt row grew to {stored} bytes"
