@@ -107,17 +107,9 @@ database URL or that opt-in the service answers 503 rather than creating a ledge
 * **One box.** Wi-Fi only, disk not encrypted, an hour's worth of data at risk between backups, no automatic security updates
   (`deploy/mint/README.md`, "Honest limits").
 * The ledger records claims; it does not evaluate them.
-* An AI Twin coverage index exists on `main` (`app/twin.py`, `docs/AI_TWIN.md`) — **off by default**
-  (`JARVIS_TWIN_ENABLED`), read-only, and it measures ledger structure, not truth.
-* A governed Twin Narrator also exists (`app/narrator/`, `docs/TWIN_NARRATOR.md`) — dark behind
-  `JARVIS_TWIN_NARRATOR_ENABLED`; model text is gated clause-by-clause against TwinState and
-  falls back to a deterministic template; narration writes nothing. A read-only dashboard
-  (`ui/twin/`) is served at `/ui/twin` behind `JARVIS_TWIN_ENABLED`.
-* A governed Twin Chat surface also exists (`app/twinchat/`, `docs/DIGITAL_TWIN_CHAT.md`) —
-  dark behind `JARVIS_TWIN_CHAT_ENABLED`; every model sentence must cite a recalled memory or
-  it is dropped, every turn writes a hash-chained receipt, and ledger writes are off unless
-  `JARVIS_TWIN_CHAT_PERSIST_ENABLED` — and even then only user-stated decisions land, as
-  drafts, with receipt evidence. Chat history is ephemeral; receipts are not.
+* The digital twin line (coverage index, narrator, Twin Chat, dashboard) used to live here and has been retired from the
+  ledger. It now lives in its own repository, `warheart1984-ctrl/jarvis-twin`; the simulation-only asset twin is in
+  `warheart1984-ctrl/asset-twin-sim`. The ledger exposes no twin routes.
 
 ## Docs
 
