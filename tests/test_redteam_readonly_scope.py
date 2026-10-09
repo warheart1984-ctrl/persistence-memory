@@ -110,4 +110,6 @@ def test_readonly_token_cannot_auto_promote_external_search(readonly_client, mon
     plain = readonly_client.post(
         "/api/jarvis/memory/external-search", json={**body, "auto_promote": False}
     )
-    assert plain.status_code == 200  # read-only search itself stays allowed
+    # nx-search reads the host filesystem with no per-tenant scoping, so even plain search is operator-only now
+    assert plain.status_code == 403 and "operator-only" in plain.text
+    assert calls == []

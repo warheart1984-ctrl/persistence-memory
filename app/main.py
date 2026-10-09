@@ -96,6 +96,7 @@ from app.auth import (
     nx_write_enabled,
     require_nx_write,
     require_nx_enabled,
+    require_nx_operator,
     validate_nx_path,
     nx_allowed_roots,
 )
@@ -739,7 +740,7 @@ def twin_ui_asset(request: Request, asset: str):
     return FileResponse(_TWIN_UI_DIR / asset, media_type=media)
 
 
-@app.post("/api/jarvis/memory/external-search", dependencies=[Depends(require_nx_enabled), Depends(require_emr_recall_api_key)])
+@app.post("/api/jarvis/memory/external-search", dependencies=[Depends(require_nx_enabled), Depends(require_nx_operator), Depends(require_emr_recall_api_key)])
 def external_search(body: ExternalSearchRequest):
     """Search nx-search; optional promotion remains bounded and auditable."""
     if body.auto_promote:
@@ -761,7 +762,7 @@ def external_search(body: ExternalSearchRequest):
     return {"external_results": results, "promoted_memories": promoted, "promotion_count": len(promoted)}
 
 
-@app.get("/api/jarvis/memory/unified", dependencies=[Depends(require_nx_enabled), Depends(require_emr_recall_api_key)])
+@app.get("/api/jarvis/memory/unified", dependencies=[Depends(require_nx_enabled), Depends(require_nx_operator), Depends(require_emr_recall_api_key)])
 def unified_search(
     query: str = Query(..., min_length=1, max_length=500),
     limit: int = Query(default=25, ge=1, le=100),
@@ -784,7 +785,7 @@ def unified_search(
     }
 
 
-@app.post("/api/jarvis/memory/promote", dependencies=[Depends(require_nx_enabled), Depends(require_memory_write)])
+@app.post("/api/jarvis/memory/promote", dependencies=[Depends(require_nx_enabled), Depends(require_nx_operator), Depends(require_memory_write)])
 def promote_external_result(body: ExternalPromotionRequest):
     """Promote only an exact result returned by nx-search for the query."""
     client = NxSearchClient()
@@ -811,7 +812,7 @@ def promote_external_result(body: ExternalPromotionRequest):
 # --- nx-search extended capabilities ---
 
 
-@app.get("/api/jarvis/memory/external/stats", dependencies=[Depends(require_nx_enabled), Depends(require_emr_recall_api_key)])
+@app.get("/api/jarvis/memory/external/stats", dependencies=[Depends(require_nx_enabled), Depends(require_nx_operator), Depends(require_emr_recall_api_key)])
 def external_stats():
     """Get nx-search index statistics."""
     client = NxSearchClient()
@@ -821,7 +822,7 @@ def external_stats():
     return stats
 
 
-@app.post("/api/jarvis/memory/external/ask", dependencies=[Depends(require_nx_enabled), Depends(require_emr_recall_api_key)])
+@app.post("/api/jarvis/memory/external/ask", dependencies=[Depends(require_nx_enabled), Depends(require_nx_operator), Depends(require_emr_recall_api_key)])
 def external_ask(body: NxAskRequest):
     """Ask JARVIS a natural-language question over indexed files (read-only)."""
     client = NxSearchClient()
@@ -831,83 +832,32 @@ def external_ask(body: NxAskRequest):
     return result
 
 
-def _nx_pref_key(key: str) -> str:
-    """nx-search keeps one local preference store; namespace non-operator tenants so keys cannot collide across tenants."""
-    tenant = current_tenant_key()
-    return key if not tenant or tenant == "operator" else f"{tenant}/{key}"
-
-
-@app.post("/api/jarvis/memory/external/remember", dependencies=[Depends(require_nx_enabled), Depends(require_nx_write), Depends(require_memory_write)])
+@app.post("/api/jarvis/memory/external/remember", dependencies=[Depends(require_nx_enabled), Depends(require_nx_operator), Depends(require_nx_write), Depends(require_memory_write)])
 def external_remember(body: NxRememberRequest, request: Request):
-    """Store a persistent preference — written to BOTH nx-search AND the Continuity Ledger as evidenced record."""
-    client = NxSearchClient()
-    
-    # 1. Write to nx-search local memory
-    result = client.remember(_nx_pref_key(body.key), body.value)
+    """Store a persistent preference in nx-search. Deliberately not mirrored into the ledger: Clause V says a preference is
+    memory, not evidence. To make one count, record a decision that cites it as evidence."""
+    result = NxSearchClient().remember(body.key, body.value)
     if "error" in result:
         raise HTTPException(status_code=502, detail=result["error"])
-    
-    # 2. Also write to ledger as evidenced memory record
-    store = get_store()
-    try:
-        ledger_data = {
-            "content": f"nx-search preference: {body.key} = {body.value}",
-            "source_agent": "nx-search-bridge",
-            "session_id": f"nx-remember-{body.key}",
-            "type": "external_context",
-            "confidence": 1.0,
-            "evidence": [
-                {"kind": "nx_memory", "ref": f"nx:{_nx_pref_key(body.key)}", "note": "nx-search persistent preference"}
-            ],
-            "subject": f"nx-preference:{body.key}",
-            "tags": ["nx-search", "preference", "user-configured"],
-        }
-        ledger_mem = store.create_memory(MemoryCreate(**ledger_data))
-        result["ledger_memory_id"] = ledger_mem.id
-        result["ledger_status"] = "written"
-    except Exception as e:
-        result["ledger_status"] = f"failed: {e}"
-    
-    # Audit log
-    _audit_log("nx_remember", request, {"key": body.key, "ledger_id": result.get("ledger_memory_id")})
+    _audit_log("nx_remember", request, {"key": body.key})
     return result
 
 
-@app.post("/api/jarvis/memory/external/forget", dependencies=[Depends(require_nx_enabled), Depends(require_nx_write), Depends(require_memory_write)])
+@app.post("/api/jarvis/memory/external/forget", dependencies=[Depends(require_nx_enabled), Depends(require_nx_operator), Depends(require_nx_write), Depends(require_memory_write)])
 def external_forget(body: NxForgetRequest, request: Request):
-    """Forget a persistent preference — removed from nx-search AND marked archived in ledger."""
-    client = NxSearchClient()
-    
-    # 1. Forget from nx-search
-    result = client.forget(_nx_pref_key(body.key))
+    """Forget a persistent preference from nx-search."""
+    result = NxSearchClient().forget(body.key)
     if "error" in result:
         raise HTTPException(status_code=502, detail=result["error"])
-    
-    # 2. Archive in ledger
-    store = get_store()
-    try:
-        # Every live record for this key (repeated remembers each wrote one); the store is already tenant-scoped.
-        subject = f"nx-preference:{body.key}"
-        archived = []
-        for mem in store.list_memories(limit=1_000_000, truth_scope="live", subject=subject):
-            if mem.type == "external_context":
-                store.update_memory(mem.id, MemoryUpdate(status="archived"))
-                archived.append(mem.id)
-        if archived:
-            result["ledger_archived"] = archived[0]
-            result["ledger_archived_ids"] = archived
-    except Exception as e:
-        result["ledger_status"] = f"archive_failed: {e}"
-    
-    _audit_log("nx_forget", request, {"key": body.key, "ledger_archived": result.get("ledger_archived")})
+    _audit_log("nx_forget", request, {"key": body.key})
     return result
 
 
-@app.post("/api/jarvis/memory/external/describe", dependencies=[Depends(require_nx_enabled), Depends(require_emr_recall_api_key)])
+@app.post("/api/jarvis/memory/external/describe", dependencies=[Depends(require_nx_enabled), Depends(require_nx_operator), Depends(require_emr_recall_api_key)])
 def external_describe(body: NxDescribeRequest, request: Request):
     """Describe an image via vision (NVIDIA + HoloRT4D). Path validated against allowed roots.
 
-    Reading is gated like the other read endpoints; `save=true` WRITES (nx-search's own memory and a ledger record), so it
+    Reading is gated like the other read endpoints; `save=true` WRITES (nx-search's own memory only; never the ledger, see remember), so it
     additionally needs the nx-write flag and a write-scoped token, checked before anything is invoked.
     """
     if body.save:
@@ -927,32 +877,11 @@ def external_describe(body: NxDescribeRequest, request: Request):
     if "error" in result:
         raise HTTPException(status_code=502, detail=result["error"])
     
-    # If save=True, also write description to ledger
-    if body.save and "error" not in result:
-        store = get_store()
-        try:
-            ledger_data = {
-                "content": f"Image description for {validated_path}: {result.get('output', result.get('text', ''))[:2000]}",
-                "source_agent": "nx-search-vision",
-                "session_id": f"nx-describe-{validated_path.name}",
-                "type": "external_context",
-                "confidence": 0.9,
-                "evidence": [
-                    {"kind": "filesystem_evidence", "ref": str(validated_path), "note": "nx-search vision description"}
-                ],
-                "subject": f"image:{validated_path.name}",
-                "tags": ["nx-search", "vision", "image-description"],
-            }
-            ledger_mem = store.create_memory(MemoryCreate(**ledger_data))
-            result["ledger_memory_id"] = ledger_mem.id
-        except Exception as e:
-            result["ledger_status"] = f"failed: {e}"
-    
     _audit_log("nx_describe", request, {"path": str(validated_path), "save": body.save})
     return result
 
 
-@app.post("/api/jarvis/memory/external/spatialize", dependencies=[Depends(require_nx_enabled), Depends(require_nx_write), Depends(require_memory_write)])
+@app.post("/api/jarvis/memory/external/spatialize", dependencies=[Depends(require_nx_enabled), Depends(require_nx_operator), Depends(require_nx_write), Depends(require_memory_write)])
 def external_spatialize(body: NxSpatializeRequest, request: Request):
     """Spatialize a directory of rendered frames (temporal + spatial memory). Path validated."""
     validated_path = validate_nx_path(body.directory)
@@ -971,7 +900,7 @@ def external_spatialize(body: NxSpatializeRequest, request: Request):
     return result
 
 
-@app.post("/api/jarvis/memory/external/scan", dependencies=[Depends(require_nx_enabled), Depends(require_nx_write), Depends(require_memory_write)])
+@app.post("/api/jarvis/memory/external/scan", dependencies=[Depends(require_nx_enabled), Depends(require_nx_operator), Depends(require_nx_write), Depends(require_memory_write)])
 def external_scan(body: NxScanRequest, request: Request):
     """Scan and index paths (incremental or full rebuild). Paths validated against allowed roots."""
     validated_paths = []
@@ -988,7 +917,7 @@ def external_scan(body: NxScanRequest, request: Request):
     return result
 
 
-@app.post("/api/jarvis/memory/external/reindex", dependencies=[Depends(require_nx_enabled), Depends(require_nx_write), Depends(require_memory_write)])
+@app.post("/api/jarvis/memory/external/reindex", dependencies=[Depends(require_nx_enabled), Depends(require_nx_operator), Depends(require_nx_write), Depends(require_memory_write)])
 def external_reindex(path: str = Query(..., min_length=1, max_length=1000), request: Request = None):
     """Incremental reindex of a single path. Path validated against allowed roots."""
     validated_path = validate_nx_path(path)
@@ -1002,7 +931,7 @@ def external_reindex(path: str = Query(..., min_length=1, max_length=1000), requ
     return result
 
 
-@app.post("/api/jarvis/memory/external/prune", dependencies=[Depends(require_nx_enabled), Depends(require_nx_write), Depends(require_memory_write)])
+@app.post("/api/jarvis/memory/external/prune", dependencies=[Depends(require_nx_enabled), Depends(require_nx_operator), Depends(require_nx_write), Depends(require_memory_write)])
 def external_prune(paths: list[str] = Query(..., min_length=1, max_length=10), request: Request = None):
     """Prune missing files from index. Paths validated against allowed roots."""
     validated_paths = [str(validate_nx_path(p)) for p in paths]
@@ -1016,7 +945,7 @@ def external_prune(paths: list[str] = Query(..., min_length=1, max_length=10), r
     return result
 
 
-@app.post("/api/jarvis/memory/external/watch", dependencies=[Depends(require_nx_enabled), Depends(require_nx_write), Depends(require_memory_write)])
+@app.post("/api/jarvis/memory/external/watch", dependencies=[Depends(require_nx_enabled), Depends(require_nx_operator), Depends(require_nx_write), Depends(require_memory_write)])
 def external_watch(body: NxWatchRequest, request: Request):
     """Start file watcher for incremental index maintenance. One instance max, capped by feature flag."""
     validated_paths = [str(validate_nx_path(p)) for p in body.paths]
@@ -1033,7 +962,7 @@ def external_watch(body: NxWatchRequest, request: Request):
     return {"status": "started", "pid": proc.pid, "paths": validated_paths, "debounce_ms": body.debounce_ms}
 
 
-@app.post("/api/jarvis/memory/external/watch/stop", dependencies=[Depends(require_nx_enabled), Depends(require_nx_write), Depends(require_memory_write)])
+@app.post("/api/jarvis/memory/external/watch/stop", dependencies=[Depends(require_nx_enabled), Depends(require_nx_operator), Depends(require_nx_write), Depends(require_memory_write)])
 def external_watch_stop(request: Request):
     """Stop the file watcher."""
     with request.app.state.nx_background_lock:
@@ -1054,7 +983,7 @@ def external_watch_stop(request: Request):
     return {"status": "stopped"}
 
 
-@app.post("/api/jarvis/memory/external/serve", dependencies=[Depends(require_nx_enabled), Depends(require_nx_write), Depends(require_memory_write)])
+@app.post("/api/jarvis/memory/external/serve", dependencies=[Depends(require_nx_enabled), Depends(require_nx_operator), Depends(require_nx_write), Depends(require_memory_write)])
 def external_serve(port: int = Query(default=7788, ge=1024, le=65535), request: Request = None):
     """Start web UI server on specified port. One instance max, capped by feature flag."""
     with request.app.state.nx_background_lock:
@@ -1068,7 +997,7 @@ def external_serve(port: int = Query(default=7788, ge=1024, le=65535), request: 
     return {"status": "started", "pid": proc.pid, "port": port, "url": f"http://127.0.0.1:{port}"}
 
 
-@app.post("/api/jarvis/memory/external/serve/stop", dependencies=[Depends(require_nx_enabled), Depends(require_nx_write), Depends(require_memory_write)])
+@app.post("/api/jarvis/memory/external/serve/stop", dependencies=[Depends(require_nx_enabled), Depends(require_nx_operator), Depends(require_nx_write), Depends(require_memory_write)])
 def external_serve_stop(request: Request):
     """Stop the web UI server."""
     with request.app.state.nx_background_lock:

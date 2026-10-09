@@ -422,38 +422,18 @@ def test_describe_with_save_is_refused_when_memory_writes_are_off(describe_env, 
     assert [i for i in _RecordingClient.instances if i.calls] == []
 
 
-def test_describe_with_save_runs_when_both_writes_are_allowed(describe_env, monkeypatch):
+def test_describe_with_save_runs_when_both_writes_are_allowed_and_never_writes_the_ledger(describe_env, monkeypatch):
     http, image, main = describe_env
     monkeypatch.setenv("JARVIS_NX_WRITE_ENABLED", "true")
-    saved = []
 
-    class Store:
-        def create_memory(self, data):
-            saved.append(data)
-            return type("M", (), {"id": "mem-1"})()
+    def boom():
+        raise AssertionError("describe must not touch the ledger store")
 
-    monkeypatch.setattr(main, "get_store", lambda: Store())
+    monkeypatch.setattr(main, "get_store", boom)
     response = http.post("/api/jarvis/memory/external/describe", json={"image_path": image, "save": True})
     assert response.status_code == 200, response.text
-    assert response.json()["ledger_memory_id"] == "mem-1" and len(saved) == 1
+    assert "ledger_memory_id" not in response.json()
     assert [c[2]["save"] for i in _RecordingClient.instances for c in i.calls] == [True]
-
-
-def test_promote_is_refused_when_the_nx_master_switch_is_off(describe_env, monkeypatch):
-    """The route used to build the client without the master-switch gate, and the client then switched the bridge on."""
-    http, _image, _main = describe_env
-    monkeypatch.setenv("JARVIS_NX_ENABLED", "false")
-    response = http.post("/api/jarvis/memory/promote", json={"query": "q", "path": "/p/file.txt", "snippet": "s"})
-    assert response.status_code == 403
-    assert "JARVIS_NX_ENABLED" in response.text
-    assert _RecordingClient.instances == [], "the client was never even constructed"
-
-
-def test_the_client_alone_refuses_while_the_master_switch_is_off(monkeypatch):
-    monkeypatch.setenv("JARVIS_NX_ENABLED", "false")
-    client = NxSearchClient(nx_path="/nowhere", require_available=False)
-    assert "disabled" in client.search("x")["error"]
-    assert "disabled" in client.stats()["error"]
 
 
 # --- remember/forget: tenant namespace, and forget archives every live record ------------------------------------
@@ -488,45 +468,18 @@ def pref_env(monkeypatch):
     return TestClient(main.app), client, main
 
 
-def test_nx_preference_keys_are_namespaced_for_non_operator_tenants(pref_env, monkeypatch):
+def test_remember_and_forget_never_write_the_ledger(pref_env, monkeypatch):
     http, client, main = pref_env
-    monkeypatch.setattr(main, "current_tenant_key", lambda: "tenant-a")
-    http.post("/api/jarvis/memory/external/remember", json={"key": "theme", "value": "dark"})
-    http.post("/api/jarvis/memory/external/forget", json={"key": "theme"})
-    assert client.remembered == [("tenant-a/theme", "dark")]
-    assert client.forgotten == ["tenant-a/theme"]
 
+    def boom():
+        raise AssertionError("remember/forget must not touch the ledger store")
 
-def test_nx_preference_keys_stay_plain_for_the_operator(pref_env, monkeypatch):
-    http, client, main = pref_env
-    monkeypatch.setattr(main, "current_tenant_key", lambda: None)
-    http.post("/api/jarvis/memory/external/remember", json={"key": "theme", "value": "dark"})
-    assert client.remembered == [("theme", "dark")]
-
-
-def test_forget_archives_every_live_record_for_the_key_beyond_100(pref_env):
-    http, client, main = pref_env
-    archived = []
-
-    def mem(i):
-        return type("M", (), {"id": f"m{i}", "type": "external_context", "subject": "nx-preference:theme"})()
-
-    class Store:
-        def list_memories(self, **kw):
-            assert kw.get("truth_scope") == "live" and kw["limit"] > 100
-            return [mem(i) for i in range(150)]
-
-        def update_memory(self, mid, upd):
-            archived.append((mid, upd.status))
-
-    main_store = main.get_store
-    try:
-        main.get_store = lambda: Store()
-        response = http.post("/api/jarvis/memory/external/forget", json={"key": "theme"})
-    finally:
-        main.get_store = main_store
-    assert response.status_code == 200, response.text
-    assert len(archived) == 150 and {s for _, s in archived} == {"archived"}
+    monkeypatch.setattr(main, "get_store", boom)
+    r1 = http.post("/api/jarvis/memory/external/remember", json={"key": "theme", "value": "dark"})
+    r2 = http.post("/api/jarvis/memory/external/forget", json={"key": "theme"})
+    assert r1.status_code == r2.status_code == 200
+    assert "ledger_status" not in r1.json() and "ledger_status" not in r2.json()
+    assert client.remembered == [("theme", "dark")] and client.forgotten == ["theme"]
 
 
 # --- watch/serve: one process even under concurrent starts; children never get undrained pipes -------------------
@@ -592,3 +545,29 @@ def test_background_children_do_not_use_undrained_pipes(monkeypatch):
     assert len(seen) == 2
     for kw in seen:
         assert kw["stdout"] == nxc.subprocess.DEVNULL and kw["stderr"] == nxc.subprocess.DEVNULL
+
+
+# --- every nx route is operator-only under OAuth ------------------------------------------------------------------
+
+def test_every_nx_route_refuses_a_memory_read_user(describe_env, monkeypatch):
+    """A normal OAuth user (memory.read, even memory.write) must be denied on every route that touches the host filesystem."""
+    import app.auth as auth
+    from app.identity import Principal
+
+    http, image, main = describe_env
+    monkeypatch.setenv("JARVIS_AUTH_MODE", "oauth")
+    monkeypatch.setenv("JARVIS_NX_WRITE_ENABLED", "true")
+    user = Principal(subject="alice", scopes=frozenset({"memory.read", "memory.write"}), issuer="https://issuer.example")
+    monkeypatch.setattr(auth, "validate_access_token", lambda token, *, required_scope="memory.read": user)
+    headers = {"Authorization": "Bearer alice"}
+    nx_paths = {
+        r.path: sorted(r.methods - {"HEAD", "OPTIONS"})
+        for r in main.app.routes
+        if getattr(r, "path", "").startswith(("/api/jarvis/memory/external", "/api/jarvis/memory/unified", "/api/jarvis/memory/promote"))
+    }
+    assert len(nx_paths) >= 16, nx_paths
+    for path, methods in nx_paths.items():
+        response = http.request(methods[0], path, json={} if methods[0] != "GET" else None, headers=headers)
+        assert response.status_code == 403, (path, response.status_code, response.text)
+        assert "operator-only" in response.text, (path, response.text)
+    assert [i for i in _RecordingClient.instances if i.calls] == []

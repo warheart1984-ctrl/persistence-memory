@@ -246,6 +246,16 @@ def require_operator_read() -> None:
         raise HTTPException(status_code=403, detail="Continuity Blocks can be read with the operator key only")
 
 
+def require_nx_operator() -> None:
+    """nx-search reads and indexes the host filesystem under deployment-wide roots, with no per-tenant scoping.
+
+    Until there is a real multi-tenant user and per-tenant roots, every nx route is operator-only: an OAuth user token
+    (even with memory.read) is refused.
+    """
+    if oauth_enabled():
+        raise HTTPException(status_code=403, detail="nx-search routes touch the host filesystem and are operator-only")
+
+
 LEDGER_READ_PREFIX = "/api/jarvis/memory"
 
 
