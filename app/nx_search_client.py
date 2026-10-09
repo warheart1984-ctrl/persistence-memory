@@ -50,6 +50,15 @@ def _find_node() -> str | None:
 
 
 MCP_TIMEOUT_S = 15.0
+DISABLED_MESSAGE = "nx-search integration is disabled on this deployment (set JARVIS_NX_ENABLED=true)"
+
+
+def _master_switch_on() -> bool:
+    """The deployment's nx master switch. Checked here as well as on the routes, so no caller can reach nx-search (or start
+    its bridge) while the switch is off."""
+    from app.auth import nx_enabled
+
+    return nx_enabled()
 
 
 class NxSearchClient:
@@ -97,13 +106,14 @@ class NxSearchClient:
     def _ensure_mcp(self) -> None:
         """Start the MCP stdio subprocess if it is not running, and complete the handshake."""
         with self._mcp_lock:
+            if not _master_switch_on():
+                raise RuntimeError(DISABLED_MESSAGE)
             if not self._available:
                 raise RuntimeError("nx-search not available")
             if self._mcp_process is not None and self._mcp_process.poll() is None:
                 return
             self._stop_mcp()
-            # This client is the authorised caller (the API already enforced JARVIS_NX_ENABLED), so the bridge is switched
-            # on for the child only. stderr is discarded: an undrained pipe fills up and stalls the child.
+            # The master switch is on (checked above), so the bridge is switched on for this child only. stderr is discarded: an undrained pipe fills up and stalls the child.
             env = {**os.environ, "JARVIS_NX_ENABLED": "1"}
             proc = subprocess.Popen(
                 [self._node, self._get_nx_bin(), "mcp"],
@@ -212,6 +222,8 @@ class NxSearchClient:
 
     def search(self, query: str, name_only: bool = False, limit: int = 25) -> dict[str, Any]:
         """Search the nx-search index via MCP, falling back to the CLI when the MCP connection fails."""
+        if not _master_switch_on():
+            return {"error": DISABLED_MESSAGE, "content": [], "filenames": []}
         if not self._available:
             return {"error": "nx-search not available", "content": [], "filenames": []}
         try:
@@ -245,6 +257,8 @@ class NxSearchClient:
 
     def stats(self) -> dict[str, Any]:
         """Get nx-search index statistics via MCP (CLI fallback)."""
+        if not _master_switch_on():
+            return {"error": DISABLED_MESSAGE}
         if not self._available:
             return {"error": "nx-search not available"}
         try:
@@ -312,6 +326,8 @@ class NxSearchClient:
 
     def watch(self, paths: list[str], debounce_ms: int = 750, no_reconcile: bool = False) -> subprocess.Popen:
         """Start file watcher (returns process handle for background monitoring)."""
+        if not _master_switch_on():
+            raise RuntimeError(DISABLED_MESSAGE)
         if not self._available:
             raise RuntimeError("nx-search not available")
         args = ["watch"] + paths + ["--debounce", str(debounce_ms)]
@@ -343,6 +359,8 @@ class NxSearchClient:
 
     def serve(self, port: int | None = None) -> subprocess.Popen:
         """Start web UI server on port 7788 (or specified)."""
+        if not _master_switch_on():
+            raise RuntimeError(DISABLED_MESSAGE)
         if not self._available:
             raise RuntimeError("nx-search not available")
         args = ["serve"]
@@ -362,6 +380,8 @@ class NxSearchClient:
         bad = [a for a in args if not isinstance(a, str)]
         if bad:
             raise TypeError(f"nx CLI arguments must be strings (unpack lists with *); got {type(bad[0]).__name__}")
+        if not _master_switch_on():
+            return {"error": DISABLED_MESSAGE}
         if not self._available:
             return {"error": "nx-search not available"}
         try:

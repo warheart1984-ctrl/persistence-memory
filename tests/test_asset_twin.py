@@ -32,7 +32,7 @@ def _telemetry(**over: object) -> Telemetry:
     return Telemetry(**base)
 
 
-def test_cycle_never_executes_and_veto_wins(tmp_path) -> None:
+def test_cycle_never_executes_and_veto_wins(isolated) -> None:
     asset = SimulatedAsset()
     tel = _telemetry()
     state = estimate_state(tel)
@@ -191,7 +191,7 @@ def test_tampered_audit_line_caught_by_verify(tmp_path) -> None:
     assert problems
 
 
-def test_tenant_isolation_for_packets_and_audit(tmp_path) -> None:
+def test_tenant_isolation_for_packets_and_audit(isolated) -> None:
     import app.asset_twin.service as svc
 
     tel_a = _telemetry(asset_id="iso-01", seq=11)
@@ -233,7 +233,7 @@ def test_tenant_isolation_for_packets_and_audit(tmp_path) -> None:
     assert found_actor
 
 
-def test_measurement_and_assumption_are_separate_kinds(tmp_path) -> None:
+def test_measurement_and_assumption_are_separate_kinds(isolated) -> None:
     import app.asset_twin.service as svc
 
     tel = _telemetry(asset_id="kinds-01", seq=21)
@@ -516,3 +516,191 @@ def test_the_api_answers_409_for_stale_telemetry_and_503_for_a_broken_chain(isol
     broken = client.post("/api/jarvis/asset-twin/cycle", json=_telemetry(asset_id="api-seq-01", seq=8).model_dump(mode="json"))
     assert broken.status_code == 503 and "broken" in broken.text
     assert client.get("/api/jarvis/asset-twin/audit").json()["chain_valid"] is False
+
+
+# -- second round: heads revalidated, sequences recovered, cycles serialised, intent written first --------------------
+
+import time
+
+
+def test_a_running_ledger_notices_the_file_changing_underneath_it(tmp_path) -> None:
+    import json
+
+    path = tmp_path / "audit.jsonl"
+    ledger = EvidenceLedger(path)
+    ledger.append("A", "measurement", {"n": 1})
+    ledger.append("B", "measurement", {"n": 2})
+    ledger.append("A", "cycle", {"n": 3})
+    ledger.append("B", "cycle", {"n": 4})
+    ledger.check("A")  # fine, even though B's records follow A's last one
+
+    original = path.read_text()
+    lines = original.splitlines()
+
+    path.write_text("\n".join(lines[:-2]) + "\n")  # A's newest record (and B's) removed: a TRUNCATED chain still verifies
+    with pytest.raises(EvidenceChainError, match="changed while the service was running"):
+        ledger.check("A")
+    with pytest.raises(EvidenceChainError):
+        ledger.append("A", "execution", {"n": 5})
+
+    # an edited tail record is caught the same way
+    path.write_text(original)
+    ledger2 = EvidenceLedger(path)
+    ledger2.append("A", "veto", {"n": 6})
+    lines = path.read_text().splitlines()
+    rec = json.loads(lines[-1])
+    rec["body"]["n"] = 7
+    lines[-1] = json.dumps(rec, sort_keys=True, separators=(",", ":"))
+    path.write_text("\n".join(lines) + "\n")
+    with pytest.raises(EvidenceChainError):
+        ledger2.check("A")
+
+
+def test_the_tail_check_finds_a_tenants_record_past_other_tenants_noise(tmp_path) -> None:
+    ledger = EvidenceLedger(tmp_path / "audit.jsonl")
+    ledger.append("A", "measurement", {"n": 0})
+    for i in range(400):  # far more than one read block of other tenants' records after A's last
+        ledger.append("B", "measurement", {"n": i, "pad": "x" * 200})
+    ledger.check("A")
+    assert ledger.append("A", "cycle", {"n": 1})["prev"].startswith("sha256:")
+    ledger.check("B")
+
+
+def test_telemetry_sequence_survives_a_restart(isolated) -> None:
+    svc = isolated
+    svc.run_cycle("T", _telemetry(asset_id="boot-01", seq=5))
+    # an ordinary restart: in-memory state gone, the audit file stays
+    svc._last_seq.clear()
+    svc._health.clear()
+    svc._decisions.clear()
+    svc.get_ledger()._last.clear()
+    for replay in (5, 4, 1):
+        with pytest.raises(svc.StaleTelemetryError, match="not newer than 5"):
+            svc.run_cycle("T", _telemetry(asset_id="boot-01", seq=replay))
+    assert svc.run_cycle("T", _telemetry(asset_id="boot-01", seq=6)).decision.seq == 6
+    # another asset, another tenant: unaffected by boot-01's history
+    svc.run_cycle("T", _telemetry(asset_id="boot-02", seq=1))
+    svc.run_cycle("U", _telemetry(asset_id="boot-01", seq=1))
+
+
+def test_cycles_for_one_asset_run_one_at_a_time_so_an_older_one_cannot_overwrite_a_newer(isolated, monkeypatch) -> None:
+    svc = isolated
+    real = svc.estimate_state
+    entered, release = threading.Event(), threading.Event()
+    started: list[int] = []
+
+    def slow(telemetry, prior_health=1.0):
+        started.append(telemetry.seq)
+        if telemetry.seq == 1:
+            entered.set()
+            assert release.wait(10)
+        return real(telemetry, prior_health=prior_health)
+
+    monkeypatch.setattr(svc, "estimate_state", slow)
+    calm = _telemetry(asset_id="ser-01", seq=1, vibration_mm_s=0.5)
+    critical = _telemetry(asset_id="ser-01", seq=2, vibration_mm_s=14.0, exhaust_temp_c=640.0)
+    errors: list[BaseException] = []
+
+    def run(tel):
+        try:
+            svc.run_cycle("T", tel)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    first = threading.Thread(target=run, args=(calm,))
+    second = threading.Thread(target=run, args=(critical,))
+    first.start()
+    assert entered.wait(10)
+    second.start()
+    time.sleep(0.4)
+    assert started == [1], "sequence 2 must wait for sequence 1 on the same asset"
+    release.set()
+    first.join(10)
+    second.join(10)
+    assert not errors, errors
+    assert started == [1, 2]
+    h1 = real(calm, prior_health=1.0).estimated_health
+    assert svc._health["T:ser-01"] == real(critical, prior_health=h1).estimated_health, "the newer reading's health is the one that stands"
+    import json
+
+    seqs = [json.loads(line)["body"]["seq"] for line in svc.get_ledger()._path.read_text().splitlines() if json.loads(line)["kind"] == "measurement"]
+    assert seqs == [1, 2]
+
+
+def test_other_assets_are_not_serialised_behind_a_slow_one(isolated, monkeypatch) -> None:
+    svc = isolated
+    real = svc.estimate_state
+    entered, release = threading.Event(), threading.Event()
+
+    def slow(telemetry, prior_health=1.0):
+        if telemetry.asset_id == "slow-01":
+            entered.set()
+            assert release.wait(10)
+        return real(telemetry, prior_health=prior_health)
+
+    monkeypatch.setattr(svc, "estimate_state", slow)
+    worker = threading.Thread(target=lambda: svc.run_cycle("T", _telemetry(asset_id="slow-01", seq=1)))
+    worker.start()
+    assert entered.wait(10)
+    assert svc.run_cycle("T", _telemetry(asset_id="fast-01", seq=1)).decision.asset_id == "fast-01"
+    release.set()
+    worker.join(10)
+
+
+def _flaky(ledger, monkeypatch, failing_kind: str) -> None:
+    real = ledger.append
+
+    def append(tenant, kind, body):
+        if kind == failing_kind:
+            raise OSError("no space left on device")
+        return real(tenant, kind, body)
+
+    monkeypatch.setattr(ledger, "append", append)
+
+
+def _approved_in_service(svc, asset: str = "wal-01"):
+    cycle = svc.run_cycle("T", _telemetry(asset_id=asset, seq=1))
+    did = cycle.decision.decision_id
+    _approve(svc, "T", did)
+    return did
+
+
+def test_the_intent_is_on_file_before_the_asset_moves(isolated, monkeypatch) -> None:
+    svc = isolated
+    did = _approved_in_service(svc)
+    order: list[str] = []
+    real_apply = SimulatedAsset.apply_control
+    ledger = svc.get_ledger()
+    real_append = ledger.append
+    monkeypatch.setattr(ledger, "append", lambda t, k, b: (order.append(k), real_append(t, k, b))[1])
+    monkeypatch.setattr(SimulatedAsset, "apply_control", lambda self, sp: (order.append("MOVE"), real_apply(self, sp))[1])
+    assert svc.execute("T", did, "wal-01").executed is True
+    assert order == ["execution_intent", "MOVE", "execution"]
+    import json
+
+    intent = [json.loads(line) for line in ledger._path.read_text().splitlines() if '"execution_intent"' in line][0]["body"]
+    assert intent["decision_id"] == did and intent["asset"] == "wal-01" and "setpoint" in intent and "action" in intent
+
+
+def test_if_the_intent_cannot_be_written_nothing_moves(isolated, monkeypatch) -> None:
+    svc = isolated
+    did = _approved_in_service(svc)
+    moved: list[float] = []
+    real_apply = SimulatedAsset.apply_control
+    monkeypatch.setattr(SimulatedAsset, "apply_control", lambda self, sp: (moved.append(sp), real_apply(self, sp))[1])
+    _flaky(svc.get_ledger(), monkeypatch, "execution_intent")
+    with pytest.raises(OSError):
+        svc.execute("T", did, "wal-01")
+    assert moved == []
+    assert svc._gates["T"].get(did).status == "approved", "the approval was given back, not consumed"
+
+
+def test_if_only_the_outcome_cannot_be_written_the_execution_is_reported_truthfully(isolated, monkeypatch) -> None:
+    svc = isolated
+    did = _approved_in_service(svc)
+    _flaky(svc.get_ledger(), monkeypatch, "execution")
+    result = svc.execute("T", did, "wal-01")
+    assert result.executed is True, "the control was applied; do not report a failure that did not happen"
+    assert "WARNING" in result.reason and "execution_intent" in result.reason
+    assert svc._gates["T"].get(did).status == "executed"
+    assert any('"execution_intent"' in line for line in svc.get_ledger()._path.read_text().splitlines())

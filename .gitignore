@@ -14,3 +14,6 @@ dist/
 build/
 data/emr-embeddings.json
 data/emr-embed-model/
+
+# asset twin runtime evidence (written by the service and by tests)
+data/asset-twin/

@@ -189,3 +189,25 @@ def test_a_nested_list_argument_is_a_loud_error_not_a_silent_failure(argv_captur
     with pytest.raises(TypeError, match="strings"):
         client._cli_cmd("ask", ["nested"])
     assert seen == []
+
+
+# --- the deployment's nx master switch is honoured by the client itself ----------------------------------------
+
+def test_the_master_switch_stops_every_client_path_before_anything_starts(fake_nx, monkeypatch):
+    path, received = fake_nx
+    monkeypatch.setenv("JARVIS_NX_ENABLED", "false")
+    client = NxSearchClient(nx_path=str(path), persistent=True)
+    assert "disabled" in client.search("x")["error"]
+    assert "disabled" in client.stats()["error"]
+    assert "disabled" in client.ask("q")["error"]
+    assert "disabled" in client.scan(["/a"])["error"]
+    for start in (lambda: client.watch(["/a"]), lambda: client.serve(), client._ensure_mcp):
+        with pytest.raises(RuntimeError, match="disabled"):
+            start()
+    assert client._mcp_process is None and received() == [], "no bridge was started, nothing was sent"
+
+    monkeypatch.setenv("JARVIS_NX_ENABLED", "true")
+    try:
+        assert client.search("x")["content"][0]["path"] == "/from-mcp"
+    finally:
+        client.close()

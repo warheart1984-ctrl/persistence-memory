@@ -23,6 +23,7 @@ _gates: dict[str, VetoGate] = {}
 _decisions: dict[tuple[str, str], DecisionPacket] = {}
 _health: dict[str, float] = {}
 _last_seq: dict[str, int] = {}  # "tenant:asset" -> newest accepted telemetry sequence
+_cycle_locks: dict[str, threading.Lock] = {}  # "tenant:asset" -> serialises that asset's cycles
 _lock = threading.Lock()
 
 
@@ -49,27 +50,38 @@ def _gate_for(tenant: str) -> VetoGate:
         return gate
 
 
-def run_cycle(tenant: str, telemetry: Telemetry) -> CycleResponse:
-    key = f"{tenant}:{telemetry.asset_id}"
-    # A late or replayed sample must not produce a fresh decision: a delayed "all clear" would otherwise supersede a later
-    # critical reading. The sequence is reserved before anything is updated, and given back if the cycle fails.
+def _cycle_lock(key: str) -> threading.Lock:
     with _lock:
-        previous_seq = _last_seq.get(key)
+        lock = _cycle_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _cycle_locks[key] = lock
+        return lock
+
+
+def run_cycle(tenant: str, telemetry: Telemetry) -> CycleResponse:
+    """One cycle for one asset at a time: the whole read-modify-write (sequence check, health, decision, evidence) runs under
+    that asset's lock, so sequence N+1 cannot finish first and then be overwritten by an older N still in flight."""
+    key = f"{tenant}:{telemetry.asset_id}"
+    ledger = get_ledger()
+    with _cycle_lock(key):
+        ledger.check(tenant)  # also verifies the chain the recovered sequence below is read from
+        # A late or replayed sample must not produce a fresh decision: a delayed "all clear" would otherwise supersede a later
+        # critical reading. After a restart the in-memory sequence is empty, so it is recovered from the verified evidence.
+        with _lock:
+            previous_seq = _last_seq.get(key)
+        if previous_seq is None:
+            previous_seq = ledger.last_measurement_seq(tenant, telemetry.asset_id)
         if previous_seq is not None and telemetry.seq <= previous_seq:
+            with _lock:
+                _last_seq.setdefault(key, previous_seq)
             raise StaleTelemetryError(
                 f"stale telemetry for {telemetry.asset_id!r}: seq {telemetry.seq} is not newer than {previous_seq}"
             )
-        _last_seq[key] = telemetry.seq
-    try:
-        return _run_accepted_cycle(tenant, telemetry)
-    except Exception:
+        response = _run_accepted_cycle(tenant, telemetry)
         with _lock:
-            if _last_seq.get(key) == telemetry.seq:
-                if previous_seq is None:
-                    _last_seq.pop(key, None)
-                else:
-                    _last_seq[key] = previous_seq
-        raise
+            _last_seq[key] = telemetry.seq  # only a cycle that completed consumes its sequence
+        return response
 
 
 def _run_accepted_cycle(tenant: str, telemetry: Telemetry) -> CycleResponse:
@@ -160,11 +172,30 @@ def execute(tenant: str, decision_id: str, asset_id: str) -> ExecutionResult:
         })
         return result
     asset = _asset_for(tenant, decision.asset_id)
-    result = execute_approved(decision, _gate_for(tenant), asset)
-    ledger.append(tenant, "execution", {
+
+    def record_intent() -> None:
+        # Written AFTER the approval is claimed and BEFORE the asset moves. If this cannot be written, nothing moves and the
+        # claim is released; if the outcome record below cannot be written, the intent is still on file.
+        ledger.append(tenant, "execution_intent", {
+            "decision_id": decision_id, "asset": decision.asset_id, "requested_asset": asset_id,
+            "action": decision.recommendation.action, "setpoint": decision.recommendation.setpoint_rpm,
+        })
+
+    result = execute_approved(decision, _gate_for(tenant), asset, before_apply=record_intent)
+    outcome = {
         "decision_id": decision_id, "asset": decision.asset_id, "requested_asset": asset_id,
         "executed": result.executed,
         "setpoint": result.applied_setpoint_rpm,
         "safe_state": result.safe_state_entered, "reason": result.reason,
-    })
+    }
+    try:
+        ledger.append(tenant, "execution", outcome)
+    except Exception as exc:
+        if not result.executed:
+            raise
+        # The control WAS applied and its intent is on file; say so rather than reporting a failure that did not happen.
+        return result.model_copy(update={
+            "reason": f"{result.reason} [WARNING: the outcome record could not be written ({type(exc).__name__}); "
+                      "the execution_intent record is on file]"[:1000],
+        })
     return result

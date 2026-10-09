@@ -870,7 +870,7 @@ def unified_search(
     }
 
 
-@app.post("/api/jarvis/memory/promote", dependencies=[Depends(require_memory_write)])
+@app.post("/api/jarvis/memory/promote", dependencies=[Depends(require_nx_enabled), Depends(require_memory_write)])
 def promote_external_result(body: ExternalPromotionRequest):
     """Promote only an exact result returned by nx-search for the query."""
     client = NxSearchClient()

@@ -12,6 +12,7 @@ Rules enforced here, not just documented:
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime, timezone
 
 from .decision import DECISION_TTL_S  # noqa: F401 (documents the TTL owner)
@@ -40,6 +41,7 @@ def execute_approved(
     decision: DecisionPacket,
     gate: VetoGate,
     asset: SimulatedAsset,
+    before_apply: Callable[[], None] | None = None,
 ) -> ExecutionResult:
     rec = gate.get(decision.decision_id)
     if rec is None:
@@ -62,6 +64,8 @@ def execute_approved(
             reason=f"refused: veto status is {now.status if now else 'unknown'}, need approved",
         )
     try:
+        if before_apply is not None:
+            before_apply()  # write-ahead: if the intent cannot be recorded, nothing moves and the approval is given back
         if decision.recommendation.action == "safe_shutdown":
             asset.enter_safe_state()
             gate.mark_safe_state(decision.decision_id)

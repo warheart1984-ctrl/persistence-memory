@@ -437,3 +437,20 @@ def test_describe_with_save_runs_when_both_writes_are_allowed(describe_env, monk
     assert response.status_code == 200, response.text
     assert response.json()["ledger_memory_id"] == "mem-1" and len(saved) == 1
     assert [c[2]["save"] for i in _RecordingClient.instances for c in i.calls] == [True]
+
+
+def test_promote_is_refused_when_the_nx_master_switch_is_off(describe_env, monkeypatch):
+    """The route used to build the client without the master-switch gate, and the client then switched the bridge on."""
+    http, _image, _main = describe_env
+    monkeypatch.setenv("JARVIS_NX_ENABLED", "false")
+    response = http.post("/api/jarvis/memory/promote", json={"query": "q", "path": "/p/file.txt", "snippet": "s"})
+    assert response.status_code == 403
+    assert "JARVIS_NX_ENABLED" in response.text
+    assert _RecordingClient.instances == [], "the client was never even constructed"
+
+
+def test_the_client_alone_refuses_while_the_master_switch_is_off(monkeypatch):
+    monkeypatch.setenv("JARVIS_NX_ENABLED", "false")
+    client = NxSearchClient(nx_path="/nowhere", require_available=False)
+    assert "disabled" in client.search("x")["error"]
+    assert "disabled" in client.stats()["error"]
