@@ -8,6 +8,7 @@ move the asset, simulated or otherwise.
 
 from __future__ import annotations
 
+import os
 import threading
 
 from .decision import build_decision
@@ -30,6 +31,30 @@ _lock = threading.Lock()
 
 class StaleTelemetryError(ValueError):
     """Telemetry whose sequence is not newer than the last accepted one for that asset."""
+
+
+class TooManyAssetsError(ValueError):
+    """A tenant tried to track more assets than the service is configured to hold in memory."""
+
+
+_tenant_assets: dict[str, set[str]] = {}   # tenant -> asset ids it has submitted
+_history: dict[str, list[str]] = {}        # "tenant:asset" -> decision ids, oldest first
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, "") or default)
+    except ValueError:
+        return default
+
+
+def _max_assets() -> int:
+    return max(1, _int_env("JARVIS_ASSET_TWIN_MAX_ASSETS", 1000))
+
+
+def _retain() -> int:
+    """Decision packets kept per asset, newest first, once they can no longer act. Older terminal ones are dropped."""
+    return max(1, _int_env("JARVIS_ASSET_TWIN_RETAIN", 50))
 
 
 def _asset_for(tenant: str, asset_id: str) -> SimulatedAsset:
@@ -65,6 +90,12 @@ def run_cycle(tenant: str, telemetry: Telemetry) -> CycleResponse:
     that asset's lock, so sequence N+1 cannot finish first and then be overwritten by an older N still in flight."""
     key = f"{tenant}:{telemetry.asset_id}"
     ledger = get_ledger()
+    with _lock:  # bound what a caller can make the service hold: unique asset ids would otherwise grow memory without limit
+        known = _tenant_assets.setdefault(tenant, set())
+        if telemetry.asset_id not in known:
+            if len(known) >= _max_assets():
+                raise TooManyAssetsError(f"tenant {tenant!r} already tracks {len(known)} assets (JARVIS_ASSET_TWIN_MAX_ASSETS)")
+            known.add(telemetry.asset_id)
     with _cycle_lock(key):
         ledger.check(tenant)  # also verifies the chain the recovered sequence below is read from
         # A late or replayed sample must not produce a fresh decision: a delayed "all clear" would otherwise supersede a later
@@ -83,6 +114,20 @@ def run_cycle(tenant: str, telemetry: Telemetry) -> CycleResponse:
         with _lock:
             _last_seq[key] = telemetry.seq  # only a cycle that completed consumes its sequence
         return response
+
+
+def _prune(tenant: str, key: str, gate: VetoGate, surplus: list[str]) -> None:
+    """Forget old packets that can never act again; one that is still live (e.g. mid-execution) stays on the list for later."""
+    keep: list[str] = []
+    for decision_id in surplus:
+        if gate.forget(decision_id):
+            with _lock:
+                _decisions.pop((tenant, decision_id), None)
+        else:
+            keep.append(decision_id)
+    if keep:
+        with _lock:
+            _history.setdefault(key, [])[:0] = keep
 
 
 def _run_accepted_cycle(tenant: str, telemetry: Telemetry) -> CycleResponse:
@@ -123,17 +168,24 @@ def _run_accepted_cycle(tenant: str, telemetry: Telemetry) -> CycleResponse:
         "assumption_ref": assumption["digest"],
     })
     # Publish only now that all of the cycle's evidence is on file: a failed append leaves no approvable decision and no
-    # health update behind, so a retry starts from the same state. The previous recommendation for this asset is superseded:
-    # it was made on older telemetry and must not be approvable once a newer cycle exists.
+    # health update behind, so a retry starts from the same state. The previous recommendation for this asset is expired
+    # FIRST, then the new one becomes visible: it was made on older telemetry and must not be approvable or executable once a
+    # newer cycle exists (execution takes this asset's lock too, so the two cannot interleave).
     gate = _gate_for(tenant)
+    with _lock:
+        older = _latest.get(key)
+    if older is not None and older != decision.decision_id:
+        gate.supersede(older)
     veto = gate.propose(decision.decision_id)
     with _lock:
         _health[key] = state.estimated_health
         _decisions[(tenant, decision.decision_id)] = decision
-        older = _latest.get(key)
         _latest[key] = decision.decision_id
-    if older is not None and older != decision.decision_id:
-        gate.supersede(older)
+        history = _history.setdefault(key, [])
+        history.append(decision.decision_id)
+        surplus = history[:-_retain()]
+        del history[:-_retain()]
+    _prune(tenant, key, gate, surplus)
     degraded = decision.confidence < 0.5 or decision.predicted_risk > 0.7
     return CycleResponse(decision=decision, veto=veto, degraded=degraded)
 
@@ -202,7 +254,8 @@ def execute(tenant: str, decision_id: str, asset_id: str) -> ExecutionResult:
             "action": decision.recommendation.action, "setpoint": decision.recommendation.setpoint_rpm,
         })
 
-    result = execute_approved(decision, _gate_for(tenant), asset, before_apply=record_intent)
+    with _cycle_lock(f"{tenant}:{decision.asset_id}"):
+        result = execute_approved(decision, _gate_for(tenant), asset, before_apply=record_intent)
     outcome = {
         "decision_id": decision_id, "asset": decision.asset_id, "requested_asset": asset_id,
         "executed": result.executed,

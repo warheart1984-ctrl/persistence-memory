@@ -734,6 +734,9 @@ def asset_twin_cycle(request: Request, body: dict):
     from app.asset_twin.models import Telemetry
 
     tenant = _asset_twin_guard(request)
+    # A cycle is not read-only: it appends three durable audit records and allocates per-asset state, so it needs the same
+    # write authorisation as approving and executing (a memory.read token must not be able to grow storage).
+    require_memory_write()
     try:
         telemetry = Telemetry.model_validate(body)
     except Exception as exc:
@@ -744,6 +747,8 @@ def asset_twin_cycle(request: Request, body: dict):
         return asset_service.run_cycle(tenant, telemetry).model_dump(mode="json")
     except asset_service.StaleTelemetryError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except asset_service.TooManyAssetsError as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
     except EvidenceChainError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 

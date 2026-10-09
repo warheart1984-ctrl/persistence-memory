@@ -273,7 +273,7 @@ def isolated(tmp_path, monkeypatch):
 
     monkeypatch.setenv("JARVIS_ASSET_TWIN_DIR", str(tmp_path))
     monkeypatch.setattr(ev, "_ledger", None)
-    for name in ("_assets", "_gates", "_decisions", "_health", "_last_seq", "_latest"):
+    for name in ("_assets", "_gates", "_decisions", "_health", "_last_seq", "_latest", "_cycle_locks", "_tenant_assets", "_history"):
         monkeypatch.setattr(svc, name, {})
     return svc
 
@@ -556,14 +556,47 @@ def test_a_running_ledger_notices_the_file_changing_underneath_it(tmp_path) -> N
         ledger2.check("A")
 
 
-def test_the_tail_check_finds_a_tenants_record_past_other_tenants_noise(tmp_path) -> None:
+def test_other_tenants_appends_do_not_disturb_a_tenants_cached_head(tmp_path) -> None:
     ledger = EvidenceLedger(tmp_path / "audit.jsonl")
     ledger.append("A", "measurement", {"n": 0})
-    for i in range(400):  # far more than one read block of other tenants' records after A's last
+    for i in range(400):
         ledger.append("B", "measurement", {"n": i, "pad": "x" * 200})
     ledger.check("A")
     assert ledger.append("A", "cycle", {"n": 1})["prev"].startswith("sha256:")
     ledger.check("B")
+
+
+def test_an_edit_to_an_EARLIER_record_is_caught_even_when_the_newest_one_is_untouched(tmp_path) -> None:
+    import json
+
+    path = tmp_path / "audit.jsonl"
+    ledger = EvidenceLedger(path)
+    for i in range(5):
+        ledger.append("A", "measurement", {"n": i})
+    ledger.check("A")
+    lines = path.read_text().splitlines()
+    rec = json.loads(lines[1])
+    rec["body"]["n"] = 424242  # an early record rewritten; the final record, and so the cached head, still match
+    lines[1] = json.dumps(rec, sort_keys=True, separators=(",", ":"))
+    path.write_text("\n".join(lines) + "\n")
+    with pytest.raises(EvidenceChainError):
+        ledger.check("A")
+    with pytest.raises(EvidenceChainError):
+        ledger.append("A", "execution", {"n": 9})
+
+
+def test_checks_on_an_untouched_file_do_not_rescan_it(tmp_path, monkeypatch) -> None:
+    import app.asset_twin.evidence as ev
+
+    ledger = EvidenceLedger(tmp_path / "audit.jsonl")
+    ledger.append("A", "measurement", {"n": 0})
+    scans = []
+    real = ev._scan
+    monkeypatch.setattr(ev, "_scan", lambda *a, **k: (scans.append(1), real(*a, **k))[1])
+    for _ in range(25):
+        ledger.check("A")
+        ledger.append("A", "cycle", {"n": 1})
+    assert scans == [], "the file only ever changed through this ledger, so nothing needed re-verifying"
 
 
 def test_telemetry_sequence_survives_a_restart(isolated) -> None:
@@ -840,3 +873,134 @@ def test_a_cycle_that_failed_part_way_does_not_consume_its_sequence_even_after_a
     assert svc.run_cycle("T", _telemetry(asset_id="part-01", seq=1)).decision.seq == 1
     with pytest.raises(svc.StaleTelemetryError):
         svc.run_cycle("T", _telemetry(asset_id="part-01", seq=1))
+
+
+# -- fourth round: write gate, atomic supersession, bounded memory ---------------------------------------------------
+
+def test_a_cycle_needs_write_authorisation_and_a_refused_one_writes_nothing(isolated, monkeypatch) -> None:
+    import app.auth as auth
+
+    body = _telemetry(asset_id="gate-01", seq=1).model_dump(mode="json")
+    monkeypatch.setenv("JARVIS_MEMORY_WRITE_ENABLED", "false")
+    refused = client.post("/api/jarvis/asset-twin/cycle", json=body)
+    assert refused.status_code == 403
+    assert not isolated.get_ledger()._path.exists() or isolated.get_ledger()._path.read_text() == ""
+    assert isolated._decisions == {} and isolated._tenant_assets == {}
+
+    # The endpoint must reach the SAME gate the approve/execute endpoints use, before doing any work (what the gate itself
+    # allows, including OAuth write scope, is app.auth.require_memory_write's job and is covered where it is defined).
+    import app.main as main
+    from fastapi import HTTPException
+
+    monkeypatch.setenv("JARVIS_MEMORY_WRITE_ENABLED", "true")
+    seen: list[str] = []
+
+    def denied():
+        seen.append("gate")
+        raise HTTPException(status_code=403, detail="OAuth access token lacks required scope: memory.write")
+
+    original_gate = main.require_memory_write
+    monkeypatch.setattr(main, "require_memory_write", denied)
+    assert client.post("/api/jarvis/asset-twin/cycle", json=body).status_code == 403
+    assert seen == ["gate"] and isolated._decisions == {} and isolated._tenant_assets == {}
+    monkeypatch.setattr(main, "require_memory_write", original_gate)
+    assert client.post("/api/jarvis/asset-twin/cycle", json=body).status_code == 200
+
+
+def test_execution_and_a_newer_cycle_cannot_interleave(isolated, monkeypatch) -> None:
+    """Order 1: the older packet is already executing, so the newer cycle waits for it to finish."""
+    svc = isolated
+    did = svc.run_cycle("T", _telemetry(asset_id="atom-01", seq=1)).decision.decision_id
+    _approve(svc, "T", did)
+    slow = SlowAsset(asset_id="atom-01")
+    slow.block = True
+    svc._assets["T:atom-01"] = slow
+    result: dict = {}
+    executor = threading.Thread(target=lambda: result.setdefault("exec", svc.execute("T", did, "atom-01")))
+    executor.start()
+    assert slow.started.wait(10)
+
+    published: list[str] = []
+    cycler = threading.Thread(target=lambda: published.append(svc.run_cycle("T", _critical(asset_id="atom-01", seq=2)).decision.decision_id))
+    cycler.start()
+    time.sleep(0.4)
+    assert published == [] and svc._latest["T:atom-01"] == did, "the newer packet is not visible while the older one is being applied"
+    slow.release.set()
+    executor.join(10)
+    cycler.join(10)
+    assert result["exec"].executed is True and slow.applied == 1
+    assert svc._gates["T"].get(did).status == "executed"
+    assert svc._gates["T"].get(published[0]).status == "pending"
+
+
+def test_a_newer_cycle_in_flight_makes_the_older_packet_unusable_before_it_can_be_claimed(isolated, monkeypatch) -> None:
+    """Order 2: the newer cycle holds the asset; an execute of the older approved packet must wait, then be refused."""
+    svc = isolated
+    did = svc.run_cycle("T", _telemetry(asset_id="atom-02", seq=1)).decision.decision_id
+    _approve(svc, "T", did)
+    real = svc.estimate_state
+    entered, release = threading.Event(), threading.Event()
+
+    def slow(telemetry, prior_health=1.0):
+        if telemetry.seq == 2:
+            entered.set()
+            assert release.wait(10)
+        return real(telemetry, prior_health=prior_health)
+
+    monkeypatch.setattr(svc, "estimate_state", slow)
+    moved: list[float] = []
+    real_apply = SimulatedAsset.apply_control
+    monkeypatch.setattr(SimulatedAsset, "apply_control", lambda self, sp: (moved.append(sp), real_apply(self, sp))[1])
+    cycler = threading.Thread(target=lambda: svc.run_cycle("T", _critical(asset_id="atom-02", seq=2)))
+    cycler.start()
+    assert entered.wait(10)
+    out: dict = {}
+    executor = threading.Thread(target=lambda: out.setdefault("r", svc.execute("T", did, "atom-02")))
+    executor.start()
+    time.sleep(0.4)
+    assert "r" not in out, "the execute waits for the asset instead of racing the publication"
+    release.set()
+    cycler.join(10)
+    executor.join(10)
+    assert out["r"].executed is False and "expired" in out["r"].reason and moved == []
+
+
+def test_decision_records_are_bounded_per_asset(isolated, monkeypatch) -> None:
+    svc = isolated
+    monkeypatch.setenv("JARVIS_ASSET_TWIN_RETAIN", "5")
+    ids = [svc.run_cycle("T", _telemetry(asset_id="mem-01", seq=n)).decision.decision_id for n in range(1, 61)]
+    assert len(svc._decisions) <= 6 and len(svc._gates["T"]._records) <= 6 and len(svc._history["T:mem-01"]) <= 6
+    gone = svc.execute("T", ids[0], "mem-01")
+    assert gone.executed is False and "unknown decision" in gone.reason
+    _approve(svc, "T", ids[-1])
+    assert svc.execute("T", ids[-1], "mem-01").executed is True, "the newest packet is always kept"
+
+
+def test_a_live_packet_is_never_pruned(isolated, monkeypatch) -> None:
+    svc = isolated
+    monkeypatch.setenv("JARVIS_ASSET_TWIN_RETAIN", "2")
+    first = svc.run_cycle("T", _telemetry(asset_id="mem-02", seq=1)).decision.decision_id
+    gate = svc._gates["T"]
+    _approve(svc, "T", first)
+    assert gate.claim_for_execution(first) is not None  # mid-execution
+    for n in range(2, 12):
+        svc.run_cycle("T", _telemetry(asset_id="mem-02", seq=n))
+    assert gate.get(first) is not None and gate.get(first).status == "executing"
+    gate.mark_executed(first)
+    svc.run_cycle("T", _telemetry(asset_id="mem-02", seq=12))
+    assert gate.get(first) is None, "once it is terminal it is pruned like the rest"
+
+
+def test_a_tenant_cannot_make_the_service_track_unlimited_assets(isolated, monkeypatch) -> None:
+    svc = isolated
+    monkeypatch.setenv("JARVIS_ASSET_TWIN_MAX_ASSETS", "3")
+    for n in range(3):
+        svc.run_cycle("T", _telemetry(asset_id=f"cap-{n}", seq=1))
+    with pytest.raises(svc.TooManyAssetsError):
+        svc.run_cycle("T", _telemetry(asset_id="cap-3", seq=1))
+    svc.run_cycle("T", _telemetry(asset_id="cap-0", seq=2))   # an asset it already tracks is fine
+    svc.run_cycle("U", _telemetry(asset_id="cap-3", seq=1))   # other tenants have their own allowance
+    for n in range(3):  # the API's own tenant ("operator")
+        assert client.post("/api/jarvis/asset-twin/cycle", json=_telemetry(asset_id=f"api-cap-{n}", seq=1).model_dump(mode="json")).status_code == 200
+    answer = client.post("/api/jarvis/asset-twin/cycle", json=_telemetry(asset_id="api-cap-9", seq=1).model_dump(mode="json"))
+    assert answer.status_code == 429 and "JARVIS_ASSET_TWIN_MAX_ASSETS" in answer.text

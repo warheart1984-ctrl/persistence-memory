@@ -31,13 +31,6 @@ class EvidenceChainError(RuntimeError):
     """The persisted chain for a tenant does not verify; nothing is appended on top of a broken chain."""
 
 
-def _checked_digest(rec: dict) -> str:
-    """The record's stored digest if it matches its own content, else a marker that can never equal a real head."""
-    body = {k: v for k, v in rec.items() if k != "digest"}
-    expect = "sha256:" + hashlib.sha256(canonical(body)).hexdigest()
-    return rec.get("digest") if rec.get("digest") == expect else "<corrupt>"
-
-
 def _scan(text: str, tenant: str) -> tuple[list[str], str]:
     """Walk one tenant's records in file order; returns (problems, last digest)."""
     problems: list[str] = []
@@ -69,59 +62,43 @@ class EvidenceLedger:
         self._path = path or (_dir() / "audit.jsonl")
         self._lock = threading.Lock()
         self._last: dict[str, str] = {}  # tenant -> digest of its newest record
+        self._seen: tuple[int, int, int] | None = None  # (size, mtime_ns, inode) as this ledger last wrote or verified the file
 
-    def _tail_digest(self, tenant: str) -> str | None:
-        """Digest of the tenant's newest record in the file, read from the END (cheap), or None if it has none."""
+    def _stat(self) -> tuple[int, int, int] | None:
         try:
-            size = self._path.stat().st_size
-            fh = self._path.open("rb")
+            st = self._path.stat()
         except FileNotFoundError:
             return None
-        with fh:
-            end = size
-            carry = b""
-            while end > 0:
-                start = max(0, end - 65536)
-                fh.seek(start)
-                data = fh.read(end - start) + carry
-                lines = data.split(b"\n")
-                carry = lines[0] if start > 0 else b""
-                for raw in reversed(lines[1:] if start > 0 else lines):
-                    if not raw.strip():
-                        continue
-                    try:
-                        rec = json.loads(raw)
-                    except (json.JSONDecodeError, UnicodeDecodeError):
-                        return "<unreadable>"
-                    if isinstance(rec, dict) and rec.get("tenant") == tenant:
-                        return _checked_digest(rec)
-                end = start
-            if carry.strip():
-                try:
-                    rec = json.loads(carry)
-                    if isinstance(rec, dict) and rec.get("tenant") == tenant:
-                        return _checked_digest(rec)
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    return "<unreadable>"
-        return None
+        return (st.st_size, st.st_mtime_ns, st.st_ino)
 
     def _head(self, tenant: str) -> str:
         """The tenant's newest digest.
 
         After a restart `_last` is empty, so recover it from the file and verify the whole chain on the way: appending to a
-        chain that does not verify would only hide the break. A cached head is not trusted blindly either: this service is the
-        only writer, so the file's tail must still end in the digest it last wrote. If it does not (records removed, edited
-        or added behind its back) that is a failure, not something to re-adopt: a truncated chain still verifies, so
-        quietly accepting the shorter one would forgive exactly the tampering this ledger exists to expose. Restart
-        recovery (above) is the only way a head is taken from disk."""
+        chain that does not verify would only hide the break.
+
+        A cached head is trusted only while the file is exactly as this ledger last left it (size, mtime, inode). This service
+        is the only writer, so if the file changed, the tenant's WHOLE chain is verified again and must still end in the digest
+        this ledger last wrote: an edited middle record, a truncation (a shortened chain still verifies on its own), or records
+        added behind its back are all failures, not something to re-adopt. Restart recovery is the only way a head is taken from
+        disk. (A change that restores size and mtime exactly is not caught by this cheap test; periodic `verify()` is.)"""
         head = self._last.get(tenant)
         if head is not None:
-            on_disk = self._tail_digest(tenant) or GENESIS  # no record on disk yet is the genesis head
-            if on_disk != head:
+            now = self._stat()
+            if now == self._seen:
+                return head
+            try:
+                text = self._path.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                text = ""
+            problems, on_disk = _scan(text, tenant)
+            if problems or on_disk != head:
+                detail = "; ".join(problems) if problems else f"expected newest digest {head}, found {on_disk}"
                 raise EvidenceChainError(
-                    f"evidence file for tenant {tenant!r} changed while the service was running "
-                    f"(expected newest digest {head}, found {on_disk}); refusing to append or authorise anything"
+                    f"evidence file for tenant {tenant!r} changed while the service was running ({detail}); "
+                    "refusing to append or authorise anything"
                 )
+            self._seen = now
             return head
         try:
             text = self._path.read_text(encoding="utf-8")
@@ -131,6 +108,7 @@ class EvidenceLedger:
         if problems:
             raise EvidenceChainError(f"evidence chain for tenant {tenant!r} is broken ({'; '.join(problems)}); refusing to append")
         self._last[tenant] = head
+        self._seen = self._stat()
         return head
 
     def check(self, tenant: str) -> None:
@@ -152,6 +130,7 @@ class EvidenceLedger:
             with self._path.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
             self._last[tenant] = digest  # only once the record is on disk
+            self._seen = self._stat()
             return record
 
     def last_measurement_seq(self, tenant: str, asset_id: str) -> int | None:

@@ -40,6 +40,16 @@ class VetoGate:
         with self._lock:
             return self._records.get(decision_id)
 
+    def forget(self, decision_id: str) -> bool:
+        """Drop a record that can never act again (expired, vetoed, executed, safe-state). Live ones (pending, approved,
+        held, executing) are kept; returns whether it was dropped."""
+        with self._lock:
+            rec = self._records.get(decision_id)
+            if rec is not None and rec.status in ("expired", "vetoed", "executed", "safe_state"):
+                del self._records[decision_id]
+                return True
+            return rec is None
+
     def supersede(self, decision_id: str) -> None:
         """A newer telemetry cycle replaced this recommendation: it can no longer be approved or executed."""
         with self._lock:
