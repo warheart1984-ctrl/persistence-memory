@@ -835,7 +835,13 @@ REVOKE ALL ON FUNCTION jarvis_store_attestation(text, text, text, text, bigint, 
 REVOKE ALL ON FUNCTION jarvis_store_trust_statement(text, text, text, text, bigint, text, bigint, text, text, text) FROM PUBLIC;
 """
 
-MIGRATIONS: list[tuple[int, str]] = [(1, _V1), (2, _V2), (3, _V3), (4, _V4), (5, _V5), (6, _V6), (7, _V7)]
+_V8 = """
+-- emr_latest: supersession is derived from the ``supersedes`` column, so finding a record's successor (and excluding superseded
+-- records from the newest-first listing) must be an index lookup, not a scan.  Additive; no data change.
+CREATE INDEX memories_supersedes_idx ON memories (tenant_key, supersedes) WHERE supersedes IS NOT NULL;
+"""
+
+MIGRATIONS: list[tuple[int, str]] = [(1, _V1), (2, _V2), (3, _V3), (4, _V4), (5, _V5), (6, _V6), (7, _V7), (8, _V8)]
 EXPECTED_SCHEMA_VERSION = MIGRATIONS[-1][0]
 
 

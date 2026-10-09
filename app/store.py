@@ -29,6 +29,8 @@ from app.models import (
     migrate_legacy_record,
 )
 from app.identity import current_tenant_key
+from app.ts import parse_utc
+from app.twin import TWIN_AGENT
 from app.store_errors import StoreUnavailableError, StoreVersionConflict
 from app import clause_v
 from app import evidence as evidence_objects
@@ -298,6 +300,46 @@ class JarvisStore:
             results = [m for m in results if memory_matches_query(m, q)]
         results.sort(key=lambda m: (m.created_at, m.id), reverse=True)
         return results[:limit]
+
+    def list_latest(
+        self,
+        *,
+        limit: int,
+        after: tuple[datetime, str] | None = None,
+        memory_type: str | None = None,
+        include_superseded: bool = False,
+        include_archived: bool = False,
+        include_twin: bool = False,
+    ) -> list[tuple[MemoryRecord, str | None]]:
+        """Newest-first keyset page: ``(record, superseded_by)`` pairs ordered by ``(created_at, id)`` descending.
+
+        ``after`` is the last ``(created_at, id)`` already returned; only strictly older rows follow it.  A record is
+        superseded when another record in this tenant names it in ``supersedes`` (the newest such successor is reported).
+        """
+        self._ensure_loaded()
+        successor: dict[str, tuple[datetime, str]] = {}
+        for m in self._memories.values():
+            if m.supersedes:
+                key = (parse_utc(m.created_at), m.id)
+                if m.supersedes not in successor or key > successor[m.supersedes]:
+                    successor[m.supersedes] = key
+        rows: list[tuple[tuple[datetime, str], MemoryRecord, str | None]] = []
+        for m in self._memories.values():
+            if memory_type and m.type != memory_type:
+                continue
+            if not include_twin and m.source_agent == TWIN_AGENT:
+                continue
+            if not include_archived and m.status == "archived":
+                continue
+            succ = successor.get(m.id)
+            if succ is not None and not include_superseded:
+                continue
+            key = (parse_utc(m.created_at), m.id)
+            if after is not None and not key < (parse_utc(after[0]), after[1]):
+                continue
+            rows.append((key, m, succ[1] if succ else None))
+        rows.sort(key=lambda r: r[0], reverse=True)
+        return [(m, s) for _, m, s in rows[: max(0, int(limit))]]
 
     def retrieve(
         self,

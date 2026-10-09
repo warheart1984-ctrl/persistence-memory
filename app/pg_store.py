@@ -40,6 +40,7 @@ from app.pg_schema import check_schema_version, validate_schema_name
 from app.store import _make_id, ledger_retrieve, memory_matches_query
 from app.store_errors import InvalidInputError, StoreUnavailableError, StoreVersionConflict
 from app import attest
+from app.twin import TWIN_AGENT
 from app import clause_v
 from app import evidence as evidence_objects
 
@@ -308,6 +309,46 @@ class PostgresRowStore:
             q = query.lower()
             records = [m for m in records if memory_matches_query(m, q)][: max(0, int(limit))]
         return records
+
+    def list_latest(
+        self,
+        *,
+        limit: int,
+        after: tuple[datetime, str] | None = None,
+        memory_type: str | None = None,
+        include_superseded: bool = False,
+        include_archived: bool = False,
+        include_twin: bool = False,
+    ) -> list[tuple[MemoryRecord, str | None]]:
+        """Newest-first keyset page; same contract as ``JarvisStore.list_latest``."""
+        where = ["m.tenant_key = %s"]
+        params: list[Any] = [self._tenant_key]
+        if memory_type:
+            where.append("m.type = %s")
+            params.append(memory_type)
+        if not include_twin:
+            where.append("m.source_agent <> %s")
+            params.append(TWIN_AGENT)
+        if not include_archived:
+            where.append("m.status <> 'archived'")
+        if not include_superseded:
+            where.append(
+                "NOT EXISTS (SELECT 1 FROM memories s WHERE s.tenant_key = m.tenant_key AND s.supersedes = m.id)"
+            )
+        if after is not None:
+            where.append('(m.created_at, m.id COLLATE "C") < (%s, %s COLLATE "C")')
+            params += [after[0], after[1]]
+        sql_text = (
+            f"SELECT {', '.join('m.' + c.strip() for c in _COLUMNS.split(','))}, "
+            "(SELECT s.id FROM memories s WHERE s.tenant_key = m.tenant_key AND s.supersedes = m.id "
+            ' ORDER BY s.created_at DESC, s.id COLLATE "C" DESC LIMIT 1) AS superseded_by '
+            f"FROM memories m WHERE {' AND '.join(where)} "
+            'ORDER BY m.created_at DESC, m.id COLLATE "C" DESC LIMIT %s'
+        )
+        params.append(max(0, int(limit)))
+        with self._tx() as conn:
+            rows = conn.execute(sql_text, params).fetchall()
+        return [(_record(r), r["superseded_by"]) for r in rows]
 
     def retrieve(
         self,
