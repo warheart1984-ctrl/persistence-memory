@@ -738,7 +738,14 @@ def asset_twin_cycle(request: Request, body: dict):
         telemetry = Telemetry.model_validate(body)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"bad telemetry: {exc}") from exc
-    return asset_service.run_cycle(tenant, telemetry).model_dump(mode="json")
+    from app.asset_twin.evidence import EvidenceChainError
+
+    try:
+        return asset_service.run_cycle(tenant, telemetry).model_dump(mode="json")
+    except asset_service.StaleTelemetryError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except EvidenceChainError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @app.post("/api/jarvis/asset-twin/decide")
@@ -754,8 +761,12 @@ def asset_twin_decide(request: Request, body: dict):
         raise HTTPException(status_code=400, detail=f"bad verdict: {exc}") from exc
     if verdict.verdict == "approve":
         require_memory_write()
+    from app.asset_twin.evidence import EvidenceChainError
+
     try:
         return asset_service.decide_human(tenant, verdict, actor=tenant)
+    except EvidenceChainError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except (KeyError, ValueError) as exc:
         raise HTTPException(status_code=404 if "unknown" in str(exc) else 400, detail=str(exc)) from exc
 
@@ -771,7 +782,12 @@ def asset_twin_execute(request: Request, body: dict):
     asset_id = str(body.get("asset_id", ""))
     if not decision_id or not asset_id:
         raise HTTPException(status_code=400, detail="decision_id and asset_id required")
-    return asset_service.execute(tenant, decision_id, asset_id).model_dump(mode="json")
+    from app.asset_twin.evidence import EvidenceChainError
+
+    try:
+        return asset_service.execute(tenant, decision_id, asset_id).model_dump(mode="json")
+    except EvidenceChainError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @app.get("/api/jarvis/asset-twin/audit")
@@ -968,7 +984,14 @@ def external_forget(body: NxForgetRequest, request: Request):
 
 @app.post("/api/jarvis/memory/external/describe", dependencies=[Depends(require_nx_enabled), Depends(require_emr_recall_api_key)])
 def external_describe(body: NxDescribeRequest, request: Request):
-    """Describe an image via vision (NVIDIA + HoloRT4D). Path validated against allowed roots."""
+    """Describe an image via vision (NVIDIA + HoloRT4D). Path validated against allowed roots.
+
+    Reading is gated like the other read endpoints; `save=true` WRITES (nx-search's own memory and a ledger record), so it
+    additionally needs the nx-write flag and a write-scoped token, checked before anything is invoked.
+    """
+    if body.save:
+        require_nx_write()
+        require_memory_write()
     # Validate path is within allowed roots
     validated_path = validate_nx_path(body.image_path)
     

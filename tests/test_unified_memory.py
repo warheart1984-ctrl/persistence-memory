@@ -1,7 +1,13 @@
 """Tests for unified memory system (nx-search integration)."""
 import sys
 import os
+import platform
+import shutil
+import subprocess
+import threading
 from pathlib import Path
+
+import pytest
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -12,13 +18,28 @@ from app.auth import nx_allowed_roots, validate_nx_path, nx_write_enabled, requi
 from fastapi import HTTPException
 
 
-def test_nx_search_client_init():
-    """Test NxSearchClient initialization."""
+def test_nx_search_client_init(monkeypatch):
+    """The default install path depends on the platform; an explicit path always wins."""
+    monkeypatch.delenv("NX_SEARCH_PATH", raising=False)
     client = NxSearchClient(require_available=False)
-    assert client.nx_path == "G:/nx-search"
-    
+    expected = "G:/nx-search" if platform.system().lower() == "windows" else str(Path.home() / ".local" / "share" / "nx-search")
+    assert client.nx_path == expected
+
     custom_client = NxSearchClient(nx_path="custom/path", require_available=False)
     assert custom_client.nx_path == "custom/path"
+
+
+def test_default_nx_path_per_platform(monkeypatch):
+    import app.nx_search_client as mod
+
+    monkeypatch.delenv("NX_SEARCH_PATH", raising=False)
+    monkeypatch.setattr(mod.platform, "system", lambda: "Windows")
+    assert NxSearchClient(require_available=False).nx_path == "G:/nx-search"
+    for system in ("Linux", "Darwin"):
+        monkeypatch.setattr(mod.platform, "system", lambda system=system: system)
+        assert NxSearchClient(require_available=False).nx_path == str(Path.home() / ".local" / "share" / "nx-search")
+    monkeypatch.setenv("NX_SEARCH_PATH", "/opt/nx")
+    assert NxSearchClient(require_available=False).nx_path == "/opt/nx"
 
 
 def test_nx_search_client_error_handling():
@@ -34,7 +55,7 @@ def test_nx_search_client_error_handling():
 
 def test_promote_to_memory_format():
     """Test promotion of nx-search results to memory format."""
-    client = NxSearchClient()
+    client = NxSearchClient(require_available=False)
     
     search_result = {
         "path": "G:\\test\\file.py",
@@ -82,7 +103,7 @@ def test_memory_create_with_external_context():
 
 def test_promote_empty_snippet():
     """Test promotion with empty snippet."""
-    client = NxSearchClient()
+    client = NxSearchClient(require_available=False)
     
     search_result = {
         "path": "G:\\test\\file.py",
@@ -101,7 +122,7 @@ def test_promote_empty_snippet():
 
 def test_promote_windows_path():
     """Test promotion handles Windows paths correctly."""
-    client = NxSearchClient()
+    client = NxSearchClient(require_available=False)
     
     search_result = {
         "path": "D:\\New Project\\test.py",
@@ -179,7 +200,7 @@ def test_nx_watch_request_model():
 
 def test_client_methods_exist():
     """Test that new client methods exist and are callable."""
-    client = NxSearchClient()
+    client = NxSearchClient(require_available=False)
     
     # These methods should exist (they'll return errors without nx-search running, but shouldn't crash)
     assert hasattr(client, 'ask')
@@ -210,48 +231,57 @@ def test_nx_allowed_roots_default():
     assert any("D:" in str(r) for r in roots)
 
 
-def test_validate_nx_path_allows_allowed_root():
-    """Test validate_nx_path allows paths within allowed roots."""
-    roots = [Path("G:/project")]
-    result = validate_nx_path("G:/project/file.py", roots)
+def test_validate_nx_path_allows_allowed_root(tmp_path):
+    """validate_nx_path allows paths within allowed roots."""
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "file.py").write_text("x")
+    result = validate_nx_path(str(root / "file.py"), [root])
     assert isinstance(result, Path)
-    assert str(result) == "G:\\project\\file.py"
+    assert result == (root / "file.py").resolve()
 
 
-def test_validate_nx_path_rejects_traversal():
-    """Test validate_nx_path rejects path traversal attempts."""
+def test_validate_nx_path_rejects_traversal(tmp_path):
+    """validate_nx_path rejects ../ traversal out of the root."""
+    root = tmp_path / "project"
+    root.mkdir()
+    with pytest.raises(HTTPException) as err:
+        validate_nx_path(str(root / ".." / ".." / "etc" / "passwd"), [root])
+    assert err.value.status_code == 403
+    assert "outside allowed roots" in err.value.detail
+
+
+def test_validate_nx_path_rejects_outside_root(tmp_path):
+    """validate_nx_path rejects a sibling directory of the root."""
+    root = tmp_path / "project"
+    other = tmp_path / "other"
+    root.mkdir()
+    other.mkdir()
+    with pytest.raises(HTTPException) as err:
+        validate_nx_path(str(other / "file.txt"), [root])
+    assert err.value.status_code == 403
+    assert "outside allowed roots" in err.value.detail
+
+
+def test_validate_nx_path_rejects_a_root_prefix_lookalike(tmp_path):
+    """/x/project-evil is not inside /x/project."""
+    root = tmp_path / "project"
+    evil = tmp_path / "project-evil"
+    root.mkdir()
+    evil.mkdir()
+    with pytest.raises(HTTPException) as err:
+        validate_nx_path(str(evil / "f.txt"), [root])
+    assert err.value.status_code == 403
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="drive-letter path semantics")
+def test_validate_nx_path_windows_forms():
     roots = [Path("G:/project")]
-    
-    # Test ../ traversal
-    try:
-        validate_nx_path("G:/project/../../etc/passwd", roots)
-        assert False, "Should have raised HTTPException"
-    except HTTPException as e:
-        assert e.status_code == 403
-        assert "outside allowed roots" in e.detail or "traversal" in e.detail.lower()
-
-
-def test_validate_nx_path_rejects_outside_root():
-    """Test validate_nx_path rejects paths outside allowed roots."""
-    roots = [Path("G:/project")]
-    
-    try:
-        validate_nx_path("C:/Windows/System32", roots)
-        assert False, "Should have raised HTTPException"
-    except HTTPException as e:
-        assert e.status_code == 403
-        assert "outside allowed roots" in e.detail
-
-
-def test_validate_nx_path_rejects_absolute_outside():
-    """Test validate_nx_path rejects absolute paths outside roots on Windows."""
-    roots = [Path("G:/project")]
-    
-    try:
-        validate_nx_path("D:/other/file.txt", roots)
-        assert False, "Should have raised HTTPException"
-    except HTTPException as e:
-        assert e.status_code == 403
+    assert str(validate_nx_path("G:/project/file.py", roots)) == "G:\\project\\file.py"
+    for bad in ("G:/project/../../etc/passwd", "C:/Windows/System32", "D:/other/file.txt"):
+        with pytest.raises(HTTPException) as err:
+            validate_nx_path(bad, roots)
+        assert err.value.status_code == 403
 
 
 def test_nx_write_enabled_default_false():
@@ -331,3 +361,79 @@ def test_nx_enabled_true_when_set():
         else:
             os.environ.pop("JARVIS_NX_ENABLED", None)
         importlib.reload(app.auth)
+
+# --- describe: save=true is a write, and is gated like one --------------------------------------------------------
+
+class _RecordingClient:
+    """Stands in for NxSearchClient in app.main; records whether it was ever asked to do anything."""
+
+    instances: list["_RecordingClient"] = []
+
+    def __init__(self, *args, **kwargs):
+        self.calls: list[tuple] = []
+        _RecordingClient.instances.append(self)
+
+    def describe(self, *args, **kwargs):
+        self.calls.append(("describe", args, kwargs))
+        return {"output": "a described image"}
+
+    def close(self):
+        pass
+
+
+@pytest.fixture()
+def describe_env(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    import app.main as main
+
+    image = tmp_path / "pic.png"
+    image.write_bytes(b"\x89PNG")
+    monkeypatch.setenv("NX_SCAN_ROOTS", str(tmp_path))
+    monkeypatch.setenv("JARVIS_NX_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_MEMORY_WRITE_ENABLED", "true")
+    monkeypatch.delenv("JARVIS_NX_WRITE_ENABLED", raising=False)
+    _RecordingClient.instances = []
+    monkeypatch.setattr(main, "NxSearchClient", _RecordingClient)
+    return TestClient(main.app), str(image), main
+
+
+def test_describe_without_save_needs_no_write_permission(describe_env):
+    http, image, _ = describe_env
+    response = http.post("/api/jarvis/memory/external/describe", json={"image_path": image, "save": False})
+    assert response.status_code == 200, response.text
+    assert [c[0] for i in _RecordingClient.instances for c in i.calls] == ["describe"]
+
+
+def test_describe_with_save_is_refused_when_nx_writes_are_off_and_nothing_runs(describe_env):
+    http, image, _ = describe_env
+    response = http.post("/api/jarvis/memory/external/describe", json={"image_path": image, "save": True})
+    assert response.status_code == 403
+    assert "JARVIS_NX_WRITE_ENABLED" in response.text
+    assert [i for i in _RecordingClient.instances if i.calls] == [], "nx-search must not be invoked, nor a ledger record written"
+
+
+def test_describe_with_save_is_refused_when_memory_writes_are_off(describe_env, monkeypatch):
+    http, image, _ = describe_env
+    monkeypatch.setenv("JARVIS_NX_WRITE_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_MEMORY_WRITE_ENABLED", "false")
+    response = http.post("/api/jarvis/memory/external/describe", json={"image_path": image, "save": True})
+    assert response.status_code == 403
+    assert [i for i in _RecordingClient.instances if i.calls] == []
+
+
+def test_describe_with_save_runs_when_both_writes_are_allowed(describe_env, monkeypatch):
+    http, image, main = describe_env
+    monkeypatch.setenv("JARVIS_NX_WRITE_ENABLED", "true")
+    saved = []
+
+    class Store:
+        def create_memory(self, data):
+            saved.append(data)
+            return type("M", (), {"id": "mem-1"})()
+
+    monkeypatch.setattr(main, "get_store", lambda: Store())
+    response = http.post("/api/jarvis/memory/external/describe", json={"image_path": image, "save": True})
+    assert response.status_code == 200, response.text
+    assert response.json()["ledger_memory_id"] == "mem-1" and len(saved) == 1
+    assert [c[2]["save"] for i in _RecordingClient.instances for c in i.calls] == [True]

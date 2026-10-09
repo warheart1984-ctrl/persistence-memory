@@ -96,7 +96,7 @@ class VetoDecision(BaseModel):
 
 class VetoRecord(BaseModel):
     decision_id: str
-    status: Literal["pending", "approved", "vetoed", "held", "expired", "executed", "safe_state"]
+    status: Literal["pending", "approved", "vetoed", "held", "expired", "executing", "executed", "safe_state"]
     veto: VetoDecision | None = None
 
 
