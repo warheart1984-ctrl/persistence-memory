@@ -29,6 +29,11 @@ VERSION_CONFLICT = "version_conflict"
 DENIED = "denied"
 UNAVAILABLE = "unavailable"
 CLAUSE_V_VIOLATION = "clause_v_violation"
+INVALID_REQUEST = "invalid_request"
+
+# emr_latest carries its spec reasons (LIMIT_OUT_OF_RANGE, AUTHORITY_DENIED, ...) in ``reason`` next to the stable ``code``.
+AUTHORITY_DENIED = "AUTHORITY_DENIED"
+LATEST_PATHS = ("/api/jarvis/memory/latest", "/api/jarvis/tools/emr_latest")
 
 
 def retry_after_seconds() -> int:
@@ -48,11 +53,13 @@ def code_for_status(status: int) -> str | None:
     return None
 
 
-def error_body(status: int, detail: Any, code: str | None = None) -> dict[str, Any]:
+def error_body(status: int, detail: Any, code: str | None = None, reason: str | None = None) -> dict[str, Any]:
     body: dict[str, Any] = {"detail": detail}
     chosen = code or code_for_status(status)
     if chosen:
         body["code"] = chosen
+    if reason:
+        body["reason"] = reason
     return body
 
 
@@ -64,8 +71,16 @@ def error_headers(status: int, headers: dict[str, str] | None = None) -> dict[st
 
 
 def json_response(
-    status: int, detail: Any, *, code: str | None = None, headers: dict[str, str] | None = None
+    status: int,
+    detail: Any,
+    *,
+    code: str | None = None,
+    headers: dict[str, str] | None = None,
+    reason: str | None = None,
+    path: str | None = None,
 ) -> JSONResponse:
+    if reason is None and path in LATEST_PATHS and status in (401, 403):
+        reason = AUTHORITY_DENIED
     return JSONResponse(
-        status_code=status, content=error_body(status, detail, code), headers=error_headers(status, headers)
+        status_code=status, content=error_body(status, detail, code, reason), headers=error_headers(status, headers)
     )

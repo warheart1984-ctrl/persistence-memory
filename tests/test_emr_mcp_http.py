@@ -74,6 +74,7 @@ def test_mcp_tools_list():
     names = [t["name"] for t in tools]
     assert names == [
         "emr_recall",
+        "emr_latest",
         "search",
         "fetch",
         "emr_search",

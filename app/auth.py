@@ -174,7 +174,7 @@ async def ledger_read_protection_middleware(request: Request, call_next):
             request.headers.get("x-emr-recall-key"),
         )
     except HTTPException as exc:
-        return json_response(exc.status_code, exc.detail, headers=getattr(exc, "headers", None))
+        return json_response(exc.status_code, exc.detail, headers=getattr(exc, "headers", None), path=request.url.path)
     return await call_next(request)
 
 
@@ -285,7 +285,7 @@ class ApiKeyMiddleware(BaseHTTPMiddleware):
         if expected is not None:
             presented = extract_presented_key(request)
             if presented is None or not secrets.compare_digest(presented, expected):
-                return json_response(401, "Invalid or missing API key")
+                return json_response(401, "Invalid or missing API key", path=request.url.path)
             return await call_next(request)
 
         if allow_unauthenticated():
@@ -294,6 +294,7 @@ class ApiKeyMiddleware(BaseHTTPMiddleware):
         return json_response(
             401,
             "API key required. Set JARVIS_API_KEY, or for local dev only set JARVIS_ALLOW_UNAUTHENTICATED=1.",
+            path=request.url.path,
         )
 
 
@@ -318,13 +319,13 @@ async def identity_middleware(request: Request, call_next):
     authorization = request.headers.get("authorization") or ""
     if not authorization.lower().startswith("bearer "):
         return json_response(
-            401, "OAuth Bearer access token required", headers={"WWW-Authenticate": oauth_challenge()}
+            401, "OAuth Bearer access token required", headers={"WWW-Authenticate": oauth_challenge()}, path=path
         )
     try:
         principal = validate_access_token(authorization[7:].strip())
     except HTTPException as exc:
         headers = {"WWW-Authenticate": oauth_challenge()} if exc.status_code == 401 else {}
-        return json_response(exc.status_code, exc.detail, headers=headers)
+        return json_response(exc.status_code, exc.detail, headers=headers, path=path)
     token = set_principal(principal)
     try:
         return await call_next(request)

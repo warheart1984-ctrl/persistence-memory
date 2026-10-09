@@ -88,6 +88,7 @@ from app.identity import current_tenant_key
 from app.oauth import protected_resource_metadata
 from app.public_security import cors_origins, public_security_middleware
 from app.refusal import DENIED, LEDGER_UNAVAILABLE, VERSION_CONFLICT, json_response, retry_after_seconds
+from app.emr_latest import LatestError, LatestParams, latest_memories, parse_limit
 from app import clause_v
 from app.clause_v import ClauseVViolation
 from app import evidence as evidence_objects
@@ -225,6 +226,7 @@ def index():
             "tools": {
                 "catalog": "GET /api/jarvis/tools",
                 "emr_recall": "POST /api/jarvis/tools/emr_recall",
+                "emr_latest": "POST /api/jarvis/tools/emr_latest",
                 "search": "POST /api/jarvis/tools/search",
                 "fetch": "POST /api/jarvis/tools/fetch",
                 "emr_remember": "POST /api/jarvis/tools/emr_remember",
@@ -236,6 +238,7 @@ def index():
                 "tools": [
                     "emr_recall",
                     "search",
+                    "emr_latest",
                     "fetch",
                     "emr_search",
                     "emr_fetch",
@@ -281,10 +284,15 @@ async def _version_conflict(request: Request, exc: StoreVersionConflict):
     return json_response(409, str(exc), code=VERSION_CONFLICT)
 
 
+@app.exception_handler(LatestError)
+async def _latest_error(request: Request, exc: LatestError):
+    return json_response(exc.status, exc.detail, code=exc.code, reason=exc.reason)
+
+
 @app.exception_handler(StarletteHTTPException)
 async def _http_exception(request: Request, exc: StarletteHTTPException):
     """Same bodies as before; 401/403 gain code=denied and every 503 gains Retry-After."""
-    return json_response(exc.status_code, exc.detail, headers=getattr(exc, "headers", None))
+    return json_response(exc.status_code, exc.detail, headers=getattr(exc, "headers", None), path=request.url.path)
 
 
 @app.get("/ready")
@@ -328,6 +336,7 @@ def health():
             "tools": [
                 "emr_recall",
                 "search",
+                "emr_latest",
                 "fetch",
                 "emr_search",
                 "emr_fetch",
@@ -339,6 +348,7 @@ def health():
         "emr_tools_http": {
             "catalog": "GET /api/jarvis/tools",
             "emr_recall": "POST /api/jarvis/tools/emr_recall",
+            "emr_latest": "POST /api/jarvis/tools/emr_latest",
             "search": "POST /api/jarvis/tools/search",
             "fetch": "POST /api/jarvis/tools/fetch",
             "emr_remember": "POST /api/jarvis/tools/emr_remember",
@@ -434,6 +444,55 @@ def list_conflicts(subject: str | None = Query(default=None)):
     store = get_store()
     conflicts = store.conflicts(subject=subject)
     return {"conflicts": [c.model_dump() for c in conflicts]}
+
+
+def _run_latest(arguments: dict[str, Any], *, http: bool) -> dict[str, Any]:
+    """Resolve the tenant and run the one emr_latest implementation (shared by the HTTP route and the MCP tool)."""
+    tenant = current_tenant_key() or (None if oauth_enabled() else "operator")
+    raw_limit = arguments.get("limit")
+    if http and isinstance(raw_limit, str):
+        try:
+            raw_limit = int(raw_limit.strip())
+        except ValueError:
+            raw_limit = -1  # not an integer: refused as out of range, never silently defaulted
+    flags = {k: arguments.get(k) for k in ("include_superseded", "include_archived", "include_twin")}
+    for name, value in flags.items():
+        if value is not None and not isinstance(value, bool):
+            raise LatestError(422, "invalid_request", "INVALID_PARAMETER", f"{name} must be a boolean")
+    cursor, mtype = arguments.get("cursor"), arguments.get("type")
+    for name, value in (("cursor", cursor), ("type", mtype)):
+        if value is not None and not isinstance(value, str):
+            raise LatestError(422, "invalid_request", "INVALID_PARAMETER", f"{name} must be a string")
+    params = LatestParams(
+        limit=parse_limit(raw_limit),
+        cursor=cursor or None,
+        include_superseded=bool(flags["include_superseded"]),
+        include_archived=bool(flags["include_archived"]),
+        include_twin=bool(flags["include_twin"]),
+        type=mtype or None,
+    )
+    if tenant is None:
+        return latest_memories(None, tenant=None, params=params, operator=False)  # raises TENANT_UNRESOLVED
+    return latest_memories(get_store(), tenant=tenant, params=params, operator=not oauth_enabled())
+
+
+@app.get("/api/jarvis/memory/latest")
+def memory_latest(
+    limit: str | None = Query(default=None),
+    cursor: str | None = Query(default=None),
+    include_superseded: bool = Query(default=False),
+    include_archived: bool = Query(default=False),
+    include_twin: bool = Query(default=False),
+    type: str | None = Query(default=None, alias="type"),
+):
+    """Newest memory records first, no id or keyword needed (read-only; see docs/emr_latest.md)."""
+    return _run_latest(
+        {
+            "limit": limit, "cursor": cursor, "include_superseded": include_superseded,
+            "include_archived": include_archived, "include_twin": include_twin, "type": type,
+        },
+        http=True,
+    )
 
 
 @app.get("/api/jarvis/memory")
@@ -806,6 +865,12 @@ def tool_emr_search(body: EmrSearchRequest):
 def tool_emr_fetch(body: EmrFetchRequest):
     """Alias of ``fetch`` for hosts that namespace EMR tools."""
     return tool_fetch(body)
+
+
+@app.post("/api/jarvis/tools/emr_latest", dependencies=[Depends(require_emr_recall_api_key)])
+def tool_emr_latest(body: dict[str, Any] | None = None):
+    """Read-only newest-first discovery (same implementation as GET /api/jarvis/memory/latest)."""
+    return _run_latest(body or {}, http=False)
 
 
 @app.post("/api/jarvis/tools/emr_recall", dependencies=[Depends(require_emr_recall_api_key)])
@@ -1628,6 +1693,8 @@ def _invoke_emr_tool(name: str, arguments: dict) -> dict:
         raise ToolRefusal(LEDGER_UNAVAILABLE, "Ledger store unavailable") from None
     except StoreVersionConflict as exc:
         raise ToolRefusal(VERSION_CONFLICT, str(exc)) from None
+    except LatestError as exc:
+        raise ToolRefusal(exc.code, exc.detail, exc.reason) from None
     except HTTPException as exc:
         if exc.status_code in (401, 403):
             raise ToolRefusal(DENIED, str(exc.detail)) from None
@@ -1642,6 +1709,8 @@ def _invoke_emr_tool_unguarded(name: str, arguments: dict) -> dict:
     if name in ("fetch", "emr_fetch"):
         body = EmrFetchRequest.model_validate(arguments)
         return emr_fetch(store, body)
+    if name == "emr_latest":
+        return _run_latest(arguments, http=False)
     if name == "emr_recall":
         body = EmrRecallRequest.model_validate(arguments)
         return emr_recall(store, body).model_dump()

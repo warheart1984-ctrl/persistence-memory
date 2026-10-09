@@ -99,6 +99,34 @@ EMR_RECALL_TOOL: dict[str, Any] = {
     },
 }
 
+EMR_LATEST_TOOL: dict[str, Any] = {
+    "name": "emr_latest",
+    "description": (
+        "Newest-first discovery over the Continuity Ledger: call it with no id and no keyword to find the most "
+        "recent memory records. Read-only. Superseded, archived and ai-twin records are excluded unless asked for. "
+        "Returns records (id, created_at, type, status, provenance, supersedes, superseded_by, summary), "
+        "next_cursor for paging, ledger_head and a result_digest that is identical for identical ledger state."
+    ),
+    "annotations": {
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
+            "cursor": {"type": "string", "description": "next_cursor from the previous page"},
+            "include_superseded": {"type": "boolean", "default": False},
+            "include_archived": {"type": "boolean", "default": False},
+            "include_twin": {"type": "boolean", "default": False},
+            "type": {"type": "string", "description": "Only records of this type"},
+        },
+        "additionalProperties": False,
+    },
+}
+
 EMR_REMEMBER_TOOL: dict[str, Any] = {
     "name": "emr_remember",
     "description": (
@@ -266,6 +294,7 @@ EMR_UPSERT_TOOL: dict[str, Any] = {
 
 MCP_TOOLS: list[dict[str, Any]] = [
     EMR_RECALL_TOOL,
+    EMR_LATEST_TOOL,
     SEARCH_TOOL,
     FETCH_TOOL,
     EMR_SEARCH_TOOL,
@@ -284,10 +313,11 @@ class ToolRefusal(Exception):
     clients can tell an unavailable ledger, a version conflict and a denial apart.
     """
 
-    def __init__(self, code: str, message: str):
+    def __init__(self, code: str, message: str, reason: str | None = None):
         super().__init__(message)
         self.code = code
         self.message = message
+        self.reason = reason
 
 
 def handle_tools_call(
@@ -306,7 +336,7 @@ def handle_tools_call(
     except ToolRefusal as exc:
         return {
             "content": [{"type": "text", "text": exc.message}],
-            "structuredContent": {"error": {"code": exc.code}},
+            "structuredContent": {"error": {"code": exc.code, **({"reason": exc.reason} if exc.reason else {})}},
             "isError": True,
         }
     except Exception as exc:  # noqa: BLE001 — surface as tool error to host
@@ -338,6 +368,7 @@ def _initialize_result(params: dict[str, Any] | None) -> dict[str, Any]:
             "EMR constitutional memory tools. "
             "Use search/fetch (or emr_search/emr_fetch) for OpenAI deep-research style "
             "company knowledge — read-only, citation URLs on every result. "
+            "Use emr_latest to find the newest memory records with no id or keyword. "
             "Use emr_recall for governed Continuity Ledger recall bundles (may abstain). "
             "Use emr_remember / emr_upsert only when the user explicitly asked to store "
             "or update memory (user_requested=true); writes are draft-only and may be "

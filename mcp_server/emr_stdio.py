@@ -119,6 +119,7 @@ def call_emr_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     """POST the named EMR tool to the memoryboard HTTP API."""
     route_map = {
         "emr_recall": "emr_recall",
+        "emr_latest": "emr_latest",
         "emr_remember": "emr_remember",
         "emr_upsert": "emr_upsert",
         "search": "search",

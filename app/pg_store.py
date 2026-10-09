@@ -483,6 +483,14 @@ class PostgresRowStore:
             "oldest_unsealed_at": _iso(oldest["oldest"]) if oldest and oldest["oldest"] else None,
         }
 
+    def history_seq(self) -> int:
+        """This tenant's newest history sequence number (0 when nothing has been written); a plain read."""
+        with self._tx() as conn:
+            counter = conn.execute(
+                "SELECT last_seq FROM history_counters WHERE tenant_key = %s", (self._tenant_key,)
+            ).fetchone()
+        return int(counter["last_seq"]) if counter else 0
+
     def verify_blocks(self) -> list[dict[str, Any]]:
         """The database's verifier plus the independent recomputation and the cited-evidence check (the same
         code ``python -m app.pg_verify`` runs); [] means intact."""
