@@ -100,6 +100,46 @@ class ExternalPromotionRequest(BaseModel):
     confidence: float = Field(default=0.7, ge=0.0, le=1.0)
 
 
+class NxAskRequest(BaseModel):
+    question: str = Field(..., min_length=1, max_length=2000)
+    no_stream: bool = False
+
+
+class NxRememberRequest(BaseModel):
+    key: str = Field(..., min_length=1, max_length=256)
+    value: str = Field(..., min_length=1, max_length=2000)
+
+
+class NxForgetRequest(BaseModel):
+    key: str = Field(..., min_length=1, max_length=256)
+
+
+class NxDescribeRequest(BaseModel):
+    image_path: str = Field(..., min_length=1, max_length=1000)
+    question: str | None = Field(default=None, max_length=500)
+    holo: bool = False
+    native: bool = False
+    save: bool = False
+
+
+class NxSpatializeRequest(BaseModel):
+    directory: str = Field(..., min_length=1, max_length=1000)
+    every_nth: int = Field(default=1, ge=1, le=100)
+    max_frames: int | None = Field(default=None, ge=1, le=10000)
+    tag: str = Field(default="", max_length=256)
+
+
+class NxScanRequest(BaseModel):
+    paths: list[str] | None = Field(default=None, max_length=10)
+    rebuild: bool = False
+
+
+class NxWatchRequest(BaseModel):
+    paths: list[str] = Field(..., min_length=1, max_length=10)
+    debounce_ms: int = Field(default=750, ge=50, le=60000)
+    no_reconcile: bool = False
+
+
 class MemoryUpdate(BaseModel):
     content: str | None = Field(default=None, min_length=1, max_length=2000)
     source_agent: str | None = Field(default=None, min_length=1, max_length=128)
