@@ -49,6 +49,10 @@ def _find_node() -> str | None:
     return shutil.which("node")
 
 
+# Per-call limits for the nx CLI. Ordinary commands are short; a full scan/rebuild or a spatialize of thousands of frames is
+# legitimately long, so those get their own (env-tunable) budget instead of being killed at 60 s.
+CLI_TIMEOUT_S = float(os.environ.get("NX_CLI_TIMEOUT_S", "60"))
+CLI_LONG_TIMEOUT_S = float(os.environ.get("NX_CLI_LONG_TIMEOUT_S", "900"))
 MCP_TIMEOUT_S = 15.0
 DISABLED_MESSAGE = "nx-search integration is disabled on this deployment (set JARVIS_NX_ENABLED=true)"
 
@@ -322,7 +326,7 @@ class NxSearchClient:
             args += ["--max-frames", str(max_frames)]
         if tag:
             args += ["--tag", tag]
-        return self._cli_cmd("spatialize", *args)
+        return self._cli_cmd("spatialize", *args, timeout=CLI_LONG_TIMEOUT_S)
 
     def watch(self, paths: list[str], debounce_ms: int = 750, no_reconcile: bool = False) -> subprocess.Popen:
         """Start file watcher (returns process handle for background monitoring)."""
@@ -347,7 +351,7 @@ class NxSearchClient:
             args.append("--rebuild")
         if paths:
             args.extend(paths)
-        return self._cli_cmd(*args)
+        return self._cli_cmd(*args, timeout=CLI_LONG_TIMEOUT_S)
 
     def reindex(self, path: str) -> dict[str, Any]:
         """Incremental reindex of a single path."""
@@ -373,7 +377,7 @@ class NxSearchClient:
             stderr=subprocess.DEVNULL,
         )
 
-    def _cli_cmd(self, *args: str) -> dict[str, Any]:
+    def _cli_cmd(self, *args: str, timeout: float | None = None) -> dict[str, Any]:
         """Run nx CLI command and parse JSON output if available."""
         # A nested list here once became one argv element and made subprocess raise inside the except below, so every call
         # "failed" without ever running nx. Misuse is a programming error and is loud.
@@ -386,7 +390,7 @@ class NxSearchClient:
             return {"error": "nx-search not available"}
         try:
             cmd = [self._node, self._get_nx_bin()] + list(args)
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=CLI_TIMEOUT_S if timeout is None else timeout)
             if result.returncode != 0:
                 return {"error": f"nx-search failed: {result.stderr}"}
             # Try to parse as JSON, fallback to text

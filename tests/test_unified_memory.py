@@ -571,3 +571,43 @@ def test_every_nx_route_refuses_a_memory_read_user(describe_env, monkeypatch):
         assert response.status_code == 403, (path, response.status_code, response.text)
         assert "operator-only" in response.text, (path, response.text)
     assert [i for i in _RecordingClient.instances if i.calls] == []
+
+
+# --- absent nx-search is a controlled 503; long jobs get a long budget ---------------------------------------------
+
+def test_missing_nx_search_is_a_503_not_an_unhandled_500(describe_env, monkeypatch):
+    http, image, main = describe_env
+
+    def absent(*a, **k):
+        raise RuntimeError("nx-search not available at /nowhere (node: not found)")
+
+    monkeypatch.setattr(main, "NxSearchClient", absent)
+    for method, path, body in [
+        ("GET", "/api/jarvis/memory/external/stats", None),
+        ("POST", "/api/jarvis/memory/external-search", {"query": "x"}),
+        ("POST", "/api/jarvis/memory/external/ask", {"question": "x"}),
+    ]:
+        response = http.request(method, path, json=body)
+        assert response.status_code == 503, (path, response.status_code, response.text)
+        assert "nx-search not available" in response.text
+
+
+def test_scan_and_spatialize_get_the_long_timeout_and_other_commands_the_short_one(monkeypatch):
+    import app.nx_search_client as nxc
+
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen[cmd[2]] = kw["timeout"]
+        return type("R", (), {"returncode": 0, "stdout": "{}", "stderr": ""})()
+
+    monkeypatch.setattr(nxc, "_master_switch_on", lambda: True)
+    monkeypatch.setattr(nxc.subprocess, "run", fake_run)
+    client = nxc.NxSearchClient.__new__(nxc.NxSearchClient)
+    client._available, client._node = True, "node"
+    client._get_nx_bin = lambda: "nx.js"
+    client.scan(["/x"], rebuild=True)
+    client.spatialize("/frames", every_nth=1, max_frames=10000)
+    client.prune(["/x"])
+    assert seen["scan"] == nxc.CLI_LONG_TIMEOUT_S and seen["spatialize"] == nxc.CLI_LONG_TIMEOUT_S
+    assert seen["prune"] == nxc.CLI_TIMEOUT_S < nxc.CLI_LONG_TIMEOUT_S

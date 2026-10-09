@@ -740,12 +740,20 @@ def twin_ui_asset(request: Request, asset: str):
     return FileResponse(_TWIN_UI_DIR / asset, media_type=media)
 
 
+def _nx_client() -> NxSearchClient:
+    """A client per request; nx-search or node missing is a controlled 503, not an unhandled 500."""
+    try:
+        return NxSearchClient()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
 @app.post("/api/jarvis/memory/external-search", dependencies=[Depends(require_nx_enabled), Depends(require_nx_operator), Depends(require_emr_recall_api_key)])
 def external_search(body: ExternalSearchRequest):
     """Search nx-search; optional promotion remains bounded and auditable."""
     if body.auto_promote:
         require_memory_write()  # promotion writes to the ledger; search alone stays read-only
-    client = NxSearchClient()
+    client = _nx_client()
     results = client.search(body.query, name_only=body.name_only, limit=body.limit)
     if "error" in results:
         raise HTTPException(status_code=502, detail=results["error"])
@@ -771,7 +779,7 @@ def unified_search(
     """Return working-memory records alongside nx-search evidence."""
     store = get_store()
     memories, selections, conflicts = store.retrieve(query=query, limit=limit, session_id=session_id)
-    external = NxSearchClient().search(query, limit=limit)
+    external = _nx_client().search(query, limit=limit)
     if "error" in external:
         raise HTTPException(status_code=502, detail=external["error"])
     return {
@@ -788,7 +796,7 @@ def unified_search(
 @app.post("/api/jarvis/memory/promote", dependencies=[Depends(require_nx_enabled), Depends(require_nx_operator), Depends(require_memory_write)])
 def promote_external_result(body: ExternalPromotionRequest):
     """Promote only an exact result returned by nx-search for the query."""
-    client = NxSearchClient()
+    client = _nx_client()
     results = client.search(body.query, limit=100)
     if "error" in results:
         raise HTTPException(status_code=502, detail=results["error"])
@@ -815,7 +823,7 @@ def promote_external_result(body: ExternalPromotionRequest):
 @app.get("/api/jarvis/memory/external/stats", dependencies=[Depends(require_nx_enabled), Depends(require_nx_operator), Depends(require_emr_recall_api_key)])
 def external_stats():
     """Get nx-search index statistics."""
-    client = NxSearchClient()
+    client = _nx_client()
     stats = client.stats()
     if "error" in stats:
         raise HTTPException(status_code=502, detail=stats["error"])
@@ -825,7 +833,7 @@ def external_stats():
 @app.post("/api/jarvis/memory/external/ask", dependencies=[Depends(require_nx_enabled), Depends(require_nx_operator), Depends(require_emr_recall_api_key)])
 def external_ask(body: NxAskRequest):
     """Ask JARVIS a natural-language question over indexed files (read-only)."""
-    client = NxSearchClient()
+    client = _nx_client()
     result = client.ask(body.question, no_stream=body.no_stream)
     if "error" in result:
         raise HTTPException(status_code=502, detail=result["error"])
@@ -836,7 +844,7 @@ def external_ask(body: NxAskRequest):
 def external_remember(body: NxRememberRequest, request: Request):
     """Store a persistent preference in nx-search. Deliberately not mirrored into the ledger: Clause V says a preference is
     memory, not evidence. To make one count, record a decision that cites it as evidence."""
-    result = NxSearchClient().remember(body.key, body.value)
+    result = _nx_client().remember(body.key, body.value)
     if "error" in result:
         raise HTTPException(status_code=502, detail=result["error"])
     _audit_log("nx_remember", request, {"key": body.key})
@@ -846,7 +854,7 @@ def external_remember(body: NxRememberRequest, request: Request):
 @app.post("/api/jarvis/memory/external/forget", dependencies=[Depends(require_nx_enabled), Depends(require_nx_operator), Depends(require_nx_write), Depends(require_memory_write)])
 def external_forget(body: NxForgetRequest, request: Request):
     """Forget a persistent preference from nx-search."""
-    result = NxSearchClient().forget(body.key)
+    result = _nx_client().forget(body.key)
     if "error" in result:
         raise HTTPException(status_code=502, detail=result["error"])
     _audit_log("nx_forget", request, {"key": body.key})
@@ -866,7 +874,7 @@ def external_describe(body: NxDescribeRequest, request: Request):
     # Validate path is within allowed roots
     validated_path = validate_nx_path(body.image_path)
     
-    client = NxSearchClient()
+    client = _nx_client()
     result = client.describe(
         str(validated_path),
         question=body.question,
@@ -886,7 +894,7 @@ def external_spatialize(body: NxSpatializeRequest, request: Request):
     """Spatialize a directory of rendered frames (temporal + spatial memory). Path validated."""
     validated_path = validate_nx_path(body.directory)
     
-    client = NxSearchClient()
+    client = _nx_client()
     result = client.spatialize(
         str(validated_path),
         every_nth=body.every_nth,
@@ -908,7 +916,7 @@ def external_scan(body: NxScanRequest, request: Request):
         for p in body.paths:
             validated_paths.append(str(validate_nx_path(p)))
     
-    client = NxSearchClient()
+    client = _nx_client()
     result = client.scan(paths=validated_paths if validated_paths else None, rebuild=body.rebuild)
     if "error" in result:
         raise HTTPException(status_code=502, detail=result["error"])
@@ -922,7 +930,7 @@ def external_reindex(path: str = Query(..., min_length=1, max_length=1000), requ
     """Incremental reindex of a single path. Path validated against allowed roots."""
     validated_path = validate_nx_path(path)
     
-    client = NxSearchClient()
+    client = _nx_client()
     result = client.reindex(str(validated_path))
     if "error" in result:
         raise HTTPException(status_code=502, detail=result["error"])
@@ -936,7 +944,7 @@ def external_prune(paths: list[str] = Query(..., min_length=1, max_length=10), r
     """Prune missing files from index. Paths validated against allowed roots."""
     validated_paths = [str(validate_nx_path(p)) for p in paths]
     
-    client = NxSearchClient()
+    client = _nx_client()
     result = client.prune(validated_paths)
     if "error" in result:
         raise HTTPException(status_code=502, detail=result["error"])
@@ -955,7 +963,7 @@ def external_watch(body: NxWatchRequest, request: Request):
         existing = request.app.state.nx_background.get("watch")
         if existing and existing.poll() is None:
             raise HTTPException(status_code=409, detail="Watch already running (stop it first or wait for shutdown)")
-        proc = NxSearchClient().watch(validated_paths, debounce_ms=body.debounce_ms, no_reconcile=body.no_reconcile)
+        proc = _nx_client().watch(validated_paths, debounce_ms=body.debounce_ms, no_reconcile=body.no_reconcile)
         request.app.state.nx_background["watch"] = proc
 
     _audit_log("nx_watch_start", request, {"paths": validated_paths, "debounce_ms": body.debounce_ms, "pid": proc.pid})
@@ -990,7 +998,7 @@ def external_serve(port: int = Query(default=7788, ge=1024, le=65535), request: 
         existing = request.app.state.nx_background.get("serve")
         if existing and existing.poll() is None:
             raise HTTPException(status_code=409, detail="Serve already running on another port (stop it first)")
-        proc = NxSearchClient().serve(port)
+        proc = _nx_client().serve(port)
         request.app.state.nx_background["serve"] = proc
 
     _audit_log("nx_serve_start", request, {"port": port, "pid": proc.pid})
