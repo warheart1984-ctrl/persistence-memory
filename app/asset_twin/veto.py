@@ -15,6 +15,7 @@ claim fails and nothing moves; if the claim got it first the veto is refused
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
 from datetime import datetime, timezone
 
 from .models import VetoDecision, VetoRecord
@@ -39,16 +40,29 @@ class VetoGate:
         with self._lock:
             return self._records.get(decision_id)
 
-    def decide(self, verdict: VetoDecision) -> VetoRecord:
+    def supersede(self, decision_id: str) -> None:
+        """A newer telemetry cycle replaced this recommendation: it can no longer be approved or executed."""
+        with self._lock:
+            rec = self._records.get(decision_id)
+            if rec is not None and rec.status in ("pending", "approved", "held"):
+                self._records[decision_id] = VetoRecord(decision_id=decision_id, status="expired", veto=rec.veto)
+
+    def decide(self, verdict: VetoDecision, before_commit: Callable[[], None] | None = None) -> VetoRecord:
+        """Record a verdict. `before_commit` runs after the transition is validated and before it takes effect, under the gate's
+        lock: if it raises (the approval cannot be written to the audit trail) the state is unchanged."""
         with self._lock:
             current = self._records.get(verdict.decision_id)
             if current is None:
                 raise KeyError("unknown decision")
+            if current.status == "expired" and verdict.verdict == "approve":
+                raise ValueError("decision expired or superseded by newer telemetry; it cannot be approved")
             if current.status in ("executing", "executed", "safe_state"):
                 raise ValueError("already executing or executed; the veto is too late")
             if current.status == "vetoed" and verdict.verdict == "approve":
                 raise ValueError("vetoed decisions cannot be re-approved; create a new cycle")
             mapping = {"approve": "approved", "veto": "vetoed", "hold": "held"}
+            if before_commit is not None:
+                before_commit()
             self._records[verdict.decision_id] = VetoRecord(
                 decision_id=verdict.decision_id,
                 status=mapping[verdict.verdict],  # type: ignore[arg-type]

@@ -53,7 +53,8 @@ def fake_nx(tmp_path, monkeypatch):
     log = tmp_path / "received.log"
     monkeypatch.setenv("FAKE_NX_LOG", str(log))
     monkeypatch.delenv("FAKE_NX_MODE", raising=False)
-    monkeypatch.setattr(mod, "MCP_TIMEOUT_S", 1.0)
+    # generous: node can be slow to start on a loaded CI runner, and a too-tight timeout would silently take the CLI path
+    monkeypatch.setattr(mod, "MCP_TIMEOUT_S", 20.0)
 
     def received() -> list[dict]:
         return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []

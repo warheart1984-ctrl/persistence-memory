@@ -273,7 +273,7 @@ def isolated(tmp_path, monkeypatch):
 
     monkeypatch.setenv("JARVIS_ASSET_TWIN_DIR", str(tmp_path))
     monkeypatch.setattr(ev, "_ledger", None)
-    for name in ("_assets", "_gates", "_decisions", "_health", "_last_seq"):
+    for name in ("_assets", "_gates", "_decisions", "_health", "_last_seq", "_latest"):
         monkeypatch.setattr(svc, name, {})
     return svc
 
@@ -704,3 +704,139 @@ def test_if_only_the_outcome_cannot_be_written_the_execution_is_reported_truthfu
     assert "WARNING" in result.reason and "execution_intent" in result.reason
     assert svc._gates["T"].get(did).status == "executed"
     assert any('"execution_intent"' in line for line in svc.get_ledger()._path.read_text().splitlines())
+
+
+# -- third round: supersession, restored health, publish-after-evidence, approval recorded first -------------------------
+
+def _critical(**over):
+    base = dict(vibration_mm_s=14.0, exhaust_temp_c=640.0)
+    base.update(over)
+    return _telemetry(**base)
+
+
+def test_a_newer_cycle_supersedes_the_older_recommendation(isolated, monkeypatch) -> None:
+    svc = isolated
+    older = svc.run_cycle("T", _telemetry(asset_id="sup-01", seq=1))
+    older_id = older.decision.decision_id
+    _approve(svc, "T", older_id)  # approved, but not yet executed
+    other_asset = svc.run_cycle("T", _telemetry(asset_id="sup-02", seq=1)).decision.decision_id
+
+    newer = svc.run_cycle("T", _critical(asset_id="sup-01", seq=2))
+    assert svc._gates["T"].get(older_id).status == "expired", "the approved-but-unexecuted older packet is no longer usable"
+    assert svc._gates["T"].get(newer.decision.decision_id).status == "pending"
+    assert svc._gates["T"].get(other_asset).status == "pending", "another asset's packet is untouched"
+
+    moved: list[float] = []
+    real_apply = SimulatedAsset.apply_control
+    monkeypatch.setattr(SimulatedAsset, "apply_control", lambda self, sp: (moved.append(sp), real_apply(self, sp))[1])
+    refused = svc.execute("T", older_id, "sup-01")
+    assert refused.executed is False and "expired" in refused.reason and moved == []
+
+    # a not-yet-approved older packet cannot be approved after the fact either
+    pending_old = svc.run_cycle("T", _telemetry(asset_id="sup-03", seq=1)).decision.decision_id
+    svc.run_cycle("T", _critical(asset_id="sup-03", seq=2))
+    with pytest.raises(ValueError, match="superseded"):
+        _approve(svc, "T", pending_old)
+
+    # the newest packet works normally
+    _approve(svc, "T", newer.decision.decision_id)
+    assert svc.execute("T", newer.decision.decision_id, "sup-01").executed is True
+
+
+def test_health_is_restored_from_the_evidence_after_a_restart(isolated) -> None:
+    svc = isolated
+    real = svc.estimate_state
+    for seq in range(1, 41):  # health erodes gradually under sustained critical readings
+        svc.run_cycle("T", _critical(asset_id="health-01", seq=seq))
+    degraded = svc._health["T:health-01"]
+    assert degraded < 0.95, degraded
+    # restart: all in-memory state is gone, the audit file stays
+    for name in ("_health", "_last_seq", "_latest", "_decisions"):
+        getattr(svc, name).clear()
+    svc.get_ledger()._last.clear()
+
+    calm = _telemetry(asset_id="health-01", seq=41, vibration_mm_s=0.5)
+    svc.run_cycle("T", calm)
+    expected = real(calm, prior_health=degraded).estimated_health
+    assert svc._health["T:health-01"] == expected
+    assert expected != real(calm, prior_health=1.0).estimated_health, "the test would prove nothing if both priors agreed"
+
+
+def test_a_cycle_whose_evidence_fails_publishes_nothing_and_a_retry_starts_clean(isolated, monkeypatch) -> None:
+    svc = isolated
+    real = svc.estimate_state
+    ledger = svc.get_ledger()
+    real_append = ledger.append
+    failures = {"left": 1}
+
+    def append(tenant, kind, body):
+        if kind == "cycle" and failures["left"]:
+            failures["left"] -= 1
+            raise OSError("no space left on device")
+        return real_append(tenant, kind, body)
+
+    monkeypatch.setattr(ledger, "append", append)
+    tel = _critical(asset_id="pub-01", seq=1)
+    with pytest.raises(OSError):
+        svc.run_cycle("T", tel)
+    assert svc._decisions == {} and "T:pub-01" not in svc._health and "T:pub-01" not in svc._latest
+    assert "T" not in svc._gates or svc._gates["T"]._records == {}, "no approvable packet was left behind"
+
+    cycle = svc.run_cycle("T", tel)  # same sequence: it was not consumed
+    assert svc._health["T:pub-01"] == real(tel, prior_health=1.0).estimated_health, "the retry did not start from the failed attempt's health"
+    assert svc._gates["T"].get(cycle.decision.decision_id).status == "pending"
+
+
+def test_an_approval_is_recorded_before_it_can_be_used(isolated, monkeypatch) -> None:
+    svc = isolated
+    did = svc.run_cycle("T", _telemetry(asset_id="appr-01", seq=1)).decision.decision_id
+    ledger = svc.get_ledger()
+    real_append = ledger.append
+    state = {"fail": True}
+
+    def append(tenant, kind, body):
+        if kind == "veto" and state["fail"]:
+            raise OSError("read-only file system")
+        return real_append(tenant, kind, body)
+
+    monkeypatch.setattr(ledger, "append", append)
+    with pytest.raises(OSError):
+        _approve(svc, "T", did)
+    assert svc._gates["T"].get(did).status == "pending", "an approval nobody recorded did not take effect"
+    state["fail"] = False
+    refused = svc.execute("T", did, "appr-01")
+    assert refused.executed is False and "pending" in refused.reason
+
+    _approve(svc, "T", did)  # storage is back: now it is recorded, then effective
+    assert svc._gates["T"].get(did).status == "approved"
+    import json
+
+    verdicts = [json.loads(line)["body"]["verdict"] for line in ledger._path.read_text().splitlines() if json.loads(line)["kind"] == "veto"]
+    assert verdicts == ["approve"]
+
+
+def test_a_veto_takes_effect_even_if_it_cannot_be_recorded(isolated, monkeypatch) -> None:
+    svc = isolated
+    did = svc.run_cycle("T", _telemetry(asset_id="appr-02", seq=1)).decision.decision_id
+    _approve(svc, "T", did)
+    _flaky(svc.get_ledger(), monkeypatch, "veto")
+    with pytest.raises(OSError):
+        svc.decide_human("T", VetoDecision(decision_id=did, verdict="veto", reviewer="op-2", at=_now_iso()))
+    assert svc._gates["T"].get(did).status == "vetoed", "stopping an action must not depend on the audit disk"
+    assert svc.execute("T", did, "appr-02").executed is False
+
+
+def test_a_cycle_that_failed_part_way_does_not_consume_its_sequence_even_after_a_restart(isolated, monkeypatch) -> None:
+    svc = isolated
+    ledger = svc.get_ledger()
+    real_append = ledger.append
+    monkeypatch.setattr(ledger, "append", lambda t, k, b: (_ for _ in ()).throw(OSError("full")) if k == "cycle" else real_append(t, k, b))
+    with pytest.raises(OSError):
+        svc.run_cycle("T", _telemetry(asset_id="part-01", seq=1))  # measurement and assumption are on file, the cycle record is not
+    monkeypatch.setattr(ledger, "append", real_append)
+    for name in ("_last_seq", "_health", "_latest", "_decisions"):
+        getattr(svc, name).clear()
+    ledger._last.clear()  # restart
+    assert svc.run_cycle("T", _telemetry(asset_id="part-01", seq=1)).decision.seq == 1
+    with pytest.raises(svc.StaleTelemetryError):
+        svc.run_cycle("T", _telemetry(asset_id="part-01", seq=1))

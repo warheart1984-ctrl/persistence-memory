@@ -155,13 +155,15 @@ class EvidenceLedger:
             return record
 
     def last_measurement_seq(self, tenant: str, asset_id: str) -> int | None:
-        """Newest telemetry sequence this tenant's chain holds for the asset (None if none), for recovery after a restart.
-        Only call after `check(tenant)`: the chain it reads has then been verified."""
+        """Newest telemetry sequence of a COMPLETED cycle for the asset (None if none), for recovery after a restart. A
+        measurement whose cycle record never made it to disk belongs to a cycle that failed part-way and published nothing, so
+        its sequence is still free to retry. Only call after `check(tenant)`: the chain it reads has then been verified."""
         try:
             text = self._path.read_text(encoding="utf-8")
         except FileNotFoundError:
             return None
-        newest: int | None = None
+        measured: dict[str, tuple[str | None, int | None]] = {}  # decision id -> (asset, seq)
+        completed: set[str] = set()
         for line in text.splitlines():
             if not line.strip():
                 continue
@@ -169,12 +171,54 @@ class EvidenceLedger:
                 rec = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            body = rec.get("body", {}) if isinstance(rec, dict) else {}
-            if rec.get("tenant") == tenant and rec.get("kind") == "measurement" and body.get("asset") == asset_id:
-                seq = body.get("seq")
-                if isinstance(seq, int) and (newest is None or seq > newest):
-                    newest = seq
-        return newest
+            if not isinstance(rec, dict) or rec.get("tenant") != tenant:
+                continue
+            body = rec.get("body", {})
+            did = body.get("decision_id")
+            if rec.get("kind") == "measurement" and did:
+                measured[did] = (body.get("asset"), body.get("seq"))
+            elif rec.get("kind") == "cycle" and did:
+                completed.add(did)
+        seqs = [seq for did, (asset, seq) in measured.items() if did in completed and asset == asset_id and isinstance(seq, int)]
+        return max(seqs) if seqs else None
+
+    def last_health(self, tenant: str, asset_id: str) -> float | None:
+        """Newest `estimated_health` of a COMPLETED cycle for the asset (None if none), for recovery after a restart. An
+        assumption record names its decision, that decision's measurement record names the asset, and its cycle record shows the
+        cycle finished; a cycle that failed part-way published nothing, so its estimate is not used. Call after `check(tenant)`."""
+        try:
+            text = self._path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        asset_of: dict[str, str | None] = {}
+        health_of: dict[str, float] = {}
+        order: list[str] = []
+        completed: set[str] = set()
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(rec, dict) or rec.get("tenant") != tenant:
+                continue
+            body = rec.get("body", {})
+            did = body.get("decision_id")
+            if not did:
+                continue
+            kind = rec.get("kind")
+            if kind == "measurement":
+                asset_of[did] = body.get("asset")
+            elif kind == "assumption" and isinstance(body.get("estimated_health"), (int, float)):
+                health_of[did] = float(body["estimated_health"])
+                order.append(did)
+            elif kind == "cycle":
+                completed.add(did)
+        for did in reversed(order):
+            if did in completed and asset_of.get(did) == asset_id:
+                return health_of[did]
+        return None
 
     def verify(self, tenant: str) -> tuple[bool, list[str]]:
         try:

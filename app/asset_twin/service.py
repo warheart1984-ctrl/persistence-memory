@@ -24,6 +24,7 @@ _decisions: dict[tuple[str, str], DecisionPacket] = {}
 _health: dict[str, float] = {}
 _last_seq: dict[str, int] = {}  # "tenant:asset" -> newest accepted telemetry sequence
 _cycle_locks: dict[str, threading.Lock] = {}  # "tenant:asset" -> serialises that asset's cycles
+_latest: dict[str, str] = {}  # "tenant:asset" -> decision id of the newest published cycle
 _lock = threading.Lock()
 
 
@@ -85,17 +86,18 @@ def run_cycle(tenant: str, telemetry: Telemetry) -> CycleResponse:
 
 
 def _run_accepted_cycle(tenant: str, telemetry: Telemetry) -> CycleResponse:
-    get_ledger().check(tenant)
-    _asset_for(tenant, telemetry.asset_id)
-    prior = _health.get(f"{tenant}:{telemetry.asset_id}", 1.0)
-    state = estimate_state(telemetry, prior_health=prior)
-    _health[f"{tenant}:{telemetry.asset_id}"] = state.estimated_health
-    decision = build_decision(telemetry, state)
-    gate = _gate_for(tenant)
-    veto = gate.propose(decision.decision_id)
-    with _lock:
-        _decisions[(tenant, decision.decision_id)] = decision
     ledger = get_ledger()
+    ledger.check(tenant)
+    key = f"{tenant}:{telemetry.asset_id}"
+    _asset_for(tenant, telemetry.asset_id)
+    with _lock:
+        prior = _health.get(key)
+    if prior is None:  # after a restart the last verified estimate is on file; do not restart from "perfectly healthy"
+        prior = ledger.last_health(tenant, telemetry.asset_id)
+    if prior is None:
+        prior = 1.0
+    state = estimate_state(telemetry, prior_health=prior)
+    decision = build_decision(telemetry, state)
     measurement = ledger.append(tenant, "measurement", {
         "decision_id": decision.decision_id, "asset": telemetry.asset_id,
         "seq": telemetry.seq, "at": telemetry.at,
@@ -120,6 +122,18 @@ def _run_accepted_cycle(tenant: str, telemetry: Telemetry) -> CycleResponse:
         "measurement_ref": measurement["digest"],
         "assumption_ref": assumption["digest"],
     })
+    # Publish only now that all of the cycle's evidence is on file: a failed append leaves no approvable decision and no
+    # health update behind, so a retry starts from the same state. The previous recommendation for this asset is superseded:
+    # it was made on older telemetry and must not be approvable once a newer cycle exists.
+    gate = _gate_for(tenant)
+    veto = gate.propose(decision.decision_id)
+    with _lock:
+        _health[key] = state.estimated_health
+        _decisions[(tenant, decision.decision_id)] = decision
+        older = _latest.get(key)
+        _latest[key] = decision.decision_id
+    if older is not None and older != decision.decision_id:
+        gate.supersede(older)
     degraded = decision.confidence < 0.5 or decision.predicted_risk > 0.7
     return CycleResponse(decision=decision, veto=veto, degraded=degraded)
 
@@ -130,17 +144,24 @@ def decide_human(tenant: str, verdict: VetoDecision, actor: str | None = None) -
     if not owned:
         raise ValueError("unknown decision")
     gate = _gate_for(tenant)
-    if verdict.verdict == "approve":
-        get_ledger().check(tenant)  # an approval nobody can audit must not be granted
-    try:
-        rec = gate.decide(verdict)
-    except KeyError as exc:
-        raise ValueError("unknown decision") from exc
-    get_ledger().append(tenant, "veto", {
+    ledger = get_ledger()
+    record = {
         "decision_id": verdict.decision_id, "verdict": verdict.verdict,
         "reviewer": verdict.reviewer, "reason": verdict.reason, "at": verdict.at,
         "actor": actor or tenant,
-    })
+    }
+    try:
+        if verdict.verdict == "approve":
+            # An approval makes something executable, so it is written to the audit trail BEFORE it takes effect (the gate runs
+            # the write after validating the transition and before applying it): if the write fails, nothing was approved.
+            ledger.check(tenant)
+            rec = gate.decide(verdict, before_commit=lambda: ledger.append(tenant, "veto", record))
+        else:
+            # A veto or hold only ever removes the ability to act, so it takes effect first and is recorded straight after.
+            rec = gate.decide(verdict)
+            ledger.append(tenant, "veto", record)
+    except KeyError as exc:
+        raise ValueError("unknown decision") from exc
     return {"veto": rec.model_dump(mode="json")}
 
 
