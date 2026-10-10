@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi import Path as PathParam
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
@@ -1132,7 +1132,7 @@ def tool_emr_fetch(body: EmrFetchRequest):
 
 
 @app.post("/api/jarvis/tools/emr_latest", dependencies=[Depends(require_emr_recall_api_key)])
-def tool_emr_latest(body: dict[str, Any] | None = None):
+def tool_emr_latest(body: dict[str, Any] | None = Body(default=None)):
     """Read-only newest-first discovery (same implementation as GET /api/jarvis/memory/latest)."""
     return _run_latest(body or {}, http=False)
 
