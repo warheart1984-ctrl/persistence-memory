@@ -104,7 +104,7 @@ EMR_LATEST_TOOL: dict[str, Any] = {
     "description": (
         "Newest-first discovery over the Continuity Ledger: call it with no id and no keyword to find the most "
         "recent memory records. Read-only. Superseded, archived and ai-twin records are excluded unless asked for. "
-        "Returns records (id, created_at, type, status, provenance, supersedes, superseded_by, summary), "
+        "Returns records (id, created_at, type, status as stored: draft/verified/archived, lifecycle: active/superseded/archived, provenance, supersedes, superseded_by, summary), "
         "next_cursor for paging, ledger_head and a result_digest that is identical for identical ledger state."
     ),
     "annotations": {
@@ -133,7 +133,7 @@ EMR_SEARCH_LEDGER_TOOL: dict[str, Any] = {
         "Ranked full-text search over the Continuity Ledger's own records (not files). Every word of the query must "
         "appear in the record (subject, content or tags); matches are ranked subject > tags > content, then newest "
         "first. Read-only. Superseded, archived and ai-twin records are excluded unless asked for. Returns records "
-        "with id, created_at, status, provenance, supersedes/superseded_by, summary and score, plus result_digest."
+        "with id, created_at, status (as stored), lifecycle, provenance, supersedes/superseded_by, summary and score, plus result_digest."
     ),
     "annotations": {
         "readOnlyHint": True,

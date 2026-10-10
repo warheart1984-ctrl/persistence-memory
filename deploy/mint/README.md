@@ -13,7 +13,7 @@ Windows PC ──ssh -L──►  127.0.0.1:8011  ─►  app (non-root, read-on
    backups (hourly, verified) ──► ~/jarvis-ledger/backups ──► age-encrypted daily ──► Windows PC (G:)
 ```
 
-## Where things stand (updated 2026-10-07; the box was last deployed 2026-10-06)
+## Where things stand (updated 2026-10-10; the box was last deployed 2026-10-10)
 
 * **Running:** the stack on `127.0.0.1:8011`, on Linux Mint 22.3 (4 CPUs, 15 GiB RAM, Wi-Fi only, disk not
   encrypted). Docker 29.1.3, compose 2.40.3 and age 1.1.1 come from Ubuntu's own archive.
@@ -31,9 +31,12 @@ Windows PC ──ssh -L──►  127.0.0.1:8011  ─►  app (non-root, read-on
 * **Deployed on 2026-10-06:** schema **v6** with Clause V, Evidence Objects and Continuity Blocks, and Replay Contracts (`RC.Ledger.v1`: the
   `/api/jarvis/replay/*` routes, receipts at sealed points, `jarvisctl replay`, the drill's replay step). The domain replay contracts are on hold
   (declared only).
-* **Not deployed:** signatures. The signer, the witness tool, schema v7 and the custody guards are on `main` but shelved: no key has been made, no key
-  ceremony done, the sign timer is off, and nothing on the box is signed. Deploying `main` would migrate the database to v7; read "Signatures
-  (schema v7)" below and take a backup first.
+* **Deployed on 2026-10-08 and 2026-10-10:** schema **v7** (the signature tables) on 2026-10-08; schema **v8** and **v9** on 2026-10-10 (`emr_latest`'s
+  supersedes index and the ledger-search index; `main` at `792e99b`), with `emr_latest`, `emr_search_ledger`, the nx-search bridge and the removal of
+  the digital twin line. The rollback for 2026-10-10 is the named backup restored under the `pre-v8v9` images; there is no down-migration for V8.
+* **Shelved, though the code is deployed:** signatures. The signer, the witness tool and the custody guards are on the box but unused: no key has been made, no key
+  ceremony done, the sign timer is off, and nothing on the box is signed (`JARVIS_SIGNATURES=warn`, empty trust roots). Read "Signatures
+  (schema v7)" below before turning anything on, and take a backup first.
 * **Checked on this hardware:** `jarvisctl smoke` passes every check; a `docker kill` of the database was back in
   48 s with `/ready` 200 and no lost record; a crash (`pg_ctl stop -m immediate`) was restarted by Docker itself in
   3 s; the restore drill passes; the offsite copy was verified by hash on the Windows side and decrypts.

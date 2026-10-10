@@ -139,7 +139,7 @@ def decode_cursor(key: bytes, tenant: str, p: LatestParams, token: str) -> tuple
 # ---------------------------------------------------------------------------------------------------------------- shaping
 
 
-def result_digest(rows: list[tuple[str, str, str]]) -> str:
+def result_digest(rows: list[tuple[Any, ...]]) -> str:
     """sha256 over canonical JSON of ``[(id, created_at, status)]`` in returned order."""
     blob = json.dumps([list(r) for r in rows], separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
@@ -154,7 +154,8 @@ def _summary(rec: MemoryRecord) -> str:
     return ""
 
 
-def _status(rec: MemoryRecord, superseded_by: str | None) -> str:
+def _lifecycle(rec: MemoryRecord, superseded_by: str | None) -> str:
+    """Whether the record is still current: archived, superseded by a newer record, or active.  Not its review state."""
     if rec.status == "archived":
         return "archived"
     return "superseded" if superseded_by else "active"
@@ -165,7 +166,8 @@ def _shape(rec: MemoryRecord, superseded_by: str | None) -> dict[str, Any]:
         "id": rec.id,
         "created_at": norm_ts(rec.created_at),
         "type": rec.type,
-        "status": _status(rec, superseded_by),
+        "status": rec.status,  # as stored: draft | verified | archived (never relabelled)
+        "lifecycle": _lifecycle(rec, superseded_by),  # active | superseded | archived
         "provenance": {
             "source_agent": rec.source_agent or None,
             "actor": None,  # not stored on a record
@@ -222,6 +224,6 @@ def latest_memories(store: Any, *, tenant: str | None, params: LatestParams, ope
         "next_cursor": next_cursor,
         "tenant": tenant,
         "ledger_head": ledger_head(store, operator=operator),
-        "result_digest": result_digest([(r["id"], r["created_at"], r["status"]) for r in records]),
+        "result_digest": result_digest([(r["id"], r["created_at"], r["status"], r["lifecycle"]) for r in records]),
         "provenance": "ledger",
     }

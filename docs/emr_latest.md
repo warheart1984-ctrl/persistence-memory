@@ -46,7 +46,8 @@ The agent should call `emr_latest` with no arguments. If it asks you for an id, 
       "id": "mem-…",
       "created_at": "2026-10-09T23:56:44.902428Z",
       "type": "fact",
-      "status": "active",
+      "status": "draft",
+      "lifecycle": "active",
       "provenance": {"source_agent": "…", "actor": null, "method": null, "evidence_refs": []},
       "supersedes": null,
       "superseded_by": null,
@@ -61,12 +62,15 @@ The agent should call `emr_latest` with no arguments. If it asks you for an id, 
 }
 ```
 
-* **`status`** is `archived` when the stored status is archived, otherwise `superseded` when another record in the tenant names
-  it in `supersedes`, otherwise `active`. (`emr_upsert` archives the record it supersedes, so those show as `archived` with
-  `superseded_by` filled in.) A record is hidden by default if it is superseded **or** archived; each flag lifts its own filter.
+* **`status`** is the stored review state, unchanged: `draft`, `verified` or `archived`. A fresh `emr_remember` record is a
+  `draft`, and it is reported as one.
+* **`lifecycle`** says whether the record is still current: `archived` when the stored status is archived, otherwise
+  `superseded` when another record in the tenant names it in `supersedes`, otherwise `active`. (`emr_upsert` archives the record
+  it supersedes, so those show as `archived` with `superseded_by` filled in.) A record is hidden by default if its lifecycle is
+  superseded **or** archived; each flag lifts its own filter. `active` means current, not reviewed: read `status` for that.
 * **`provenance.actor` and `provenance.method` are `null`**: the ledger does not store them, and nothing is guessed.
   `evidence_refs` are the `ref` values of the record's evidence.
-* **`result_digest`** = sha256 of the compact JSON of `[[id, created_at, status], …]` in returned order (UTF-8, no ASCII
+* **`result_digest`** = sha256 of the compact JSON of `[[id, created_at, status, lifecycle], …]` in returned order (UTF-8, no ASCII
   escaping). Same state → same digest.
 * **`ledger_head`**: `null` on the JSON store (it has no chain). On Postgres: the operator key sees `block:<hash>` of the newest
   Continuity Block (or `seq:<n>` before the first block); OAuth tenants only ever see `seq:<n>`, their own history counter.

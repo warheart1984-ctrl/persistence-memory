@@ -290,11 +290,11 @@ def test_mcp_tool_tool_route_and_http_agree(client):
         assert posted["result_digest"] == http["result_digest"]
 
 
-def test_the_digest_covers_id_created_at_status_and_score_in_order(client):
+def test_the_digest_covers_id_created_at_status_lifecycle_and_score_in_order(client):
     add(client, "deploy one")
     add(client, "deploy two", subject="deploy")
     body = search(client, "deploy").json()
-    blob = json.dumps([[r["id"], r["created_at"], r["status"], r["score"]] for r in body["records"]], separators=(",", ":"), ensure_ascii=False)
+    blob = json.dumps([[r["id"], r["created_at"], r["status"], r["lifecycle"], r["score"]] for r in body["records"]], separators=(",", ":"), ensure_ascii=False)
     assert body["result_digest"] == hashlib.sha256(blob.encode("utf-8")).hexdigest()
     assert search(client, "nothing").json()["result_digest"] == hashlib.sha256(b"[]").hexdigest()
 
