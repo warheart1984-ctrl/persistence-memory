@@ -847,7 +847,7 @@ def unified_search(
             "selections": [s.model_dump() for s in selections],
             "conflicts": [c.model_dump() for c in conflicts],
         },
-        "long_term_memory": external,
+        "file_hits": external,  # nx-search results over local files: evidence pointers, not ledger memory
         "query": query,
     }
 
