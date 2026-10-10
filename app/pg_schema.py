@@ -841,7 +841,31 @@ _V8 = """
 CREATE INDEX memories_supersedes_idx ON memories (tenant_key, supersedes) WHERE supersedes IS NOT NULL;
 """
 
-MIGRATIONS: list[tuple[int, str]] = [(1, _V1), (2, _V2), (3, _V3), (4, _V4), (5, _V5), (6, _V6), (7, _V7), (8, _V8)]
+_V9 = r"""
+-- Ledger search: an expression index over the record's search tokens.  Deliberately NOT a stored column: history
+-- snapshots are to_jsonb(memories row), so a new column would change every snapshot and make the history verifier
+-- report every existing record as drifted.  The index changes no row, no snapshot, no hash and no replay root.
+-- Tokenisation is defined here and mirrored exactly by app/ledger_search.py::tokens: ASCII letters are lower-cased
+-- (translate, so the result never depends on the database locale) and the text is split on every character that is
+-- not an ASCII letter or digit and not a non-ASCII character.  No stemming, no stop words ("simple").
+CREATE FUNCTION jarvis_search_tokens(subject text, content text, tags text[]) RETURNS text[]
+LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $fn$
+    SELECT regexp_split_to_array(
+        translate(coalesce(subject, '') || ' ' || coalesce(content, '') || ' ' || coalesce(array_to_string(tags, ' '), ''),
+                  'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'),
+        '[^0-9a-z\u0080-\U0010FFFF]+')
+$fn$;
+CREATE INDEX memories_search_idx ON memories USING GIN (jarvis_search_tokens(subject, content, tags));
+"""
+
+# Rolling V9 back removes only what V9 added (run as the migration role, inside one transaction).
+V9_ROLLBACK = """
+DROP INDEX IF EXISTS memories_search_idx;
+DROP FUNCTION IF EXISTS jarvis_search_tokens(text, text, text[]);
+DELETE FROM schema_version WHERE version = 9;
+"""
+
+MIGRATIONS: list[tuple[int, str]] = [(1, _V1), (2, _V2), (3, _V3), (4, _V4), (5, _V5), (6, _V6), (7, _V7), (8, _V8), (9, _V9)]
 EXPECTED_SCHEMA_VERSION = MIGRATIONS[-1][0]
 
 

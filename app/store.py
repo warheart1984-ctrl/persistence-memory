@@ -30,6 +30,7 @@ from app.models import (
 )
 from app.identity import current_tenant_key
 from app.ts import parse_utc
+from app.ledger_search import record_tokens as search_tokens
 from app.twin import TWIN_AGENT
 from app.store_errors import StoreUnavailableError, StoreVersionConflict
 from app import clause_v
@@ -310,6 +311,7 @@ class JarvisStore:
         include_superseded: bool = False,
         include_archived: bool = False,
         include_twin: bool = False,
+        tokens: list[str] | None = None,
     ) -> list[tuple[MemoryRecord, str | None]]:
         """Newest-first keyset page: ``(record, superseded_by)`` pairs ordered by ``(created_at, id)`` descending.
 
@@ -336,6 +338,8 @@ class JarvisStore:
                 continue
             key = (parse_utc(m.created_at), m.id)
             if after is not None and not key < (parse_utc(after[0]), after[1]):
+                continue
+            if tokens and not set(tokens) <= set(search_tokens(m.subject, m.content, m.tags)):
                 continue
             rows.append((key, m, succ[1] if succ else None))
         rows.sort(key=lambda r: r[0], reverse=True)
