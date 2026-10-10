@@ -394,6 +394,7 @@ def tool_catalog() -> dict[str, Any]:
         "write_policy": {
             "emr_recall": "read",
             "emr_latest": "read (newest-first discovery, no id or keyword needed)",
+            "emr_search_ledger": "read (ranked word search over ledger records)",
             "search": "read (OpenAI company knowledge)",
             "fetch": "read (OpenAI company knowledge)",
             "emr_search": "read (alias of search)",
