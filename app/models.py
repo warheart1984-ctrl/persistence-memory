@@ -23,6 +23,10 @@ MemoryType = Literal[
 ]
 MemoryStatus = Literal["draft", "verified", "archived"]
 
+# source_agent of records written by the retired digital twin (now its own repo). Recall leaves them out unless a caller
+# asks for them (include_twin); the ledger keeps the name only so those records stay recognisable.
+TWIN_AGENT = "ai-twin"
+
 # Board UI slots (unchanged; board is workspace context, not the ledger record)
 SlotClass = Literal["foundation", "identity", "preference", "operational"]
 

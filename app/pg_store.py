@@ -29,6 +29,7 @@ from psycopg_pool import ConnectionPool
 
 from app.continuity import detect_conflicts, content_sha256
 from app.models import (
+    TWIN_AGENT,
     ConflictSet,
     MemoryBoard,
     MemoryCreate,
@@ -40,7 +41,6 @@ from app.pg_schema import check_schema_version, validate_schema_name
 from app.store import _make_id, ledger_retrieve, memory_matches_query
 from app.store_errors import InvalidInputError, StoreUnavailableError, StoreVersionConflict
 from app import attest
-from app.twin import TWIN_AGENT
 from app import clause_v
 from app import evidence as evidence_objects
 
