@@ -266,3 +266,26 @@ def test_the_markdown_labels_witnessed_calls_as_self_reported_and_records_the_he
     ev = rel.build_evidence(raw, checks, {"agents": AGENTS, "summary": "s"}, "http://x", [], {"old": OLD, "new": NEW, "receipt": RECEIPT})
     md = rel.render_markdown(ev, rel.render_printout(checks))
     assert "client names are self-reported" in md and "`" + "c" * 64 + "`" in md and "Record this off the box" in md and "| Cursor | 1 |" in md
+
+
+def test_every_client_name_in_the_log_is_listed_and_unmatched_ones_are_flagged(rel):
+    entries = [call_entry(5, "cursor-vscode"), call_entry(4, "mystery-client"), call_entry(3, "OpenCode"), call_entry(2, "cursor-vscode"),
+               {**call_entry(1, None), "tool": "POST /api/jarvis/blocks/seal", "transport": "http-api"}]
+    raw = {
+        "calls_emr_latest": {"http_status": 200, "body": {"entries": [e for e in entries if e["tool"] == "emr_latest"]}},
+        "calls_all": {"http_status": 200, "body": {"entries": entries}},
+        "calls_verify": {"http_status": 200, "body": {"ok": True, "head": {"seq": 5, "entry_hash": "h" * 64}, "files": ["calls-20261010.jsonl"], "entries": 5, "problems": []}},
+    }
+    agents = [{"agent": "OpenCode"}, {"agent": "Cursor", "aliases": ["cursor-vscode"]}, {"agent": "Kilo"}]
+    section = rel.call_log_section(raw, agents)
+    by = {a["agent"]: a for a in section["per_agent"]}
+    assert by["Cursor"]["witnessed_emr_latest_calls"] == 2 and by["Cursor"]["latest"]["seq"] == 5  # matched through the alias
+    assert by["OpenCode"]["witnessed_emr_latest_calls"] == 1 and by["Kilo"]["witnessed_emr_latest_calls"] == 0 and "see the list of every client name" in by["Kilo"]["note"]
+    seen = {(r["client_name"], r["transport"]): r for r in section["clients_seen"]}
+    assert seen[("mystery-client", "mcp-stdio")]["matched_an_agent"] is False  # a call is in the log, but under a name no agent was matched on
+    assert seen[("cursor-vscode", "mcp-stdio")]["calls"] == 2 and seen[("cursor-vscode", "mcp-stdio")]["matched_an_agent"] is True
+    assert seen[("(none)", "http-api")]["tools"] == ["POST /api/jarvis/blocks/seal"]
+    ev = rel.build_evidence(raw, rel.run_checks(canned(), OLD, NEW, NEW, None), {"agents": agents, "summary": "s"}, "http://x", [], {"old": OLD, "new": NEW, "receipt": RECEIPT})
+    ev["call_log"] = section
+    md = rel.render_markdown(ev, "printout")
+    assert "Every client name the log saw" in md and "| mystery-client/1.0 | mcp-stdio | 1 | emr_latest |" in md and "**no**" in md
