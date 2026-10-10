@@ -58,7 +58,9 @@ notify() {
   if [ -f "$key" ] && [ $(( $(date +%s) - $(cat "$key" 2>/dev/null || echo 0) )) -lt "$every" ]; then
     return 0
   fi
-  if command -v notify-send >/dev/null 2>&1; then
+  # JARVIS_NO_DESKTOP_NOTIFY=1 keeps alerts.log but never pops anything up (the test suite sets it: its fake failures, such as a
+  # refused key, must not appear on the operator's desktop through the real session bus).
+  if [ "${JARVIS_NO_DESKTOP_NOTIFY:-0}" != 1 ] && command -v notify-send >/dev/null 2>&1; then
     local bus="${DBUS_SESSION_BUS_ADDRESS:-}"
     if [ -z "$bus" ] && [ -S "/run/user/$(id -u)/bus" ]; then bus="unix:path=/run/user/$(id -u)/bus"; fi
     if [ -n "$bus" ]; then
