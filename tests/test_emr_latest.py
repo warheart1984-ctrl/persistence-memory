@@ -35,7 +35,7 @@ URL = "/api/jarvis/memory/latest"
 # ------------------------------------------------------------------------------------------------ fixtures
 
 
-@pytest.fixture(params=["json", "postgres"])
+@pytest.fixture(params=[pytest.param("json", marks=pytest.mark.json_store_only), "postgres"])
 def backend(request, tmp_path, monkeypatch):
     """Configure get_store() for the backend (and the operator key), and yield its name."""
     monkeypatch.setenv("JARVIS_API_KEY", KEY)
