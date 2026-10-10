@@ -4,12 +4,12 @@ A governed, evidence-first memory ledger for AI agents, backed by PostgreSQL. It
 provenance, and proves it was not quietly changed. It does **not** decide what is true (`docs/CONTINUITY_LEDGER_SOC.md`).
 Continuity lives in ledger records, not in chat transcripts; the service itself is replaceable.
 
-## What is live on 8011 (last deployed 2026-10-06; nothing has been deployed since)
+## What is live on 8011 (last deployed 2026-10-10)
 
 One ledger runs in Docker on a private Linux box at **`127.0.0.1:8011`** (PostgreSQL row store, schema **v9**). Nothing is
 reachable from the network; the PC and the agents reach it through an SSH tunnel. Deployment, operations and the rehearsed
-restore are in [`deploy/mint/README.md`](deploy/mint/README.md). **This table describes the deployed build, not `main`**: `main` is ahead of the box
-(schema v7 and the signature code, below).
+restore are in [`deploy/mint/README.md`](deploy/mint/README.md). **This table describes the deployed build**, which is `main` as of 2026-10-10 (`792e99b`, schema v9);
+anything merged after that day is not deployed until the next deploy.
 
 | Capability | Status |
 |---|---|
@@ -19,7 +19,7 @@ restore are in [`deploy/mint/README.md`](deploy/mint/README.md). **This table de
 | **Continuity Blocks**: sealed, Merkle-rooted, hash-chained ranges of the history; every block hash is also kept outside the database in the backup anchors | **live**, **unsigned** (`docs/CONTINUITY_BLOCKS.md`) |
 | **Replay Contracts, `RC.Ledger.v1`**: rebuild the ledger's state and ordered events as of any seq or sealed block, with a state root; receipts at sealed points (Evidence Objects); offline verifier `python -m app.replay verify`; `jarvisctl replay`; a restore-drill step | **live** since 2026-10-06: the `/api/jarvis/replay/*` routes, receipts at sealed points, the offline verifier, `jarvisctl replay` and the restore-drill step run on the box (`docs/REPLAY_CONTRACTS.md`). A receipt is an unsigned claim until it is re-derived |
 | Domain Replay Contracts (`RC.AIKI`, `ARIS`, `SX`, `Lineage`, `Mandala`) | **on hold**: declared only (no schema, owner or algorithm exists) |
-| **Signatures**: attestations of blocks, receipts and checkpoints by a key a root key authorized, a trust log, the host signer, the PC witness/cosign tool, signature levels L0/L1/L2 in replay verification, `JARVIS_SIGNATURES=off\|warn\|require` (schema v7, `docs/SIGNATURES.md`, `docs/SIGNING_RUNBOOK.md`) | **built on `main`, shelved, not deployed**: no key has been made and no key ceremony done, the sign timer is off, nothing is signed, and the live database is schema v6 (deploying `main` would migrate it to v7; the way back is the backup taken before) |
+| **Signatures**: attestations of blocks, receipts and checkpoints by a key a root key authorized, a trust log, the host signer, the PC witness/cosign tool, signature levels L0/L1/L2 in replay verification, `JARVIS_SIGNATURES=off\|warn\|require` (schema v7, `docs/SIGNATURES.md`, `docs/SIGNING_RUNBOOK.md`) | **deployed since 2026-10-08 (schema v7 tables), shelved**: no key has been made and no key ceremony done, the sign timer is off, nothing is signed; `JARVIS_SIGNATURES=warn` with an empty trust roots file, so a replay reports blocks as unsigned and never as verified (the live database is schema v9) |
 | CES registry, unified provenance chain, ESFR promotion | **not built** (`docs/CCS_CHARTER.md`) |
 
 Also enforced by tests: continuity across sessions, replay of a retrieve with why / where / when / session, conflicts surfaced
