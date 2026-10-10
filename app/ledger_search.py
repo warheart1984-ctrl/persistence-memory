@@ -55,6 +55,30 @@ def query_tokens(query: Any) -> list[str]:
     return seen
 
 
+def _contains_run(seq: list[str], run: list[str]) -> bool:
+    """Whether ``run`` occurs as consecutive items of ``seq`` (Knuth-Morris-Pratt: O(len(seq) + len(run)), no slicing)."""
+    m = len(run)
+    if m == 0 or m > len(seq):
+        return m == 0
+    fail = [0] * m
+    k = 0
+    for i in range(1, m):
+        while k and run[i] != run[k]:
+            k = fail[k - 1]
+        if run[i] == run[k]:
+            k += 1
+        fail[i] = k
+    k = 0
+    for item in seq:
+        while k and item != run[k]:
+            k = fail[k - 1]
+        if item == run[k]:
+            k += 1
+            if k == m:
+                return True
+    return False
+
+
 def score(record: Any, qtoks: list[str], phrase: list[str] | None = None) -> int:
     """Deterministic integer relevance of one candidate (which already contains every query token).
 
@@ -72,9 +96,8 @@ def score(record: Any, qtoks: list[str], phrase: list[str] | None = None) -> int
             total += W_TAG
         total += W_CONTENT * min(CONTENT_TF_CAP, content.count(q))
     if len(phrase) > 1:
-        n = len(phrase)
         for seq in (tokens(record.subject), content):
-            if any(seq[i:i + n] == phrase for i in range(len(seq) - n + 1)):
+            if _contains_run(seq, phrase):
                 total += PHRASE_BONUS
                 break
     return total
