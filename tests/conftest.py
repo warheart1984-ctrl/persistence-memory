@@ -27,6 +27,13 @@ def _embeddings_off_and_isolated(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _no_desktop_popups(monkeypatch):
+    """The deploy-script tests provoke real failures (a refused key, a missing endpoint). lib.sh's notify() falls back to the
+    operator's live session bus, so without this every full run popped "Jarvis ledger: seal failed" on the desktop."""
+    monkeypatch.setenv("JARVIS_NO_DESKTOP_NOTIFY", "1")
+
+
+@pytest.fixture(autouse=True)
 def _allow_unauthenticated_for_tests(monkeypatch):
     """Ledger tests use the local-dev opt-out; auth-required behavior is in test_auth.py."""
     monkeypatch.delenv("JARVIS_API_KEY", raising=False)
