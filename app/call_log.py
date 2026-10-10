@@ -261,16 +261,18 @@ class CallLog:
             return self._head()
 
     # ----- degraded latch and preflight
-    def degraded(self) -> dict[str, Any] | None:
-        """The outage state: the DEGRADED file and this process's memory of it, merged (the file may be unwritable, the memory never is)."""
+    def _file_state(self) -> dict[str, Any] | None:
         try:
-            on_disk = json.loads(self.degraded_path.read_text(encoding="utf-8"))
+            state = json.loads(self.degraded_path.read_text(encoding="utf-8"))
+            return state if isinstance(state, dict) else None
         except (OSError, ValueError):
-            on_disk = None
-        in_memory = self._outage
-        if not on_disk and not in_memory:
             return None
-        parts = [p for p in (on_disk, in_memory) if p]
+
+    @staticmethod
+    def _merge(parts: list[dict[str, Any]]) -> dict[str, Any] | None:
+        parts = [p for p in parts if p]
+        if not parts:
+            return None
         return {
             "since": min(str(p.get("since")) for p in parts),
             "unlogged": max(int(p.get("unlogged", 0)) for p in parts),
@@ -278,25 +280,41 @@ class CallLog:
             "last_error": str(parts[-1].get("last_error", ""))[:300],
         }
 
+    def degraded(self) -> dict[str, Any] | None:
+        """The outage state: the DEGRADED file, plus this process's memory of whatever could not be persisted to it."""
+        return self._merge([self._file_state(), self._outage])
+
     def _clear_degraded(self) -> None:
         self._outage = None
         with contextlib.suppress(OSError):
             self.degraded_path.unlink()
 
     def _mark_degraded(self, error: str, *, unlogged: int = 1, refused: int = 0) -> None:
-        """Record an outage.  ``unlogged``: calls that were served but could not be logged; ``refused``: writes refused because the log was unavailable."""
-        state = self.degraded() or {"since": _ts(self._clock()), "unlogged": 0, "refused": 0}
-        state["unlogged"] = int(state.get("unlogged", 0)) + unlogged
-        state["refused"] = int(state.get("refused", 0)) + refused
-        state["last_error"] = error[:300]
-        self._outage = dict(state)  # always kept in memory
-        with contextlib.suppress(OSError):  # and on disk when the directory allows it
-            self.dir.mkdir(parents=True, exist_ok=True)
-            tmp = self.degraded_path.with_suffix(".tmp")
-            fd = self._open_private(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.write(json.dumps(state))
-            os.replace(tmp, self.degraded_path)
+        """Record an outage.  ``unlogged``: calls that were served but could not be logged; ``refused``: writes refused because the log was unavailable.
+
+        The DEGRADED file is the shared record (updated under the lock, so workers do not lose each other's counts).  Memory holds the state only
+        while it could not be persisted there (the directory is the thing that is unwritable); once it is on disk the memory copy is dropped, so a
+        worker never replays a stale copy after another worker has recorded the gap.
+        """
+        def bump(state: dict[str, Any] | None) -> dict[str, Any]:
+            state = dict(state or {"since": _ts(self._clock()), "unlogged": 0, "refused": 0})
+            state["unlogged"] = int(state.get("unlogged", 0)) + unlogged
+            state["refused"] = int(state.get("refused", 0)) + refused
+            state["last_error"] = error[:300]
+            return state
+
+        try:
+            with self._locked():
+                state = bump(self._merge([self._file_state(), self._outage]))
+                tmp = self.degraded_path.with_suffix(".tmp")
+                fd = self._open_private(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(json.dumps(state))
+                os.replace(tmp, self.degraded_path)
+            self._outage = None  # persisted: the file is the single record
+        except (OSError, CallLogError):
+            state = bump(self._merge([self._file_state(), self._outage]))
+            self._outage = dict(state)  # could not be persisted: keep it in memory so recovery can still record the gap
         _log.error("call log degraded: %s (served but unlogged: %s, writes refused: %s)", error, state["unlogged"], state["refused"])
 
     def preflight(self) -> None:

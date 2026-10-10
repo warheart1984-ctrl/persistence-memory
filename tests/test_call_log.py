@@ -666,3 +666,18 @@ def test_the_gap_counts_served_but_unlogged_calls_separately_from_refused_writes
 
 def entries_in(log):
     return [e for e in reversed(list(log.entries_desc()))]
+
+
+def test_workers_sharing_a_log_record_one_gap_not_one_per_worker(tmp_path):
+    """Two workers refuse writes during the same outage; after recovery the shared record produces exactly one gap with the summed counts."""
+    shared = tmp_path / "shared"
+    w1, w2 = call_log.CallLog(shared), call_log.CallLog(shared)
+    w1._mark_degraded("today's file is read-only", unlogged=0, refused=1)
+    w2._mark_degraded("today's file is read-only", unlogged=0, refused=1)
+    w2._mark_degraded("today's file is read-only", unlogged=1, refused=0)
+    w1.append(_fields(1))  # recovery on worker 1: it writes the gap and clears the shared record
+    w2.append(_fields(2))  # worker 2 must not replay a stale copy of the same outage
+    gaps = [e for e in reversed(list(w1.entries_desc())) if e["outcome"] == "gap"]
+    assert len(gaps) == 1, f"{len(gaps)} gap entries for one outage"
+    assert (gaps[0]["count"], gaps[0]["refused"]) == (1, 2)
+    assert w1.degraded() is None and w2.degraded() is None and w1.verify()["ok"] is True
