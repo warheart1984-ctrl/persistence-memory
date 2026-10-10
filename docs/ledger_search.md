@@ -37,13 +37,13 @@ on both backends.
 {
   "query": "mint deploy",
   "tokens": ["mint", "deploy"],
-  "records": [{"id": "mem-…", "created_at": "…Z", "type": "fact", "status": "active",
+  "records": [{"id": "mem-…", "created_at": "…Z", "type": "fact", "status": "draft", "lifecycle": "active",
                "provenance": {"source_agent": "…", "actor": null, "method": null, "evidence_refs": []},
                "supersedes": null, "superseded_by": null, "summary": "…", "score": 17}],
   "candidates_capped": false,
   "tenant": "operator",
   "ledger_head": "seq:42",
-  "result_digest": "sha256 of [[id, created_at, status, score], …] in returned order",
+  "result_digest": "sha256 of [[id, created_at, status, lifecycle, score], …] in returned order",
   "provenance": "ledger"
 }
 ```

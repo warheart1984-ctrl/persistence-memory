@@ -6,7 +6,7 @@ Continuity lives in ledger records, not in chat transcripts; the service itself 
 
 ## What is live on 8011 (last deployed 2026-10-06; nothing has been deployed since)
 
-One ledger runs in Docker on a private Linux box at **`127.0.0.1:8011`** (PostgreSQL row store, schema **v6**). Nothing is
+One ledger runs in Docker on a private Linux box at **`127.0.0.1:8011`** (PostgreSQL row store, schema **v9**). Nothing is
 reachable from the network; the PC and the agents reach it through an SSH tunnel. Deployment, operations and the rehearsed
 restore are in [`deploy/mint/README.md`](deploy/mint/README.md). **This table describes the deployed build, not `main`**: `main` is ahead of the box
 (schema v7 and the signature code, below).
@@ -102,7 +102,7 @@ database URL or that opt-in the service answers 503 rather than creating a ledge
   A block sealed after the last backup is not anchored yet; a receipt taken earlier also exposes a later rewrite.
 * **Domain Replay Contracts (on hold) and CES schemas are not built.** Earlier docs claimed stubs under `schemas/rc/` and `schemas/ces/`;
   they never existed (corrected). Only `RC.Ledger.v1` has files (`schemas/rc/`). Receipts are unsigned claims until re-derived.
-* **`main` is ahead of the box.** The live ledger is schema v6 and unsigned; the signature code (schema v7) is on `main` and shelved. Nothing on 8011 verifies or makes a signature.
+* **Signing is shelved.** The live ledger is schema v9 (deployed 2026-10-10), with `JARVIS_SIGNATURES=warn` and no trust roots: no key is authorized, nothing is signed, and a replay reports blocks as unsigned, never as verified.
 * **Soft Clause V rules only warn** (emotion, transient state, transcripts) until the operator flips `JARVIS_CLAUSE_V_SOFT`.
 * **One box.** Wi-Fi only, disk not encrypted, an hour's worth of data at risk between backups, no automatic security updates
   (`deploy/mint/README.md`, "Honest limits").

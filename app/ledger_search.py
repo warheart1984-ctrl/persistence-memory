@@ -145,6 +145,6 @@ def search_ledger(store: Any, *, tenant: str | None, params: SearchParams, opera
         "candidates_capped": capped,
         "tenant": tenant,
         "ledger_head": ledger_head(store, operator=operator),
-        "result_digest": result_digest([(r["id"], r["created_at"], r["status"], r["score"]) for r in records]),
+        "result_digest": result_digest([(r["id"], r["created_at"], r["status"], r["lifecycle"], r["score"]) for r in records]),
         "provenance": "ledger",
     }

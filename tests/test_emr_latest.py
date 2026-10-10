@@ -99,7 +99,7 @@ def latest(client, **params):
 
 
 def digest_of(records):
-    blob = json.dumps([[r["id"], r["created_at"], r["status"]] for r in records], separators=(",", ":"), ensure_ascii=False)
+    blob = json.dumps([[r["id"], r["created_at"], r["status"], r["lifecycle"]] for r in records], separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
@@ -208,7 +208,8 @@ def test_superseded_archived_and_twin_records_are_excluded_by_default_and_includ
     assert ids(type="decision") == {decision}
     assert ids(include_superseded="true", include_archived="true", include_twin="true") == {plain, old, new, archived, twin, decision}
     by_id = {r["id"]: r for r in latest(client, limit=50, include_archived="true", include_twin="true").json()["records"]}
-    assert by_id[archived]["status"] == "archived" and by_id[plain]["status"] == "active"
+    assert (by_id[archived]["status"], by_id[archived]["lifecycle"]) == ("archived", "archived")
+    assert (by_id[plain]["status"], by_id[plain]["lifecycle"]) == ("draft", "active")  # stored review state, and still current
 
 
 # ------------------------------------------------------------------------------------------------ 5. chain A -> B -> C
@@ -219,9 +220,9 @@ def test_supersedes_and_superseded_by_on_a_chain(client):
     b = add(client, "B", supersedes=a)["id"]
     c = add(client, "C", supersedes=b)["id"]
     recs = {r["id"]: r for r in latest(client, limit=50, include_superseded="true").json()["records"]}
-    assert (recs[a]["supersedes"], recs[a]["superseded_by"], recs[a]["status"]) == (None, b, "superseded")
-    assert (recs[b]["supersedes"], recs[b]["superseded_by"], recs[b]["status"]) == (a, c, "superseded")
-    assert (recs[c]["supersedes"], recs[c]["superseded_by"], recs[c]["status"]) == (b, None, "active")
+    assert (recs[a]["supersedes"], recs[a]["superseded_by"], recs[a]["lifecycle"]) == (None, b, "superseded")
+    assert (recs[b]["supersedes"], recs[b]["superseded_by"], recs[b]["lifecycle"]) == (a, c, "superseded")
+    assert (recs[c]["supersedes"], recs[c]["superseded_by"], recs[c]["lifecycle"]) == (b, None, "active")
     assert [r["id"] for r in latest(client, limit=50).json()["records"]] == [c]
 
 
@@ -231,7 +232,7 @@ def test_record_fields_are_stored_values_or_null_never_invented(client):
     assert got["id"] == rec["id"] and got["summary"] == "first line" and got["type"] == "fact"
     assert got["provenance"] == {"source_agent": "agent", "actor": None, "method": None, "evidence_refs": ["doc#1"]}
     assert got["created_at"].endswith("Z") and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z", got["created_at"])
-    assert set(got) == {"id", "created_at", "type", "status", "provenance", "supersedes", "superseded_by", "summary"}
+    assert set(got) == {"id", "created_at", "type", "status", "lifecycle", "provenance", "supersedes", "superseded_by", "summary"}
 
 
 # ------------------------------------------------------------------------------------------------ 6. tenant isolation
@@ -449,3 +450,15 @@ def test_non_ascii_summaries_survive_and_the_digest_is_reproducible_from_the_wir
     body = latest(client).json()
     assert body["records"][1]["summary"] == "naïve — 日本語 summary line"
     assert body["result_digest"] == digest_of(body["records"])
+
+
+def test_a_draft_record_is_reported_as_a_draft_not_as_active(client):
+    """emr_latest used to relabel the stored status ("draft") as "active". status is the stored review state; lifecycle says
+    whether the record is still current. The two must never be conflated."""
+    rec = add(client, "a freshly written record")
+    got = latest(client).json()["records"][0]
+    assert rec["status"] == "draft"
+    assert got["id"] == rec["id"] and got["status"] == rec["status"] == "draft" and got["lifecycle"] == "active"
+    # the search route uses the same shape
+    hit = client.get("/api/jarvis/memory/search", headers=HDR, params={"query": "freshly"}).json()["records"][0]
+    assert (hit["status"], hit["lifecycle"]) == ("draft", "active")
