@@ -48,14 +48,17 @@ off on live), which is why its writes are in scope.
 ## If the log cannot be written
 
 * **Ledger writes fail closed.** `emr_remember`, `emr_upsert`, `POST /api/jarvis/memory` and `PATCH`/`DELETE /api/jarvis/memory/{id}` run
-  a preflight first (lock, read the head, directory writable, 1 MiB free). If it fails the call is refused with **503
+  a preflight first (lock, read the head, directory writable, **today's log file writable**, 1 MiB free). If it fails the call is refused with **503
   `CALL_LOG_UNAVAILABLE`** and nothing is written. Other non-GET calls (seal, receipts) are logged but fail open, so an unwritable
   log cannot stop the hourly seal.
 * **Reads fail open.** The call is served, the failure is logged at ERROR, the log is flagged degraded (`DEGRADED` file, and
   `X-Jarvis-Call-Log: degraded` on the response).
 * **A write that committed but could not be logged** returns its real result (it cannot be undone, and the ledger's own history records
   it), flags the log degraded, and further writes are refused until the log can be written again.
-* On recovery a `gap` entry records how many calls were not logged and since when, so `verify` shows the hole.
+* On recovery a `gap` entry records how many calls were served but not logged (`count`), how many ledger writes were refused
+  because the log was unavailable (`refused`), and since when, so `verify` shows the hole. The outage is remembered **in memory as well
+  as in the `DEGRADED` file**, because that file lives in the directory that may be the thing that cannot be written; if the process
+  itself dies during such an outage the memory is lost with it.
 
 ## Endpoints (operator only; an OAuth tenant gets `403` `AUTHORITY_DENIED`)
 

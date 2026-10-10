@@ -172,6 +172,7 @@ class CallLog:
         self.dir = Path(directory)
         self._clock = clock
         self._tlock = threading.RLock()
+        self._outage: dict[str, Any] | None = None  # unlogged/refused calls kept in memory, so a gap can be recorded even if the DEGRADED file cannot be written
         self._suppressed: dict[str, Any] | None = None  # the open denied-flood window for this process
         self._denied_window: tuple[str, int] = ("", 0)
 
@@ -261,23 +262,42 @@ class CallLog:
 
     # ----- degraded latch and preflight
     def degraded(self) -> dict[str, Any] | None:
+        """The outage state: the DEGRADED file and this process's memory of it, merged (the file may be unwritable, the memory never is)."""
         try:
-            return json.loads(self.degraded_path.read_text(encoding="utf-8"))
+            on_disk = json.loads(self.degraded_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
+            on_disk = None
+        in_memory = self._outage
+        if not on_disk and not in_memory:
             return None
+        parts = [p for p in (on_disk, in_memory) if p]
+        return {
+            "since": min(str(p.get("since")) for p in parts),
+            "unlogged": max(int(p.get("unlogged", 0)) for p in parts),
+            "refused": max(int(p.get("refused", 0)) for p in parts),
+            "last_error": str(parts[-1].get("last_error", ""))[:300],
+        }
 
-    def _mark_degraded(self, error: str) -> None:
-        state = self.degraded() or {"since": _ts(self._clock()), "unlogged": 0}
-        state["unlogged"] = int(state.get("unlogged", 0)) + 1
-        state["last_error"] = error[:300]
+    def _clear_degraded(self) -> None:
+        self._outage = None
         with contextlib.suppress(OSError):
+            self.degraded_path.unlink()
+
+    def _mark_degraded(self, error: str, *, unlogged: int = 1, refused: int = 0) -> None:
+        """Record an outage.  ``unlogged``: calls that were served but could not be logged; ``refused``: writes refused because the log was unavailable."""
+        state = self.degraded() or {"since": _ts(self._clock()), "unlogged": 0, "refused": 0}
+        state["unlogged"] = int(state.get("unlogged", 0)) + unlogged
+        state["refused"] = int(state.get("refused", 0)) + refused
+        state["last_error"] = error[:300]
+        self._outage = dict(state)  # always kept in memory
+        with contextlib.suppress(OSError):  # and on disk when the directory allows it
             self.dir.mkdir(parents=True, exist_ok=True)
             tmp = self.degraded_path.with_suffix(".tmp")
             fd = self._open_private(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 fh.write(json.dumps(state))
             os.replace(tmp, self.degraded_path)
-        _log.error("call log degraded: %s (calls not logged so far: %s)", error, state["unlogged"])
+        _log.error("call log degraded: %s (served but unlogged: %s, writes refused: %s)", error, state["unlogged"], state["refused"])
 
     def preflight(self) -> None:
         """Raise CallLogError unless a write could be logged right now (used before running a ledger write)."""
@@ -286,13 +306,15 @@ class CallLog:
                 head = self._head()  # the log is readable and its tail parses
                 if not os.access(self.dir, os.W_OK):
                     raise CallLogError("the call-log directory is not writable")
+                today = self.dir / f"calls-{self._clock():%Y%m%d}.jsonl"
+                if today.exists() and not os.access(today, os.W_OK):
+                    raise CallLogError("today's call-log file is not writable")
                 if shutil.disk_usage(self.dir).free < MIN_FREE_BYTES:
                     raise CallLogError("the call-log volume is nearly full")
                 state = self.degraded()
                 if state:
                     self._append_locked(self._gap_entry(state), head)
-                    with contextlib.suppress(OSError):
-                        self.degraded_path.unlink()
+                    self._clear_degraded()
         except CallLogError:
             raise
         except OSError as exc:
@@ -302,9 +324,10 @@ class CallLog:
     def _gap_entry(self, state: dict[str, Any]) -> dict[str, Any]:
         return {
             "transport": "http-api", "client_name": None, "client_version": None, "client_self_reported": True, "tenant": "operator",
-            "tool": "(call-log)", "route": None, "method": None, "target": None, "args_sha256": args_hash({"since": state.get("since"), "unlogged": state.get("unlogged")}),
-            "outcome": "gap", "error_code": f"UNLOGGED_CALLS:{state.get('unlogged')}", "status_code": None, "result_digest": None, "duration_ms": 0,
-            "window_start": state.get("since"), "window_end": _ts(self._clock()), "count": state.get("unlogged"),
+            "tool": "(call-log)", "route": None, "method": None, "target": None,
+            "args_sha256": args_hash({"since": state.get("since"), "unlogged": state.get("unlogged"), "refused": state.get("refused", 0)}),
+            "outcome": "gap", "error_code": f"UNLOGGED_CALLS:{state.get('unlogged')};REFUSED_WRITES:{state.get('refused', 0)}", "status_code": None, "result_digest": None, "duration_ms": 0,
+            "window_start": state.get("since"), "window_end": _ts(self._clock()), "count": state.get("unlogged"), "refused": state.get("refused", 0),
         }
 
     def _append_locked(self, fields: dict[str, Any], head: dict[str, Any]) -> dict[str, Any]:
@@ -358,8 +381,7 @@ class CallLog:
                 if state:  # recovered: say how many calls were not logged before anything else
                     gap = self._append_locked(self._gap_entry(state), head)
                     head = {"seq": gap["seq"], "entry_hash": gap["entry_hash"]}
-                    with contextlib.suppress(OSError):
-                        self.degraded_path.unlink()
+                    self._clear_degraded()
                 if fields.get("outcome") == "denied":
                     window = self._clock().strftime("%Y-%m-%dT%H:%M")
                     if self._denied_window[0] != window:
@@ -405,7 +427,7 @@ class CallLog:
         try:
             return self.append(fields)
         except CallLogError as exc:
-            self._mark_degraded(str(exc))
+            self._mark_degraded(str(exc), unlogged=1)
             return None
 
     # ----- reading

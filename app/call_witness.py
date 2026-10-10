@@ -135,7 +135,7 @@ class CallWitnessMiddleware:
             try:
                 log.preflight()
             except call_log.CallLogError as exc:
-                log._mark_degraded(str(exc))
+                log._mark_degraded(str(exc), unlogged=0, refused=1)
                 payload = json.dumps(error_body(503, "the call log is unavailable, so ledger writes are refused", code="unavailable", reason="CALL_LOG_UNAVAILABLE")).encode()
                 await send({"type": "http.response.start", "status": 503, "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(payload)).encode()),
                                                                                      *[(k.lower().encode(), v.encode()) for k, v in (error_headers(503) or {}).items()]]})
@@ -277,7 +277,7 @@ def witnessed_dispatch(message: dict[str, Any], dispatch: Callable[[dict[str, An
         try:
             log.preflight()
         except call_log.CallLogError as exc:
-            log._mark_degraded(str(exc))
+            log._mark_degraded(str(exc), unlogged=0, refused=1)
             return {"jsonrpc": "2.0", "id": message.get("id"), "result": {
                 "content": [{"type": "text", "text": "the call log is unavailable, so ledger writes are refused"}],
                 "structuredContent": {"error": {"code": "unavailable", "reason": "CALL_LOG_UNAVAILABLE"}}, "isError": True}}
