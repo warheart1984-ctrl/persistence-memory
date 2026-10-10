@@ -115,5 +115,5 @@ database URL or that opt-in the service answers 503 rather than creating a ledge
 
 `docs/CCS_CHARTER.md` and `docs/LEDGER_TO_CCS_MAPPING.md` (what is declared versus built) · `docs/CONSTITUTIONAL_BOUNDARY_CLAUSE.md` ·
 `docs/CONTINUITY_LEDGER_SOC.md` · `docs/CONSTITUTIONAL_MEMORY_CONTRACT.md` · `docs/EMR_RECALL_PROTOCOL.md` · `docs/ADAPTER_CONSUMERS.md` ·
-`docs/chaos/CL_CHAOS_100x.md` (the throwaway-stack hammer and its first report) · `docs/POSTGRES.md` · `docs/CLAUSE_V_HYGIENE.md` · `docs/EVIDENCE_OBJECTS.md` · `docs/CONTINUITY_BLOCKS.md` · `docs/REPLAY_CONTRACTS.md` · `docs/SIGNATURES.md` · `docs/SIGNING_RUNBOOK.md` ·
+`docs/chaos/CL_CHAOS_100x.md` (the throwaway-stack hammer and its first report) · `docs/POSTGRES.md` · `docs/call_log.md` (the server-side tool-call log, off on the live box until its deploy step) · `docs/CLAUSE_V_HYGIENE.md` · `docs/EVIDENCE_OBJECTS.md` · `docs/CONTINUITY_BLOCKS.md` · `docs/REPLAY_CONTRACTS.md` · `docs/SIGNATURES.md` · `docs/SIGNING_RUNBOOK.md` ·
 `SECURITY.md`.

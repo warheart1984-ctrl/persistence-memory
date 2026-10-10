@@ -106,6 +106,27 @@ def _key_may_travel(url: str) -> bool:
     return parsed.scheme == "https" or (parsed.hostname or "") in ("127.0.0.1", "localhost", "::1")
 
 
+# --- who is calling (self-reported; the ledger's call log records it as such) ------------------------------------------------
+_CLIENT = {"name": "ledger_stdio", "version": None}
+
+
+def _client_header() -> str:
+    """'name/version' for X-Jarvis-MCP-Client: the host's MCP clientInfo when it sent one, else this adapter's own name."""
+    def clean(text: object) -> str:
+        return "".join(ch if ch.isprintable() and not ch.isspace() else "_" for ch in str(text or ""))[:64].encode("latin-1", "replace").decode("latin-1")
+
+    name = clean(_CLIENT["name"]) or "ledger_stdio"
+    version = clean(_CLIENT["version"])
+    return f"{name}/{version}" if version else name
+
+
+def _note_client(message: dict[str, Any]) -> None:
+    if message.get("method") == "initialize":
+        info = (message.get("params") or {}).get("clientInfo")
+        if isinstance(info, dict) and info.get("name"):
+            _CLIENT["name"], _CLIENT["version"] = info.get("name"), info.get("version")
+
+
 # --- HTTP ---------------------------------------------------------------------------------------------------
 
 def _request(method: str, path: str, body: dict[str, Any] | None = None, *, tolerate: tuple[int, ...] = ()) -> tuple[int, Any]:
@@ -118,7 +139,7 @@ def _request(method: str, path: str, body: dict[str, Any] | None = None, *, tole
             "key_not_allowed",
             "refusing to send the API key over plain http to a non-loopback host; use https or an SSH tunnel to 127.0.0.1",
         )
-    headers = {"Accept": "application/json", "X-API-Key": key}
+    headers = {"Accept": "application/json", "X-API-Key": key, "X-Jarvis-MCP-Transport": "stdio", "X-Jarvis-MCP-Client": _client_header()}
     data = None
     if body is not None:
         data = json.dumps(body).encode("utf-8")
@@ -356,6 +377,7 @@ def handle_tools_call(params: dict[str, Any]) -> dict[str, Any]:
 
 
 def dispatch(message: dict[str, Any]) -> dict[str, Any] | None:
+    _note_client(message)
     method = message.get("method")
     request_id = message.get("id")
     params = message.get("params") if isinstance(message.get("params"), dict) else {}

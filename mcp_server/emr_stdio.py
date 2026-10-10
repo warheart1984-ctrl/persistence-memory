@@ -78,11 +78,33 @@ def api_key() -> str:
     )
 
 
+# --- who is calling (self-reported; the ledger's call log records it as such) ------------------------------------------------
+_CLIENT = {"name": "emr_stdio", "version": None}
+
+
+def _client_header() -> str:
+    """'name/version' for X-Jarvis-MCP-Client: the host's MCP clientInfo when it sent one, else this adapter's own name."""
+    def clean(text: object) -> str:
+        return "".join(ch if ch.isprintable() and not ch.isspace() else "_" for ch in str(text or ""))[:64].encode("latin-1", "replace").decode("latin-1")
+
+    name = clean(_CLIENT["name"]) or "emr_stdio"
+    version = clean(_CLIENT["version"])
+    return f"{name}/{version}" if version else name
+
+
+def _note_client(message: dict[str, Any]) -> None:
+    if message.get("method") == "initialize":
+        info = (message.get("params") or {}).get("clientInfo")
+        if isinstance(info, dict) and info.get("name"):
+            _CLIENT["name"], _CLIENT["version"] = info.get("name"), info.get("version")
+
+
 def _http_post(path: str, arguments: dict[str, Any]) -> dict[str, Any]:
     url = f"{base_url()}{path}"
     parsed = urllib.parse.urlparse(url)
     payload = json.dumps(arguments).encode("utf-8")
-    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    headers = {"Content-Type": "application/json", "Accept": "application/json",
+               "X-Jarvis-MCP-Transport": "stdio", "X-Jarvis-MCP-Client": _client_header()}
     # Server accepts EMR_RECALL_API_KEY when set, else JARVIS_API_KEY; the key may come from JARVIS_API_KEY_FILE.
     key = api_key()
     if key:
@@ -147,6 +169,7 @@ def handle_tools_call(params: dict[str, Any]) -> dict[str, Any]:
 
 def handle_message(message: dict[str, Any]) -> bool:
     """Handle one JSON-RPC message. Returns False when the server should exit."""
+    _note_client(message)
     out = dispatch_rpc(message, call_emr_tool)
     if out is not None:
         _send(out)

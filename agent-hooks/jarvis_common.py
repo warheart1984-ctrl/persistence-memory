@@ -218,7 +218,8 @@ def read_stdin_json() -> dict[str, Any]:
 def http_json(method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
     url = f"{base_url()}{path}"
     data = None
-    headers = {"Accept": "application/json"}
+    # Self-reported, so the ledger's call log can say which hook made the call.
+    headers = {"Accept": "application/json", "X-Jarvis-MCP-Client": "jarvis-hook-" + (os.path.splitext(os.path.basename(sys.argv[0] or "hook"))[0] or "hook")[:48]}
     if body is not None:
         data = json.dumps(body).encode("utf-8")
         headers["Content-Type"] = "application/json"

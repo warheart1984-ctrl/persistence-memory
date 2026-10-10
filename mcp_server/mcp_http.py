@@ -14,7 +14,9 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
+from app import call_witness
 from app.auth import optional_verify_operator_api_key
+from app.identity import current_tenant_key
 from mcp_server.protocol import (
     PROTOCOL_VERSION,
     EmrToolCaller,
@@ -69,7 +71,11 @@ def create_mcp_router(call_tool: EmrToolCaller) -> APIRouter:
     @router.post("/")
     async def mcp_post(request: Request) -> Response:
         _validate_accept(request)
-        _require_mcp_auth(request)
+        try:
+            _require_mcp_auth(request)
+        except HTTPException:
+            call_witness.log_unauthenticated_mcp(request.headers.get("user-agent"))
+            raise
 
         session_id = request.headers.get(SESSION_HEADER)
         messages = _parse_body(await request.body())
@@ -88,7 +94,12 @@ def create_mcp_router(call_tool: EmrToolCaller) -> APIRouter:
         for msg in requests:
             if msg.get("method") == "initialize" and not session_id:
                 new_session = secrets.token_urlsafe(24)
-            out = dispatch_rpc(msg, call_tool)
+            if msg.get("method") == "initialize":
+                call_witness.remember_client(new_session or session_id, msg.get("params"))
+            out = call_witness.witnessed_dispatch(
+                msg, lambda m: dispatch_rpc(m, call_tool), session_id=session_id or new_session,
+                tenant=current_tenant_key(), user_agent=request.headers.get("user-agent"),
+            )
             if out is not None:
                 responses.append(out)
 

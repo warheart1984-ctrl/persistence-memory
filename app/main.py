@@ -101,10 +101,12 @@ from app.auth import (
     nx_allowed_roots,
 )
 from app.identity import current_tenant_key
+from app import call_log
+from app.call_witness import CallWitnessMiddleware
 from app.oauth import protected_resource_metadata
 from app.public_security import cors_origins, public_security_middleware
 from app.refusal import DENIED, LEDGER_UNAVAILABLE, VERSION_CONFLICT, json_response, retry_after_seconds
-from app.emr_latest import LatestError, LatestParams, latest_memories, parse_limit
+from app.emr_latest import AUTHORITY_DENIED, LatestError, LatestParams, latest_memories, parse_limit
 from app.ledger_search import SearchParams, search_ledger
 from app import clause_v
 from app.clause_v import ClauseVViolation
@@ -185,6 +187,10 @@ async def _public_security(request: Request, call_next):
 @app.middleware("http")
 async def _identity(request: Request, call_next):
     return await identity_middleware(request, call_next)
+
+
+# Outermost (added last): sees every request, including the ones auth rejects.  See app/call_witness.py and docs/call_log.md.
+app.add_middleware(CallWitnessMiddleware)
 
 
 @app.get("/")
@@ -931,6 +937,37 @@ def _audit_log(action: str, request: Request | None, details: dict):
 
 
 # --- EMR / STM (LTM stays the store; STM is an activated view) ---
+
+
+def require_call_log_operator() -> None:
+    """The call log is operator-only: an OAuth principal (a tenant) never reads it."""
+    if oauth_enabled():
+        raise LatestError(403, "denied", AUTHORITY_DENIED, "the call log is operator-only")
+
+
+@app.get("/api/jarvis/tools/calls", dependencies=[Depends(require_emr_recall_api_key), Depends(require_call_log_operator)])
+def tool_calls(
+    tool: str | None = Query(default=None, max_length=64),
+    client: str | None = Query(default=None, max_length=128),
+    since: str | None = Query(default=None, max_length=40),
+    limit: int = Query(default=50, ge=1, le=200),
+    cursor: str | None = Query(default=None, max_length=20),
+):
+    """Server-witnessed tool calls, newest first (see docs/call_log.md).  Client names are self-reported."""
+    if not call_log.enabled():
+        raise HTTPException(status_code=404, detail="the call log is switched off (JARVIS_CALL_LOG_ENABLED)")
+    if cursor is not None and not cursor.isdigit():
+        raise HTTPException(status_code=422, detail="cursor must be the next_cursor from a previous page")
+    page = call_log.get_call_log().query(tool=tool, client=client, since=since, limit=limit, before_seq=int(cursor) if cursor else None)
+    return {**page, "head": call_log.get_call_log().head(), "client_names": "self-reported", "provenance": "server-witnessed"}
+
+
+@app.get("/api/jarvis/tools/calls/verify", dependencies=[Depends(require_emr_recall_api_key), Depends(require_call_log_operator)])
+def tool_calls_verify():
+    """Walk the call log's hash chain across files; returns the head hash so it can be recorded elsewhere."""
+    if not call_log.enabled():
+        raise HTTPException(status_code=404, detail="the call log is switched off (JARVIS_CALL_LOG_ENABLED)")
+    return call_log.get_call_log().verify()
 
 
 @app.post("/api/jarvis/tools/search", dependencies=[Depends(require_emr_recall_api_key)])
