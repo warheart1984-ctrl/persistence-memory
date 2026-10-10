@@ -20,6 +20,7 @@ from app.continuity import (
     to_selection,
 )
 from app.models import (
+    TWIN_AGENT,
     ConflictSet,
     MemoryBoard,
     MemoryCreate,
@@ -31,7 +32,6 @@ from app.models import (
 from app.identity import current_tenant_key
 from app.ts import parse_utc
 from app.ledger_search import record_tokens as search_tokens
-from app.twin import TWIN_AGENT
 from app.store_errors import StoreUnavailableError, StoreVersionConflict
 from app import clause_v
 from app import evidence as evidence_objects
