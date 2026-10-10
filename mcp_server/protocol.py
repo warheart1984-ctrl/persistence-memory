@@ -127,6 +127,35 @@ EMR_LATEST_TOOL: dict[str, Any] = {
     },
 }
 
+EMR_SEARCH_LEDGER_TOOL: dict[str, Any] = {
+    "name": "emr_search_ledger",
+    "description": (
+        "Ranked full-text search over the Continuity Ledger's own records (not files). Every word of the query must "
+        "appear in the record (subject, content or tags); matches are ranked subject > tags > content, then newest "
+        "first. Read-only. Superseded, archived and ai-twin records are excluded unless asked for. Returns records "
+        "with id, created_at, status, provenance, supersedes/superseded_by, summary and score, plus result_digest."
+    ),
+    "annotations": {
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "minLength": 1, "maxLength": 500},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
+            "include_superseded": {"type": "boolean", "default": False},
+            "include_archived": {"type": "boolean", "default": False},
+            "include_twin": {"type": "boolean", "default": False},
+            "type": {"type": "string", "description": "Only records of this type"},
+        },
+        "required": ["query"],
+        "additionalProperties": False,
+    },
+}
+
 EMR_REMEMBER_TOOL: dict[str, Any] = {
     "name": "emr_remember",
     "description": (
@@ -295,6 +324,7 @@ EMR_UPSERT_TOOL: dict[str, Any] = {
 MCP_TOOLS: list[dict[str, Any]] = [
     EMR_RECALL_TOOL,
     EMR_LATEST_TOOL,
+    EMR_SEARCH_LEDGER_TOOL,
     SEARCH_TOOL,
     FETCH_TOOL,
     EMR_SEARCH_TOOL,
@@ -369,6 +399,7 @@ def _initialize_result(params: dict[str, Any] | None) -> dict[str, Any]:
             "Use search/fetch (or emr_search/emr_fetch) for OpenAI deep-research style "
             "company knowledge — read-only, citation URLs on every result. "
             "Use emr_latest to find the newest memory records with no id or keyword. "
+            "Use emr_search_ledger for ranked word search over the ledger's own records. "
             "Use emr_recall for governed Continuity Ledger recall bundles (may abstain). "
             "Use emr_remember / emr_upsert only when the user explicitly asked to store "
             "or update memory (user_requested=true); writes are draft-only and may be "

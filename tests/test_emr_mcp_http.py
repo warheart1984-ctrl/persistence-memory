@@ -75,6 +75,7 @@ def test_mcp_tools_list():
     assert names == [
         "emr_recall",
         "emr_latest",
+        "emr_search_ledger",
         "search",
         "fetch",
         "emr_search",

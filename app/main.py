@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi import Path as PathParam
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
@@ -105,6 +105,7 @@ from app.oauth import protected_resource_metadata
 from app.public_security import cors_origins, public_security_middleware
 from app.refusal import DENIED, LEDGER_UNAVAILABLE, VERSION_CONFLICT, json_response, retry_after_seconds
 from app.emr_latest import LatestError, LatestParams, latest_memories, parse_limit
+from app.ledger_search import SearchParams, search_ledger
 from app import clause_v
 from app.clause_v import ClauseVViolation
 from app import evidence as evidence_objects
@@ -265,6 +266,7 @@ def index():
                 "catalog": "GET /api/jarvis/tools",
                 "emr_recall": "POST /api/jarvis/tools/emr_recall",
                 "emr_latest": "POST /api/jarvis/tools/emr_latest",
+                "emr_search_ledger": "POST /api/jarvis/tools/emr_search_ledger",
                 "search": "POST /api/jarvis/tools/search",
                 "fetch": "POST /api/jarvis/tools/fetch",
                 "emr_remember": "POST /api/jarvis/tools/emr_remember",
@@ -277,6 +279,7 @@ def index():
                     "emr_recall",
                     "search",
                     "emr_latest",
+                    "emr_search_ledger",
                     "fetch",
                     "emr_search",
                     "emr_fetch",
@@ -375,6 +378,7 @@ def health():
                 "emr_recall",
                 "search",
                 "emr_latest",
+                "emr_search_ledger",
                 "fetch",
                 "emr_search",
                 "emr_fetch",
@@ -387,6 +391,7 @@ def health():
             "catalog": "GET /api/jarvis/tools",
             "emr_recall": "POST /api/jarvis/tools/emr_recall",
             "emr_latest": "POST /api/jarvis/tools/emr_latest",
+            "emr_search_ledger": "POST /api/jarvis/tools/emr_search_ledger",
             "search": "POST /api/jarvis/tools/search",
             "fetch": "POST /api/jarvis/tools/fetch",
             "emr_remember": "POST /api/jarvis/tools/emr_remember",
@@ -512,6 +517,54 @@ def _run_latest(arguments: dict[str, Any], *, http: bool) -> dict[str, Any]:
     if tenant is None:
         return latest_memories(None, tenant=None, params=params, operator=False)  # raises TENANT_UNRESOLVED
     return latest_memories(get_store(), tenant=tenant, params=params, operator=not oauth_enabled())
+
+
+def _run_search(arguments: dict[str, Any], *, http: bool) -> dict[str, Any]:
+    """Resolve the tenant and run the one ledger-search implementation (HTTP route, tool route and MCP tool)."""
+    tenant = current_tenant_key() or (None if oauth_enabled() else "operator")
+    raw_limit = arguments.get("limit")
+    if http and isinstance(raw_limit, str):
+        try:
+            raw_limit = int(raw_limit.strip())
+        except ValueError:
+            raw_limit = -1  # not an integer: refused as out of range, never silently defaulted
+    flags = {k: arguments.get(k) for k in ("include_superseded", "include_archived", "include_twin")}
+    for name, value in flags.items():
+        if value is not None and not isinstance(value, bool):
+            raise LatestError(422, "invalid_request", "INVALID_PARAMETER", f"{name} must be a boolean")
+    mtype = arguments.get("type")
+    if mtype is not None and not isinstance(mtype, str):
+        raise LatestError(422, "invalid_request", "INVALID_PARAMETER", "type must be a string")
+    params = SearchParams(
+        query=arguments.get("query"),  # validated (and refused if empty) by the service
+        limit=parse_limit(raw_limit),
+        include_superseded=bool(flags["include_superseded"]),
+        include_archived=bool(flags["include_archived"]),
+        include_twin=bool(flags["include_twin"]),
+        type=mtype or None,
+    )
+    if tenant is None:
+        return search_ledger(None, tenant=None, params=params, operator=False)  # raises TENANT_UNRESOLVED
+    return search_ledger(get_store(), tenant=tenant, params=params, operator=not oauth_enabled())
+
+
+@app.get("/api/jarvis/memory/search")
+def memory_search(
+    query: str | None = Query(default=None),
+    limit: str | None = Query(default=None),
+    include_superseded: bool = Query(default=False),
+    include_archived: bool = Query(default=False),
+    include_twin: bool = Query(default=False),
+    type: str | None = Query(default=None, alias="type"),
+):
+    """Ranked full-text search over this tenant's ledger records (read-only; see docs/ledger_search.md)."""
+    return _run_search(
+        {
+            "query": query, "limit": limit, "include_superseded": include_superseded,
+            "include_archived": include_archived, "include_twin": include_twin, "type": type,
+        },
+        http=True,
+    )
 
 
 @app.get("/api/jarvis/memory/latest")
@@ -847,7 +900,7 @@ def unified_search(
             "selections": [s.model_dump() for s in selections],
             "conflicts": [c.model_dump() for c in conflicts],
         },
-        "long_term_memory": external,
+        "file_hits": external,  # nx-search results over local files: evidence pointers, not ledger memory
         "query": query,
     }
 
@@ -1131,8 +1184,14 @@ def tool_emr_fetch(body: EmrFetchRequest):
     return tool_fetch(body)
 
 
+@app.post("/api/jarvis/tools/emr_search_ledger", dependencies=[Depends(require_emr_recall_api_key)])
+def tool_emr_search_ledger(body: dict[str, Any] | None = Body(default=None)):
+    """Read-only ranked ledger search (same implementation as GET /api/jarvis/memory/search)."""
+    return _run_search(body or {}, http=False)
+
+
 @app.post("/api/jarvis/tools/emr_latest", dependencies=[Depends(require_emr_recall_api_key)])
-def tool_emr_latest(body: dict[str, Any] | None = None):
+def tool_emr_latest(body: dict[str, Any] | None = Body(default=None)):
     """Read-only newest-first discovery (same implementation as GET /api/jarvis/memory/latest)."""
     return _run_latest(body or {}, http=False)
 
@@ -1975,6 +2034,8 @@ def _invoke_emr_tool_unguarded(name: str, arguments: dict) -> dict:
         return emr_fetch(store, body)
     if name == "emr_latest":
         return _run_latest(arguments, http=False)
+    if name == "emr_search_ledger":
+        return _run_search(arguments, http=False)
     if name == "emr_recall":
         body = EmrRecallRequest.model_validate(arguments)
         return emr_recall(store, body).model_dump()

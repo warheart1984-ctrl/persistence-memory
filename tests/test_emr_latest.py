@@ -339,6 +339,22 @@ def test_the_mcp_tool_and_the_http_endpoint_agree(client):
     assert posted["records"] == latest(client, limit=2).json()["records"]
 
 
+def test_the_tool_route_honours_its_json_body_so_stdio_clients_can_page(client):
+    # The stdio proxy (Devin, OpenCode) POSTs the tool arguments as the JSON body; they must not be dropped.
+    made = [add(client, f"tool route {i}")["id"] for i in range(5)]
+    seen, cursor = [], None
+    for _ in range(5):
+        body = client.post("/api/jarvis/tools/emr_latest", headers=HDR, json={"limit": 2, **({"cursor": cursor} if cursor else {})}).json()
+        assert len(body["records"]) <= 2
+        seen += [r["id"] for r in body["records"]]
+        cursor = body["next_cursor"]
+        if cursor is None:
+            break
+    assert seen == list(reversed(made))
+    bad = client.post("/api/jarvis/tools/emr_latest", headers=HDR, json={"limit": 0})
+    assert bad.status_code == 422 and bad.json()["reason"] == "LIMIT_OUT_OF_RANGE"
+
+
 # ------------------------------------------------------------------------------------------------ ledger_head, cursor key
 
 

@@ -319,6 +319,7 @@ class PostgresRowStore:
         include_superseded: bool = False,
         include_archived: bool = False,
         include_twin: bool = False,
+        tokens: list[str] | None = None,
     ) -> list[tuple[MemoryRecord, str | None]]:
         """Newest-first keyset page; same contract as ``JarvisStore.list_latest``."""
         where = ["m.tenant_key = %s"]
@@ -338,6 +339,10 @@ class PostgresRowStore:
         if after is not None:
             where.append('(m.created_at, m.id COLLATE "C") < (%s, %s COLLATE "C")')
             params += [after[0], after[1]]
+        if tokens:
+            # Uses memories_search_idx (V9); the same tokens as app/ledger_search.py::record_tokens.
+            where.append("jarvis_search_tokens(m.subject, m.content, m.tags) @> %s::text[]")
+            params.append(list(tokens))
         sql_text = (
             f"SELECT {', '.join('m.' + c.strip() for c in _COLUMNS.split(','))}, "
             "(SELECT s.id FROM memories s WHERE s.tenant_key = m.tenant_key AND s.supersedes = m.id "

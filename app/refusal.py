@@ -33,7 +33,10 @@ INVALID_REQUEST = "invalid_request"
 
 # emr_latest carries its spec reasons (LIMIT_OUT_OF_RANGE, AUTHORITY_DENIED, ...) in ``reason`` next to the stable ``code``.
 AUTHORITY_DENIED = "AUTHORITY_DENIED"
-LATEST_PATHS = ("/api/jarvis/memory/latest", "/api/jarvis/tools/emr_latest")
+LATEST_PATHS = (
+    "/api/jarvis/memory/latest", "/api/jarvis/tools/emr_latest",
+    "/api/jarvis/memory/search", "/api/jarvis/tools/emr_search_ledger",
+)
 
 
 def retry_after_seconds() -> int:
