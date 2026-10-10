@@ -19,7 +19,7 @@ from starlette.responses import JSONResponse, Response
 
 from app.public_security import is_public_deployment
 from app.refusal import json_response
-from app.identity import current_principal, reset_principal, set_principal
+from app.identity import current_principal, current_tenant_key, reset_principal, set_principal
 from app.oauth import READ_SCOPE, WRITE_SCOPE, auth_mode, public_base_url, validate_access_token
 
 
@@ -426,6 +426,7 @@ async def identity_middleware(request: Request, call_next):
         headers = {"WWW-Authenticate": oauth_challenge()} if exc.status_code == 401 else {}
         return json_response(exc.status_code, exc.detail, headers=headers, path=path)
     token = set_principal(principal)
+    request.scope["jarvis_tenant"] = current_tenant_key()  # the call log reads this from the outermost layer
     try:
         return await call_next(request)
     finally:

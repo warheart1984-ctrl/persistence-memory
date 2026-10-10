@@ -27,6 +27,18 @@ def _embeddings_off_and_isolated(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _call_log_isolated(monkeypatch, tmp_path):
+    """The call log never writes into the repo's data/ during tests: each test gets its own directory, with the log on."""
+    from app import call_log
+
+    monkeypatch.setenv("JARVIS_CALL_LOG_DIR", str(tmp_path / "call-log"))
+    monkeypatch.setenv("JARVIS_CALL_LOG_ENABLED", "1")
+    call_log.reset_for_tests()
+    yield
+    call_log.reset_for_tests()
+
+
+@pytest.fixture(autouse=True)
 def _no_desktop_popups(monkeypatch):
     """The deploy-script tests provoke real failures (a refused key, a missing endpoint). lib.sh's notify() falls back to the
     operator's live session bus, so without this every full run popped "Jarvis ledger: seal failed" on the desktop."""

@@ -1,0 +1,42 @@
+{
+  "title": "Four-agent relay test, 2026-10-10",
+  "summary": "Two agents each wrote one record to the live Continuity Ledger on 2026-10-10: Codex wrote mem-1dc144c193a1 (a draft decision recording the schema v9 deploy) and Claude later wrote mem-c42330528ad5, which supersedes it and cites a plain-text deploy report with its hash. The test asks whether other agents, using only the ledger's own tools, find the same newest record and the same result_digest. This report has two parts that must not be mixed up. The results table is what scripts/relay_evidence.py itself read from the live ledger and re-checked (read-only; the API key is never printed). The agent table is what each agent told the operator it saw; the script did not observe or confirm any of it. The agents read the ledger at history seq 135, before the superseding record existed; the script reads it at the seq shown below.",
+  "known_gaps": [
+    "Until PR #71 is deployed, the live ledger's emr_latest and emr_search_ledger still report status 'active' for a record whose stored status is 'draft' (it relabels the stored status). #71 is merged to main but not deployed; live runs the build deployed on 2026-10-10. The digest formula also differs after #71 (it covers status and lifecycle); the script detects which shape it received.",
+    "One known deviation during the schema v8/v9 deploy: self-heal restarted the old app container at 19:17:14Z, because 'jarvisctl up' removes the stopped-on-purpose flag before it builds. No writes landed (59 records and seq 134 before and after), but the app was not stopped for the whole window as planned.",
+    "'The newest record is mem-c42330528ad5' is a point-in-time check. It holds only while nothing newer has been written; the report records the history seq it was read at.",
+    "The check 'agent_digest_reproduces_from_seq_135_state' is a reconstruction from the current ledger (drop the newer record, treat the older one as active), not a read of a historical state.",
+    "The agents' results are as pasted by the operator. Whether an agent called emr_latest itself (as a tool) or used curl is only what the agent said; server-side call logging for that does not exist yet (see the MCP call-log work).",
+    "No Cursor output was supplied for this report."
+  ],
+  "agents": [
+    {
+      "agent": "Devin",
+      "entry_status": "reported by agent",
+      "newest_id": "mem-1dc144c193a1",
+      "result_digest": "e1e2f0da8658855319ad77eb1c57b9284756010a7b438b77ff416fe33938695d",
+      "notes": "Said it called emr_latest with no arguments and then opened the record with emr_fetch; the pasted transcript shows only the emr_fetch curl. Reported status 'draft' (and noted emr_latest showed 'active'), created_at 2026-10-10T20:39:50.728361+00:00, source_agent codex. Read at seq 135. It also said Codex deployed and that signing was likely live: both are wrong (Claude deployed; signing is shelved)."
+    },
+    {
+      "agent": "OpenCode",
+      "entry_status": "reported by agent",
+      "newest_id": "mem-1dc144c193a1",
+      "result_digest": "e1e2f0da8658855319ad77eb1c57b9284756010a7b438b77ff416fe33938695d",
+      "notes": "Its MCP tool list had no emr_latest (its checkout on the PC was 121 commits behind main and was updated afterwards); it said it used bash and curl against the REST API, so this was not an MCP tool call. Reported status draft, same created_at and provenance. Read at seq 135. A retest after restarting OpenCode with the updated checkout has not been reported."
+    },
+    {
+      "agent": "Codex",
+      "entry_status": "reported by agent",
+      "newest_id": "mem-1dc144c193a1",
+      "result_digest": null,
+      "notes": "Wrote the record (created 2026-10-10T16:39:50-04:00). Reported history seq 134 to 135, state root before 4384611745453de9... and after 62763cef..., record read-back matched, history chain passed, old receipt re-derived, and no configuration changed. Did not report an emr_latest digest."
+    },
+    {
+      "agent": "Cursor",
+      "entry_status": "not provided",
+      "newest_id": null,
+      "result_digest": null,
+      "notes": "No output was supplied for this report."
+    }
+  ]
+}
