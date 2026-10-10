@@ -53,7 +53,7 @@ Response:
 ```
 
 ### GET /api/jarvis/memory/unified
-Search both working memory (Jarvis) and long-term memory (nx-search) simultaneously.
+Search both working memory (the ledger) and local files (nx-search) simultaneously. The nx-search results are file pointers (evidence), not ledger memory, so they are returned as `file_hits`.
 
 ```
 GET /api/jarvis/memory/unified?query=evolving+ai&limit=25&source_agent=ai-assistant&session_id=session-123
@@ -67,7 +67,7 @@ Response:
     "selections": [...],
     "conflicts": [...]
   },
-  "long_term_memory": {
+  "file_hits": {
     "content": [...],
     "filenames": [...]
   },
@@ -141,9 +141,9 @@ Extended evidence kinds to include `"filesystem_evidence"`:
 response = requests.get("http://localhost:8000/api/jarvis/memory/unified", 
     params={"query": "evolving ai", "session_id": "session-123"})
 
-# 2. Analyze results from both memory systems
+# 2. Analyze results from both (ledger records and file hits)
 working_memories = response.json()["working_memory"]["memories"]
-external_results = response.json()["long_term_memory"]["content"]
+external_results = response.json()["file_hits"]["content"]
 
 # 3. Promote important external findings
 for result in external_results[:3]:

@@ -378,12 +378,28 @@ EMR_RECALL_TOOL_SCHEMA: dict[str, Any] = {
 }
 
 
+def _function_schema(mcp_tool: dict[str, Any]) -> dict[str, Any]:
+    """The OpenAI-style form of an MCP tool definition, so the two catalogs cannot drift apart."""
+    return {
+        "type": "function",
+        "function": {
+            "name": mcp_tool["name"],
+            "description": mcp_tool["description"],
+            "parameters": mcp_tool["inputSchema"],
+        },
+    }
+
+
 def tool_catalog() -> dict[str, Any]:
     """Exported tool catalog for agent hosts (recall + gated writes)."""
+    from mcp_server.protocol import EMR_LATEST_TOOL, EMR_SEARCH_LEDGER_TOOL
+
     return {
         "schema": "emr-tool-catalog-v1",
         "tools": [
             EMR_RECALL_TOOL_SCHEMA,
+            _function_schema(EMR_LATEST_TOOL),
+            _function_schema(EMR_SEARCH_LEDGER_TOOL),
             EMR_SEARCH_TOOL_SCHEMA,
             EMR_FETCH_TOOL_SCHEMA,
             EMR_SEARCH_ALIAS_SCHEMA,

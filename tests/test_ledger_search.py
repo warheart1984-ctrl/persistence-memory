@@ -397,3 +397,71 @@ def test_search_is_refused_when_unexpected_types_are_passed(client):
     assert out["isError"] and out["structuredContent"]["error"]["reason"] == "QUERY_EMPTY"
     with pytest.raises(LatestError):
         ledger_search.query_tokens(None)
+
+
+# --- review follow-ups: repeated query words, exported catalog -------------------------------------------------------
+
+def test_phrase_bonus_needs_the_whole_query_including_repeated_words():
+    from types import SimpleNamespace
+
+    from app import ledger_search as ls
+
+    rec = lambda text: SimpleNamespace(subject=None, tags=[], content=text)
+    qtoks = ls.query_tokens("foo bar foo")
+    assert qtoks == ["foo", "bar"]  # distinct words still drive candidate selection
+    phrase = ls.tokens("foo bar foo")
+    without = ls.score(rec("foo bar"), qtoks, phrase)  # lacks the whole phrase: no bonus
+    with_phrase = ls.score(rec("foo bar foo"), qtoks, phrase)
+    assert with_phrase >= without + ls.PHRASE_BONUS
+    # without repeats nothing changes: the default phrase is the distinct tokens
+    assert ls.score(rec("foo bar"), ["foo", "bar"]) == ls.score(rec("foo bar"), ["foo", "bar"], ["foo", "bar"])
+
+
+def test_exported_tool_catalog_carries_the_ledger_search_and_latest_schemas():
+    from app.emr_tool import tool_catalog
+    from mcp_server.protocol import EMR_LATEST_TOOL, EMR_SEARCH_LEDGER_TOOL
+
+    cat = tool_catalog()
+    by_name = {t["function"]["name"]: t["function"] for t in cat["tools"]}
+    for mcp in (EMR_SEARCH_LEDGER_TOOL, EMR_LATEST_TOOL):
+        assert mcp["name"] in by_name, f"{mcp['name']} is in write_policy but not discoverable"
+        assert by_name[mcp["name"]]["parameters"] == mcp["inputSchema"]
+    # every tool the policy names as callable here has a schema
+    assert set(cat["write_policy"]) - {"emr_recall"} >= {"emr_latest", "emr_search_ledger"}
+    assert {"emr_latest", "emr_search_ledger"} <= set(by_name)
+
+
+def test_unified_guide_uses_the_file_hits_key():
+    from pathlib import Path
+
+    guide = (Path(__file__).resolve().parent.parent / "UNIFIED_MEMORY_SYSTEM.md").read_text(encoding="utf-8")
+    assert "long_term_memory" not in guide and '"file_hits"' in guide
+
+
+def test_phrase_search_is_linear_and_agrees_with_the_naive_definition():
+    import random
+    import time
+    from types import SimpleNamespace
+
+    from app import ledger_search as ls
+
+    rng = random.Random(7)
+    for _ in range(500):
+        seq = [rng.choice("ab") for _ in range(rng.randint(0, 12))]
+        run = [rng.choice("ab") for _ in range(rng.randint(1, 5))]
+        naive = any(seq[i:i + len(run)] == run for i in range(len(seq) - len(run) + 1))
+        assert ls._contains_run(seq, run) is naive, (seq, run)
+
+    # worst case for the old per-position slicing: a 124-word phrase that almost matches everywhere in a 2000-word record
+    seq, run = ["the"] * 1999 + ["x"], ["the"] * 123 + ["y"]
+    n = len(run)
+
+    def timed(fn):
+        start = time.perf_counter()
+        for _ in range(300):
+            assert fn() is False
+        return time.perf_counter() - start
+
+    linear = timed(lambda: ls._contains_run(seq, run))
+    slicing = timed(lambda: any(seq[i:i + n] == run for i in range(len(seq) - n + 1)))
+    assert linear < slicing / 2, (linear, slicing)  # relative, so a slow runner does not flake it
