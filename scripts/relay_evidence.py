@@ -47,6 +47,7 @@ ALLOWED: list[tuple[str, re.Pattern[str]]] = [
     ("GET", re.compile(r"^/api/jarvis/replay/(state|events)$")),
     ("GET", re.compile(rf"^/api/jarvis/replay/receipts/{_ID}/verify$")),
     ("POST", re.compile(r"^/api/jarvis/tools/(emr_latest|emr_fetch|emr_search_ledger)$")),
+    ("GET", re.compile(r"^/api/jarvis/tools/calls(/verify)?$")),  # the server-side call log: operator-only reads
 ]
 
 
@@ -159,7 +160,35 @@ def gather(client: ReadOnlyClient, old_id: str, new_id: str, receipt_id: str) ->
     keep("latest_default", client.tool("emr_latest", {}))
     keep("latest_default_12", client.tool("emr_latest", {"limit": 12}))
     keep("latest_with_superseded", client.tool("emr_latest", {"include_superseded": True, "limit": 12}))
+    keep("calls_emr_latest", client.get("/api/jarvis/tools/calls", tool="emr_latest", limit=200))
+    keep("calls_verify", client.get("/api/jarvis/tools/calls/verify"))
     return raw
+
+
+def call_log_section(raw: dict[str, Any], agents: list[dict[str, Any]]) -> dict[str, Any]:
+    """What the SERVER says about each agent's emr_latest calls (client names are self-reported by the clients).
+
+    ``available`` is False when the server has no call log (not deployed, switched off, or the key is not the operator's); nothing is
+    then claimed about any agent.
+    """
+    calls = raw.get("calls_emr_latest") or {}
+    verify = (raw.get("calls_verify") or {}).get("body") or {}
+    if calls.get("http_status") != 200 or not isinstance(calls.get("body"), dict):
+        return {"available": False, "reason": f"GET /api/jarvis/tools/calls returned HTTP {calls.get('http_status')} (the call log is not deployed, is switched off, or this key may not read it)",
+                "head": None, "chain_ok": None, "per_agent": []}
+    entries = calls["body"].get("entries") or []
+    per_agent = []
+    for a in agents:
+        name = str(a.get("agent") or "")
+        hits = [e for e in entries if name and name.lower() in str(e.get("client_name") or "").lower()]
+        per_agent.append({
+            "agent": name,
+            "witnessed_emr_latest_calls": len(hits),
+            "latest": ({k: hits[0].get(k) for k in ("seq", "ts", "transport", "client_name", "client_version", "outcome", "result_digest", "tenant")} if hits else None),
+            "note": "server-witnessed; the client name is self-reported" if hits else "no emr_latest call from a client that names itself like this is in the server's log (it may have called under another name, before the log existed, or not at all)",
+        })
+    return {"available": True, "reason": None, "head": verify.get("head"), "chain_ok": verify.get("ok"), "problems": verify.get("problems"), "per_agent": per_agent,
+            "log_files": verify.get("files"), "entries_total": verify.get("entries")}
 
 
 def run_checks(raw: dict[str, Any], old_id: str, new_id: str, expect_newest: str, reported_digest: str | None) -> list[dict[str, Any]]:
@@ -212,6 +241,12 @@ def run_checks(raw: dict[str, Any], old_id: str, new_id: str, expect_newest: str
                            f"reconstructed {recon[:16]}… vs agents' reported {reported_digest[:16]}… (reconstruction from the current ledger, not a historical read)"))
     else:
         out.append(_result("agent_digest_reproduces_from_seq_135_state", None, "no agent-reported digest in the inputs file"))
+    cv = body("calls_verify") or {}
+    status = (raw.get("calls_verify") or {}).get("http_status")
+    if status == 200:
+        out.append(_result("call_log_chain_verifies", bool(cv.get("ok")), f"call log entries={cv.get('entries')} head seq={((cv.get('head') or {}).get('seq'))} problems={cv.get('problems')}"))
+    else:
+        out.append(_result("call_log_chain_verifies", None, f"the server has no readable call log (HTTP {status}): not deployed, switched off, or not the operator key"))
     return out
 
 
@@ -246,6 +281,7 @@ def build_evidence(raw: dict[str, Any], checks: list[dict[str, Any]], inputs: di
         "checks": checks,
         "all_checks_pass": all(c["result"] == "PASS" for c in checks if c["result"] != "NOT RUN") and any(c["result"] == "PASS" for c in checks),
         "agents_reported_not_verified": inputs.get("agents", []),
+        "call_log": call_log_section(raw, inputs.get("agents", [])),
         "requests_made": calls,
         "raw": raw,
     }
@@ -268,7 +304,23 @@ def render_markdown(ev: dict[str, Any], printout: str) -> str:
     L += ["| Agent | Status of this entry | Newest id reported | Digest reported | Notes |", "|---|---|---|---|---|"]
     for a in ev["agents_reported_not_verified"]:
         L.append(f"| {a.get('agent')} | {a.get('entry_status', 'reported by agent')} | `{a.get('newest_id') or '-'}` | `{a.get('result_digest') or '-'}` | {_esc(a.get('notes', ''))} |")
-    L += ["", "## Script printout", "", "```", printout, "```", "", "## Raw command outputs", "",
+    cl = ev["call_log"]
+    L += ["", "## Server-witnessed calls to emr_latest (client names are self-reported)", ""]
+    if not cl["available"]:
+        L += [f"Not available: {cl['reason']}. Nothing is claimed about any agent here.", ""]
+    else:
+        head = cl.get("head") or {}
+        L += [f"Call log chain verifies: **{cl['chain_ok']}** ({cl.get('entries_total')} entries in {len(cl.get('log_files') or [])} file(s)). "
+              f"**Head: seq {head.get('seq')}, hash `{head.get('entry_hash')}`**. Record this off the box, and in the next ledger record that is written.", "",
+              "| Agent | Witnessed emr_latest calls | Latest: seq, time, transport | Client as it reported itself | result_digest | Outcome |", "|---|---|---|---|---|---|"]
+        for a in cl["per_agent"]:
+            e = a["latest"]
+            if e:
+                L.append(f"| {a['agent']} | {a['witnessed_emr_latest_calls']} | {e['seq']}, {e['ts']}, {e['transport']} | {_esc(e['client_name'])}/{_esc(e['client_version'])} | `{e['result_digest']}` | {e['outcome']} |")
+            else:
+                L.append(f"| {a['agent']} | 0 | - | - | - | {_esc(a['note'])} |")
+        L.append("")
+    L += ["## Script printout", "", "```", printout, "```", "", "## Raw command outputs", "",
           "Every request the script made (method, path, query, HTTP status; no headers, no key):", "", "```json", json.dumps(ev["requests_made"], indent=2), "```", ""]
     for label, item in ev["raw"].items():
         L += [f"### `{label}` (HTTP {item['http_status']})", "", "```json", json.dumps(item["body"], indent=2, ensure_ascii=False), "```", ""]

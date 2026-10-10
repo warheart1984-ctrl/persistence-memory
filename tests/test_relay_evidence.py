@@ -195,6 +195,8 @@ def test_a_full_run_writes_both_reports_and_never_contains_the_key(rel, tmp_path
     def transport(method, url, headers, body):
         path = url.split("?")[0].replace("http://127.0.0.1:1", "")
         assert method in ("GET", "POST") and headers["X-API-Key"] == KEY
+        if path.startswith("/api/jarvis/tools/calls"):
+            return 404, b'{"detail": "the call log is switched off"}'
         if path == "/api/jarvis/tools/emr_latest":
             args = json.loads(body or b"{}")
             key = "latest_with_superseded" if args.get("include_superseded") else ("latest_default_12" if args.get("limit") == 12 else "latest_default")
@@ -212,5 +214,55 @@ def test_a_full_run_writes_both_reports_and_never_contains_the_key(rel, tmp_path
     ev = json.loads(out_json.read_text())
     assert ev["all_checks_pass"] is True and ev["read_at"]["history_seq"] == 136
     assert "not provided" in out_md.read_text() and "NOT verified by the script" in out_md.read_text()
+    assert ev["call_log"]["available"] is False and "Nothing is claimed about any agent" in out_md.read_text()
+    assert {c["check"]: c["result"] for c in ev["checks"]}["call_log_chain_verifies"] == "NOT RUN"
     for path in (out_json, out_md):
         assert KEY not in path.read_text()
+
+
+# --------------------------------------------------------------------------------------- the call-log section
+
+
+def call_entry(seq, client, digest="d" * 64, transport="mcp-stdio"):
+    return {"seq": seq, "ts": f"2026-10-10T22:0{seq}:00.000000Z", "transport": transport, "client_name": client, "client_version": "1.0", "outcome": "ok",
+            "result_digest": digest, "tenant": "operator", "tool": "emr_latest"}
+
+
+AGENTS = [{"agent": "Devin"}, {"agent": "OpenCode"}, {"agent": "Codex"}, {"agent": "Cursor"}]
+
+
+def test_the_call_log_section_shows_only_what_the_server_witnessed_per_agent(rel):
+    raw = {
+        "calls_emr_latest": {"http_status": 200, "body": {"entries": [call_entry(3, "OpenCode"), call_entry(2, "devin-cli"), call_entry(1, "OPENCODE")]}},
+        "calls_verify": {"http_status": 200, "body": {"ok": True, "head": {"seq": 3, "entry_hash": "h" * 64}, "files": ["calls-20261010.jsonl"], "entries": 3, "problems": []}},
+    }
+    section = rel.call_log_section(raw, AGENTS)
+    by = {a["agent"]: a for a in section["per_agent"]}
+    assert section["available"] and section["chain_ok"] is True and section["head"]["entry_hash"] == "h" * 64
+    assert by["OpenCode"]["witnessed_emr_latest_calls"] == 2 and by["OpenCode"]["latest"]["seq"] == 3  # newest first, case-insensitive match
+    assert by["Devin"]["witnessed_emr_latest_calls"] == 1 and by["Devin"]["latest"]["client_name"] == "devin-cli"
+    for silent in ("Codex", "Cursor"):
+        assert by[silent]["witnessed_emr_latest_calls"] == 0 and by[silent]["latest"] is None and "no emr_latest call" in by[silent]["note"]
+
+
+def test_an_unavailable_call_log_claims_nothing(rel):
+    for status in (404, 401, 403):
+        section = rel.call_log_section({"calls_emr_latest": {"http_status": status, "body": {"detail": "x"}}}, AGENTS)
+        assert section["available"] is False and section["per_agent"] == [] and str(status) in section["reason"]
+
+
+def test_the_log_endpoints_are_allowed_reads_and_nothing_else_on_that_path_is(rel):
+    assert rel.is_allowed("GET", "/api/jarvis/tools/calls") and rel.is_allowed("GET", "/api/jarvis/tools/calls/verify")
+    assert not rel.is_allowed("POST", "/api/jarvis/tools/calls") and not rel.is_allowed("DELETE", "/api/jarvis/tools/calls")
+    assert not rel.is_allowed("GET", "/api/jarvis/tools/calls/other")
+
+
+def test_the_markdown_labels_witnessed_calls_as_self_reported_and_records_the_head(rel):
+    raw = canned()
+    raw["calls_emr_latest"] = {"http_status": 200, "body": {"entries": [call_entry(7, "cursor")]}}
+    raw["calls_verify"] = {"http_status": 200, "body": {"ok": True, "head": {"seq": 7, "entry_hash": "c" * 64}, "files": ["calls-20261010.jsonl"], "entries": 7, "problems": []}}
+    checks = rel.run_checks(raw, OLD, NEW, NEW, None)
+    assert {c["check"]: c["result"] for c in checks}["call_log_chain_verifies"] == "PASS"
+    ev = rel.build_evidence(raw, checks, {"agents": AGENTS, "summary": "s"}, "http://x", [], {"old": OLD, "new": NEW, "receipt": RECEIPT})
+    md = rel.render_markdown(ev, rel.render_printout(checks))
+    assert "client names are self-reported" in md and "`" + "c" * 64 + "`" in md and "Record this off the box" in md and "| Cursor | 1 |" in md

@@ -548,3 +548,34 @@ def test_an_append_that_fails_after_a_write_committed_keeps_the_real_result_and_
     monkeypatch.undo()
     monkeypatch.setenv("JARVIS_API_KEY", KEY)
     assert call_log.CallLog.append is original
+
+
+# ------------------------------------------------------------- 12. the relay evidence script reads the real endpoints
+
+
+def test_the_relay_report_section_reads_the_real_log_and_labels_client_names_self_reported(jclient):
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("relay_evidence_cl", ROOT / "scripts" / "relay_evidence.py")
+    rel = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = rel
+    spec.loader.exec_module(rel)
+
+    for client_name in ("devin/1.0", "opencode/0.9", "devin/1.1"):
+        tool(jclient, "emr_latest", {}, headers={"X-Jarvis-MCP-Client": client_name})
+
+    def transport(method, url, headers, body):
+        path_and_query = url.replace("http://testserver", "")
+        r = jclient.request(method, path_and_query, headers={"X-API-Key": headers["X-API-Key"]}, content=body)
+        return r.status_code, r.content
+
+    client = rel.ReadOnlyClient("http://testserver", KEY, transport)
+    raw = {}
+    for label, status_body in (("calls_emr_latest", client.get("/api/jarvis/tools/calls", tool="emr_latest", limit=200)), ("calls_verify", client.get("/api/jarvis/tools/calls/verify"))):
+        raw[label] = {"http_status": status_body[0], "body": status_body[1]}
+    section = rel.call_log_section(raw, [{"agent": "Devin"}, {"agent": "OpenCode"}, {"agent": "Cursor"}])
+    by = {a["agent"]: a for a in section["per_agent"]}
+    assert section["available"] and section["chain_ok"] is True and section["head"]["seq"] == 3
+    assert by["Devin"]["witnessed_emr_latest_calls"] == 2 and by["Devin"]["latest"]["client_version"] == "1.1"
+    assert by["OpenCode"]["witnessed_emr_latest_calls"] == 1 and by["Cursor"]["witnessed_emr_latest_calls"] == 0
+    assert all(k["method"] == "GET" for k in client.calls) and KEY not in json.dumps(client.calls)

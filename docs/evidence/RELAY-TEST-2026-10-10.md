@@ -1,6 +1,6 @@
 # Four-agent relay test, 2026-10-10
 
-Generated 2026-10-10T22:03:43Z by `scripts/relay_evidence.py` against `http://127.0.0.1:8011` (read-only (GET reads and read-only tool POSTs only)).
+Generated 2026-10-10T22:39:59Z by `scripts/relay_evidence.py` against `http://127.0.0.1:8011` (read-only (GET reads and read-only tool POSTs only)).
 
 ## Summary
 
@@ -27,6 +27,7 @@ Two agents each wrote one record to the live Continuity Ledger on 2026-10-10: Co
 | **PASS** | `old_receipt_re_derives` | receipt verify ok=True problems=[] |
 | **PASS** | `history_seq_135_136_are_the_two_records` | seq 135 -> 'mem-1dc144c193a1' ('create'); seq 136 -> 'mem-c42330528ad5' ('create') |
 | **PASS** | `agent_digest_reproduces_from_seq_135_state` | reconstructed e1e2f0da86588553… vs agents' reported e1e2f0da86588553… (reconstruction from the current ledger, not a historical read) |
+| **NOT RUN** | `call_log_chain_verifies` | the server has no readable call log (HTTP 404): not deployed, switched off, or not the operator key |
 
 All checks passed: **True**
 
@@ -50,6 +51,10 @@ These are what each agent said it saw, as pasted by the operator. The script did
 | Codex | reported by agent | `mem-1dc144c193a1` | `-` | Wrote the record (created 2026-10-10T16:39:50-04:00). Reported history seq 134 to 135, state root before 4384611745453de9... and after 62763cef..., record read-back matched, history chain passed, old receipt re-derived, and no configuration changed. Did not report an emr_latest digest. |
 | Cursor | not provided | `-` | `-` | No output was supplied for this report. |
 
+## Server-witnessed calls to emr_latest (client names are self-reported)
+
+Not available: GET /api/jarvis/tools/calls returned HTTP 404 (the call log is not deployed, is switched off, or this key may not read it). Nothing is claimed about any agent here.
+
 ## Script printout
 
 ```
@@ -63,6 +68,7 @@ PASS     chain_verifies: history ok=True problems=[]; blocks ok=True problems=[]
 PASS     old_receipt_re_derives: receipt verify ok=True problems=[]
 PASS     history_seq_135_136_are_the_two_records: seq 135 -> 'mem-1dc144c193a1' ('create'); seq 136 -> 'mem-c42330528ad5' ('create')
 PASS     agent_digest_reproduces_from_seq_135_state: reconstructed e1e2f0da86588553… vs agents' reported e1e2f0da86588553… (reconstruction from the current ledger, not a historical read)
+NOT RUN  call_log_chain_verifies: the server has no readable call log (HTTP 404): not deployed, switched off, or not the operator key
 ```
 
 ## Raw command outputs
@@ -153,6 +159,21 @@ Every request the script made (method, path, query, HTTP status; no headers, no 
     "path": "/api/jarvis/tools/emr_latest",
     "query": null,
     "status": 200
+  },
+  {
+    "method": "GET",
+    "path": "/api/jarvis/tools/calls",
+    "query": {
+      "tool": "emr_latest",
+      "limit": 200
+    },
+    "status": 404
+  },
+  {
+    "method": "GET",
+    "path": "/api/jarvis/tools/calls/verify",
+    "query": null,
+    "status": 404
   }
 ]
 ```
@@ -1373,5 +1394,21 @@ Every request the script made (method, path, query, HTTP status; no headers, no 
   "ledger_head": "block:36a22998920174d104bc500696ff6c21547cf9e50dad546f06ea661557336ce0",
   "result_digest": "919be4734cf184eaad957a82b43a5847ea9a15ecfa022861bcc2a3b5a47c8808",
   "provenance": "ledger"
+}
+```
+
+### `calls_emr_latest` (HTTP 404)
+
+```json
+{
+  "detail": "Not Found"
+}
+```
+
+### `calls_verify` (HTTP 404)
+
+```json
+{
+  "detail": "Not Found"
 }
 ```
