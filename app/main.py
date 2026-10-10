@@ -4,6 +4,9 @@ import json
 import logging
 import os
 import secrets
+import subprocess
+import threading
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -66,6 +69,13 @@ from app.models import (
     MemoryUpdate,
     ExternalSearchRequest,
     ExternalPromotionRequest,
+    NxAskRequest,
+    NxRememberRequest,
+    NxForgetRequest,
+    NxDescribeRequest,
+    NxSpatializeRequest,
+    NxScanRequest,
+    NxWatchRequest,
 )
 from app.nx_search_client import NxSearchClient
 from app.auth import (
@@ -83,6 +93,12 @@ from app.auth import (
     verify_operator_api_key,
     identity_middleware,
     oauth_enabled,
+    nx_write_enabled,
+    require_nx_write,
+    require_nx_enabled,
+    require_nx_operator,
+    validate_nx_path,
+    nx_allowed_roots,
 )
 from app.identity import current_tenant_key
 from app.oauth import protected_resource_metadata
@@ -123,6 +139,27 @@ from app.graph import (
 from mcp_server.mcp_http import create_mcp_router
 from mcp_server.protocol import ToolRefusal
 
+from contextlib import asynccontextmanager
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan: track and cleanup background nx-search processes."""
+    # Store for background processes
+    app.state.nx_background = {"watch": None, "serve": None}
+    app.state.nx_background_lock = threading.Lock()
+    yield
+    # Cleanup on shutdown
+    for name, proc in app.state.nx_background.items():
+        if proc and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+
+
 app = FastAPI(
     title="Jarvis Continuity Ledger",
     description=(
@@ -131,6 +168,7 @@ app = FastAPI(
         "EMR decides active cognition; does not invent persistent LTM."
     ),
     version="0.2.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -702,12 +740,20 @@ def twin_ui_asset(request: Request, asset: str):
     return FileResponse(_TWIN_UI_DIR / asset, media_type=media)
 
 
-@app.post("/api/jarvis/memory/external-search", dependencies=[Depends(require_emr_recall_api_key)])
+def _nx_client() -> NxSearchClient:
+    """A client per request; nx-search or node missing is a controlled 503, not an unhandled 500."""
+    try:
+        return NxSearchClient()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.post("/api/jarvis/memory/external-search", dependencies=[Depends(require_nx_enabled), Depends(require_nx_operator), Depends(require_emr_recall_api_key)])
 def external_search(body: ExternalSearchRequest):
     """Search nx-search; optional promotion remains bounded and auditable."""
     if body.auto_promote:
         require_memory_write()  # promotion writes to the ledger; search alone stays read-only
-    client = NxSearchClient()
+    client = _nx_client()
     results = client.search(body.query, name_only=body.name_only, limit=body.limit)
     if "error" in results:
         raise HTTPException(status_code=502, detail=results["error"])
@@ -724,7 +770,7 @@ def external_search(body: ExternalSearchRequest):
     return {"external_results": results, "promoted_memories": promoted, "promotion_count": len(promoted)}
 
 
-@app.get("/api/jarvis/memory/unified", dependencies=[Depends(require_emr_recall_api_key)])
+@app.get("/api/jarvis/memory/unified", dependencies=[Depends(require_nx_enabled), Depends(require_nx_operator), Depends(require_emr_recall_api_key)])
 def unified_search(
     query: str = Query(..., min_length=1, max_length=500),
     limit: int = Query(default=25, ge=1, le=100),
@@ -733,7 +779,7 @@ def unified_search(
     """Return working-memory records alongside nx-search evidence."""
     store = get_store()
     memories, selections, conflicts = store.retrieve(query=query, limit=limit, session_id=session_id)
-    external = NxSearchClient().search(query, limit=limit)
+    external = _nx_client().search(query, limit=limit)
     if "error" in external:
         raise HTTPException(status_code=502, detail=external["error"])
     return {
@@ -747,10 +793,10 @@ def unified_search(
     }
 
 
-@app.post("/api/jarvis/memory/promote", dependencies=[Depends(require_memory_write)])
+@app.post("/api/jarvis/memory/promote", dependencies=[Depends(require_nx_enabled), Depends(require_nx_operator), Depends(require_memory_write)])
 def promote_external_result(body: ExternalPromotionRequest):
     """Promote only an exact result returned by nx-search for the query."""
-    client = NxSearchClient()
+    client = _nx_client()
     results = client.search(body.query, limit=100)
     if "error" in results:
         raise HTTPException(status_code=502, detail=results["error"])
@@ -769,6 +815,224 @@ def promote_external_result(body: ExternalPromotionRequest):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"memory": memory.model_dump(), "status": "promoted"}
+
+
+# --- nx-search extended capabilities ---
+
+
+@app.get("/api/jarvis/memory/external/stats", dependencies=[Depends(require_nx_enabled), Depends(require_nx_operator), Depends(require_emr_recall_api_key)])
+def external_stats():
+    """Get nx-search index statistics."""
+    client = _nx_client()
+    stats = client.stats()
+    if "error" in stats:
+        raise HTTPException(status_code=502, detail=stats["error"])
+    return stats
+
+
+@app.post("/api/jarvis/memory/external/ask", dependencies=[Depends(require_nx_enabled), Depends(require_nx_operator), Depends(require_emr_recall_api_key)])
+def external_ask(body: NxAskRequest):
+    """Ask JARVIS a natural-language question over indexed files (read-only)."""
+    client = _nx_client()
+    result = client.ask(body.question, no_stream=body.no_stream)
+    if "error" in result:
+        raise HTTPException(status_code=502, detail=result["error"])
+    return result
+
+
+@app.post("/api/jarvis/memory/external/remember", dependencies=[Depends(require_nx_enabled), Depends(require_nx_operator), Depends(require_nx_write), Depends(require_memory_write)])
+def external_remember(body: NxRememberRequest, request: Request):
+    """Store a persistent preference in nx-search. Deliberately not mirrored into the ledger: Clause V says a preference is
+    memory, not evidence. To make one count, record a decision that cites it as evidence."""
+    result = _nx_client().remember(body.key, body.value)
+    if "error" in result:
+        raise HTTPException(status_code=502, detail=result["error"])
+    _audit_log("nx_remember", request, {"key": body.key})
+    return result
+
+
+@app.post("/api/jarvis/memory/external/forget", dependencies=[Depends(require_nx_enabled), Depends(require_nx_operator), Depends(require_nx_write), Depends(require_memory_write)])
+def external_forget(body: NxForgetRequest, request: Request):
+    """Forget a persistent preference from nx-search."""
+    result = _nx_client().forget(body.key)
+    if "error" in result:
+        raise HTTPException(status_code=502, detail=result["error"])
+    _audit_log("nx_forget", request, {"key": body.key})
+    return result
+
+
+@app.post("/api/jarvis/memory/external/describe", dependencies=[Depends(require_nx_enabled), Depends(require_nx_operator), Depends(require_emr_recall_api_key)])
+def external_describe(body: NxDescribeRequest, request: Request):
+    """Describe an image via vision (NVIDIA + HoloRT4D). Path validated against allowed roots.
+
+    Reading is gated like the other read endpoints; `save=true` WRITES (nx-search's own memory only; never the ledger, see remember), so it
+    additionally needs the nx-write flag and a write-scoped token, checked before anything is invoked.
+    """
+    if body.save:
+        require_nx_write()
+        require_memory_write()
+    # Validate path is within allowed roots
+    validated_path = validate_nx_path(body.image_path)
+    
+    client = _nx_client()
+    result = client.describe(
+        str(validated_path),
+        question=body.question,
+        holo=body.holo,
+        native=body.native,
+        save=body.save,
+    )
+    if "error" in result:
+        raise HTTPException(status_code=502, detail=result["error"])
+    
+    _audit_log("nx_describe", request, {"path": str(validated_path), "save": body.save})
+    return result
+
+
+@app.post("/api/jarvis/memory/external/spatialize", dependencies=[Depends(require_nx_enabled), Depends(require_nx_operator), Depends(require_nx_write), Depends(require_memory_write)])
+def external_spatialize(body: NxSpatializeRequest, request: Request):
+    """Spatialize a directory of rendered frames (temporal + spatial memory). Path validated."""
+    validated_path = validate_nx_path(body.directory)
+    
+    client = _nx_client()
+    result = client.spatialize(
+        str(validated_path),
+        every_nth=body.every_nth,
+        max_frames=body.max_frames,
+        tag=body.tag,
+    )
+    if "error" in result:
+        raise HTTPException(status_code=502, detail=result["error"])
+    
+    _audit_log("nx_spatialize", request, {"directory": str(validated_path), "every_nth": body.every_nth, "max_frames": body.max_frames})
+    return result
+
+
+@app.post("/api/jarvis/memory/external/scan", dependencies=[Depends(require_nx_enabled), Depends(require_nx_operator), Depends(require_nx_write), Depends(require_memory_write)])
+def external_scan(body: NxScanRequest, request: Request):
+    """Scan and index paths (incremental or full rebuild). Paths validated against allowed roots."""
+    validated_paths = []
+    if body.paths:
+        for p in body.paths:
+            validated_paths.append(str(validate_nx_path(p)))
+    
+    client = _nx_client()
+    result = client.scan(paths=validated_paths if validated_paths else None, rebuild=body.rebuild)
+    if "error" in result:
+        raise HTTPException(status_code=502, detail=result["error"])
+    
+    _audit_log("nx_scan", request, {"paths": validated_paths, "rebuild": body.rebuild})
+    return result
+
+
+@app.post("/api/jarvis/memory/external/reindex", dependencies=[Depends(require_nx_enabled), Depends(require_nx_operator), Depends(require_nx_write), Depends(require_memory_write)])
+def external_reindex(path: str = Query(..., min_length=1, max_length=1000), request: Request = None):
+    """Incremental reindex of a single path. Path validated against allowed roots."""
+    validated_path = validate_nx_path(path)
+    
+    client = _nx_client()
+    result = client.reindex(str(validated_path))
+    if "error" in result:
+        raise HTTPException(status_code=502, detail=result["error"])
+    
+    _audit_log("nx_reindex", request, {"path": str(validated_path)})
+    return result
+
+
+@app.post("/api/jarvis/memory/external/prune", dependencies=[Depends(require_nx_enabled), Depends(require_nx_operator), Depends(require_nx_write), Depends(require_memory_write)])
+def external_prune(paths: list[str] = Query(..., min_length=1, max_length=10), request: Request = None):
+    """Prune missing files from index. Paths validated against allowed roots."""
+    validated_paths = [str(validate_nx_path(p)) for p in paths]
+    
+    client = _nx_client()
+    result = client.prune(validated_paths)
+    if "error" in result:
+        raise HTTPException(status_code=502, detail=result["error"])
+    
+    _audit_log("nx_prune", request, {"paths": validated_paths})
+    return result
+
+
+@app.post("/api/jarvis/memory/external/watch", dependencies=[Depends(require_nx_enabled), Depends(require_nx_operator), Depends(require_nx_write), Depends(require_memory_write)])
+def external_watch(body: NxWatchRequest, request: Request):
+    """Start file watcher for incremental index maintenance. One instance max, capped by feature flag."""
+    validated_paths = [str(validate_nx_path(p)) for p in body.paths]
+
+    # Check, spawn and store as one step: two concurrent starts must not both see "not running".
+    with request.app.state.nx_background_lock:
+        existing = request.app.state.nx_background.get("watch")
+        if existing and existing.poll() is None:
+            raise HTTPException(status_code=409, detail="Watch already running (stop it first or wait for shutdown)")
+        proc = _nx_client().watch(validated_paths, debounce_ms=body.debounce_ms, no_reconcile=body.no_reconcile)
+        request.app.state.nx_background["watch"] = proc
+
+    _audit_log("nx_watch_start", request, {"paths": validated_paths, "debounce_ms": body.debounce_ms, "pid": proc.pid})
+    return {"status": "started", "pid": proc.pid, "paths": validated_paths, "debounce_ms": body.debounce_ms}
+
+
+@app.post("/api/jarvis/memory/external/watch/stop", dependencies=[Depends(require_nx_enabled), Depends(require_nx_operator), Depends(require_nx_write), Depends(require_memory_write)])
+def external_watch_stop(request: Request):
+    """Stop the file watcher."""
+    with request.app.state.nx_background_lock:
+        existing = request.app.state.nx_background.get("watch")
+        if not existing or existing.poll() is not None:
+            return {"status": "not_running"}
+    
+        existing.terminate()
+        try:
+            existing.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            existing.kill()
+            existing.wait()
+    
+        request.app.state.nx_background["watch"] = None
+
+    _audit_log("nx_watch_stop", request, {})
+    return {"status": "stopped"}
+
+
+@app.post("/api/jarvis/memory/external/serve", dependencies=[Depends(require_nx_enabled), Depends(require_nx_operator), Depends(require_nx_write), Depends(require_memory_write)])
+def external_serve(port: int = Query(default=7788, ge=1024, le=65535), request: Request = None):
+    """Start web UI server on specified port. One instance max, capped by feature flag."""
+    with request.app.state.nx_background_lock:
+        existing = request.app.state.nx_background.get("serve")
+        if existing and existing.poll() is None:
+            raise HTTPException(status_code=409, detail="Serve already running on another port (stop it first)")
+        proc = _nx_client().serve(port)
+        request.app.state.nx_background["serve"] = proc
+
+    _audit_log("nx_serve_start", request, {"port": port, "pid": proc.pid})
+    return {"status": "started", "pid": proc.pid, "port": port, "url": f"http://127.0.0.1:{port}"}
+
+
+@app.post("/api/jarvis/memory/external/serve/stop", dependencies=[Depends(require_nx_enabled), Depends(require_nx_operator), Depends(require_nx_write), Depends(require_memory_write)])
+def external_serve_stop(request: Request):
+    """Stop the web UI server."""
+    with request.app.state.nx_background_lock:
+        existing = request.app.state.nx_background.get("serve")
+        if not existing or existing.poll() is not None:
+            return {"status": "not_running"}
+    
+        existing.terminate()
+        try:
+            existing.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            existing.kill()
+            existing.wait()
+    
+        request.app.state.nx_background["serve"] = None
+
+    _audit_log("nx_serve_stop", request, {})
+    return {"status": "stopped"}
+
+
+def _audit_log(action: str, request: Request | None, details: dict):
+    """Log nx-search operations for audit trail."""
+    import logging
+    logger = logging.getLogger("jarvis.nx_audit")
+    client_ip = request.client.host if request and request.client else "unknown"
+    auth = "oauth" if oauth_enabled() else "apikey"
+    logger.info(f"nx_audit action={action} ip={client_ip} auth={auth} details={details}")
 
 
 # --- EMR / STM (LTM stays the store; STM is an activated view) ---

@@ -4,12 +4,14 @@ Ledger routes: JARVIS_API_KEY required by default (ApiKeyMiddleware);
 JARVIS_ALLOW_UNAUTHENTICATED=1 is the local-dev opt-out.
 EMR tool / MCP routes: EMR_RECALL_API_KEY (optional, hosted recall).
 Write gate: JARVIS_MEMORY_WRITE_ENABLED / JARVIS_MCP_WRITE_ENABLED.
+NX Search write gate: JARVIS_NX_WRITE_ENABLED (off by default).
 """
 
 from __future__ import annotations
 
 import os
 import secrets
+from pathlib import Path
 
 from fastapi import Header, HTTPException, Request
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -47,6 +49,93 @@ def mcp_write_enabled() -> bool:
         "true",
         "yes",
     )
+
+
+def nx_write_enabled() -> bool:
+    """Gate for nx-search mutating operations (scan, reindex, prune, remember, forget,
+    describe --save, spatialize, watch, serve).
+
+    Defaults to **false** so local file index mutations are opt-in.
+    Independent of JARVIS_MEMORY_WRITE_ENABLED and JARVIS_MCP_WRITE_ENABLED.
+    """
+    return os.getenv("JARVIS_NX_WRITE_ENABLED", "false").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def nx_enabled() -> bool:
+    """Master switch for all nx-search integration.
+    
+    Defaults to false on public deployments (Render, etc.), true for local dev.
+    Set JARVIS_NX_ENABLED=true to explicitly enable.
+    """
+    default = "false" if is_public_deployment() else "true"
+    return os.getenv("JARVIS_NX_ENABLED", default).lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def require_nx_enabled() -> None:
+    """Require nx-search integration to be enabled."""
+    if not nx_enabled():
+        raise HTTPException(
+            status_code=403,
+            detail="NX search integration is disabled on this deployment (set JARVIS_NX_ENABLED=true)",
+        )
+
+
+def nx_allowed_roots() -> list[Path]:
+    """Paths that nx-search operations may read/write. Defaults to indexed drives from NX_SCAN_ROOTS."""
+    roots_env = os.getenv("NX_SCAN_ROOTS", "").strip()
+    if roots_env:
+        return [Path(r.strip()) for r in roots_env.split(";") if r.strip()]
+    # Default to common Windows drives if not configured
+    return [Path("D:/"), Path("F:/"), Path("G:/")]
+
+
+def require_nx_write() -> None:
+    """Require nx-write feature flag and memory write auth."""
+    if oauth_enabled():
+        principal = current_principal()
+        if principal is None or WRITE_SCOPE not in principal.scopes:
+            raise HTTPException(status_code=403, detail="OAuth access token lacks required scope: memory.write")
+    if not nx_write_enabled():
+        raise HTTPException(
+            status_code=403,
+            detail="NX search writes are disabled on this deployment (set JARVIS_NX_WRITE_ENABLED=true)",
+        )
+
+
+def validate_nx_path(path: str, allowed_roots: list[Path] | None = None) -> Path:
+    """Validate that a path is within allowed roots. Raises HTTPException if not."""
+    if allowed_roots is None:
+        allowed_roots = nx_allowed_roots()
+    
+    try:
+        target = Path(path).resolve()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid path: {e}")
+    
+    # Check path traversal
+    try:
+        target.relative_to(target.anchor)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Path traversal not allowed")
+    
+    # Check against allowed roots
+    for root in allowed_roots:
+        try:
+            target.relative_to(root.resolve())
+            return target
+        except ValueError:
+            continue
+    
+    allowed = ", ".join(str(r) for r in allowed_roots)
+    raise HTTPException(status_code=403, detail=f"Path outside allowed roots: {allowed}")
 
 
 def require_mcp_write_scope() -> None:
@@ -155,6 +244,16 @@ def require_operator_read() -> None:
     """Continuity Block reads are for the operator key only: never through an OAuth user token."""
     if oauth_enabled():
         raise HTTPException(status_code=403, detail="Continuity Blocks can be read with the operator key only")
+
+
+def require_nx_operator() -> None:
+    """nx-search reads and indexes the host filesystem under deployment-wide roots, with no per-tenant scoping.
+
+    Until there is a real multi-tenant user and per-tenant roots, every nx route is operator-only: an OAuth user token
+    (even with memory.read) is refused.
+    """
+    if oauth_enabled():
+        raise HTTPException(status_code=403, detail="nx-search routes touch the host filesystem and are operator-only")
 
 
 LEDGER_READ_PREFIX = "/api/jarvis/memory"
