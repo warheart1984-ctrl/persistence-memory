@@ -681,3 +681,40 @@ def test_workers_sharing_a_log_record_one_gap_not_one_per_worker(tmp_path):
     assert len(gaps) == 1, f"{len(gaps)} gap entries for one outage"
     assert (gaps[0]["count"], gaps[0]["refused"]) == (1, 2)
     assert w1.degraded() is None and w2.degraded() is None and w1.verify()["ok"] is True
+
+
+def test_unpersisted_increments_are_added_to_the_shared_count_not_max_merged(tmp_path, monkeypatch):
+    """Worker A fails to persist one call; worker B (which can write the file) records more.  Three calls happened, so the total is three."""
+    shared = tmp_path / "disjoint"
+    a, b = call_log.CallLog(shared), call_log.CallLog(shared)
+    b._mark_degraded("file unwritable for B? no: B persists", unlogged=1)  # file: unlogged=1
+    monkeypatch.setattr(a, "_locked", lambda: (_ for _ in ()).throw(OSError("A cannot persist")))
+    a._mark_degraded("A cannot write the directory", unlogged=1)  # A keeps a delta of 1 in memory
+    assert a.degraded()["unlogged"] == 2  # file 1 + A's delta 1
+    b._mark_degraded("B persists another", unlogged=1)  # file: unlogged=2
+    assert a.degraded()["unlogged"] == 3, "max() would have reported 2 for three calls"
+    monkeypatch.undo()
+    a.append(_fields())
+    gap = [e for e in reversed(list(a.entries_desc())) if e["outcome"] == "gap"]
+    assert len(gap) == 1 and gap[0]["count"] == 3 and a.degraded() is None
+
+
+def test_concurrent_threads_do_not_lose_counts_when_the_outage_cannot_be_persisted(tmp_path, monkeypatch):
+    log = call_log.CallLog(tmp_path / "threads")
+    monkeypatch.setattr(log, "_locked", lambda: (_ for _ in ()).throw(OSError("directory unwritable")))
+    for name in ("_combine", "_merge"):  # widen the read-modify-write window whichever name the implementation uses
+        original = getattr(call_log.CallLog, name, None)
+        if original is not None:
+            monkeypatch.setattr(call_log.CallLog, name, staticmethod(lambda *a, _o=original, **k: (time.sleep(0.002), _o(*a, **k))[1]), raising=False)
+
+    def work():
+        for _ in range(10):
+            log._mark_degraded("down", unlogged=1, refused=1)
+
+    threads = [threading.Thread(target=work) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    state = log.degraded()
+    assert (state["unlogged"], state["refused"]) == (80, 80), state

@@ -57,8 +57,8 @@ off on live), which is why its writes are in scope.
   it), flags the log degraded, and further writes are refused until the log can be written again.
 * On recovery a `gap` entry records how many calls were served but not logged (`count`), how many ledger writes were refused
   because the log was unavailable (`refused`), and since when, so `verify` shows the hole. The shared record is the `DEGRADED` file
-  (updated under the log's lock, so several workers add to one count and write one gap). The outage is kept **in memory only while it
-  could not be written there**, because that file lives in the directory that may be the thing that cannot be written; if the process
+  (updated under the log's lock, so several workers add to one count and write one gap). The increments a process could not write there are kept **in memory** (and added to the file's count, never max'd,
+  so concurrent workers and threads do not lose each other's counts), because that file lives in the directory that may be the thing that cannot be written; if the process
   itself dies during such an outage, that memory is lost with it.
 
 ## Endpoints (operator only; an OAuth tenant gets `403` `AUTHORITY_DENIED`)
