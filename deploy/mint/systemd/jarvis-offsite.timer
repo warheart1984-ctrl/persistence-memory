@@ -3,7 +3,8 @@ Description=Jarvis ledger: daily offsite copy
 
 [Timer]
 # 03:30 local time; Persistent=true runs it at the next opportunity if the box was off (or the PC was unreachable
-# at that moment is retried by the next day's run and flagged by the watchdog after 48 h).
+# at that moment is retried every 30 min for ~8 h by the service's Restart=, then by the next day's run, and
+# flagged by the watchdog after 48 h).
 OnCalendar=*-*-* 03:30:00
 RandomizedDelaySec=300
 Persistent=true
