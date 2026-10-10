@@ -37,6 +37,8 @@ def test_tool_catalog_includes_three_tools():
     names = [t["function"]["name"] for t in cat["tools"]]
     assert names == [
         "emr_recall",
+        "emr_latest",
+        "emr_search_ledger",
         "search",
         "fetch",
         "emr_search",

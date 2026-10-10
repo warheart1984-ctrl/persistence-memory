@@ -55,8 +55,12 @@ def query_tokens(query: Any) -> list[str]:
     return seen
 
 
-def score(record: Any, qtoks: list[str]) -> int:
-    """Deterministic integer relevance of one candidate (which already contains every query token)."""
+def score(record: Any, qtoks: list[str], phrase: list[str] | None = None) -> int:
+    """Deterministic integer relevance of one candidate (which already contains every query token).
+
+    ``qtoks`` are the distinct query words; ``phrase`` is the whole query as written, repeats included (default: ``qtoks``),
+    because the phrase bonus is for the whole query: ``foo bar foo`` is not matched by a record that only says "foo bar"."""
+    phrase = qtoks if phrase is None else phrase
     subject = set(tokens(record.subject))
     tag_toks = set(tokens(" ".join(record.tags or [])))
     content = tokens(record.content)
@@ -67,10 +71,10 @@ def score(record: Any, qtoks: list[str]) -> int:
         if q in tag_toks:
             total += W_TAG
         total += W_CONTENT * min(CONTENT_TF_CAP, content.count(q))
-    if len(qtoks) > 1:
-        n = len(qtoks)
+    if len(phrase) > 1:
+        n = len(phrase)
         for seq in (tokens(record.subject), content):
-            if any(seq[i:i + n] == qtoks for i in range(len(seq) - n + 1)):
+            if any(seq[i:i + n] == phrase for i in range(len(seq) - n + 1)):
                 total += PHRASE_BONUS
                 break
     return total
@@ -94,6 +98,7 @@ def search_ledger(store: Any, *, tenant: str | None, params: SearchParams, opera
         raise LatestError(403, "denied", TENANT_UNRESOLVED, "tenant could not be resolved")
     limit = parse_limit(params.limit)
     qtoks = query_tokens(params.query)
+    phrase = tokens(params.query)  # the whole query in order, repeats kept, for the phrase bonus
     candidates = store.list_latest(
         limit=MAX_CANDIDATES + 1,
         memory_type=params.type,
@@ -104,11 +109,11 @@ def search_ledger(store: Any, *, tenant: str | None, params: SearchParams, opera
     )
     capped = len(candidates) > MAX_CANDIDATES
     # Candidates arrive newest first, (created_at, id) descending; a stable sort on -score keeps that as the tie-break.
-    ranked = sorted(candidates[:MAX_CANDIDATES], key=lambda pair: -score(pair[0], qtoks))[:limit]
+    ranked = sorted(candidates[:MAX_CANDIDATES], key=lambda pair: -score(pair[0], qtoks, phrase))[:limit]
     records = []
     for rec, succ in ranked:
         shaped = _shape(rec, succ)
-        shaped["score"] = score(rec, qtoks)
+        shaped["score"] = score(rec, qtoks, phrase)
         records.append(shaped)
     return {
         "query": params.query,
