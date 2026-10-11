@@ -368,3 +368,32 @@ def test_the_script_identifies_itself_to_the_servers_call_log(rel):
     client = rel.ReadOnlyClient("http://x", KEY, lambda m, u, h, b: (seen.update(h) or (200, b"{}")))
     client.tool("emr_latest", {})
     assert seen["X-Jarvis-MCP-Client"] == "relay-evidence/1" and seen["X-API-Key"] == KEY
+
+
+def test_a_failed_unfiltered_read_is_never_reported_as_complete(rel):
+    entries = [call_entry(2, "opencode-x"), call_entry(1, "cursor-x")]
+    raw = {"calls_emr_latest": {"http_status": 200, "body": {"entries": entries, "pages": 1, "truncated": False}},
+           "calls_all": {"http_status": 500, "body": {"detail": "boom"}},
+           "calls_verify": {"http_status": 200, "body": {"ok": True, "head": {"seq": 2, "entry_hash": "h" * 64}, "files": ["f"], "entries": 2, "problems": []}}}
+    section = rel.call_log_section(raw, [{"agent": "Kilo"}])
+    assert section["truncated"] is True and section["coverage"].startswith("PARTIAL: the unfiltered read of the log failed (HTTP 500)")
+    assert "complete" not in section["coverage"].split(":")[0] and "PARTIAL" in section["per_agent"][0]["note"]
+    assert section["clients_seen"], "the fallback list is still shown, labelled partial"
+
+
+def test_a_failure_on_a_later_page_keeps_what_was_read_and_says_it_is_partial(rel):
+    rows, ok_transport = paged_log(450)
+
+    def flaky(method, url, headers, body):
+        if "cursor=51" in url:  # the third page fails
+            return 500, b'{"detail":"boom"}'
+        return ok_transport(method, url, headers, body)
+
+    client = rel.ReadOnlyClient("http://x", KEY, flaky)
+    status, body = rel.fetch_all_calls(client)
+    assert status == 200 and len(body["entries"]) == 400 and body["pages"] == 2 and body["truncated"] is True and "page 3 failed with HTTP 500" in body["error"]
+    raw = {"calls_emr_latest": {"http_status": 200, "body": body}, "calls_all": {"http_status": 200, "body": body},
+           "calls_verify": {"http_status": 200, "body": {"ok": True, "head": {"seq": 450, "entry_hash": "h" * 64}, "files": ["f"], "entries": 450, "problems": []}}}
+    section = rel.call_log_section(raw, [{"agent": "Oldest"}])
+    assert section["coverage"].startswith("PARTIAL: only the newest 400") and "page 3 failed with HTTP 500" in section["coverage"]
+    assert "oldest-client" not in {r["client_name"] for r in section["clients_seen"]}

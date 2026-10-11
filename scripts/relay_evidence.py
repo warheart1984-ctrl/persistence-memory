@@ -146,8 +146,8 @@ def fetch_all_calls(client: ReadOnlyClient, **filters: Any) -> tuple[int, Any]:
     """GET /api/jarvis/tools/calls, following next_cursor page by page.
 
     Returns (status, body).  A failure on the first page is returned as it came (the call log may simply not be there).  Otherwise body is
-    ``{"entries": [...all pages, newest first...], "pages": n, "truncated": bool}``; ``truncated`` is True only if MAX_CALL_PAGES was reached
-    with more pages still to read, so the caller must call the result a partial view.
+    ``{"entries": [...all pages, newest first...], "pages": n, "truncated": bool}``; ``truncated`` is True if MAX_CALL_PAGES was reached with
+    more pages still to read, or if a later page failed (then ``error`` says which), so the caller must call the result a partial view.
     """
     entries: list[dict[str, Any]] = []
     cursor: str | None = None
@@ -156,7 +156,10 @@ def fetch_all_calls(client: ReadOnlyClient, **filters: Any) -> tuple[int, Any]:
         query = {**filters, "limit": 200, **({"cursor": cursor} if cursor else {})}
         status, body = client.get("/api/jarvis/tools/calls", **query)
         if status != 200 or not isinstance(body, dict):
-            return status, body
+            if pages == 0:
+                return status, body  # the very first page failed: report it as it came
+            # a LATER page failed: keep what was read, but this is not the whole log, and the caller must say so
+            return 200, {"entries": entries, "pages": pages, "truncated": True, "error": f"page {pages + 1} failed with HTTP {status}"}
         entries += list(body.get("entries") or [])
         pages += 1
         cursor = body.get("next_cursor")
@@ -204,12 +207,21 @@ def call_log_section(raw: dict[str, Any], agents: list[dict[str, Any]]) -> dict[
         return {"available": False, "reason": f"GET /api/jarvis/tools/calls returned HTTP {calls.get('http_status')} (the call log is not deployed, is switched off, or this key may not read it)",
                 "head": None, "chain_ok": None, "per_agent": [], "clients_seen": [], "coverage": None, "truncated": None, "pages_read": 0}
     entries = calls["body"].get("entries") or []
-    all_body_cov = (raw.get("calls_all") or {}).get("body") or {}
-    truncated = bool(calls["body"].get("truncated") or all_body_cov.get("truncated"))
+    all_raw = raw.get("calls_all") or {}
+    all_ok = all_raw.get("http_status") == 200 and isinstance(all_raw.get("body"), dict)
+    all_body_cov = all_raw["body"] if all_ok else {}
+    errors = [e for e in (calls["body"].get("error"), all_body_cov.get("error")) if e]
+    truncated = bool(calls["body"].get("truncated") or all_body_cov.get("truncated") or not all_ok)
     pages = max(int(calls["body"].get("pages") or 1), int(all_body_cov.get("pages") or 1))
     n_all = len(all_body_cov.get("entries") or entries)
-    coverage = (f"PARTIAL: only the newest {n_all} log entries ({pages} pages) were read; older entries, and so older client names, are not in this report"
-                if truncated else f"complete: all {n_all} log entries ({pages} page(s)) were read")
+    if not all_ok:
+        coverage = (f"PARTIAL: the unfiltered read of the log failed (HTTP {all_raw.get('http_status')}), so the client-name list below is built only from the "
+                    f"{len(entries)} emr_latest entries that were read; other clients and older names may be missing")
+    elif truncated:
+        why = ("; " + "; ".join(errors)) if errors else ""
+        coverage = f"PARTIAL: only the newest {n_all} log entries ({pages} pages) were read; older entries, and so older client names, are not in this report{why}"
+    else:
+        coverage = f"complete: all {n_all} log entries ({pages} page(s)) were read"
     per_agent = []
     matched_names: set[str] = set()
     for a in agents:
