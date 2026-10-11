@@ -161,6 +161,7 @@ def gather(client: ReadOnlyClient, old_id: str, new_id: str, receipt_id: str) ->
     keep("latest_default_12", client.tool("emr_latest", {"limit": 12}))
     keep("latest_with_superseded", client.tool("emr_latest", {"include_superseded": True, "limit": 12}))
     keep("calls_emr_latest", client.get("/api/jarvis/tools/calls", tool="emr_latest", limit=200))
+    keep("calls_all", client.get("/api/jarvis/tools/calls", limit=200))
     keep("calls_verify", client.get("/api/jarvis/tools/calls/verify"))
     return raw
 
@@ -175,19 +176,34 @@ def call_log_section(raw: dict[str, Any], agents: list[dict[str, Any]]) -> dict[
     verify = (raw.get("calls_verify") or {}).get("body") or {}
     if calls.get("http_status") != 200 or not isinstance(calls.get("body"), dict):
         return {"available": False, "reason": f"GET /api/jarvis/tools/calls returned HTTP {calls.get('http_status')} (the call log is not deployed, is switched off, or this key may not read it)",
-                "head": None, "chain_ok": None, "per_agent": []}
+                "head": None, "chain_ok": None, "per_agent": [], "clients_seen": []}
     entries = calls["body"].get("entries") or []
     per_agent = []
+    matched_names: set[str] = set()
     for a in agents:
         name = str(a.get("agent") or "")
-        hits = [e for e in entries if name and name.lower() in str(e.get("client_name") or "").lower()]
+        needles = [n.lower() for n in [name, *[str(x) for x in (a.get("aliases") or [])]] if n]
+        hits = [e for e in entries if any(n in str(e.get("client_name") or "").lower() for n in needles)]
+        matched_names |= {str(e.get("client_name")) for e in hits}
         per_agent.append({
             "agent": name,
+            "matched_on": needles,
             "witnessed_emr_latest_calls": len(hits),
             "latest": ({k: hits[0].get(k) for k in ("seq", "ts", "transport", "client_name", "client_version", "outcome", "result_digest", "tenant")} if hits else None),
-            "note": "server-witnessed; the client name is self-reported" if hits else "no emr_latest call from a client that names itself like this is in the server's log (it may have called under another name, before the log existed, or not at all)",
+            "note": "server-witnessed; the client name is self-reported" if hits else "no emr_latest call from a client whose name contains any of " + ", ".join(repr(n) for n in needles) + " is in the server's log (it may have called under another name, before the log existed, or not at all: see the list of every client name the log saw)",
         })
-    return {"available": True, "reason": None, "head": verify.get("head"), "chain_ok": verify.get("ok"), "problems": verify.get("problems"), "per_agent": per_agent,
+    seen: dict[tuple[str, str, str], dict[str, Any]] = {}
+    all_body = (raw.get("calls_all") or {}).get("body") or {}
+    for e in (all_body.get("entries") or entries):
+        if e.get("outcome") in ("gap", "denied_suppressed"):
+            continue
+        key = (str(e.get("client_name") or "(none)"), str(e.get("client_version") or ""), str(e.get("transport")))
+        row = seen.setdefault(key, {"client_name": key[0], "client_version": key[1], "transport": key[2], "calls": 0, "tools": set(), "last_ts": e.get("ts")})
+        row["calls"] += 1
+        row["tools"].add(str(e.get("tool")))
+        row["last_ts"] = max(str(row["last_ts"]), str(e.get("ts")))
+    clients_seen = sorted(({**r, "tools": sorted(r["tools"]), "matched_an_agent": r["client_name"] in matched_names} for r in seen.values()), key=lambda r: (-r["calls"], r["client_name"]))
+    return {"available": True, "reason": None, "head": verify.get("head"), "chain_ok": verify.get("ok"), "problems": verify.get("problems"), "per_agent": per_agent, "clients_seen": clients_seen,
             "log_files": verify.get("files"), "entries_total": verify.get("entries")}
 
 
@@ -320,6 +336,12 @@ def render_markdown(ev: dict[str, Any], printout: str) -> str:
             else:
                 L.append(f"| {a['agent']} | 0 | - | - | - | {_esc(a['note'])} |")
         L.append("")
+        if cl.get("clients_seen"):
+            L += ["Every client name the log saw (the latest 200 entries; self-reported, so a name is a claim and not an identity). `matched` says whether it was counted for one of the agents above:", "",
+                  "| Client name / version | Transport | Calls | Tools | Last seen | Matched an agent above |", "|---|---|---|---|---|---|"]
+            for r in cl["clients_seen"]:
+                L.append(f"| {_esc(r['client_name'])}/{_esc(r['client_version'])} | {r['transport']} | {r['calls']} | {_esc(', '.join(r['tools']))} | {r['last_ts']} | {'yes' if r['matched_an_agent'] else '**no**'} |")
+            L.append("")
     L += ["## Script printout", "", "```", printout, "```", "", "## Raw command outputs", "",
           "Every request the script made (method, path, query, HTTP status; no headers, no key):", "", "```json", json.dumps(ev["requests_made"], indent=2), "```", ""]
     for label, item in ev["raw"].items():
