@@ -948,6 +948,96 @@ def test_the_degraded_state_belongs_to_the_same_snapshot_as_the_page_and_head(tm
     assert log.degraded() is None                                                       # the latch was cleared meanwhile, and the next read will say so
 
 
+def _log_with_days(tmp_path, name, days, monkeypatch):
+    monkeypatch.setenv("JARVIS_CALL_LOG_RETAIN_DAYS", "400")
+    day = [1]
+    log = call_log.CallLog(tmp_path / name, clock=lambda: datetime(2026, 1, day[0], 12, tzinfo=timezone.utc))
+    for d in range(1, days + 1):
+        day[0] = d
+        log.append(_fields(d))
+    return log, day
+
+
+@posix_user_only
+def test_a_snapshot_pins_only_the_newest_files_and_still_reads_them_all(tmp_path, monkeypatch):
+    """The log keeps ~90 daily files: one descriptor per file per request would let a handful of concurrent reads exhaust the process's descriptors."""
+    monkeypatch.setenv("JARVIS_CALL_LOG_SNAPSHOT_PINNED", "3")
+    log, _ = _log_with_days(tmp_path, "pinned", 12, monkeypatch)
+    with log._locked():
+        snap = log._snapshot()
+    assert len(snap.files) == 12 and sum(1 for _, _, fh in snap.files if fh is not None) == 3
+    assert [fh is not None for _, _, fh in snap.files] == [False] * 9 + [True] * 3       # exactly the newest three
+    assert [e["seq"] for e in log.entries_desc(snap)] == list(range(12, 0, -1))            # every entry, newest first
+    snap.close()
+
+
+@posix_user_only
+def test_an_unpinned_file_that_disappears_makes_the_read_fail_with_retry_never_a_shorter_page(tmp_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_CALL_LOG_SNAPSHOT_PINNED", "2")
+    log, _ = _log_with_days(tmp_path, "gone", 6, monkeypatch)
+    with log._locked():
+        snap = log._snapshot()
+    oldest = snap.files[0][0]
+    newest = snap.files[-1][0]
+    oldest.unlink()                                                    # retention removed an old, unpinned file after the snapshot
+    newest.unlink()                                                    # (and, for contrast, a pinned one: its handle still reads)
+    with pytest.raises(call_log.CallLogError, match="retry"):
+        list(log.entries_desc(snap))
+    snap.close()
+
+
+@posix_user_only
+def test_a_page_read_holds_at_most_the_pinned_number_of_descriptors(tmp_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_CALL_LOG_SNAPSHOT_PINNED", "2")
+    log, _ = _log_with_days(tmp_path, "fds", 15, monkeypatch)
+    real = call_log.CallLog.entries_desc
+    during = {}
+
+    def counting(self, snapshot=None):
+        during["fds"] = len(os.listdir("/proc/self/fd"))
+        yield from (real(self) if snapshot is None else real(self, snapshot))
+
+    baseline = len(os.listdir("/proc/self/fd"))
+    monkeypatch.setattr(call_log.CallLog, "entries_desc", counting)
+    log.query_with_head(limit=50)
+    monkeypatch.setattr(call_log.CallLog, "entries_desc", real)
+    assert during["fds"] - baseline <= 2 + 1                           # the 2 pinned files (+1 of slack for the interpreter), not 15
+    assert len(os.listdir("/proc/self/fd")) <= baseline + 1            # and all of them closed afterwards
+
+
+def test_concurrent_page_reads_are_bounded_and_the_rest_are_told_to_retry(tmp_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_CALL_LOG_SNAPSHOT_READERS", "1")
+    monkeypatch.setenv("JARVIS_CALL_LOG_SNAPSHOT_WAIT_SECONDS", "0.2")
+    log = call_log.CallLog(tmp_path / "slots")
+    for i in range(3):
+        log.append(_fields(i))
+    real = call_log.CallLog.entries_desc
+    inside, release = threading.Event(), threading.Event()
+
+    def slow(self, snapshot=None):
+        inside.set()
+        release.wait(timeout=5)
+        yield from (real(self) if snapshot is None else real(self, snapshot))
+
+    monkeypatch.setattr(call_log.CallLog, "entries_desc", slow)
+    first = threading.Thread(target=lambda: log.query_with_head(limit=10))
+    first.start()
+    assert inside.wait(timeout=5)
+    waiting = threading.Thread(target=lambda: pytest.raises(call_log.CallLogError, log.query_with_head, limit=10))
+    waiting.start()                                                    # a second reader, waiting for the only slot
+    time.sleep(0.05)
+    started = time.perf_counter()
+    assert log.head()["seq"] == 3                                      # the log's own lock is NOT held while a reader waits for a slot: a writer-side call is not blocked
+    assert time.perf_counter() - started < 0.1
+    waiting.join(timeout=5)
+    with pytest.raises(call_log.CallLogError, match="too many"):
+        log.query_with_head(limit=10)                                  # one reader is in flight and only one is allowed: this one is told to retry
+    release.set()
+    first.join(timeout=5)
+    monkeypatch.setattr(call_log.CallLog, "entries_desc", real)
+    assert [e["seq"] for e in log.query_with_head(limit=10)["entries"]] == [3, 2, 1]     # the slot was released: reads work again
+
+
 def test_a_snapshot_page_ignores_what_was_appended_after_it(tmp_path):
     log = call_log.CallLog(tmp_path / "snapbytes")
     for i in range(3):

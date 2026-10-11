@@ -196,6 +196,42 @@ def split_client(header: str | None) -> tuple[str | None, str | None]:
 # -------------------------------------------------------------------------------------------------------- the log
 
 
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    try:
+        return max(minimum, int((os.environ.get(name) or "").strip() or default))
+    except ValueError:
+        return default
+
+
+def snapshot_pinned_files() -> int:
+    """How many of the NEWEST daily files one page read keeps open (JARVIS_CALL_LOG_SNAPSHOT_PINNED, default 8). The log keeps 90 days by default, so pinning
+    every file would cost ~91 descriptors a request. Older files are reopened when the page reaches them (they are only ever removed by retention, which
+    runs when the log rotates to a new day); if one has gone by then the read fails with 'retry', never with a quietly shorter page."""
+    return _env_int("JARVIS_CALL_LOG_SNAPSHOT_PINNED", 8)
+
+
+_slots: tuple[int, threading.BoundedSemaphore] | None = None
+_slots_lock = threading.Lock()
+
+
+def _snapshot_slots() -> threading.BoundedSemaphore:
+    """At most JARVIS_CALL_LOG_SNAPSHOT_READERS (default 8) page reads at a time per process, so the descriptors they pin are bounded process-wide
+    (readers x pinned files, 64 by default) and cannot starve the log's own lock and file opens, which the ledger-write preflight depends on."""
+    global _slots
+    size = _env_int("JARVIS_CALL_LOG_SNAPSHOT_READERS", 8)
+    with _slots_lock:
+        if _slots is None or _slots[0] != size:
+            _slots = (size, threading.BoundedSemaphore(size))
+        return _slots[1]
+
+
+def snapshot_wait_seconds() -> float:
+    try:
+        return max(0.0, float(os.environ.get("JARVIS_CALL_LOG_SNAPSHOT_WAIT_SECONDS") or 2.0))
+    except ValueError:
+        return 2.0
+
+
 def _pin_by_handle() -> bool:
     """Linux keeps each snapshotted file open (an unlinked file stays readable) and reads the page after releasing the lock; Windows cannot do either."""
     return os.name != "nt"
@@ -559,10 +595,15 @@ class CallLog:
         each are exactly the log as of this moment, and can be read later without the lock. The open handles matter: if a later append rotates the log and
         retention unlinks an older file, the handle still reads it, so the page is never missing a file the snapshot advertised. Close it when done."""
         snap = Snapshot()
-        for path in self._files():
+        files = self._files()
+        first_pinned = max(0, len(files) - snapshot_pinned_files())      # only the newest few are held open; the rest are sized now and reopened if reached
+        for index, path in enumerate(files):
             try:
-                fh = open(path, "rb")
-                snap.files.append((path, os.fstat(fh.fileno()).st_size, fh))
+                if index >= first_pinned:
+                    fh = open(path, "rb")
+                    snap.files.append((path, os.fstat(fh.fileno()).st_size, fh))
+                else:
+                    snap.files.append((path, path.stat().st_size, None))
             except FileNotFoundError:
                 continue  # retention removed it between listing and opening: it is simply not part of the log any more
             except OSError as exc:
@@ -582,6 +623,9 @@ class CallLog:
                 if fh is not None:
                     fh.seek(0)
                     lines = fh.read(size).decode("utf-8", "replace").splitlines()
+                elif size is not None:  # an older file of a snapshot, not pinned: reopened now, read up to the size it had
+                    with open(path, "rb") as reopened:
+                        lines = reopened.read(size).decode("utf-8", "replace").splitlines()
                 else:
                     lines = path.read_text(encoding="utf-8").splitlines()
             except OSError as exc:
@@ -604,24 +648,35 @@ class CallLog:
         """The page and the log's head from ONE snapshot: the head and the size of every file are taken together under the lock, and the page is read
         from exactly those bytes after the lock is released. So no append can fall between them (for an unfiltered request the head is always the newest
         entry of the first page, or the page is empty and the head is the genesis), and a large log never holds the writers' lock while it is parsed."""
-        with self._locked():
-            with contextlib.suppress(CallLogError, OSError):  # open denied/read summaries are written first, like flush(); a failure here changes nothing
-                self._flush_reads_locked(self._flush_suppressed_locked(self._head()))
-            head = self._head()                                 # read after the flush, in the same hold of the lock as the file sizes
-            degraded = self.degraded()                          # and so is the outage state: a writer that recovers after the lock is released appends a gap
-            if not _pin_by_handle():                            # entry and clears the latch, which the snapshotted page and head do not contain
-                # Windows cannot unlink an open file (no delete-sharing for ordinary handles), so a pinned handle would make retention fail inside an append,
-                # and copying every retained file into memory could exhaust it. There the page is read lazily WHILE the lock is held: nothing is pinned,
-                # nothing is copied, nothing can be deleted from under the page (retention runs inside an append, which needs this lock). It stalls writers
-                # for the length of the read, which was the behaviour before the snapshot; the servers run on Linux, where the lock is released first.
-                page = self._query_unlocked(tool=tool, client=client, since=since, limit=limit, before_seq=before_seq)
-                return {**page, "head": head, "degraded": degraded}
-            snapshot = self._snapshot()
+        slots = None
+        if _pin_by_handle():
+            # taken BEFORE the log's lock, so waiting for a slot never holds up a writer. A bounded number of reads at once keeps the descriptors they pin bounded
+            # process-wide; past that, the caller is told to retry (503) instead of the process running out of descriptors the log itself needs.
+            slots = _snapshot_slots()
+            if not slots.acquire(timeout=snapshot_wait_seconds()):
+                raise CallLogError("too many call-log reads are in progress")
+        snapshot = None
         try:
+            with self._locked():
+                with contextlib.suppress(CallLogError, OSError):  # open denied/read summaries are written first, like flush(); a failure here changes nothing
+                    self._flush_reads_locked(self._flush_suppressed_locked(self._head()))
+                head = self._head()                             # read after the flush, in the same hold of the lock as the file sizes
+                degraded = self.degraded()                      # and so is the outage state: a writer that recovers after the lock is released appends a gap
+                if not _pin_by_handle():                        # entry and clears the latch, which the snapshotted page and head do not contain
+                    # Windows cannot unlink an open file (no delete-sharing for ordinary handles), so a pinned handle would make retention fail inside an append,
+                    # and copying every retained file into memory could exhaust it. There the page is read lazily WHILE the lock is held: nothing is pinned,
+                    # nothing is copied, nothing can be deleted from under the page (retention runs inside an append, which needs this lock). It stalls writers
+                    # for the length of the read, which was the behaviour before the snapshot; the servers run on Linux, where the lock is released first.
+                    page = self._query_unlocked(tool=tool, client=client, since=since, limit=limit, before_seq=before_seq)
+                    return {**page, "head": head, "degraded": degraded}
+                snapshot = self._snapshot()
             page = self._query_unlocked(tool=tool, client=client, since=since, limit=limit, before_seq=before_seq, snapshot=snapshot)
+            return {**page, "head": head, "degraded": degraded}
         finally:
-            snapshot.close()
-        return {**page, "head": head, "degraded": degraded}
+            if snapshot is not None:
+                snapshot.close()
+            if slots is not None:
+                slots.release()
 
     def _query_unlocked(self, *, tool: str | None, client: str | None, since: str | None, limit: int, before_seq: int | None,
                         snapshot: "Snapshot | None" = None) -> dict[str, Any]:
