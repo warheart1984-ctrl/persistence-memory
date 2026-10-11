@@ -79,7 +79,7 @@ pool is shed with an immediate 503 rather than queued behind a slow database.
 * `GET /ready` - **readiness**: 200 only if all of these hold, checked live on every call (never cached);
   otherwise 503 with `Retry-After` and the failing check names (no details):
   `database` (`SELECT 1` as the application role), `schema_version` (matches the code exactly), `role`
-  (not superuser, no `BYPASSRLS`), `history_write_denied` (the role is *proven* unable to write
+  (not superuser, no `BYPASSRLS`), `rls_tables` (every table of the schema with a `tenant_key` column has row-level security enabled, **forced**, and at least one policy; the role check proves the app role cannot bypass RLS, this proves there is RLS to be subject to, so a migration that adds a tenant table without it, or drops its FORCE, makes `/ready` 503; the offending tables are named in the log only), `history_write_denied` (the role is *proven* unable to write
   `record_history`, `chain_heads` or `history_counters`: the catalog shows no write privilege and attempted
   INSERT/UPDATE/DELETE are refused, inside rolled-back savepoints; `TRUNCATE` is checked in the catalog
   only because attempting it would take an exclusive lock) and `legacy_data` (no un-imported legacy

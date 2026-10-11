@@ -68,7 +68,7 @@ def pg(pg_schema, monkeypatch):
     pg_store.close_pools()
 
 
-_ALL_OK = {"database": "ok", "schema_version": "ok", "role": "ok", "history_write_denied": "ok", "legacy_data": "ok"}
+_ALL_OK = {"database": "ok", "schema_version": "ok", "role": "ok", "rls_tables": "ok", "history_write_denied": "ok", "legacy_data": "ok"}
 
 
 @pg_only
@@ -170,6 +170,58 @@ def test_not_ready_when_the_role_could_write_the_history(pg, client, grant):
         conn.execute("REVOKE ALL ON record_history, chain_heads, history_counters FROM jarvis_app_test")
         conn.execute("GRANT SELECT ON record_history, chain_heads, history_counters TO jarvis_app_test")
     assert client.get("/ready").status_code == 200
+
+
+@pg_only
+@pytest.mark.parametrize(
+    "weaken",
+    [
+        "ALTER TABLE memories NO FORCE ROW LEVEL SECURITY",                      # the owner (and so a role that becomes the owner) is exempt again
+        "ALTER TABLE memories DISABLE ROW LEVEL SECURITY",                       # no row-level security at all on a tenant table
+        "ALTER TABLE record_history NO FORCE ROW LEVEL SECURITY",
+        "DROP POLICY IF EXISTS tenant_isolation ON boards",                      # RLS is on, but there is no policy: nothing is isolated by it
+    ],
+)
+def test_not_ready_when_a_tenant_table_loses_forced_row_level_security(pg, client, weaken):
+    """The role check proves the app role cannot bypass RLS; this proves there is RLS, forced, with a policy, on every table that holds a tenant's rows."""
+    assert client.get("/ready").status_code == 200
+    with pg.admin_conn() as conn:
+        policies = [r[0] for r in conn.execute("SELECT polname FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid WHERE c.relname = 'boards'").fetchall()]
+        if weaken.startswith("DROP POLICY"):
+            weaken = f"DROP POLICY IF EXISTS {policies[0]} ON boards"
+        conn.execute(weaken)
+    r = _not_ready(client, rls_tables="failed")
+    assert "memories" not in r.text and "record_history" not in r.text and "boards" not in r.text      # the offenders are named in the log, never in the response
+
+
+@pg_only
+def test_not_ready_when_a_new_tenant_table_is_added_without_row_level_security(pg, client):
+    """A migration that adds a table with a tenant_key and forgets RLS is the drift this check exists for."""
+    assert client.get("/ready").status_code == 200
+    with pg.admin_conn() as conn:
+        conn.execute("CREATE TABLE forgotten (tenant_key text NOT NULL, id text NOT NULL, note text)")
+    _not_ready(client, rls_tables="failed")
+    with pg.admin_conn() as conn:                                                # fixed live, never cached
+        conn.execute("ALTER TABLE forgotten ENABLE ROW LEVEL SECURITY")
+        conn.execute("ALTER TABLE forgotten FORCE ROW LEVEL SECURITY")
+        conn.execute("CREATE POLICY isolate ON forgotten USING (tenant_key = current_setting('jarvis.tenant_key', true))")
+    assert client.get("/ready").status_code == 200
+
+
+@pg_only
+def test_the_offending_tables_are_named_by_the_helper_and_the_real_schema_has_none(pg):
+    with pg.admin_conn() as conn:
+        conn.row_factory = __import__("psycopg").rows.dict_row
+        assert pg_store.tenant_tables_without_forced_rls(conn, pg.schema) == []
+        conn.execute("ALTER TABLE boards NO FORCE ROW LEVEL SECURITY")
+        assert pg_store.tenant_tables_without_forced_rls(conn, pg.schema) == ["boards"]
+
+
+@pg_only
+def test_a_schema_with_no_tenant_tables_is_not_ready(pg):
+    with pg.admin_conn() as conn:
+        conn.row_factory = __import__("psycopg").rows.dict_row
+        assert pg_store.tenant_tables_without_forced_rls(conn, "no_such_schema_here") == ["(no tenant table found in the schema)"]
 
 
 @pg_only

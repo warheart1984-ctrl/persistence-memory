@@ -204,7 +204,7 @@ class PostgresRowStore:
         Uses the same bounded pool checkout as requests.  Each check runs in its own savepoint so one
         failure cannot hide the others; details go to the log, never into the result.
         """
-        names = ("database", "schema_version", "role", "history_write_denied", "legacy_data")
+        names = ("database", "schema_version", "role", "rls_tables", "history_write_denied", "legacy_data")
         checks = {name: "failed" for name in names}
         try:
             pool, _ = _pool_for(self._dsn, self._schema)
@@ -223,6 +223,7 @@ class PostgresRowStore:
                 run("database", lambda: conn.execute("SELECT 1").fetchone() is not None)
                 run("schema_version", lambda: check_schema_version(conn))
                 run("role", lambda: _require_rls_enforced(conn))
+                run("rls_tables", lambda: _require_tenant_tables_forced(conn, self._schema))
                 run("history_write_denied", lambda: _history_is_unwritable(conn))
                 run("legacy_data", lambda: _refuse_if_legacy_data_unimported(conn, self._tenant_key))
                 conn.rollback()  # nothing above may leave anything behind
@@ -1065,6 +1066,37 @@ def _require_rls_enforced(conn: psycopg.Connection) -> None:
             "Connect as an ordinary role (JARVIS_DATABASE_URL); use JARVIS_DATABASE_MIGRATE_URL for DDL."
         )
         raise StoreUnavailableError("Ledger database role must not bypass row-level security")
+
+
+def tenant_tables_without_forced_rls(conn: psycopg.Connection, schema: str | None) -> list[str]:
+    """Every table of the ledger schema that has a ``tenant_key`` column but not (row-level security enabled AND forced AND at least one policy).
+
+    The role check above proves the app role cannot bypass row-level security; this proves there is row-level security to be subject to, on every
+    table that holds a tenant's rows. A table added in a migration without it (or one whose FORCE was dropped, so that its owner is exempt) is exactly
+    the kind of drift that turns "the database isolates tenants" into "the application's WHERE clauses isolate tenants". An empty schema is a failure too."""
+    rows = conn.execute(
+        """
+        SELECT c.relname AS name, c.relrowsecurity AS enabled, c.relforcerowsecurity AS forced,
+               (SELECT count(*) FROM pg_policy p WHERE p.polrelid = c.oid) AS policies
+          FROM pg_class c
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+          JOIN pg_attribute a ON a.attrelid = c.oid AND a.attname = 'tenant_key' AND NOT a.attisdropped AND a.attnum > 0
+         WHERE n.nspname = COALESCE(%s, current_schema()) AND c.relkind IN ('r', 'p')
+         ORDER BY c.relname
+        """,
+        (schema,),
+    ).fetchall()
+    if not rows:
+        return ["(no tenant table found in the schema)"]
+    return [r["name"] for r in rows if not (r["enabled"] and r["forced"] and r["policies"] > 0)]
+
+
+def _require_tenant_tables_forced(conn: psycopg.Connection, schema: str | None) -> None:
+    """Fail closed (503) unless every tenant table has forced row-level security with a policy; the offenders are named in the log, never in the response."""
+    bad = tenant_tables_without_forced_rls(conn, schema)
+    if bad:
+        _log.error("tables with a tenant_key column that do not have row-level security enabled, forced and a policy: %s; refusing to serve", ", ".join(bad))
+        raise StoreUnavailableError("Every tenant table must have forced row-level security")
 
 
 def _refuse_if_legacy_data_unimported(conn: psycopg.Connection, tenant: str) -> None:
