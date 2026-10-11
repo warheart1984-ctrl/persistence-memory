@@ -871,14 +871,38 @@ def test_read_summaries_keep_their_tenant_and_transport_and_each_tenant_has_its_
 def test_reads_of_different_records_or_artifacts_have_different_witness_hashes(jclient):
     a, b = add(jclient, "first record"), add(jclient, "second record")
     before = len(entries())
-    for path in (f"/api/jarvis/memory/{a['id']}", f"/api/jarvis/memory/{b['id']}", "/api/jarvis/memory/amul/artifacts/art-0a1b2c-r1", "/api/jarvis/memory/amul/artifacts/art-3d4e5f-r1",
+    for path in (f"/api/jarvis/memory/{a['id']}", f"/api/jarvis/memory/{b['id']}", "/api/jarvis/memory/amul/artifacts/art-0a1b2c3d4e5f-r1", "/api/jarvis/memory/amul/artifacts/art-3d4e5f6a7b8c-r12",
                  "/api/jarvis/memory/bearer-secret-123", "/api/jarvis/memory/bearer-secret-456"):
         jclient.get(path, headers=HDR)
     got = entries()[before:]
     assert len({e["args_sha256"] for e in got}) == 6                                                   # every path argument is in the fingerprint
-    assert [e["target"] for e in got] == [a["id"], b["id"], "art-0a1b2c-r1", "art-3d4e5f-r1", None, None]  # artifact ids are recognised as ids; typed text is not
+    assert [e["target"] for e in got] == [a["id"], b["id"], "art-0a1b2c3d4e5f-r1", "art-3d4e5f6a7b8c-r12", None, None]  # artifact ids are recognised as ids; typed text is not
     assert "bearer-secret" not in json.dumps(got)
     assert got[0]["args_sha256"] == call_log.args_hash({"args": {}, "path": [a["id"]]})                 # hashed, never stored
+
+
+def test_only_the_generated_artifact_id_grammar_is_recorded_as_a_target(jclient):
+    before = len(entries())
+    for path in ("/api/jarvis/memory/amul/artifacts/art-0a1b2c3d4e5f-r1", "/api/jarvis/memory/amul/artifacts/art-deadbeef-bearersecret",
+                 "/api/jarvis/memory/amul/artifacts/art-0a1b2c3d4e5f-bearersecret", "/api/jarvis/memory/amul/artifacts/art-0a1b2c3d4e5fabcdef-r1"):
+        jclient.get(path, headers=HDR)
+    got = entries()[before:]
+    assert [e["target"] for e in got] == ["art-0a1b2c3d4e5f-r1", None, None, None]
+    assert "bearersecret" not in json.dumps(got) and "abcdef-r1" not in json.dumps(got)
+
+
+def test_failed_reads_are_never_swallowed_by_the_read_cap(fixed_minute, jclient, monkeypatch):
+    """After the cap, successful reads are summarised, but a failed one (404) keeps its route, status and error code."""
+    monkeypatch.setenv("JARVIS_CALL_LOG_READ_CAP_PER_MIN", "2")
+    for _ in range(5):
+        jclient.get("/api/jarvis/memory", headers=HDR)
+    r = jclient.get("/api/jarvis/memory/mem-000000000000", headers=HDR)
+    assert r.status_code == 404
+    jclient.get("/api/jarvis/tools/calls?limit=1", headers=HDR)                        # closes the open summary
+    got = entries()
+    failed = [e for e in got if e["outcome"] == "error"]
+    assert len(failed) == 1 and failed[0]["status_code"] == 404 and failed[0]["route"] == "/api/jarvis/memory/{id}" and failed[0]["error_code"]
+    assert [e["count"] for e in got if e["outcome"] == "read_suppressed"] == [3]
 
 
 def test_a_route_with_no_path_parameter_hashes_exactly_as_before(jclient):

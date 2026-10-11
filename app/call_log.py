@@ -434,7 +434,8 @@ class CallLog:
                         return {"suppressed": True}
                 else:
                     head = self._flush_suppressed_locked(head)
-                    if fields.get("method") == "GET" and fields.get("transport") != "http-tool":  # a memory read: capped, never silently dropped
+                    if fields.get("method") == "GET" and fields.get("transport") != "http-tool" and fields.get("outcome") == "ok":
+                        # a successful memory read: capped, never silently dropped. A failed read (404, 500) is evidence of something wrong and is never summarised.
                         window = self._clock().strftime("%Y-%m-%dT%H:%M")
                         if self._read_window[0] != window:
                             head = self._flush_reads_locked(head)

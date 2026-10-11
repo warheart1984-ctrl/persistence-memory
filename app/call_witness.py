@@ -37,7 +37,7 @@ _ID_SEGMENTS = (
     (re.compile(r"^mem-[0-9a-f]+$"), "{id}"),
     (re.compile(r"^eo:sha256:[0-9a-f]+$"), "{eo}"),
     (re.compile(r"^[0-9]+$"), "{n}"),
-    (re.compile(r"^art-[0-9a-f]+-[A-Za-z0-9]+$"), "{art}"),
+    (re.compile(r"^art-[0-9a-f]{12}-[A-Za-z][0-9]{1,9}$"), "{art}"),  # exactly what app/amul.py generates: art-<12 hex>-<resolution letter><seq>
 )
 _CODE_SAFE = re.compile(r"[^A-Za-z0-9_:.\-]")
 # The route templates under /api/jarvis/memory, per method (relative; "{id}" is any one segment). A path is templated by matching it position by

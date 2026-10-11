@@ -17,7 +17,7 @@ from the store, so logging can never change the ledger's state root, history or 
 
 Denied (`401`/`403`) and failed calls are logged too, including requests the API-key check rejects before the route runs.
 
-Reads are high volume (the sessionStart hook, `ping_memoryboard.py`, soak runs), so they are **capped, never dropped silently**: up to
+Only successful reads are ever summarised: a failed read (404, 500) is always written on its own, with its route, status and error code. Reads are high volume (the sessionStart hook, `ping_memoryboard.py`, soak runs), so they are **capped, never dropped silently**: up to
 `JARVIS_CALL_LOG_READ_CAP_PER_MIN` (default 600, per process per minute **per tenant**) are written one by one; the rest of that minute is rolled into one
 `read_suppressed` entry **per tenant and transport** (`tool: "(read calls)"`, `count`, `window_start`, `window_end`). A write (or the next read in a new minute) closes the
 open summary; other calls, such as a read-only tool, do not, so mixed traffic cannot write one summary per read. The order of the log shows how many reads came before a write. `JARVIS_CALL_LOG_READS=0` turns read witnessing off (writes and
