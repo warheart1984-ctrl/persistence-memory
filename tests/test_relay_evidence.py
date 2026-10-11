@@ -370,14 +370,13 @@ def test_the_script_identifies_itself_to_the_servers_call_log(rel):
     assert seen["X-Jarvis-MCP-Client"] == "relay-evidence/1" and seen["X-API-Key"] == KEY
 
 
-<<<<<<< HEAD
 def test_the_report_says_whether_the_witnessed_call_used_no_arguments(rel):
     with_args = call_entry(2, "devin-x", args_sha256=hashlib.sha256(b'{"limit":3}').hexdigest())
     raw = {"calls_emr_latest": {"http_status": 200, "body": {"entries": [call_entry(3, "cursor-x"), with_args]}},
            "calls_verify": {"http_status": 200, "body": {"ok": True, "head": {"seq": 3, "entry_hash": "h" * 64}, "files": ["f"], "entries": 3, "problems": []}}}
     by = {a["agent"]: a for a in rel.call_log_section(raw, [{"agent": "Cursor"}, {"agent": "Devin"}])["per_agent"]}
     assert by["Cursor"]["latest"]["no_arguments"] is True and by["Devin"]["latest"]["no_arguments"] is False
-=======
+
 def test_a_failed_unfiltered_read_is_never_reported_as_complete(rel):
     entries = [call_entry(2, "opencode-x"), call_entry(1, "cursor-x")]
     raw = {"calls_emr_latest": {"http_status": 200, "body": {"entries": entries, "pages": 1, "truncated": False}},
@@ -405,4 +404,3 @@ def test_a_failure_on_a_later_page_keeps_what_was_read_and_says_it_is_partial(re
     section = rel.call_log_section(raw, [{"agent": "Oldest"}])
     assert section["coverage"].startswith("PARTIAL: only the newest 400") and "page 3 failed with HTTP 500" in section["coverage"]
     assert "oldest-client" not in {r["client_name"] for r in section["clients_seen"]}
->>>>>>> origin/fix/relay-call-log-pagination
