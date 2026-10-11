@@ -38,6 +38,7 @@ Every method+path the app serves is listed in `REGISTRY` with one class:
 Written as `xfail(strict=True)`, so the day one is fixed the test flips and has to be promoted to a plain test:
 
 * the inference backend's address is shown to any tenant (`GET /api/jarvis/llm/status`);
+* `llm/status` also shows the server's filesystem path of the replay log (`replay_log.path`);
 * any tenant can spend the shared inference backend (`POST /api/jarvis/llm/generate`);
 * the AMUL field status shows the server's filesystem path.
 * **a real leak:** EMR reinforcement state is a process-global map keyed by memory id only, saved to one shared sidecar, and `GET /api/jarvis/memory/emr/status` reports every tenant's entries (memory ids, outcome ids) to any tenant. `emr-status` is excluded from the generic comparison (`KNOWN_LEAKS`) and pinned by its own strict xfail; the fix is a tenant-keyed overlay (its own PR). Not exploitable on the shared-key deployment, where there is one tenant, and a blocker for outside tenants;

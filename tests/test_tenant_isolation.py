@@ -521,6 +521,9 @@ def test_bob_s_writes_that_are_not_addressed_by_id_change_nothing_of_alices(clie
     failures = []
     for case, (method, path, body) in sorted(MUTATION_CASES.items()):
         r = client.request(method, path, headers=h("bob"), json=body)
+        fresh = client.request(method, path, headers=h(f"carol-{case}"), json=body)          # a tenant that has never written: the same request must look the same to bob
+        if (r.status_code, _body(r, case)) != (fresh.status_code, _body(fresh, case)):
+            failures.append(f"{case}: bob's response differs from a brand-new tenant's (he is shown something of alice's, such as her artifact counts):\n   bob   {r.status_code} {str(_body(r, case))[:200]}\n   fresh {fresh.status_code} {str(_body(fresh, case))[:200]}")
         if r.status_code >= 500 or r.status_code == 422:
             failures.append(f"{case}: {r.status_code} {r.text[:120]} (a mutation case must get past validation)")
         try:
@@ -600,10 +603,23 @@ def test_the_rag_index_refuses_every_tenant_until_its_access_control_is_configur
         assert_nothing_of_alices(r, world)
 
 
+BACKEND_ADDRESS = "http://inference.internal.example:13305/api/v1"
+
+
 @pytest.mark.xfail(strict=True, reason="GAP: the inference backend's address is shown to any tenant (phase 0 should make llm/status operator-only or neutral)")
-def test_a_tenant_does_not_see_the_inference_backend_address(client):
+def test_a_tenant_does_not_see_the_inference_backend_address(client, monkeypatch):
+    from app import amul_llm
+
+    monkeypatch.setattr(amul_llm, "LLM_URL", BACKEND_ADDRESS)           # a real, recognisable address (the suite normally blanks it)
     r = client.get("/api/jarvis/llm/status", headers=h("bob"))
-    assert r.status_code in (403, 404) or "url" not in json.dumps(r.json()).lower()
+    assert r.status_code in (403, 404) or "inference.internal" not in r.text, "bob can read where the inference backend lives"
+
+
+@pytest.mark.xfail(strict=True, reason="GAP: llm/status shows the server's filesystem path of the replay log (replay_log.path) to any tenant")
+def test_a_tenant_is_not_told_the_llm_replay_log_path(client):
+    r = client.get("/api/jarvis/llm/status", headers=h("bob"))
+    leaked = [v for v in _values_of(r.json() if r.status_code == 200 else {}, "path") if isinstance(v, str) and v]
+    assert not leaked, f"llm/status shows server paths: {leaked}"
 
 
 @pytest.mark.xfail(strict=True, reason="GAP: any tenant can spend the shared inference backend (no per-tenant quota or operator gate yet)")
