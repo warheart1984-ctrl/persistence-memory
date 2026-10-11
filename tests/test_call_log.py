@@ -1028,6 +1028,40 @@ def test_a_body_over_the_limit_is_not_refused_it_streams_through_to_the_app_and_
     assert e["outcome"] == "ok" and e["args_sha256"] == call_log.args_hash({"_streamed_body_sha256": hashlib.sha256(whole).hexdigest(), "_streamed_body_bytes": len(whole)})
 
 
+def test_one_giant_final_message_is_streamed_not_retained_either(jclient, monkeypatch):
+    """A server may deliver the whole body in one last http.request: it is over the bound, so it takes the streaming path (hashed, not retained)."""
+    import hashlib
+    monkeypatch.setenv("JARVIS_CALL_LOG_MAX_BODY_BYTES", "2048")
+    giant = b"g" * (3 * 1024 * 1024)
+    info = {}
+    status, receives, _ = _drive([], "POST", "/api/jarvis/memory", [giant], info=info)
+    assert status == 200 and info["app_saw"] == giant and receives == 1
+    (e,) = entries()
+    assert e["args_sha256"] == call_log.args_hash({"_streamed_body_sha256": hashlib.sha256(giant).hexdigest(), "_streamed_body_bytes": len(giant)})
+
+
+def test_a_failure_while_a_big_response_is_still_streaming_is_recorded(jclient):
+    import asyncio
+    from app.call_witness import CallWitnessMiddleware
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(m):
+        pass
+
+    async def breaks_midway(scope, rcv, snd):
+        await snd({"type": "http.response.start", "status": 200, "headers": []})
+        await snd({"type": "http.response.body", "body": b"y" * (3 * 1024 * 1024), "more_body": True})   # past the buffer: witnessed now, as 200 ok
+        raise RuntimeError("the database went away")
+
+    scope = {"type": "http", "method": "GET", "path": "/api/jarvis/memory", "query_string": b"", "headers": []}
+    with pytest.raises(RuntimeError):
+        asyncio.run(CallWitnessMiddleware(breaks_midway)(scope, receive, send))
+    got = entries()
+    assert [(e["outcome"], e["error_code"]) for e in got] == [("ok", None), ("error", "STREAMING_FAILED")]
+
+
 def test_the_streamed_hash_covers_only_what_the_app_read(jclient, monkeypatch):
     """An app that answers without reading the rest (an early auth failure, say) leaves a hash of what it did read."""
     import hashlib

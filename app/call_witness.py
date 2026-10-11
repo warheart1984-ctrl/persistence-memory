@@ -228,23 +228,22 @@ class CallWitnessMiddleware:
             # smaller limit than the API's own on routes such as bulk document import): what has been read is replayed, the rest streams through to
             # the app untouched while it is hashed on the way, so this process never holds more than the bound.
             limit = max_body_bytes()
-            chunks: list[bytes] = []
+            messages: list[dict[str, Any]] = []
             received = 0
             complete = False
             while True:
                 message = await receive()
                 if message["type"] != "http.request":  # disconnect before the body arrived: nothing to serve
                     return
-                chunk = message.get("body", b"")
-                chunks.append(chunk)
-                received += len(chunk)
+                messages.append(message)
+                received += len(message.get("body", b""))
                 if not message.get("more_body"):
                     complete = True
                     break
                 if received > limit:
                     break
-            if complete:
-                body_bytes = b"".join(chunks)
+            if complete and received <= limit:  # (checked for the final message too: one giant message must not be retained either)
+                body_bytes = b"".join(m.get("body", b"") for m in messages)
                 replayed = False
 
                 async def replay():
@@ -256,13 +255,13 @@ class CallWitnessMiddleware:
             else:
                 body_bytes = None
                 stream = BodyStream()
-                for c in chunks:
-                    stream.add(c)
-                pending = list(chunks)
+                for m in messages:
+                    stream.add(m.get("body", b""))
+                pending = messages  # handed to the app as they were received (more_body flags included), each dropped once delivered
 
                 async def replay():
                     if pending:
-                        return {"type": "http.request", "body": pending.pop(0), "more_body": True}
+                        return pending.pop(0)
                     message = await receive()
                     if message["type"] == "http.request":
                         stream.add(message.get("body", b""))
@@ -346,10 +345,13 @@ class CallWitnessMiddleware:
         try:
             await self.app(scope, replay, capture)
         except Exception:
-            if not logged:  # (an overflow or finished response was already witnessed)
+            if not logged or overflow:
+                # a finished response was already witnessed; but a big one is witnessed when its headers go out, so a failure while the rest streams
+                # is recorded as a second entry (the first already said what the status line claimed)
                 log.record(call_log.make_fields(transport=_transport(plan, headers), tool=plan["tool"], args=witness_args(plan, body_bytes, scope.get("query_string", b""), stream),
                                                 outcome="error", started=started, client_header=headers.get("x-jarvis-mcp-client") or headers.get("user-agent"),
-                                                tenant=scope.get("jarvis_tenant"), error_code="INTERNAL", status_code=500, route=plan["route"], method=method, target=plan["target"]))
+                                                tenant=scope.get("jarvis_tenant"), error_code="STREAMING_FAILED" if logged else "INTERNAL", status_code=500 if not logged else status,
+                                                route=plan["route"], method=method, target=plan["target"]))
             raise
         if held:  # the app ended without a final body chunk
             await finish()
