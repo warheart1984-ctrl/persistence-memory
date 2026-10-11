@@ -430,3 +430,75 @@ def test_with_no_concurrent_writes_the_snapshot_equals_the_head_and_nothing_is_m
            "calls_verify": {"http_status": 200, "body": {"ok": True, "head": {"seq": 30, "entry_hash": "h" * 64}, "files": ["f"], "entries": 30, "problems": []}}}
     section = rel.call_log_section(raw, [])
     assert section["newer_entries_not_included"] == 0 and section["coverage"].startswith("complete: all 30 log entries")
+
+
+# ------------------------------------------------------- one snapshot for coverage and the agent table; the page must hold its head
+
+
+def test_the_agent_table_is_built_from_the_same_unfiltered_snapshot_as_the_coverage(rel):
+    """An agent's call that landed between a filtered and an unfiltered read must not show as 'no call' next to a 'complete' claim."""
+    older_filtered = {"entries": [call_entry(3, "opencode-x")], "pages": 1, "truncated": False}
+    later_all = {"entries": [call_entry(5, "cursor-x"), call_entry(4, "codex-x", transport="mcp-stdio"), call_entry(3, "opencode-x")], "pages": 1, "truncated": False, "head_seq": 5}
+    later_all["entries"][1]["tool"] = "emr_recall"  # a different tool must not count as an emr_latest call
+    raw = {"calls_emr_latest": {"http_status": 200, "body": older_filtered}, "calls_all": {"http_status": 200, "body": later_all},
+           "calls_verify": {"http_status": 200, "body": {"ok": True, "head": {"seq": 5, "entry_hash": "h" * 64}, "files": ["f"], "entries": 5, "problems": []}}}
+    section = rel.call_log_section(raw, [{"agent": "Cursor"}, {"agent": "Codex"}, {"agent": "OpenCode"}])
+    by = {a["agent"]: a["witnessed_emr_latest_calls"] for a in section["per_agent"]}
+    assert by == {"Cursor": 1, "Codex": 0, "OpenCode": 1}  # Cursor's call is only in the unfiltered snapshot; Codex's entry is emr_recall
+    assert section["coverage"].startswith("complete: all 3 log entries") and section["newer_entries_not_included"] == 0
+
+
+def test_the_unfiltered_read_is_the_only_read_unless_it_fails(rel):
+    def run(calls_status):
+        def transport(method, url, headers, body):
+            if "/api/jarvis/tools/calls" in url and "verify" not in url:
+                return calls_status, b'{"entries": [], "next_cursor": null, "head": {"seq": 0, "entry_hash": "h"}}' if calls_status == 200 else b'{"detail": "boom"}'
+            return 200, b"{}"
+        return rel.gather(rel.ReadOnlyClient("http://x", KEY, transport), OLD, NEW, RECEIPT)
+
+    ok = run(200)
+    assert "calls_all" in ok and "calls_emr_latest" not in ok  # one snapshot, nothing to disagree with it
+    failed = run(500)
+    assert failed["calls_all"]["http_status"] == 500 and "calls_emr_latest" in failed  # the narrower read exists only as the fallback
+
+
+def test_a_first_page_that_does_not_contain_its_head_is_re_read(rel, monkeypatch):
+    monkeypatch.setattr(rel.time, "sleep", lambda s: None)
+    rows, base = paged_log(10)
+    state = {"n": 0}
+
+    def transport(method, url, headers, body):
+        state["n"] += 1
+        status, raw = base(method, url, headers, body)
+        data = json.loads(raw)
+        if state["n"] == 1:
+            data["head"] = {"seq": 12, "entry_hash": "h" * 64}  # an entry landed between building the page and reading the head
+        else:
+            rows.insert(0, {**call_entry(1, "late"), "seq": 11})
+            rows.insert(0, {**call_entry(1, "late"), "seq": 12})
+            status, raw = base(method, url, headers, body)
+            data = json.loads(raw)
+        return status, json.dumps(data).encode()
+
+    client = rel.ReadOnlyClient("http://x", KEY, transport)
+    status, body = rel.fetch_all_calls(client)
+    assert body["head_mismatch"] is False and body["head_seq"] == 12 and body["entries"][0]["seq"] == 12 and len(client.calls) == 2
+
+
+def test_a_persistent_mismatch_snapshots_what_was_read_and_counts_the_rest_as_newer(rel, monkeypatch):
+    monkeypatch.setattr(rel.time, "sleep", lambda s: None)
+    rows, base = paged_log(10)
+
+    def transport(method, url, headers, body):
+        status, raw = base(method, url, headers, body)
+        data = json.loads(raw)
+        data["head"] = {"seq": 12, "entry_hash": "h" * 64}  # always ahead of the page it comes with
+        return status, json.dumps(data).encode()
+
+    status, body = rel.fetch_all_calls(rel.ReadOnlyClient("http://x", KEY, transport))
+    assert body["head_mismatch"] is True and body["entries"][0]["seq"] == 10
+    raw = {"calls_all": {"http_status": 200, "body": body},
+           "calls_verify": {"http_status": 200, "body": {"ok": True, "head": {"seq": 12, "entry_hash": "h" * 64}, "files": ["f"], "entries": 12, "problems": []}}}
+    section = rel.call_log_section(raw, [])
+    assert section["snapshot_head_seq"] == 10 and section["newer_entries_not_included"] == 2
+    assert section["coverage"].startswith("through seq 10: all 10 log entries") and "2 newer entries were written" in section["coverage"]
