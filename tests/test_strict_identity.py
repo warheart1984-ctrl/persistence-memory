@@ -188,6 +188,27 @@ def test_strict_mode_serves_the_operator_and_refuses_everyone_else_over_http(key
         assert c.get("/api/jarvis/memory", headers=headers).status_code == 401
 
 
+def test_the_public_routes_still_answer_in_strict_mode_with_no_credential(keyed, tmp_path):
+    """/ready builds a store to check the database; strict mode refuses a store to an unidentified request, but readiness is infrastructure and must keep
+    working, or the container would look unhealthy forever (found by the throwaway drill)."""
+    keyed.setenv("JARVIS_MULTI_TENANT", "1")
+    keyed.setenv("JARVIS_STORE_BOOTSTRAP", "1")
+    keyed.setenv("JARVIS_STORE_PATH", str(tmp_path / "s.json"))
+    c = TestClient(app)
+    for path in ("/ready", "/health", "/", "/privacy", "/terms", "/api/jarvis/tools", "/.well-known/oauth-protected-resource"):
+        r = c.get(path)
+        assert r.status_code == 200, f"{path}: {r.status_code} {r.text[:120]}"     # (the tool catalog is public in key mode; it needs a token only under OAuth)
+
+
+def test_system_scope_is_the_operator_only_inside_the_block():
+    assert not is_operator()
+    from app.identity import system_scope
+
+    with system_scope():
+        assert is_operator() and request_tenant() == OPERATOR_TENANT
+    assert not is_operator()
+
+
 # ----------------------------------------------------------------------------------------------------- the startup guard
 @pytest.mark.parametrize(
     "env,fragment",

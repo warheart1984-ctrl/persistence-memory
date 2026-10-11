@@ -6,6 +6,7 @@ user's records.  The authenticated OAuth subject is the sole tenant selector.
 
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import hashlib
 import os
@@ -49,6 +50,17 @@ def reset_principal(token) -> None:
 
 def current_principal() -> Principal | None:
     return _principal.get()
+
+
+@contextlib.contextmanager
+def system_scope():
+    """Run infrastructure code (the readiness check) as the operator namespace, explicitly. It concerns the database and its roles, not any tenant, and it must
+    keep working in strict mode, where a request with no identity is refused a store."""
+    token = _principal.set(operator_principal())
+    try:
+        yield
+    finally:
+        _principal.reset(token)
 
 
 def is_operator() -> bool:

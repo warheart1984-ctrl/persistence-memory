@@ -102,7 +102,7 @@ from app.auth import (
     validate_nx_path,
     nx_allowed_roots,
 )
-from app.identity import current_tenant_key, request_tenant
+from app.identity import current_tenant_key, request_tenant, system_scope
 from app import call_log, drift
 from app.call_witness import CallWitnessMiddleware
 from app.oauth import protected_resource_metadata
@@ -351,7 +351,8 @@ def ready():
     no legacy blob ledger is waiting to be imported.  Failing checks are named; details stay in the log.
     """
     try:
-        checks = get_store().readiness()
+        with system_scope():  # readiness is about the database and its roles, not a tenant: keep it working when a request with no identity is refused a store
+            checks = get_store().readiness()
     except StoreUnavailableError as exc:
         logging.getLogger("jarvis.store").error("not ready: %s", exc)
         checks = {"store": "failed"}
