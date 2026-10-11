@@ -110,11 +110,15 @@ def main(argv: list[str]) -> int:
         print(f"call log chain problem: {p}", file=sys.stderr)
     head = max(entries) if entries else 0
     cutoff = timedelta(days=retain_days() + RETENTION_MARGIN_DAYS)
+    matched = 0                                  # anchors found in the log with the same hash: the only trusted comparisons
+    waived: list[str] = []
     for source, seq, h, age in anchored(argv[3:]):
         if seq in entries:
             if entries[seq] != h:
                 print(f"{source}: call log entry {seq} is not the one anchored (rebuilt or edited)", file=sys.stderr)
                 bad = 1
+            else:
+                matched += 1
         elif anchor and seq <= int(anchor["seq"]) and age is not None and age > cutoff:
             # Retention deletes whole files older than the window, so an anchor taken longer ago than that may legitimately be gone.
             # anchor.json sits in the directory an attacker can write, so it never excuses an anchor from INSIDE the window: a forged
@@ -122,12 +126,19 @@ def main(argv: list[str]) -> int:
             if seq == int(anchor["seq"]) and str(anchor["entry_hash"]) != h:
                 print(f"{source}: the retention anchor at seq {seq} differs from the one anchored", file=sys.stderr)
                 bad = 1
+            else:
+                waived.append(source)
         elif seq > head:
             print(f"{source}: anchored head {seq} is beyond this log's head {head} (the log was truncated or is older)", file=sys.stderr)
             bad = 1
         else:
             print(f"{source}: call log entry {seq} is missing (the log was rebuilt or lines removed)", file=sys.stderr)
             bad = 1
+    if waived and not matched:
+        # every anchor handed in was old enough to be excused, so nothing trusted was compared at all (backups were interrupted for
+        # longer than the retention window): a forged retention anchor could be hiding a rebuilt log, so do not excuse them
+        print(f"{waived[0]}: no anchor inside the retention window could be compared with the log, so the old anchors cannot be excused", file=sys.stderr)
+        bad = 1
     return 1 if bad else (3 if problems else 0)
 
 

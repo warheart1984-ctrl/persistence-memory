@@ -189,7 +189,8 @@ def retained_log(tmp_path: Path, monkeypatch) -> tuple[Path, str]:
 def test_an_anchor_older_than_the_retention_window_is_not_a_false_alarm(tmp_path, monkeypatch):
     d, first = retained_log(tmp_path, monkeypatch)
     old = set_named(tmp_path, 30, first)                              # taken long before the (2 day) window: its entry was pruned on purpose
-    assert run("head", d).returncode == 0 and run("check", d, old).returncode == 0
+    recent = set_named(tmp_path, 0.01, head_line(d))                  # and a recent one that really is in the log
+    assert run("head", d).returncode == 0 and run("check", d, old, recent).returncode == 0
 
 
 def test_a_recent_anchor_is_never_excused_by_the_retention_anchor(tmp_path, monkeypatch):
@@ -214,6 +215,33 @@ def test_a_recent_anchor_is_never_excused_by_the_retention_anchor(tmp_path, monk
     assert run("head", d).returncode == 0                               # the forged log verifies on its own
     r = run("check", d, genuine)
     assert r.returncode == 1 and "missing" in r.stderr
+
+
+def test_old_anchors_are_not_excused_when_no_recent_anchor_could_be_compared(tmp_path, monkeypatch):
+    """Backups interrupted for longer than the window: every external anchor is old, so a forged anchor.json must not excuse them all."""
+    d = tmp_path / "log"
+    make_log(d, 6)
+    only_old = set_named(tmp_path, 200, head_line(d))
+    rebuild(d, 9, salt="qq")
+    first = next(iter(sorted(d.glob("calls-*.jsonl"))))
+    entries = [json.loads(x) for x in first.read_text().splitlines()]
+    (d / "anchor.json").write_text(json.dumps({"seq": 500, "entry_hash": "f" * 64}))
+    prev, out = "f" * 64, []
+    for i, e in enumerate(entries):
+        e = {**e, "seq": 501 + i, "prev_hash": prev}
+        e["entry_hash"] = call_log.entry_hash_of(e)
+        prev = e["entry_hash"]
+        out.append(json.dumps(e, sort_keys=True, separators=(",", ":")))
+    first.write_text("\n".join(out) + "\n")
+    r = run("check", d, only_old)
+    assert r.returncode == 1 and "cannot be excused" in r.stderr
+
+
+def test_old_anchors_are_excused_alongside_one_that_matched(tmp_path, monkeypatch):
+    d, first = retained_log(tmp_path, monkeypatch)
+    old = set_named(tmp_path, 30, first)
+    recent = set_named(tmp_path, 0.01, head_line(d))
+    assert run("check", d, old, recent).returncode == 0
 
 
 def test_a_forged_retention_anchor_does_not_excuse_old_anchors_with_the_wrong_hash(tmp_path, monkeypatch):
