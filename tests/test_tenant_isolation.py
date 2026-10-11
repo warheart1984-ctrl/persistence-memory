@@ -235,11 +235,10 @@ def world(client):
     second = mk(client, "alice", f"alice private note {MARK} beta {SEARCH}", supersedes=first["id"])
     third = mk(client, "alice", f"alice private note {MARK} gamma {SEARCH}")
     anchored = client.post("/api/jarvis/memory/amul/anchor", headers=h("alice"), json={"memory_id": first["id"]})
-    artifact = None
-    if anchored.status_code == 200:
-        body = anchored.json()
-        artifact = next(iter(body.get("artifacts") or body.get("anchored") or []), None)
-        artifact = artifact.get("artifact_id") if isinstance(artifact, dict) else artifact
+    assert anchored.status_code == 200, anchored.text
+    created = anchored.json().get("created") or []                 # AnchorReport: the new artifact ids
+    assert created, f"anchoring produced no artifact: {anchored.text}"
+    artifact = created[0]
     client.post("/api/jarvis/memory/emr/excite", headers=h("alice"), json={"query": SEARCH, "session_key": "default", "theta_promote": 0.0})
     client.post("/api/jarvis/memory/board", headers=h("alice"), json={"summary": f"alice board {MARK}"})
     return {"first": first["id"], "second": second["id"], "third": third["id"], "artifact": artifact}
@@ -285,7 +284,7 @@ def _concrete(path: str) -> str:
 
 
 OPERATOR_ROWS = sorted(k for k, (cls, _) in REGISTRY.items() if cls == OPERATOR)
-NON_PUBLIC_ROWS = sorted(k for k, (cls, _) in REGISTRY.items() if cls not in (PUBLIC, MCP))
+NON_PUBLIC_ROWS = sorted(k for k, (cls, _) in REGISTRY.items() if cls != PUBLIC)
 PUBLIC_ROWS = sorted(k for k, (cls, _) in REGISTRY.items() if cls == PUBLIC)
 
 
@@ -349,7 +348,8 @@ def id_cases(i: str, art: str | None) -> dict[str, tuple[str, str, dict | None]]
         "graph-bfs": ("POST", "/api/jarvis/memory/graph/bfs", {"start_id": i}),
         "graph-path": ("POST", "/api/jarvis/memory/graph/shortest-path", {"source": i, "target": i}),
         "stm-expand": ("POST", "/api/jarvis/memory/stm/expand", {"memory_id": i}),
-        "reinforce": ("POST", "/api/jarvis/memory/emr/reinforce", {"memory_ids": [i]}),
+        "reinforce": ("POST", "/api/jarvis/memory/emr/reinforce", {"memory_ids": [i], "outcome": {"signal": "positive", "source": "user", "outcome_id": "outcome-1"}}),
+        "correct": ("POST", "/api/jarvis/memory/emr/correct", {"memory_ids": [i], "correction": {"source": "operator", "correction_id": "correction-1", "reason": "bob corrects"}}),
         "supersede-api": ("POST", "/api/jarvis/memory", {**BODY, "supersedes": i}),
         "supersede-tool": ("POST", "/api/jarvis/tools/emr_remember", {**BODY, **APPROVED, "supersedes": i}),
         "tool-fetch": ("POST", "/api/jarvis/tools/fetch", {"id": i}),
@@ -364,6 +364,7 @@ def id_cases(i: str, art: str | None) -> dict[str, tuple[str, str, dict | None]]
 
 
 CASE_NAMES = sorted(id_cases(GHOST, None))
+VALIDATES_FIRST: set[str] = set()   # a case allowed to answer 422 (none today): an id case that stops at validation has not reached the lookup it claims to test
 
 
 def _alice_snapshot(client, world):
@@ -379,6 +380,9 @@ def test_alices_id_is_indistinguishable_from_an_id_that_never_existed(client, wo
         theirs = client.request(method, path, headers=h(f"bob-one-{case}"), json=body)
         method, path, body = id_cases(GHOST, GHOST_ARTIFACT)[case]
         nobodys = client.request(method, path, headers=h(f"bob-two-{case}"), json=body)
+        if 422 in (theirs.status_code, nobodys.status_code) and case not in VALIDATES_FIRST:
+            failures.append(f"{case}: the request never got past validation ({theirs.status_code} {theirs.text[:140]}), so it proves nothing about isolation")
+            continue
         if norm(theirs, world["first"]) != norm(nobodys, GHOST):
             failures.append(f"{case}: bob can tell alice's id from a nonexistent one: {theirs.status_code} {theirs.text[:140]} | {nobodys.status_code} {nobodys.text[:140]}")
         try:
@@ -396,6 +400,8 @@ def test_the_isolation_cases_are_not_vacuous(client, world):
     assert own.status_code == 200 and MARK in own.text
     assert client.get(f"/api/jarvis/memory/{GHOST}", headers=h("alice")).status_code == 404
     assert client.post("/api/jarvis/tools/fetch", headers=h("alice"), json={"id": world["second"]}).status_code == 200
+    assert client.get(f"/api/jarvis/memory/amul/artifacts/{world['artifact']}", headers=h("alice")).status_code == 200   # the artifact case reads a real one
+    assert world["artifact"] != GHOST_ARTIFACT
 
 
 # ------------------------------------------------------------------------- list / search / read-model routes: bob sees nothing of alice's
@@ -479,7 +485,6 @@ MUTATION_CASES = {
     "board-patch": ("PATCH", "/api/jarvis/memory/board", {"summary": "bob overwrote it"}),
     "stm-clear": ("DELETE", "/api/jarvis/memory/stm", None),
     "emr-excite": ("POST", "/api/jarvis/memory/emr/excite", {"query": SEARCH, "session_key": "default", "theta_promote": 0.0}),
-    "emr-correct": ("POST", "/api/jarvis/memory/emr/correct", {"memory_ids": [GHOST], "note": "bob corrects"}),
     "amul-verify": ("POST", "/api/jarvis/memory/amul/field/verify", {}),
 }
 
@@ -494,8 +499,8 @@ def test_bob_s_writes_that_are_not_addressed_by_id_change_nothing_of_alices(clie
     failures = []
     for case, (method, path, body) in sorted(MUTATION_CASES.items()):
         r = client.request(method, path, headers=h("bob"), json=body)
-        if r.status_code >= 500:
-            failures.append(f"{case}: {r.status_code} {r.text[:120]}")
+        if r.status_code >= 500 or r.status_code == 422:
+            failures.append(f"{case}: {r.status_code} {r.text[:120]} (a mutation case must get past validation)")
         try:
             assert_nothing_of_alices(r, world)
         except AssertionError as exc:
