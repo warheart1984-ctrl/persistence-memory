@@ -16,6 +16,7 @@ and on the Postgres row store (forced RLS) when JARVIS_TEST_BACKEND=postgres, wh
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 from fastapi.testclient import TestClient
@@ -239,12 +240,18 @@ def world(client):
     created = anchored.json().get("created") or []                 # AnchorReport: the new artifact ids
     assert created, f"anchoring produced no artifact: {anchored.text}"
     artifact = created[0]
-    client.post("/api/jarvis/memory/emr/excite", headers=h("alice"), json={"query": SEARCH, "session_key": "default", "theta_promote": 0.0})
+    # Short-term memory is only populated when excitation does not abstain, and it abstains when two candidates score alike: so alice gets one record that a
+    # specific query singles out. (With only her near-duplicate notes the STM stayed empty and every STM isolation check compared empty with empty.)
+    working = mk(client, "alice", f"alice working note {MARK} quokkaflux telemetry notebook")
+    excited = client.post("/api/jarvis/memory/emr/excite", headers=h("alice"), json={"query": "quokkaflux telemetry notebook", "session_key": "default", "theta_promote": 0.0})
+    assert excited.status_code == 200 and excited.json().get("abstained") is False and working["id"] in excited.text, excited.text[:300]
+    context = client.get("/api/jarvis/memory/stm/context", headers=h("alice"))
+    assert context.status_code == 200 and MARK in context.text, f"alice has no short-term memory to protect: {context.text[:200]}"   # else the STM checks compare empty to empty
     client.post("/api/jarvis/memory/board", headers=h("alice"), json={"summary": f"alice board {MARK}"})
     reinforced = client.post("/api/jarvis/memory/emr/reinforce", headers=h("alice"), json={
         "memory_ids": [first["id"]], "outcome": {"signal": "positive", "source": "user", "outcome_id": f"outcome-{MARK}"}})
     assert reinforced.status_code == 200, reinforced.text                          # alice now has reinforcement state, which the status view reports
-    return {"first": first["id"], "second": second["id"], "third": third["id"], "artifact": artifact}
+    return {"first": first["id"], "second": second["id"], "third": third["id"], "working": working["id"], "artifact": artifact}
 
 
 VOLATILE = {"tenant", "result_digest", "ledger_head", "head", "ts", "created_at", "updated_at", "generated_at", "checked_at", "duration_ms"}
@@ -372,6 +379,8 @@ def id_cases(i: str, art: str | None) -> dict[str, tuple[str, str, dict | None]]
 
 
 CASE_NAMES = sorted(id_cases(GHOST, None))
+POSTGRES_ONLY = {"history"}                                     # answered 501 by the JSON store; only meaningful (and required to be a real answer) on Postgres
+ON_POSTGRES = (os.environ.get("JARVIS_TEST_BACKEND") or "").strip().lower() == "postgres"
 VALIDATES_FIRST: set[str] = set()   # a case allowed to answer 422 (none today): an id case that stops at validation has not reached the lookup it claims to test
 
 
@@ -388,6 +397,11 @@ def test_alices_id_is_indistinguishable_from_an_id_that_never_existed(client, wo
         theirs = client.request(method, path, headers=h(f"bob-one-{case}"), json=body)
         method, path, body = id_cases(GHOST, GHOST_ARTIFACT)[case]
         nobodys = client.request(method, path, headers=h(f"bob-two-{case}"), json=body)
+        if case in POSTGRES_ONLY and not ON_POSTGRES and theirs.status_code == nobodys.status_code == 501:
+            continue                                                  # the JSON store has no record history (501 for everyone); the Postgres run exercises this case for real
+        if max(theirs.status_code, nobodys.status_code) >= 500:
+            failures.append(f"{case}: a server error ({theirs.status_code} {theirs.text[:120]} | {nobodys.status_code} {nobodys.text[:120]}): the handler failed before its lookup, which proves nothing about isolation")
+            continue
         if 422 in (theirs.status_code, nobodys.status_code) and case not in VALIDATES_FIRST:
             failures.append(f"{case}: the request never got past validation ({theirs.status_code} {theirs.text[:140]}), so it proves nothing about isolation")
             continue
@@ -604,10 +618,19 @@ def test_mcp_tools_call_cannot_tell_alices_id_from_a_nonexistent_one(client, wor
     assert not failures, "\n".join(failures)
 
 
+def _tool_payload(result: dict) -> dict:
+    """The JSON a successful tool result carries in its first text block."""
+    assert not result.get("isError"), f"the tool failed: {json.dumps(result)[:200]}"
+    return json.loads(result["content"][0]["text"])
+
+
 def test_mcp_search_shows_bob_nothing_of_alices(client, world):
+    alice = _tool_payload(_tool_result(mcp_call(client, "alice", "emr_search_ledger", {"query": SEARCH})))
+    assert alice["records"] and MARK in json.dumps(alice)                                  # the control: through this very tool alice finds her records
     r = mcp_call(client, "bob", "emr_search_ledger", {"query": SEARCH})
+    bob = _tool_payload(_tool_result(r))                                                   # a valid, successful tool result (an error of any kind would also contain none of alice's data)
+    assert bob["records"] == [] and bob["query"] == SEARCH                                 # ... and it is the expected EMPTY result for a tenant with no records
     assert_nothing_of_alices(r, world)
-    assert MARK in mcp_call(client, "alice", "emr_search_ledger", {"query": SEARCH}).text
 
 
 # --------------------------------------------------------------------------------- shared process-wide resources: written-down gaps
