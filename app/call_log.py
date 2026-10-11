@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import io
 import json
 import logging
 import os
@@ -196,6 +197,11 @@ def split_client(header: str | None) -> tuple[str | None, str | None]:
 # -------------------------------------------------------------------------------------------------------- the log
 
 
+def _pin_by_handle() -> bool:
+    """Linux keeps each snapshotted file open (an unlinked file stays readable); Windows cannot, so it copies the bytes instead."""
+    return os.name != "nt"
+
+
 class Snapshot:
     """The daily files of a log at one instant: (path, size, open handle). `close()` releases the handles."""
 
@@ -204,8 +210,9 @@ class Snapshot:
 
     def close(self) -> None:
         for _, _, fh in self.files:
-            with contextlib.suppress(OSError):
-                fh.close()
+            if fh is not None:  # (always set today; the guard keeps close() safe whatever a snapshot holds)
+                with contextlib.suppress(OSError):
+                    fh.close()
         self.files = []
 
 
@@ -555,13 +562,15 @@ class CallLog:
         snap = Snapshot()
         for path in self._files():
             try:
-                if os.name == "nt":
-                    # Windows cannot unlink a file that is open (no delete-sharing for ordinary handles): pinning would make retention fail inside an
-                    # append. Remember the size only; if retention removes the file before the page is read, the read fails loudly (see entries_desc).
-                    snap.files.append((path, path.stat().st_size, None))
-                else:
-                    fh = open(path, "rb")
-                    snap.files.append((path, os.fstat(fh.fileno()).st_size, fh))
+                fh = open(path, "rb")
+                if not _pin_by_handle():
+                    # Windows cannot unlink a file that is open (no delete-sharing for ordinary handles), so pinning would make retention fail inside an
+                    # append. Copy the bytes while the lock is held instead: nothing is left open, nothing can be deleted from under the page, and no later
+                    # reopen can fail. (The cost, reading under the lock, is the old behaviour; the servers run on Linux.)
+                    with fh:
+                        data = fh.read()
+                    fh = io.BytesIO(data)
+                snap.files.append((path, len(fh.getbuffer()) if isinstance(fh, io.BytesIO) else os.fstat(fh.fileno()).st_size, fh))
             except FileNotFoundError:
                 continue  # retention removed it between listing and opening: it is simply not part of the log any more
             except OSError as exc:
@@ -581,9 +590,6 @@ class CallLog:
                 if fh is not None:
                     fh.seek(0)
                     lines = fh.read(size).decode("utf-8", "replace").splitlines()
-                elif size is not None:  # a snapshot without a pinned handle (Windows): the file must still be there, or the page would be incomplete
-                    with open(path, "rb") as reopened:
-                        lines = reopened.read(size).decode("utf-8", "replace").splitlines()
                 else:
                     lines = path.read_text(encoding="utf-8").splitlines()
             except OSError as exc:

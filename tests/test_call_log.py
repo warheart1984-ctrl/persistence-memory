@@ -884,19 +884,35 @@ def test_a_snapshot_that_cannot_open_a_file_fails_instead_of_dropping_it(tmp_pat
             log._snapshot()
 
 
-def test_a_page_whose_snapshot_lost_a_file_raises_and_the_endpoint_says_retry(fixed_minute, tmp_path, monkeypatch):
-    """The no-pinned-handle path (Windows): if retention removes a file before the page is read, the read fails loudly."""
-    log = call_log.CallLog(tmp_path / "winlike")
-    for i in range(3):
-        log.append(_fields(i))
+def test_a_windows_style_snapshot_copies_the_bytes_so_nothing_is_open_and_retention_cannot_break_the_page(tmp_path, monkeypatch):
+    """Windows cannot unlink an open file, so there the snapshot copies each file's bytes while the lock is held: no handle stays open for retention to trip
+    over, nothing can be deleted from under the page, no reopen can fail, and close() works on what it holds."""
+    monkeypatch.setenv("JARVIS_CALL_LOG_RETAIN_DAYS", "2")
+    monkeypatch.setattr(call_log, "_pin_by_handle", lambda: False)
+    day = [1]
+    log = call_log.CallLog(tmp_path / "winlike", clock=lambda: datetime(2026, 10, day[0], 12, tzinfo=timezone.utc))
+    log.append(_fields(0))
+    day[0] = 2
+    log.append(_fields(1))
+    day[0] = 8
+    log.append(_fields(2))
     with log._locked():
         snap = log._snapshot()
-    path, size, fh = snap.files[0]
-    fh.close()
-    snap.files[0] = (path, size, None)                # as if pinning is unavailable
-    path.unlink()
-    with pytest.raises(call_log.CallLogError, match="retry"):
-        list(log.entries_desc(snap))
+    assert len(snap.files) == 3 and all(type(fh).__name__ == "BytesIO" for _, _, fh in snap.files)     # copies, not open files
+    day[0] = 9
+    log.append(_fields(3))                                                  # retention unlinks the old files: nothing holds them open, so it can
+    assert [p.name for p in log._files()] == ["calls-20261008.jsonl", "calls-20261009.jsonl"]
+    assert [e["seq"] for e in log.entries_desc(snap)] == [3, 2, 1]
+    snap.close()                                                            # (used to raise AttributeError on a missing handle)
+    snap.close()                                                            # and is idempotent
+    assert snap.files == []
+
+
+def test_close_tolerates_a_snapshot_entry_with_no_handle(tmp_path):
+    snap = call_log.Snapshot()
+    snap.files.append((tmp_path / "x.jsonl", 0, None))
+    snap.close()
+    assert snap.files == []
 
 
 def test_the_calls_endpoint_answers_503_retry_when_the_snapshot_cannot_be_read(jclient, monkeypatch):
