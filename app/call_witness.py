@@ -37,6 +37,7 @@ _ID_SEGMENTS = (
     (re.compile(r"^mem-[0-9a-f]+$"), "{id}"),
     (re.compile(r"^eo:sha256:[0-9a-f]+$"), "{eo}"),
     (re.compile(r"^[0-9]+$"), "{n}"),
+    (re.compile(r"^art-[0-9a-f]+-[A-Za-z0-9]+$"), "{art}"),
 )
 _CODE_SAFE = re.compile(r"[^A-Za-z0-9_:.\-]")
 # The route templates under /api/jarvis/memory, per method (relative; "{id}" is any one segment). A path is templated by matching it position by
@@ -55,8 +56,9 @@ MEMORY_TEMPLATES: dict[str, tuple[tuple[str, ...], ...]] = {
 }
 
 
-def normalize_memory_route(method: str, path: str) -> tuple[str, str | None]:
-    """Route template for a request under /api/jarvis/memory, taken from the route table by method and position, never from the typed path."""
+def normalize_memory_route(method: str, path: str) -> tuple[str, str | None, list[str]]:
+    """Route template for a request under /api/jarvis/memory, taken from the route table by method and position, never from the typed path.
+    Also returns the values that sat in the path-parameter slots: they are never stored, but they go into the argument hash (see ``witness_args``)."""
     segs = [s for s in path[len(MEMORY_PREFIX):].split("/") if s]
     best: tuple[str, ...] | None = None
     for tpl in MEMORY_TEMPLATES.get(method.upper(), ()):
@@ -65,9 +67,10 @@ def normalize_memory_route(method: str, path: str) -> tuple[str, str | None]:
         if best is None or sum(p != "{id}" for p in tpl) > sum(p != "{id}" for p in best):
             best = tpl
     if best is None:
-        return MEMORY_PREFIX + "/{other}", None
-    target = next((s for p, s in zip(best, segs) if p == "{id}" and any(rx.match(s) for rx, _ in _ID_SEGMENTS)), None)
-    return "/".join([MEMORY_PREFIX, *best]), target
+        return MEMORY_PREFIX + "/{other}", None, segs
+    params = [s for p, s in zip(best, segs) if p == "{id}"]
+    target = next((s for s in params if any(rx.match(s) for rx, _ in _ID_SEGMENTS)), None)
+    return "/".join([MEMORY_PREFIX, *best]), target, params
 
 
 def normalize_route(path: str) -> tuple[str, str | None]:
@@ -91,12 +94,16 @@ def classify(method: str, path: str) -> dict[str, Any] | None:
         name = path[len(TOOLS_PREFIX):].strip("/") or "(none)"
         return {"kind": "tool", "tool": name[:64], "route": path, "target": None, "write": name in call_log.WRITE_TOOLS}
     if method == "GET" and (path == MEMORY_PREFIX or path.startswith(MEMORY_PREFIX + "/")) and call_log.reads_enabled():
-        route, target = normalize_memory_route("GET", path)
-        return {"kind": "api", "tool": f"GET {route}", "route": route, "target": target, "write": False}
+        route, target, params = normalize_memory_route("GET", path)
+        return {"kind": "api", "tool": f"GET {route}", "route": route, "target": target, "write": False, "path_params": params}
     if path.startswith("/api/jarvis/") and method not in READ_METHODS:
-        route, target = normalize_memory_route(method, path) if (path == MEMORY_PREFIX or path.startswith(MEMORY_PREFIX + "/")) else normalize_route(path)
+        params: list[str] = []
+        if path == MEMORY_PREFIX or path.startswith(MEMORY_PREFIX + "/"):
+            route, target, params = normalize_memory_route(method, path)
+        else:
+            route, target = normalize_route(path)
         write = (route == "/api/jarvis/memory" and method == "POST") or (route == "/api/jarvis/memory/{id}" and method in ("PATCH", "PUT", "DELETE"))
-        return {"kind": "api", "tool": f"{method} {route}", "route": route, "target": target, "write": write}
+        return {"kind": "api", "tool": f"{method} {route}", "route": route, "target": target, "write": write, "path_params": params}
     return None
 
 
@@ -135,6 +142,14 @@ def _query_dict(query_string: bytes) -> dict[str, Any] | None:
         else:
             out[key] = value
     return out
+
+
+def witness_args(plan: dict[str, Any], body_bytes: bytes, query_string: bytes) -> Any:
+    """What the argument hash is taken over: the body and query, plus the path parameters (hashed, never stored) so that a read of one record
+    or artifact is not indistinguishable from a read of another. A route with no path parameter hashes exactly as before."""
+    args = request_args(_json_or_none(body_bytes), query_string)
+    params = plan.get("path_params")
+    return {"args": args, "path": params} if params else args
 
 
 def request_args(body: Any, query_string: bytes) -> Any:
@@ -236,7 +251,7 @@ class CallWitnessMiddleware:
             client_header = headers.get("x-jarvis-mcp-client") or headers.get("user-agent")
             transport = "mcp-stdio" if headers.get("x-jarvis-mcp-transport", "").strip().lower() == "stdio" else ("http-tool" if plan["kind"] == "tool" else "http-api")
             fields = call_log.make_fields(
-                transport=transport, tool=plan["tool"], args=request_args(_json_or_none(body_bytes), scope.get("query_string", b"")), outcome=_outcome(status),
+                transport=transport, tool=plan["tool"], args=witness_args(plan, body_bytes, scope.get("query_string", b"")), outcome=_outcome(status),
                 started=started, client_header=client_header, tenant=scope.get("jarvis_tenant"), error_code=_code(status, parsed), status_code=status,
                 result_digest=digest, route=plan["route"], method=method, target=plan["target"],
             )
@@ -257,7 +272,7 @@ class CallWitnessMiddleware:
         try:
             await self.app(scope, replay, capture)
         except Exception:
-            log.record(call_log.make_fields(transport="http-tool" if plan["kind"] == "tool" else "http-api", tool=plan["tool"], args=request_args(_json_or_none(body_bytes), scope.get("query_string", b"")),
+            log.record(call_log.make_fields(transport="http-tool" if plan["kind"] == "tool" else "http-api", tool=plan["tool"], args=witness_args(plan, body_bytes, scope.get("query_string", b"")),
                                             outcome="error", started=started, client_header=headers.get("x-jarvis-mcp-client") or headers.get("user-agent"),
                                             tenant=scope.get("jarvis_tenant"), error_code="INTERNAL", status_code=500, route=plan["route"], method=method, target=plan["target"]))
             raise
@@ -265,7 +280,7 @@ class CallWitnessMiddleware:
             await finish()
         if overflow:
             call_fields = call_log.make_fields(
-                transport="http-tool" if plan["kind"] == "tool" else "http-api", tool=plan["tool"], args=request_args(_json_or_none(body_bytes), scope.get("query_string", b"")),
+                transport="http-tool" if plan["kind"] == "tool" else "http-api", tool=plan["tool"], args=witness_args(plan, body_bytes, scope.get("query_string", b"")),
                 outcome=_outcome(status), started=started, client_header=headers.get("x-jarvis-mcp-client") or headers.get("user-agent"),
                 tenant=scope.get("jarvis_tenant"), error_code=_code(status, None), status_code=status, route=plan["route"], method=method, target=plan["target"])
             log.record(call_fields)

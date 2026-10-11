@@ -847,6 +847,48 @@ def test_a_literal_from_one_route_is_not_kept_in_another_routes_parameter_slot(j
     assert "secret-77" not in json.dumps(got)
 
 
+def _tenant_read(tenant, transport, i=0):
+    f = call_log.make_fields(transport=transport, tool="GET /api/jarvis/memory", args={"i": i}, outcome="ok", started=time.perf_counter(), route="/api/jarvis/memory", method="GET", tenant=tenant)
+    return f
+
+
+def test_read_summaries_keep_their_tenant_and_transport_and_each_tenant_has_its_own_cap(fixed_minute, tmp_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_CALL_LOG_READ_CAP_PER_MIN", "2")
+    log = call_log.CallLog(tmp_path / "tenants")
+    for i in range(6):
+        log.record(_tenant_read("operator", "http-api", i))                  # a busy caller: 2 written, 4 suppressed
+    for i in range(3):
+        log.record(_tenant_read("tenant-b", "mcp-stdio", i))                 # another tenant: its own cap, so 2 written, 1 suppressed
+    log.record(_tenant_read("tenant-c", "http-api"))                         # and a quiet one is never summarised
+    got = log.query(limit=50)["entries"][::-1]
+    written = [(e["tenant"], e["transport"]) for e in got if e["outcome"] == "ok"]
+    assert written.count(("operator", "http-api")) == 2 and written.count(("tenant-b", "mcp-stdio")) == 2 and written.count(("tenant-c", "http-api")) == 1
+    summaries = {(e["tenant"], e["transport"]): e["count"] for e in log.query(limit=50)["entries"] if e["outcome"] == "read_suppressed"}
+    assert summaries == {("operator", "http-api"): 4, ("tenant-b", "mcp-stdio"): 1}                     # attributed to who made the calls, not to the operator
+    assert log.verify()["ok"] is True
+
+
+def test_reads_of_different_records_or_artifacts_have_different_witness_hashes(jclient):
+    a, b = add(jclient, "first record"), add(jclient, "second record")
+    before = len(entries())
+    for path in (f"/api/jarvis/memory/{a['id']}", f"/api/jarvis/memory/{b['id']}", "/api/jarvis/memory/amul/artifacts/art-0a1b2c-r1", "/api/jarvis/memory/amul/artifacts/art-3d4e5f-r1",
+                 "/api/jarvis/memory/bearer-secret-123", "/api/jarvis/memory/bearer-secret-456"):
+        jclient.get(path, headers=HDR)
+    got = entries()[before:]
+    assert len({e["args_sha256"] for e in got}) == 6                                                   # every path argument is in the fingerprint
+    assert [e["target"] for e in got] == [a["id"], b["id"], "art-0a1b2c-r1", "art-3d4e5f-r1", None, None]  # artifact ids are recognised as ids; typed text is not
+    assert "bearer-secret" not in json.dumps(got)
+    assert got[0]["args_sha256"] == call_log.args_hash({"args": {}, "path": [a["id"]]})                 # hashed, never stored
+
+
+def test_a_route_with_no_path_parameter_hashes_exactly_as_before(jclient):
+    add(jclient)
+    before = len(entries())
+    jclient.get("/api/jarvis/memory/latest?limit=2", headers=HDR)
+    (e,) = entries()[before:]
+    assert e["args_sha256"] == call_log.args_hash({"limit": "2"})
+
+
 def test_the_route_template_depends_on_the_method_not_only_the_path(jclient):
     """`promote`, `pipeline` and `external-search` are POST-only: a GET of the same path is served as a record lookup and must be templated as one."""
     rec = add(jclient)
