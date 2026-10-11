@@ -926,6 +926,28 @@ def test_the_calls_endpoint_answers_503_retry_when_the_snapshot_cannot_be_read(j
     assert r.status_code == 503 and "retry" in r.json()["detail"]
 
 
+def test_the_degraded_state_belongs_to_the_same_snapshot_as_the_page_and_head(tmp_path, monkeypatch):
+    """A writer that recovers while the page is being read appends the gap entry and clears the latch. The page and head do not contain that gap, so the
+    response must still say `degraded`: reporting a healthy log beside an incomplete page would present incomplete evidence as complete."""
+    log = call_log.CallLog(tmp_path / "degsnap")
+    for i in range(3):
+        log.append(_fields(i))
+    log._mark_degraded("simulated outage", unlogged=2)
+    assert log.degraded() is not None
+    real = call_log.CallLog.entries_desc
+
+    def recovering(self, snapshot=None):
+        call_log.CallLog(tmp_path / "degsnap").append(_fields(9))      # another worker: writes the gap entry first, then its own, and clears the latch
+        yield from (real(self) if snapshot is None else real(self, snapshot))
+
+    monkeypatch.setattr(call_log.CallLog, "entries_desc", recovering)
+    page = log.query_with_head(limit=50)
+    monkeypatch.setattr(call_log.CallLog, "entries_desc", real)
+    assert page["degraded"] and page["degraded"]["unlogged"] == 2                       # as of the snapshot
+    assert [e["outcome"] for e in page["entries"]].count("gap") == 0 and page["head"]["seq"] == 3   # the page and the head predate the recovery
+    assert log.degraded() is None                                                       # the latch was cleared meanwhile, and the next read will say so
+
+
 def test_a_snapshot_page_ignores_what_was_appended_after_it(tmp_path):
     log = call_log.CallLog(tmp_path / "snapbytes")
     for i in range(3):

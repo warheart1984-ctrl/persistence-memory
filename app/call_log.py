@@ -608,19 +608,20 @@ class CallLog:
             with contextlib.suppress(CallLogError, OSError):  # open denied/read summaries are written first, like flush(); a failure here changes nothing
                 self._flush_reads_locked(self._flush_suppressed_locked(self._head()))
             head = self._head()                                 # read after the flush, in the same hold of the lock as the file sizes
-            if not _pin_by_handle():
+            degraded = self.degraded()                          # and so is the outage state: a writer that recovers after the lock is released appends a gap
+            if not _pin_by_handle():                            # entry and clears the latch, which the snapshotted page and head do not contain
                 # Windows cannot unlink an open file (no delete-sharing for ordinary handles), so a pinned handle would make retention fail inside an append,
                 # and copying every retained file into memory could exhaust it. There the page is read lazily WHILE the lock is held: nothing is pinned,
                 # nothing is copied, nothing can be deleted from under the page (retention runs inside an append, which needs this lock). It stalls writers
                 # for the length of the read, which was the behaviour before the snapshot; the servers run on Linux, where the lock is released first.
                 page = self._query_unlocked(tool=tool, client=client, since=since, limit=limit, before_seq=before_seq)
-                return {**page, "head": head}
+                return {**page, "head": head, "degraded": degraded}
             snapshot = self._snapshot()
         try:
             page = self._query_unlocked(tool=tool, client=client, since=since, limit=limit, before_seq=before_seq, snapshot=snapshot)
         finally:
             snapshot.close()
-        return {**page, "head": head}
+        return {**page, "head": head, "degraded": degraded}
 
     def _query_unlocked(self, *, tool: str | None, client: str | None, since: str | None, limit: int, before_seq: int | None,
                         snapshot: "Snapshot | None" = None) -> dict[str, Any]:
