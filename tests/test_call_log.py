@@ -9,6 +9,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import math
 import multiprocessing
 import os
 import socket
@@ -1036,6 +1037,15 @@ def test_concurrent_page_reads_are_bounded_and_the_rest_are_told_to_retry(tmp_pa
     first.join(timeout=5)
     monkeypatch.setattr(call_log.CallLog, "entries_desc", real)
     assert [e["seq"] for e in log.query_with_head(limit=10)["entries"]] == [3, 2, 1]     # the slot was released: reads work again
+
+
+@pytest.mark.parametrize("raw,expected", [("nan", 2.0), ("NaN", 2.0), ("inf", 2.0), ("Infinity", 2.0), ("-inf", 2.0), ("abc", 2.0), ("", 2.0),
+                                          ("-5", 0.0), ("0", 0.0), ("0.25", 0.25), ("5", 5.0), ("1e9", 60.0)])
+def test_the_snapshot_wait_is_always_a_finite_bounded_number(monkeypatch, raw, expected):
+    """acquire(timeout=nan) can block forever and acquire(timeout=inf) raises: a bad setting must fall back, never hang or 500."""
+    monkeypatch.setenv("JARVIS_CALL_LOG_SNAPSHOT_WAIT_SECONDS", raw)
+    value = call_log.snapshot_wait_seconds()
+    assert value == expected and math.isfinite(value)
 
 
 def test_a_snapshot_page_ignores_what_was_appended_after_it(tmp_path):

@@ -30,6 +30,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -226,10 +227,15 @@ def _snapshot_slots() -> threading.BoundedSemaphore:
 
 
 def snapshot_wait_seconds() -> float:
+    """How long a page read waits for a reader slot (JARVIS_CALL_LOG_SNAPSHOT_WAIT_SECONDS, default 2, at most 60). Anything that is not a finite number,
+    NaN and infinity included (float() accepts both, and acquire(timeout=nan) can block forever while infinity raises), is the default."""
     try:
-        return max(0.0, float(os.environ.get("JARVIS_CALL_LOG_SNAPSHOT_WAIT_SECONDS") or 2.0))
+        value = float(os.environ.get("JARVIS_CALL_LOG_SNAPSHOT_WAIT_SECONDS") or 2.0)
     except ValueError:
         return 2.0
+    if not math.isfinite(value):
+        return 2.0
+    return min(60.0, max(0.0, value))
 
 
 def _pin_by_handle() -> bool:
