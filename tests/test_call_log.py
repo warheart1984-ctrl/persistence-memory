@@ -796,11 +796,26 @@ def test_a_literal_from_one_route_is_not_kept_in_another_routes_parameter_slot(j
     """`watch` is a literal of /external/watch only; as a path parameter of /memory/{id} it must be redacted. Position decides, not the word."""
     before = len(entries())
     jclient.get("/api/jarvis/memory/watch", headers=HDR)
-    jclient.get("/api/jarvis/memory/external/watch", headers=HDR)          # not a GET route, but the path still matches the table
+    jclient.get("/api/jarvis/memory/external/stats", headers=HDR)           # a real GET route with two literals
     jclient.get("/api/jarvis/memory/not/a/route/at/all-secret-77", headers=HDR)
     got = entries()[before:]
-    assert [e["route"] for e in got] == ["/api/jarvis/memory/{id}", "/api/jarvis/memory/external/watch", "/api/jarvis/memory/{other}"]
+    assert [e["route"] for e in got] == ["/api/jarvis/memory/{id}", "/api/jarvis/memory/external/stats", "/api/jarvis/memory/{other}"]
     assert "secret-77" not in json.dumps(got)
+
+
+def test_the_route_template_depends_on_the_method_not_only_the_path(jclient):
+    """`promote`, `pipeline` and `external-search` are POST-only: a GET of the same path is served as a record lookup and must be templated as one."""
+    rec = add(jclient)
+    before = len(entries())
+    for path in ("/api/jarvis/memory/promote", "/api/jarvis/memory/pipeline", "/api/jarvis/memory/external-search"):
+        jclient.get(path, headers=HDR)                                      # 404 record lookups
+    jclient.post("/api/jarvis/memory/promote", headers=HDR, json={})
+    jclient.post(f"/api/jarvis/memory/{rec['id']}", headers=HDR, json={})  # not a route at all for POST
+    got = entries()[before:]
+    assert [e["route"] for e in got[:3]] == ["/api/jarvis/memory/{id}"] * 3 and all(e["target"] is None and e["method"] == "GET" for e in got[:3])
+    assert got[3]["route"] == "/api/jarvis/memory/promote" and got[3]["method"] == "POST"
+    assert got[4]["route"] == "/api/jarvis/memory/{other}"
+    assert not any(w in json.dumps(got[:3]) for w in ("promote", "pipeline", "external-search"))
 
 
 def test_mixed_traffic_does_not_write_a_summary_per_read(jclient, monkeypatch):

@@ -39,16 +39,35 @@ _ID_SEGMENTS = (
     (re.compile(r"^[0-9]+$"), "{n}"),
 )
 _CODE_SAFE = re.compile(r"[^A-Za-z0-9_:.\-]")
-# The route templates under /api/jarvis/memory (relative; "{id}" is any one segment). A path is templated by matching it position by position
-# against these, preferring the template with the most literal segments; a segment that lands on a "{id}" is a path parameter and is never
-# written (the target is recorded only if it really is a record id), and a path that matches nothing is logged as .../{other}.
-MEMORY_TEMPLATES = tuple(tuple(x for x in route.split("/") if x) for route in (
-    "", "board", "retrieve", "conflicts", "search", "latest", "unified", "promote", "external-search", "active", "stm", "stm/context", "stm/expand",
-    "pipeline", "history/verify", "{id}", "{id}/history", "{id}/resolve", "external/stats", "external/ask", "external/remember", "external/forget",
-    "external/describe", "external/spatialize", "external/scan", "external/reindex", "external/prune", "external/watch", "external/watch/stop",
-    "external/serve", "external/serve/stop", "emr/status", "emr/excite", "emr/reinforce", "emr/correct", "amul/anchor", "amul/artifacts/{id}",
-    "amul/lineage/{id}", "amul/field/status", "amul/field/verify", "graph/bfs", "graph/shortest-path", "graph/related", "graph/stats", "graph/components",
-))
+# The route templates under /api/jarvis/memory, per method (relative; "{id}" is any one segment). A path is templated by matching it position by
+# position against the templates of ITS method, preferring the one with the most literal segments: a route that exists only for POST (promote,
+# pipeline, external-search ...) is not a literal for a GET, which the app serves as a record lookup. A segment that lands on a "{id}" is a path
+# parameter and is never written (the target is recorded only if it really is a record id); a path that matches nothing is logged as .../{other}.
+_GET_ROUTES = ("", "board", "retrieve", "conflicts", "search", "latest", "unified", "active", "stm", "stm/context", "history/verify", "{id}", "{id}/history",
+               "{id}/resolve", "external/stats", "emr/status", "amul/artifacts/{id}", "amul/lineage/{id}", "amul/field/status", "graph/stats")
+_POST_ROUTES = ("", "board", "external-search", "promote", "pipeline", "stm/expand", "external/ask", "external/remember", "external/forget", "external/describe",
+                "external/spatialize", "external/scan", "external/reindex", "external/prune", "external/watch", "external/watch/stop", "external/serve",
+                "external/serve/stop", "emr/excite", "emr/reinforce", "emr/correct", "amul/anchor", "amul/field/verify", "graph/bfs", "graph/shortest-path",
+                "graph/related", "graph/components")
+MEMORY_TEMPLATES: dict[str, tuple[tuple[str, ...], ...]] = {
+    method: tuple(tuple(x for x in route.split("/") if x) for route in routes)
+    for method, routes in {"GET": _GET_ROUTES, "POST": _POST_ROUTES, "PATCH": ("board", "{id}"), "PUT": ("{id}",), "DELETE": ("stm", "{id}")}.items()
+}
+
+
+def normalize_memory_route(method: str, path: str) -> tuple[str, str | None]:
+    """Route template for a request under /api/jarvis/memory, taken from the route table by method and position, never from the typed path."""
+    segs = [s for s in path[len(MEMORY_PREFIX):].split("/") if s]
+    best: tuple[str, ...] | None = None
+    for tpl in MEMORY_TEMPLATES.get(method.upper(), ()):
+        if len(tpl) != len(segs) or any(p != "{id}" and p != s for p, s in zip(tpl, segs)):
+            continue
+        if best is None or sum(p != "{id}" for p in tpl) > sum(p != "{id}" for p in best):
+            best = tpl
+    if best is None:
+        return MEMORY_PREFIX + "/{other}", None
+    target = next((s for p, s in zip(best, segs) if p == "{id}" and any(rx.match(s) for rx, _ in _ID_SEGMENTS)), None)
+    return "/".join([MEMORY_PREFIX, *best]), target
 
 
 def normalize_route(path: str) -> tuple[str, str | None]:
@@ -64,21 +83,6 @@ def normalize_route(path: str) -> tuple[str, str | None]:
     return "/".join(parts), target
 
 
-def normalize_memory_route(path: str) -> tuple[str, str | None]:
-    """Route template for a path under /api/jarvis/memory, taken from the route table by position, never from the typed path."""
-    segs = [s for s in path[len(MEMORY_PREFIX):].split("/") if s]
-    best: tuple[str, ...] | None = None
-    for tpl in MEMORY_TEMPLATES:
-        if len(tpl) != len(segs) or any(p != "{id}" and p != s for p, s in zip(tpl, segs)):
-            continue
-        if best is None or sum(p != "{id}" for p in tpl) > sum(p != "{id}" for p in best):
-            best = tpl
-    if best is None:
-        return MEMORY_PREFIX + "/{other}", None
-    target = next((s for p, s in zip(best, segs) if p == "{id}" and any(rx.match(s) for rx, _ in _ID_SEGMENTS)), None)
-    return "/".join([MEMORY_PREFIX, *best]), target
-
-
 def classify(method: str, path: str) -> dict[str, Any] | None:
     """What to log for this request, or None if it is not witnessed."""
     if any(path == p or path.startswith(p + "/") for p in OWN_PREFIXES):
@@ -87,10 +91,10 @@ def classify(method: str, path: str) -> dict[str, Any] | None:
         name = path[len(TOOLS_PREFIX):].strip("/") or "(none)"
         return {"kind": "tool", "tool": name[:64], "route": path, "target": None, "write": name in call_log.WRITE_TOOLS}
     if method == "GET" and (path == MEMORY_PREFIX or path.startswith(MEMORY_PREFIX + "/")) and call_log.reads_enabled():
-        route, target = normalize_memory_route(path)
+        route, target = normalize_memory_route("GET", path)
         return {"kind": "api", "tool": f"GET {route}", "route": route, "target": target, "write": False}
     if path.startswith("/api/jarvis/") and method not in READ_METHODS:
-        route, target = normalize_memory_route(path) if (path == MEMORY_PREFIX or path.startswith(MEMORY_PREFIX + "/")) else normalize_route(path)
+        route, target = normalize_memory_route(method, path) if (path == MEMORY_PREFIX or path.startswith(MEMORY_PREFIX + "/")) else normalize_route(path)
         write = (route == "/api/jarvis/memory" and method == "POST") or (route == "/api/jarvis/memory/{id}" and method in ("PATCH", "PUT", "DELETE"))
         return {"kind": "api", "tool": f"{method} {route}", "route": route, "target": target, "write": write}
     return None
