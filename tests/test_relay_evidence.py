@@ -289,3 +289,265 @@ def test_every_client_name_in_the_log_is_listed_and_unmatched_ones_are_flagged(r
     ev["call_log"] = section
     md = rel.render_markdown(ev, "printout")
     assert "Every client name the log saw" in md and "| mystery-client/1.0 | mcp-stdio | 1 | emr_latest |" in md and "**no**" in md
+
+
+# ------------------------------------------------------------------------------ pagination of the call-log reads
+
+
+def paged_log(n, *, old_name="oldest-client"):
+    """A fake call-log endpoint with n entries (seq n..1, newest first); only the very oldest entries carry old_name."""
+    rows = [{**call_entry(1, old_name if seq <= 5 else "newer-client"), "seq": seq, "ts": f"2026-10-10T{(seq // 3600) % 24:02d}:{(seq // 60) % 60:02d}:{seq % 60:02d}.000000Z"} for seq in range(n, 0, -1)]
+
+    def transport(method, url, headers, body):
+        from urllib.parse import parse_qs, urlparse
+
+        parsed = urlparse(url)
+        q = {k: v[0] for k, v in parse_qs(parsed.query).items()}
+        assert method == "GET" and parsed.path == "/api/jarvis/tools/calls" and "X-API-Key" in headers
+        limit = int(q.get("limit", 50))
+        before = int(q["cursor"]) if "cursor" in q else None
+        pool = [r for r in rows if (before is None or r["seq"] < before) and (not q.get("tool") or r["tool"] == q["tool"])]
+        page = pool[:limit]
+        more = len(pool) > limit
+        head = {"seq": max(r["seq"] for r in rows), "entry_hash": "h" * 64}
+        return 200, json.dumps({"entries": page, "next_cursor": str(page[-1]["seq"]) if more else None, "head": head}).encode()
+
+    return rows, transport
+
+
+def test_every_page_of_the_log_is_read_so_an_old_client_name_is_not_hidden(rel):
+    rows, transport = paged_log(450)
+    client = rel.ReadOnlyClient("http://x", KEY, transport)
+    status, body = rel.fetch_all_calls(client)
+    assert status == 200 and len(body["entries"]) == 450 and body["pages"] == 3 and body["truncated"] is False
+    assert [e["seq"] for e in body["entries"]] == list(range(450, 0, -1))  # no duplicates, no gaps, newest first
+    assert [c["query"] for c in client.calls] == [{"limit": 200}, {"limit": 200, "cursor": "251"}, {"limit": 200, "cursor": "51"}]
+    raw = {"calls_emr_latest": {"http_status": 200, "body": body}, "calls_all": {"http_status": 200, "body": body},
+           "calls_verify": {"http_status": 200, "body": {"ok": True, "head": {"seq": 450, "entry_hash": "h" * 64}, "files": ["f"], "entries": 450, "problems": []}}}
+    section = rel.call_log_section(raw, [{"agent": "Oldest"}, {"agent": "Nobody"}])
+    names = {r["client_name"] for r in section["clients_seen"]}
+    assert names == {"oldest-client", "newer-client"}  # the old name only appears on page 3
+    assert {a["agent"]: a["witnessed_emr_latest_calls"] for a in section["per_agent"]} == {"Oldest": 5, "Nobody": 0}
+    assert section["truncated"] is False and section["coverage"].startswith("complete: all 450 log entries (3 page(s))")
+
+
+def test_hitting_the_page_cap_is_reported_as_a_partial_view(rel, monkeypatch):
+    monkeypatch.setattr(rel, "MAX_CALL_PAGES", 2)
+    rows, transport = paged_log(450)
+    client = rel.ReadOnlyClient("http://x", KEY, transport)
+    status, body = rel.fetch_all_calls(client)
+    assert status == 200 and len(body["entries"]) == 400 and body["pages"] == 2 and body["truncated"] is True
+    raw = {"calls_emr_latest": {"http_status": 200, "body": body}, "calls_all": {"http_status": 200, "body": body},
+           "calls_verify": {"http_status": 200, "body": {"ok": True, "head": {"seq": 450, "entry_hash": "h" * 64}, "files": ["f"], "entries": 450, "problems": []}}}
+    section = rel.call_log_section(raw, [{"agent": "Oldest"}])
+    assert section["truncated"] is True and section["coverage"].startswith("PARTIAL: only the newest 400 log entries")
+    assert "oldest-client" not in {r["client_name"] for r in section["clients_seen"]}  # honestly missing, and said to be
+    assert "PARTIAL" in section["per_agent"][0]["note"]
+    ev = rel.build_evidence(raw, rel.run_checks(canned(), OLD, NEW, NEW, None), {"agents": [{"agent": "Oldest"}], "summary": "s"}, "http://x", [], {"old": OLD, "new": NEW, "receipt": RECEIPT})
+    assert "PARTIAL: only the newest 400" in rel.render_markdown(ev, "p")
+
+
+def test_a_failure_on_the_first_page_is_reported_unchanged(rel):
+    client = rel.ReadOnlyClient("http://x", KEY, lambda *a: (404, b'{"detail":"switched off"}'))
+    assert rel.fetch_all_calls(client) == (404, {"detail": "switched off"})
+    assert len(client.calls) == 1
+
+
+def test_the_markdown_does_not_paste_the_whole_log_into_the_raw_section(rel):
+    rows, transport = paged_log(450)
+    client = rel.ReadOnlyClient("http://x", KEY, transport)
+    status, body = rel.fetch_all_calls(client)
+    raw = {**canned(), "calls_emr_latest": {"http_status": status, "body": body}, "calls_all": {"http_status": status, "body": body},
+           "calls_verify": {"http_status": 200, "body": {"ok": True, "head": {"seq": 450, "entry_hash": "h" * 64}, "files": ["f"], "entries": 450, "problems": []}}}
+    ev = rel.build_evidence(raw, rel.run_checks(raw, OLD, NEW, NEW, None), {"agents": [], "summary": "s"}, "http://x", [], {"old": OLD, "new": NEW, "receipt": RECEIPT})
+    md = rel.render_markdown(ev, "p")
+    assert md.count('"seq":') < 120 and "entries_omitted_from_this_listing" in md and len(md) < 120_000
+
+
+def test_the_script_identifies_itself_to_the_servers_call_log(rel):
+    seen = {}
+    client = rel.ReadOnlyClient("http://x", KEY, lambda m, u, h, b: (seen.update(h) or (200, b"{}")))
+    client.tool("emr_latest", {})
+    assert seen["X-Jarvis-MCP-Client"] == "relay-evidence/1" and seen["X-API-Key"] == KEY
+
+
+def test_a_failed_unfiltered_read_is_never_reported_as_complete(rel):
+    entries = [call_entry(2, "opencode-x"), call_entry(1, "cursor-x")]
+    raw = {"calls_emr_latest": {"http_status": 200, "body": {"entries": entries, "pages": 1, "truncated": False}},
+           "calls_all": {"http_status": 500, "body": {"detail": "boom"}},
+           "calls_verify": {"http_status": 200, "body": {"ok": True, "head": {"seq": 2, "entry_hash": "h" * 64}, "files": ["f"], "entries": 2, "problems": []}}}
+    section = rel.call_log_section(raw, [{"agent": "Kilo"}])
+    assert section["truncated"] is True and section["coverage"].startswith("PARTIAL: the unfiltered read of the log failed (HTTP 500)")
+    assert "complete" not in section["coverage"].split(":")[0] and "PARTIAL" in section["per_agent"][0]["note"]
+    assert section["clients_seen"], "the fallback list is still shown, labelled partial"
+
+
+def test_a_failure_on_a_later_page_keeps_what_was_read_and_says_it_is_partial(rel):
+    rows, ok_transport = paged_log(450)
+
+    def flaky(method, url, headers, body):
+        if "cursor=51" in url:  # the third page fails
+            return 500, b'{"detail":"boom"}'
+        return ok_transport(method, url, headers, body)
+
+    client = rel.ReadOnlyClient("http://x", KEY, flaky)
+    status, body = rel.fetch_all_calls(client)
+    assert status == 200 and len(body["entries"]) == 400 and body["pages"] == 2 and body["truncated"] is True and "page 3 failed with HTTP 500" in body["error"]
+    raw = {"calls_emr_latest": {"http_status": 200, "body": body}, "calls_all": {"http_status": 200, "body": body},
+           "calls_verify": {"http_status": 200, "body": {"ok": True, "head": {"seq": 450, "entry_hash": "h" * 64}, "files": ["f"], "entries": 450, "problems": []}}}
+    section = rel.call_log_section(raw, [{"agent": "Oldest"}])
+    assert section["coverage"].startswith("PARTIAL: only the newest 400") and "page 3 failed with HTTP 500" in section["coverage"]
+    assert "oldest-client" not in {r["client_name"] for r in section["clients_seen"]}
+
+
+def test_entries_written_while_the_report_is_read_are_counted_not_hidden_behind_a_complete_claim(rel):
+    rows, transport = paged_log(450)
+    calls_made = []
+
+    def racing(method, url, headers, body):
+        calls_made.append(url)
+        out = transport(method, url, headers, body)
+        if len(calls_made) == 1:  # right after the first page, two other clients write
+            rows[:0] = [{**call_entry(1, "late-client"), "seq": 452}, {**call_entry(1, "late-client"), "seq": 451}]
+        return out
+
+    client = rel.ReadOnlyClient("http://x", KEY, racing)
+    status, body = rel.fetch_all_calls(client)
+    assert status == 200 and body["head_seq"] == 450 and body["truncated"] is False and len(body["entries"]) == 450  # a snapshot through seq 450
+    raw = {"calls_emr_latest": {"http_status": 200, "body": body}, "calls_all": {"http_status": 200, "body": body},
+           "calls_verify": {"http_status": 200, "body": {"ok": True, "head": {"seq": 452, "entry_hash": "h" * 64}, "files": ["f"], "entries": 452, "problems": []}}}
+    section = rel.call_log_section(raw, [{"agent": "Oldest"}])
+    assert section["snapshot_head_seq"] == 450 and section["newer_entries_not_included"] == 2
+    assert section["coverage"].startswith("through seq 450: all 450 log entries") and "2 newer entries were written while this report was being read" in section["coverage"]
+    assert "head seq 452" in section["coverage"] and "late-client" not in {r["client_name"] for r in section["clients_seen"]}
+
+
+def test_with_no_concurrent_writes_the_snapshot_equals_the_head_and_nothing_is_missing(rel):
+    rows, transport = paged_log(30)
+    client = rel.ReadOnlyClient("http://x", KEY, transport)
+    status, body = rel.fetch_all_calls(client)
+    raw = {"calls_emr_latest": {"http_status": 200, "body": body}, "calls_all": {"http_status": 200, "body": body},
+           "calls_verify": {"http_status": 200, "body": {"ok": True, "head": {"seq": 30, "entry_hash": "h" * 64}, "files": ["f"], "entries": 30, "problems": []}}}
+    section = rel.call_log_section(raw, [])
+    assert section["newer_entries_not_included"] == 0 and section["coverage"].startswith("complete: all 30 log entries")
+
+
+# ------------------------------------------------------- one snapshot for coverage and the agent table; the page must hold its head
+
+
+def test_the_agent_table_is_built_from_the_same_unfiltered_snapshot_as_the_coverage(rel):
+    """An agent's call that landed between a filtered and an unfiltered read must not show as 'no call' next to a 'complete' claim."""
+    older_filtered = {"entries": [call_entry(3, "opencode-x")], "pages": 1, "truncated": False}
+    later_all = {"entries": [call_entry(3, "cursor-x"), call_entry(2, "codex-x", transport="mcp-stdio"), call_entry(1, "opencode-x")], "pages": 1, "truncated": False, "head_seq": 3}
+    later_all["entries"][1]["tool"] = "emr_recall"  # a different tool must not count as an emr_latest call
+    raw = {"calls_emr_latest": {"http_status": 200, "body": older_filtered}, "calls_all": {"http_status": 200, "body": later_all},
+           "calls_verify": {"http_status": 200, "body": {"ok": True, "head": {"seq": 3, "entry_hash": "h" * 64}, "files": ["f"], "entries": 3, "problems": []}}}
+    section = rel.call_log_section(raw, [{"agent": "Cursor"}, {"agent": "Codex"}, {"agent": "OpenCode"}])
+    by = {a["agent"]: a["witnessed_emr_latest_calls"] for a in section["per_agent"]}
+    assert by == {"Cursor": 1, "Codex": 0, "OpenCode": 1}  # Cursor's call is only in the unfiltered snapshot; Codex's entry is emr_recall
+    assert section["coverage"].startswith("complete: all 3 log entries") and section["newer_entries_not_included"] == 0
+
+
+def test_the_unfiltered_read_is_the_only_read_unless_it_fails(rel):
+    def run(calls_status):
+        def transport(method, url, headers, body):
+            if "/api/jarvis/tools/calls" in url and "verify" not in url:
+                return calls_status, b'{"entries": [], "next_cursor": null, "head": {"seq": 0, "entry_hash": "h"}}' if calls_status == 200 else b'{"detail": "boom"}'
+            return 200, b"{}"
+        return rel.gather(rel.ReadOnlyClient("http://x", KEY, transport), OLD, NEW, RECEIPT)
+
+    ok = run(200)
+    assert "calls_all" in ok and "calls_emr_latest" not in ok  # one snapshot, nothing to disagree with it
+    failed = run(500)
+    assert failed["calls_all"]["http_status"] == 500 and "calls_emr_latest" in failed  # the narrower read exists only as the fallback
+
+
+def test_a_first_page_that_does_not_contain_its_head_is_re_read(rel, monkeypatch):
+    monkeypatch.setattr(rel.time, "sleep", lambda s: None)
+    rows, base = paged_log(10)
+    state = {"n": 0}
+
+    def transport(method, url, headers, body):
+        state["n"] += 1
+        status, raw = base(method, url, headers, body)
+        data = json.loads(raw)
+        if state["n"] == 1:
+            data["head"] = {"seq": 12, "entry_hash": "h" * 64}  # an entry landed between building the page and reading the head
+        else:
+            rows.insert(0, {**call_entry(1, "late"), "seq": 11})
+            rows.insert(0, {**call_entry(1, "late"), "seq": 12})
+            status, raw = base(method, url, headers, body)
+            data = json.loads(raw)
+        return status, json.dumps(data).encode()
+
+    client = rel.ReadOnlyClient("http://x", KEY, transport)
+    status, body = rel.fetch_all_calls(client)
+    assert body["head_mismatch"] is False and body["head_seq"] == 12 and body["entries"][0]["seq"] == 12 and len(client.calls) == 2
+
+
+def test_a_persistent_mismatch_snapshots_what_was_read_and_counts_the_rest_as_newer(rel, monkeypatch):
+    monkeypatch.setattr(rel.time, "sleep", lambda s: None)
+    rows, base = paged_log(10)
+
+    def transport(method, url, headers, body):
+        status, raw = base(method, url, headers, body)
+        data = json.loads(raw)
+        data["head"] = {"seq": 12, "entry_hash": "h" * 64}  # always ahead of the page it comes with
+        return status, json.dumps(data).encode()
+
+    status, body = rel.fetch_all_calls(rel.ReadOnlyClient("http://x", KEY, transport))
+    assert body["head_mismatch"] is True and body["entries"][0]["seq"] == 10
+    raw = {"calls_all": {"http_status": 200, "body": body},
+           "calls_verify": {"http_status": 200, "body": {"ok": True, "head": {"seq": 12, "entry_hash": "h" * 64}, "files": ["f"], "entries": 12, "problems": []}}}
+    section = rel.call_log_section(raw, [])
+    assert section["snapshot_head_seq"] == 10 and section["newer_entries_not_included"] == 2
+    assert section["coverage"].startswith("through seq 10: all 10 log entries") and "2 newer entries were written" in section["coverage"]
+
+
+# ------------------------------------------- what the log says it does NOT contain: retention-pruned history and gaps
+
+
+def _section(rel, entries, *, anchor=None, degraded=None, agents=None, head=None):
+    body = {"entries": entries, "pages": 1, "truncated": False, "head_seq": entries[0]["seq"] if entries else 0}
+    raw = {"calls_all": {"http_status": 200, "body": body},
+           "calls_verify": {"http_status": 200, "body": {"ok": True, "head": {"seq": head or (entries[0]["seq"] if entries else 0), "entry_hash": "h" * 64}, "files": ["f"], "entries": len(entries),
+                                                         "problems": [], "anchor": anchor, "degraded": degraded}}}
+    return rel.call_log_section(raw, agents or [{"agent": "Kilo"}])
+
+
+def test_a_log_pruned_by_retention_is_complete_only_for_what_was_retained(rel):
+    entries = [call_entry(9, "opencode-x"), call_entry(8, "cursor-x"), call_entry(7, "codex-x")]  # the log now starts at seq 7
+    section = _section(rel, entries, anchor={"seq": 6, "entry_hash": "a" * 64, "file": "calls-20260101.jsonl", "deleted_at": "2026-10-11T00:00:00Z"})
+    assert section["retention_pruned"] is True and section["oldest_seq_read"] == 7 and section["agent_view_complete"] is False
+    assert section["coverage"].startswith("complete for the retained log only: all 3 log entries") and "up to seq 6 were removed by the log's retention" in section["coverage"]
+    assert "NOT complete" in section["per_agent"][0]["note"] and "retention" in section["per_agent"][0]["note"]
+    assert _section(rel, entries)["retention_pruned"] is True  # no anchor field, but the oldest seq is above 1: same conclusion
+
+
+def test_a_log_that_starts_at_seq_one_is_not_called_pruned(rel):
+    section = _section(rel, [call_entry(2, "opencode-x"), call_entry(1, "cursor-x")])
+    assert section["retention_pruned"] is False and section["agent_view_complete"] is True and section["coverage"].startswith("complete: all 2 log entries")
+
+
+def test_gap_entries_are_kept_and_make_the_agent_view_incomplete(rel):
+    gap = {**call_entry(3, None), "tool": "(call-log)", "outcome": "gap", "count": 2, "refused": 1, "window_start": "2026-10-11T00:10:00.000000Z", "window_end": "2026-10-11T00:12:00.000000Z"}
+    section = _section(rel, [gap, call_entry(2, "opencode-x"), call_entry(1, "cursor-x")])
+    assert section["gaps"] == [{"seq": 3, "window_start": gap["window_start"], "window_end": gap["window_end"], "unlogged_calls": 2, "refused_writes": 1}]
+    assert section["agent_view_complete"] is False and "2 call(s) were served but not logged" in section["coverage"]
+    assert "a call in a gap window is not in this log" in section["per_agent"][0]["note"]
+    assert "(none)" not in {r["client_name"] for r in section["clients_seen"]}  # a gap is not a client
+
+
+def test_a_log_that_is_degraded_right_now_says_so(rel):
+    section = _section(rel, [call_entry(1, "cursor-x")], degraded={"since": "2026-10-11T01:00:00Z", "unlogged": 4, "refused": 2})
+    assert section["degraded_now"]["unlogged"] == 4 and section["agent_view_complete"] is False and "degraded right now (4 call(s)" in section["coverage"]
+
+
+def test_the_markdown_lists_the_gaps_and_warns_a_zero_is_not_proof(rel):
+    gap = {**call_entry(2, None), "tool": "(call-log)", "outcome": "gap", "count": 3, "refused": 0, "window_start": "2026-10-11T00:10:00.000000Z", "window_end": "2026-10-11T00:12:00.000000Z"}
+    section = _section(rel, [gap, call_entry(1, "cursor-x")])
+    raw = {**canned(), "calls_all": {"http_status": 200, "body": {"entries": [gap, call_entry(1, "cursor-x")], "pages": 1, "truncated": False}}}
+    ev = rel.build_evidence(raw, rel.run_checks(canned(), OLD, NEW, NEW, None), {"agents": [{"agent": "Kilo"}], "summary": "s"}, "http://x", [], {"old": OLD, "new": NEW, "receipt": RECEIPT})
+    ev["call_log"] = section
+    md = rel.render_markdown(ev, "p")
+    assert "Gaps in the call log" in md and "seq 2: 3 unlogged call(s)" in md and "not proof the agent made no call" in md

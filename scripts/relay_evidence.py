@@ -23,6 +23,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -30,6 +31,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+CLIENT_NAME = "relay-evidence/1"
+MAX_CALL_PAGES = 50  # 200 entries per page: up to 10,000 log entries are read; past that the report says it is a partial view
 DEFAULT_BASE = "http://127.0.0.1:8011"
 DEFAULT_OLD_ID = "mem-1dc144c193a1"  # written by Codex
 DEFAULT_NEW_ID = "mem-c42330528ad5"  # written by Claude; supersedes the old one
@@ -83,7 +86,8 @@ class ReadOnlyClient:
         if not is_allowed(method, path):
             raise WriteRefused(f"refused: {method} {path} is not a read-only call")
         url = self._base + path + (("?" + urllib.parse.urlencode(query)) if query else "")
-        headers = {"X-API-Key": self._key, "Accept": "application/json"}
+        # Self-reported, so the server's call log shows these reads as this report's own and not as an anonymous Python client.
+        headers = {"X-API-Key": self._key, "Accept": "application/json", "X-Jarvis-MCP-Client": CLIENT_NAME}
         data = None
         if body is not None:
             data = json.dumps(body).encode("utf-8")
@@ -139,6 +143,48 @@ def _result(name: str, ok: bool | None, detail: str) -> dict[str, Any]:
     return {"check": name, "result": "PASS" if ok else ("FAIL" if ok is False else "NOT RUN"), "detail": detail}
 
 
+def fetch_all_calls(client: ReadOnlyClient, **filters: Any) -> tuple[int, Any]:
+    """GET /api/jarvis/tools/calls, following next_cursor page by page.
+
+    Returns (status, body).  A failure on the first page is returned as it came (the call log may simply not be there).  Otherwise body is
+    ``{"entries": [...all pages, newest first...], "pages": n, "truncated": bool}``; ``truncated`` is True if MAX_CALL_PAGES was reached with
+    more pages still to read, or if a later page failed (then ``error`` says which), so the caller must call the result a partial view.
+    """
+    entries: list[dict[str, Any]] = []
+    cursor: str | None = None
+    pages = 0
+    attempts = 0
+    head_seq: int | None = None  # the log head the first page reported
+    head_mismatch = False
+    while pages < MAX_CALL_PAGES:
+        query = {**filters, "limit": 200, **({"cursor": cursor} if cursor else {})}
+        status, body = client.get("/api/jarvis/tools/calls", **query)
+        if status != 200 or not isinstance(body, dict):
+            if pages == 0:
+                return status, body  # the very first page failed: report it as it came
+            # a LATER page failed: keep what was read, but this is not the whole log, and the caller must say so
+            return 200, {"entries": entries, "pages": pages, "truncated": True, "head_seq": head_seq, "head_mismatch": head_mismatch, "error": f"page {pages + 1} failed with HTTP {status}"}
+        if pages == 0:
+            head = body.get("head")
+            head_seq = int(head["seq"]) if isinstance(head, dict) and isinstance(head.get("seq"), int) else None
+            page = body.get("entries") or []
+            newest = page[0].get("seq") if page and isinstance(page[0], dict) else None
+            # The server builds the page and the head in two steps, so an entry written between them can leave the head ahead of the page.
+            # For an unfiltered read the newest entry on the first page IS the head, so re-read until they agree (a few tries), then say so.
+            if not filters and page and head_seq is not None and newest != head_seq:
+                if attempts < 3:
+                    attempts += 1
+                    time.sleep(0.05)
+                    continue
+                head_mismatch = True
+        entries += list(body.get("entries") or [])
+        pages += 1
+        cursor = body.get("next_cursor")
+        if not cursor:
+            break
+    return 200, {"entries": entries, "pages": pages, "truncated": bool(cursor), "head_seq": head_seq, "head_mismatch": head_mismatch}
+
+
 def gather(client: ReadOnlyClient, old_id: str, new_id: str, receipt_id: str) -> dict[str, Any]:
     """Every read the checks need.  Raw bodies are kept for the report (they never contain the key)."""
     raw: dict[str, Any] = {}
@@ -160,8 +206,10 @@ def gather(client: ReadOnlyClient, old_id: str, new_id: str, receipt_id: str) ->
     keep("latest_default", client.tool("emr_latest", {}))
     keep("latest_default_12", client.tool("emr_latest", {"limit": 12}))
     keep("latest_with_superseded", client.tool("emr_latest", {"include_superseded": True, "limit": 12}))
-    keep("calls_emr_latest", client.get("/api/jarvis/tools/calls", tool="emr_latest", limit=200))
-    keep("calls_all", client.get("/api/jarvis/tools/calls", limit=200))
+    all_status_body = fetch_all_calls(client)
+    keep("calls_all", all_status_body)
+    if all_status_body[0] != 200:  # only then is the narrower, filtered read worth making (it is the fallback, and is labelled as such)
+        keep("calls_emr_latest", fetch_all_calls(client, tool="emr_latest"))
     keep("calls_verify", client.get("/api/jarvis/tools/calls/verify"))
     return raw
 
@@ -172,29 +220,75 @@ def call_log_section(raw: dict[str, Any], agents: list[dict[str, Any]]) -> dict[
     ``available`` is False when the server has no call log (not deployed, switched off, or the key is not the operator's); nothing is
     then claimed about any agent.
     """
-    calls = raw.get("calls_emr_latest") or {}
+    all_raw = raw.get("calls_all") or {}
+    all_ok = all_raw.get("http_status") == 200 and isinstance(all_raw.get("body"), dict)
+    filt = raw.get("calls_emr_latest") or {}
+    filt_ok = filt.get("http_status") == 200 and isinstance(filt.get("body"), dict)
     verify = (raw.get("calls_verify") or {}).get("body") or {}
-    if calls.get("http_status") != 200 or not isinstance(calls.get("body"), dict):
-        return {"available": False, "reason": f"GET /api/jarvis/tools/calls returned HTTP {calls.get('http_status')} (the call log is not deployed, is switched off, or this key may not read it)",
-                "head": None, "chain_ok": None, "per_agent": [], "clients_seen": []}
-    entries = calls["body"].get("entries") or []
+    if not all_ok and not filt_ok:
+        status = all_raw.get("http_status") if all_raw else filt.get("http_status")
+        return {"available": False, "reason": f"GET /api/jarvis/tools/calls returned HTTP {status} (the call log is not deployed, is switched off, or this key may not read it)",
+                "head": None, "chain_ok": None, "per_agent": [], "clients_seen": [], "coverage": None, "truncated": None, "pages_read": 0, "snapshot_head_seq": None, "newer_entries_not_included": 0, "retention_pruned": False, "oldest_seq_read": None, "gaps": [], "degraded_now": None, "agent_view_complete": False}
+    # ONE snapshot feeds both the coverage statement and the per-agent table: the unfiltered read, or (only if that failed) the filtered fallback.
+    primary = all_raw["body"] if all_ok else filt["body"]
+    entries = primary.get("entries") or []
+    errors = [e for e in (primary.get("error"),) if e]
+    truncated = bool(primary.get("truncated") or not all_ok)
+    pages = int(primary.get("pages") or 1)
+    n_all = len(entries)
+    if not all_ok:
+        coverage = (f"PARTIAL: the unfiltered read of the log failed (HTTP {all_raw.get('http_status')}), so the client-name list below is built only from the "
+                    f"{len(entries)} emr_latest entries that were read; other clients and older names may be missing")
+    elif truncated:
+        why = ("; " + "; ".join(errors)) if errors else ""
+        coverage = f"PARTIAL: only the newest {n_all} log entries ({pages} pages) were read; older entries, and so older client names, are not in this report{why}"
+    else:
+        coverage = f"complete: all {n_all} log entries ({pages} page(s)) were read"
+    # the snapshot ends at the newest entry actually READ (the head the endpoint reported can run ahead of its own page)
+    newest_read = entries[0].get("seq") if all_ok and entries and isinstance(entries[0], dict) and isinstance(entries[0].get("seq"), int) else None
+    snapshot = newest_read if newest_read is not None else primary.get("head_seq")
+    verify_head = ((verify.get("head") or {}).get("seq")) if isinstance(verify.get("head"), dict) else None
+    newer = (verify_head - snapshot) if isinstance(verify_head, int) and isinstance(snapshot, int) and verify_head > snapshot else 0
+    if newer:
+        coverage += (f"; complete only THROUGH seq {snapshot} (the newest entry read): {newer} newer entr{'y was' if newer == 1 else 'ies were'} "
+                     f"written while this report was being read, up to head seq {verify_head}, and are not included")
+        coverage = coverage.replace("complete: all", "through seq %d: all" % snapshot, 1) if coverage.startswith("complete: all") else coverage
+    # What the log itself says about what it does NOT contain: pruned history (retention) and calls served while it could not be written (gaps).
+    gap_entries = [e for e in entries if e.get("outcome") == "gap"]
+    gaps = [{"seq": e.get("seq"), "window_start": e.get("window_start"), "window_end": e.get("window_end"), "unlogged_calls": int(e.get("count") or 0), "refused_writes": int(e.get("refused") or 0)} for e in gap_entries]
+    degraded_now = verify.get("degraded") or None
+    oldest_seq = entries[-1].get("seq") if entries and isinstance(entries[-1], dict) and isinstance(entries[-1].get("seq"), int) else None
+    anchor = verify.get("anchor") or None
+    retention_pruned = bool(all_ok and not truncated and (anchor or (isinstance(oldest_seq, int) and oldest_seq > 1)))
+    caveats: list[str] = []
+    if retention_pruned:
+        gone = (int(anchor["seq"]) if anchor and isinstance(anchor.get("seq"), int) else (oldest_seq - 1))
+        coverage = coverage.replace("complete: all", "complete for the retained log only: all", 1).replace("through seq", "through seq", 1)
+        caveats.append(f"entries up to seq {gone} were removed by the log's retention and are not available, so older client names and calls cannot be checked")
+    if gaps:
+        n_unlogged = sum(g["unlogged_calls"] for g in gaps)
+        caveats.append(f"the log records {len(gaps)} gap(s) in which {n_unlogged} call(s) were served but not logged (and {sum(g['refused_writes'] for g in gaps)} write(s) refused): a call in a gap window is not in this log")
+    if degraded_now:
+        caveats.append(f"the log is degraded right now ({degraded_now.get('unlogged', 0)} call(s) served but not yet logged, {degraded_now.get('refused', 0)} write(s) refused)")
+    if caveats:
+        coverage += "; " + "; ".join(caveats)
+    agent_view_partial = bool(truncated or retention_pruned or gaps or degraded_now)
     per_agent = []
     matched_names: set[str] = set()
     for a in agents:
         name = str(a.get("agent") or "")
         needles = [n.lower() for n in [name, *[str(x) for x in (a.get("aliases") or [])]] if n]
-        hits = [e for e in entries if any(n in str(e.get("client_name") or "").lower() for n in needles)]
+        hits = [e for e in entries if e.get("tool") == "emr_latest" and any(n in str(e.get("client_name") or "").lower() for n in needles)]
         matched_names |= {str(e.get("client_name")) for e in hits}
         per_agent.append({
             "agent": name,
             "matched_on": needles,
             "witnessed_emr_latest_calls": len(hits),
             "latest": ({k: hits[0].get(k) for k in ("seq", "ts", "transport", "client_name", "client_version", "outcome", "result_digest", "tenant")} if hits else None),
-            "note": "server-witnessed; the client name is self-reported" if hits else "no emr_latest call from a client whose name contains any of " + ", ".join(repr(n) for n in needles) + " is in the server's log (it may have called under another name, before the log existed, or not at all: see the list of every client name the log saw)",
+            "note": "server-witnessed; the client name is self-reported" if hits else ("no emr_latest call from a client whose name contains any of " + ", ".join(repr(n) for n in needles) + " is in the part of the server's log that was read (it may have called under another name, before the log existed, or not at all: see the list of every client name the log saw)" + (" - and this view is NOT complete: " + "; ".join((["it is PARTIAL"] if truncated else []) + caveats) if agent_view_partial else "")),
         })
     seen: dict[tuple[str, str, str], dict[str, Any]] = {}
-    all_body = (raw.get("calls_all") or {}).get("body") or {}
-    for e in (all_body.get("entries") or entries):
+    for e in entries:
         if e.get("outcome") in ("gap", "denied_suppressed"):
             continue
         key = (str(e.get("client_name") or "(none)"), str(e.get("client_version") or ""), str(e.get("transport")))
@@ -203,7 +297,8 @@ def call_log_section(raw: dict[str, Any], agents: list[dict[str, Any]]) -> dict[
         row["tools"].add(str(e.get("tool")))
         row["last_ts"] = max(str(row["last_ts"]), str(e.get("ts")))
     clients_seen = sorted(({**r, "tools": sorted(r["tools"]), "matched_an_agent": r["client_name"] in matched_names} for r in seen.values()), key=lambda r: (-r["calls"], r["client_name"]))
-    return {"available": True, "reason": None, "head": verify.get("head"), "chain_ok": verify.get("ok"), "problems": verify.get("problems"), "per_agent": per_agent, "clients_seen": clients_seen,
+    return {"available": True, "reason": None, "head": verify.get("head"), "chain_ok": verify.get("ok"), "problems": verify.get("problems"), "per_agent": per_agent, "clients_seen": clients_seen, "coverage": coverage, "truncated": truncated, "pages_read": pages, "snapshot_head_seq": snapshot, "newer_entries_not_included": newer,
+            "retention_pruned": retention_pruned, "oldest_seq_read": oldest_seq, "gaps": gaps, "degraded_now": degraded_now, "agent_view_complete": not agent_view_partial,
             "log_files": verify.get("files"), "entries_total": verify.get("entries")}
 
 
@@ -336,8 +431,14 @@ def render_markdown(ev: dict[str, Any], printout: str) -> str:
             else:
                 L.append(f"| {a['agent']} | 0 | - | - | - | {_esc(a['note'])} |")
         L.append("")
+        if cl.get("gaps") or cl.get("degraded_now"):
+            L += ["**Gaps in the call log (calls served but not logged):**", ""]
+            L += [f"- seq {g['seq']}: {g['unlogged_calls']} unlogged call(s), {g['refused_writes']} refused write(s), window {g['window_start']} to {g['window_end']}" for g in cl.get("gaps", [])]
+            if cl.get("degraded_now"):
+                L.append(f"- degraded right now: {cl['degraded_now']}")
+            L += ["", "A zero count for an agent in a gap window is not proof the agent made no call.", ""]
         if cl.get("clients_seen"):
-            L += ["Every client name the log saw (the latest 200 entries; self-reported, so a name is a claim and not an identity). `matched` says whether it was counted for one of the agents above:", "",
+            L += [f"Every client name the log saw (coverage: {cl.get('coverage')}; self-reported, so a name is a claim and not an identity). The last column says whether it was counted for one of the agents above. Rows named `relay-evidence` are this report's own read-only calls:", "",
                   "| Client name / version | Transport | Calls | Tools | Last seen | Matched an agent above |", "|---|---|---|---|---|---|"]
             for r in cl["clients_seen"]:
                 L.append(f"| {_esc(r['client_name'])}/{_esc(r['client_version'])} | {r['transport']} | {r['calls']} | {_esc(', '.join(r['tools']))} | {r['last_ts']} | {'yes' if r['matched_an_agent'] else '**no**'} |")
@@ -345,7 +446,10 @@ def render_markdown(ev: dict[str, Any], printout: str) -> str:
     L += ["## Script printout", "", "```", printout, "```", "", "## Raw command outputs", "",
           "Every request the script made (method, path, query, HTTP status; no headers, no key):", "", "```json", json.dumps(ev["requests_made"], indent=2), "```", ""]
     for label, item in ev["raw"].items():
-        L += [f"### `{label}` (HTTP {item['http_status']})", "", "```json", json.dumps(item["body"], indent=2, ensure_ascii=False), "```", ""]
+        body = item["body"]
+        if isinstance(body, dict) and isinstance(body.get("entries"), list) and len(body["entries"]) > 20:  # the full log is not pasted into the report
+            body = {**body, "entries": body["entries"][:20], "entries_omitted_from_this_listing": len(body["entries"]) - 20}
+        L += [f"### `{label}` (HTTP {item['http_status']})", "", "```json", json.dumps(body, indent=2, ensure_ascii=False), "```", ""]
     return "\n".join(L).rstrip() + "\n"
 
 
