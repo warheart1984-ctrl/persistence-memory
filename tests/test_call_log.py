@@ -735,6 +735,26 @@ def test_a_summary_whose_append_failed_keeps_its_count_and_is_written_later(tmp_
     assert log.verify()["ok"] is True
 
 
+def test_a_shutdown_flush_that_fails_leaves_the_counts_as_unlogged_for_the_next_process(tmp_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_CALL_LOG_READ_CAP_PER_MIN", "1")
+    monkeypatch.setenv("JARVIS_CALL_LOG_DENIED_CAP_PER_MIN", "1")
+    d = tmp_path / "shut"
+    log = call_log.CallLog(d)
+    for i in range(4):
+        log.record(_read_fields(i))                                      # 1 written, 3 suppressed
+    for i in range(3):
+        log.record(_denied_fields(i))                                    # 1 written, 2 suppressed
+    real = call_log.CallLog._append_locked
+    monkeypatch.setattr(call_log.CallLog, "_append_locked", lambda self, *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+    log.flush_for_shutdown()                                             # the volume is full as the app exits
+    monkeypatch.setattr(call_log.CallLog, "_append_locked", real)
+    assert log.degraded()["unlogged"] == 5 and "shutdown" in log.degraded()["last_error"]
+    nxt = call_log.CallLog(d)                                            # the next process
+    nxt.record(_read_fields(99))
+    gaps = [e for e in nxt.query(limit=50)["entries"] if e["outcome"] == "gap"]
+    assert len(gaps) == 1 and gaps[0]["count"] == 5 and nxt.verify()["ok"] is True
+
+
 def test_open_summaries_are_written_when_the_app_shuts_down(monkeypatch):
     monkeypatch.setenv("JARVIS_API_KEY", KEY)
     monkeypatch.delenv("JARVIS_ALLOW_UNAUTHENTICATED", raising=False)

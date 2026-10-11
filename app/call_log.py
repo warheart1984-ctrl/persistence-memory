@@ -469,6 +469,15 @@ class CallLog:
         self._suppressed = None  # only once the summary is durably in the log: a failed append keeps the count for the next flush
         return {"seq": entry["seq"], "entry_hash": entry["entry_hash"]}
 
+    def flush_for_shutdown(self) -> None:
+        """Last chance to write the open summaries. If that fails, the process is about to exit with their counts only in memory, so the
+        counts are recorded as unlogged calls in the DEGRADED state; the next process then writes them into a gap entry."""
+        self.flush()
+        pending = (self._suppressed or {}).get("count", 0) + (self._read_suppressed or {}).get("count", 0)
+        if pending:
+            self._mark_degraded("shutdown: the open denied/read summaries could not be written", unlogged=pending)
+            self._suppressed = self._read_suppressed = None
+
     def _flush_reads_locked(self, head: dict[str, Any]) -> dict[str, Any]:
         s = self._read_suppressed
         if not s:
