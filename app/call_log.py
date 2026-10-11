@@ -116,12 +116,20 @@ def denied_cap_per_minute() -> int:
         return 60
 
 
+# The REST routes that write ledger records (create_memory / update_memory / delete_memory in app/main.py): POST /memory, the promotion of an nx-search
+# result, the memory pipeline that materialises a record, and PATCH/PUT/DELETE of a record. POST /memory/external-search is NOT here: it writes only
+# when its auto_promote flag is set, which the log (it stores no arguments) cannot see, and without the flag it only reads.
+LEDGER_WRITE_ROUTES = frozenset({
+    ("POST", "/api/jarvis/memory"), ("POST", "/api/jarvis/memory/promote"), ("POST", "/api/jarvis/memory/pipeline"),
+    ("PATCH", "/api/jarvis/memory/{id}"), ("PUT", "/api/jarvis/memory/{id}"), ("DELETE", "/api/jarvis/memory/{id}"),
+})
+
+
 def _is_rest_write(fields: dict[str, Any]) -> bool:
     """A ledger write over REST (POST /memory, PATCH/PUT/DELETE /memory/{id}), whatever transport carried it: a stdio adapter sends it with the
     stdio label, and it is as much an ordering boundary as a plain HTTP one. It is matched by route, not by method alone: many POST endpoints
     (graph/bfs, rag/query, the tool routes) only read, and treating them as writes would let mixed traffic write a summary per read."""
-    route, method = fields.get("route"), fields.get("method")
-    return (route == "/api/jarvis/memory" and method == "POST") or (route == "/api/jarvis/memory/{id}" and method in ("PATCH", "PUT", "DELETE"))
+    return (fields.get("method"), fields.get("route")) in LEDGER_WRITE_ROUTES
 
 
 def read_cap_per_minute() -> int:

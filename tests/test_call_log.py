@@ -304,6 +304,18 @@ def test_a_read_only_post_endpoint_does_not_close_the_read_summary(fixed_minute,
     assert len(got) == 1 and got[0]["count"] == 7
 
 
+@pytest.mark.parametrize("method,route,closes", [("POST", "/api/jarvis/memory/promote", True), ("POST", "/api/jarvis/memory/pipeline", True), ("POST", "/api/jarvis/memory", True),
+                                                  ("PUT", "/api/jarvis/memory/{id}", True), ("POST", "/api/jarvis/memory/external-search", False),
+                                                  ("POST", "/api/jarvis/memory/graph/bfs", False), ("POST", "/api/jarvis/rag/query", False)])
+def test_which_rest_routes_close_the_read_summary(fixed_minute, tmp_path, monkeypatch, method, route, closes):
+    monkeypatch.setenv("JARVIS_CALL_LOG_READ_CAP_PER_MIN", "1")
+    log = call_log.CallLog(tmp_path / "which")
+    for i in range(3):
+        log.record(_read_fields(i))                                             # 1 written, 2 suppressed
+    log.record(call_log.make_fields(transport="http-api", tool=f"{method} {route}", args={}, outcome="ok", started=time.perf_counter(), route=route, method=method))
+    assert [e["outcome"] for e in log.entries_desc()].count("read_suppressed") == (1 if closes else 0)
+
+
 def test_a_failed_write_is_not_an_ordering_boundary(fixed_minute, tmp_path, monkeypatch):
     """A PATCH that 404s or a write tool that errors changed nothing; alternating them with reads must not write a summary per read."""
     monkeypatch.setenv("JARVIS_CALL_LOG_READ_CAP_PER_MIN", "1")
