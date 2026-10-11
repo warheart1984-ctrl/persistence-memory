@@ -271,9 +271,18 @@ def call_log_section(raw: dict[str, Any], agents: list[dict[str, Any]]) -> dict[
         caveats.append(f"the log records {len(gaps)} gap(s) in which {n_unlogged} call(s) were served but not logged (and {sum(g['refused_writes'] for g in gaps)} write(s) refused): a call in a gap window is not in this log")
     if degraded_now:
         caveats.append(f"the log is degraded right now ({degraded_now.get('unlogged', 0)} call(s) served but not yet logged, {degraded_now.get('refused', 0)} write(s) refused)")
+    # A log whose own chain check failed (or could not be run) cannot back a "complete" claim: an edited or deleted entry is skipped by the reader.
+    verify_raw = raw.get("calls_verify") or {}
+    verify_status = verify_raw.get("http_status")
+    chain_unverified = not (verify_status == 200 and verify.get("ok") is True)
+    if chain_unverified:
+        problems = verify.get("problems") if isinstance(verify.get("problems"), list) else []
+        caveats.append(f"the call log's own chain check did not pass (HTTP {verify_status}, ok={verify.get('ok')}, {len(problems)} problem(s)): entries may have been edited, deleted or skipped, so a zero count is unreliable")
     if caveats:
         coverage += "; " + "; ".join(caveats)
-    agent_view_partial = bool(truncated or retention_pruned or gaps or degraded_now)
+    if chain_unverified:
+        coverage = "UNVERIFIED LOG: " + coverage.replace("complete for the retained log only: all", "all", 1).replace("complete: all", "all", 1).replace("through seq", "through seq", 1)
+    agent_view_partial = bool(truncated or retention_pruned or gaps or degraded_now or chain_unverified)
     per_agent = []
     matched_names: set[str] = set()
     for a in agents:
@@ -300,7 +309,7 @@ def call_log_section(raw: dict[str, Any], agents: list[dict[str, Any]]) -> dict[
         row["last_ts"] = max(str(row["last_ts"]), str(e.get("ts")))
     clients_seen = sorted(({**r, "tools": sorted(r["tools"]), "matched_an_agent": r["client_name"] in matched_names} for r in seen.values()), key=lambda r: (-r["calls"], r["client_name"]))
     return {"available": True, "reason": None, "head": verify.get("head"), "chain_ok": verify.get("ok"), "problems": verify.get("problems"), "per_agent": per_agent, "clients_seen": clients_seen, "coverage": coverage, "truncated": truncated, "pages_read": pages, "snapshot_head_seq": snapshot, "newer_entries_not_included": newer,
-            "retention_pruned": retention_pruned, "oldest_seq_read": oldest_seq, "gaps": gaps, "degraded_now": degraded_now, "agent_view_complete": not agent_view_partial,
+            "retention_pruned": retention_pruned, "oldest_seq_read": oldest_seq, "gaps": gaps, "degraded_now": degraded_now, "agent_view_complete": not agent_view_partial, "chain_verified": not chain_unverified, "verify_http_status": verify_status,
             "log_files": verify.get("files"), "entries_total": verify.get("entries")}
 
 

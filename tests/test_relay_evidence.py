@@ -558,3 +558,21 @@ def test_the_markdown_lists_the_gaps_and_warns_a_zero_is_not_proof(rel):
     ev["call_log"] = section
     md = rel.render_markdown(ev, "p")
     assert "Gaps in the call log" in md and "seq 2: 3 unlogged call(s)" in md and "not proof the agent made no call" in md
+
+
+def test_a_log_whose_chain_check_failed_is_never_called_complete(rel):
+    entries = [call_entry(3, "opencode-x"), call_entry(2, "codex-x"), call_entry(1, "cursor-x")]
+    base = {"calls_all": {"http_status": 200, "body": {"entries": entries, "pages": 1, "truncated": False, "head_seq": 3}}}
+    broken = {**base, "calls_verify": {"http_status": 200, "body": {"ok": False, "head": {"seq": 3, "entry_hash": "h" * 64}, "files": ["f"], "entries": 3,
+                                                                     "problems": [{"file": "f", "line": 2, "problem": "entry 2: entry_hash does not match the content (edited)"}]}}}
+    section = rel.call_log_section(broken, [{"agent": "Kilo"}])
+    assert section["chain_verified"] is False and section["agent_view_complete"] is False
+    assert section["coverage"].startswith("UNVERIFIED LOG: all 3 log entries") and "complete" not in section["coverage"].split(";")[0]
+    assert "1 problem(s)" in section["coverage"] and "NOT complete" in section["per_agent"][0]["note"] and "chain check did not pass" in section["per_agent"][0]["note"]
+    for status in (500, 404, 401):  # verify could not even be run
+        unreadable = {**base, "calls_verify": {"http_status": status, "body": {"detail": "x"}}}
+        s2 = rel.call_log_section(unreadable, [{"agent": "Kilo"}])
+        assert s2["chain_verified"] is False and s2["verify_http_status"] == status and s2["coverage"].startswith("UNVERIFIED LOG:")
+    good = {**base, "calls_verify": {"http_status": 200, "body": {"ok": True, "head": {"seq": 3, "entry_hash": "h" * 64}, "files": ["f"], "entries": 3, "problems": []}}}
+    ok = rel.call_log_section(good, [{"agent": "Kilo"}])
+    assert ok["chain_verified"] is True and ok["agent_view_complete"] is True and ok["coverage"].startswith("complete: all 3 log entries")
