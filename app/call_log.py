@@ -551,6 +551,19 @@ class CallLog:
 
     def query(self, *, tool: str | None = None, client: str | None = None, since: str | None = None, limit: int = 50, before_seq: int | None = None) -> dict[str, Any]:
         self.flush()
+        return self._query_unlocked(tool=tool, client=client, since=since, limit=limit, before_seq=before_seq)
+
+    def query_with_head(self, *, tool: str | None = None, client: str | None = None, since: str | None = None, limit: int = 50, before_seq: int | None = None) -> dict[str, Any]:
+        """The page and the log's head from ONE locked snapshot: no append can land between reading the entries and reading the head, so for an
+        unfiltered request the head is always the newest entry of the first page (or the page is empty and the head is the genesis)."""
+        with self._locked():
+            with contextlib.suppress(CallLogError, OSError):  # open denied/read summaries are written first, like flush(); a failure here changes nothing
+                self._flush_reads_locked(self._flush_suppressed_locked(self._head()))
+            head = self._head()                                 # read after the flush, in the same hold of the lock as the page
+            page = self._query_unlocked(tool=tool, client=client, since=since, limit=limit, before_seq=before_seq)
+            return {**page, "head": head}
+
+    def _query_unlocked(self, *, tool: str | None, client: str | None, since: str | None, limit: int, before_seq: int | None) -> dict[str, Any]:
         out: list[dict[str, Any]] = []
         more = False
         for e in self.entries_desc():

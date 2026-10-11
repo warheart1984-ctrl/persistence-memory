@@ -799,6 +799,113 @@ def lockable_log_dir(jclient):
     unlock()
 
 
+# ------------------------------------------------------ the page and the head come from one locked snapshot (issue #80)
+
+
+def _race_appends(monkeypatch, directory: Path):
+    """While the page is read, another writer tries to append: once before the entries are read and once after. An unlocked reader lets
+    both finish (`join` returns because they are done); a locked snapshot makes them wait (`join` times out, they finish afterwards)."""
+    real = call_log.CallLog.entries_desc
+    threads: list[threading.Thread] = []
+
+    def racing(self):
+        def writer():
+            call_log.CallLog(directory).append(_fields(99))
+        t = threading.Thread(target=writer)
+        t.start()
+        threads.append(t)
+        t.join(timeout=0.4)
+        items = list(real(self))
+        t = threading.Thread(target=writer)
+        t.start()
+        threads.append(t)
+        t.join(timeout=0.4)
+        yield from items
+
+    monkeypatch.setattr(call_log.CallLog, "entries_desc", racing)
+
+    def finish():
+        for t in threads:
+            t.join(timeout=5)
+        monkeypatch.setattr(call_log.CallLog, "entries_desc", real)
+    return finish
+
+
+def test_an_append_while_the_page_is_read_cannot_split_it_from_its_head(tmp_path, monkeypatch):
+    log = call_log.CallLog(tmp_path / "snap")
+    for i in range(5):
+        log.append(_fields(i))
+    finish = _race_appends(monkeypatch, tmp_path / "snap")
+    page = log.query_with_head(limit=50)
+    finish()
+    assert page["entries"][0]["seq"] == page["head"]["seq"] == 5 and page["head"]["entry_hash"] == page["entries"][0]["entry_hash"]
+    assert log.head()["seq"] == 7                        # both appends did happen, just after the snapshot
+
+
+def test_the_old_two_step_read_would_have_split_the_page_from_its_head(tmp_path, monkeypatch):
+    """The same race against query() then head(): proves the test above can fail (the head runs ahead of the page)."""
+    log = call_log.CallLog(tmp_path / "split")
+    for i in range(5):
+        log.append(_fields(i))
+    finish = _race_appends(monkeypatch, tmp_path / "split")
+    page = log.query()
+    head = log.head()
+    finish()
+    assert head["seq"] > page["entries"][0]["seq"]
+
+
+def test_the_calls_endpoint_is_not_split_by_an_append_either(jclient, monkeypatch):
+    add(jclient)
+    tool(jclient, "emr_latest", {})
+    finish = _race_appends(monkeypatch, log_dir())
+    body = jclient.get("/api/jarvis/tools/calls?limit=200", headers=HDR).json()
+    finish()
+    assert body["entries"][0]["seq"] == body["head"]["seq"] == 2
+
+
+def test_under_concurrent_writers_the_head_is_always_the_first_entry_of_an_unfiltered_page(tmp_path):
+    log = call_log.CallLog(tmp_path / "stress")
+    stop = threading.Event()
+
+    def write():
+        w = call_log.CallLog(tmp_path / "stress")
+        i = 0
+        while not stop.is_set():
+            w.append(_fields(i))
+            i += 1
+
+    threads = [threading.Thread(target=write) for _ in range(3)]
+    for t in threads:
+        t.start()
+    try:
+        bad = []
+        for _ in range(60):
+            page = log.query_with_head(limit=200)
+            if page["entries"] and (page["entries"][0]["seq"] != page["head"]["seq"] or page["entries"][0]["entry_hash"] != page["head"]["entry_hash"]):
+                bad.append((page["entries"][0]["seq"], page["head"]["seq"]))
+    finally:
+        stop.set()
+        for t in threads:
+            t.join(timeout=10)
+    assert not bad, bad
+    assert log.verify()["ok"] is True
+
+
+def test_the_calls_endpoint_returns_the_head_with_the_page_and_keeps_its_shape(jclient):
+    add(jclient)
+    tool(jclient, "emr_latest", {})
+    body = jclient.get("/api/jarvis/tools/calls?limit=200", headers=HDR).json()
+    assert body["entries"][0]["seq"] == body["head"]["seq"] == len(body["entries"])
+    assert set(body["head"]) == {"seq", "entry_hash", "file", "ts"} and body["client_names"] == "self-reported" and body["provenance"] == "server-witnessed"
+    older = jclient.get(f"/api/jarvis/tools/calls?limit=1&cursor={body['head']['seq']}", headers=HDR).json()
+    assert older["entries"][0]["seq"] == body["head"]["seq"] - 1 and older["head"]["seq"] == body["head"]["seq"]   # a later page: the head is still the log's head
+
+
+def test_the_empty_log_has_the_genesis_head(tmp_path):
+    page = call_log.CallLog(tmp_path / "none").query_with_head(limit=10)
+    assert page["entries"] == [] and page["head"]["seq"] == 0 and page["head"]["entry_hash"] == call_log.GENESIS
+
+
 def _read_fields(i=0):
     f = call_log.make_fields(transport="http-api", tool="GET /api/jarvis/memory", args={"i": i}, outcome="ok", started=time.perf_counter(), route="/api/jarvis/memory", method="GET")
     return f

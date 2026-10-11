@@ -964,8 +964,8 @@ def tool_calls(
         raise HTTPException(status_code=404, detail="the call log is switched off (JARVIS_CALL_LOG_ENABLED)")
     if cursor is not None and not cursor.isdigit():
         raise HTTPException(status_code=422, detail="cursor must be the next_cursor from a previous page")
-    page = call_log.get_call_log().query(tool=tool, client=client, since=since, limit=limit, before_seq=int(cursor) if cursor else None)
-    return {**page, "head": call_log.get_call_log().head(), "client_names": "self-reported", "provenance": "server-witnessed"}
+    page = call_log.get_call_log().query_with_head(tool=tool, client=client, since=since, limit=limit, before_seq=int(cursor) if cursor else None)
+    return {**page, "client_names": "self-reported", "provenance": "server-witnessed"}
 
 
 @app.get("/api/jarvis/tools/calls/verify", dependencies=[Depends(require_emr_recall_api_key), Depends(require_call_log_operator)])
