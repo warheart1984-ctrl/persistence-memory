@@ -535,10 +535,25 @@ class CallLog:
             return None
 
     # ----- reading
-    def entries_desc(self) -> Iterator[dict[str, Any]]:
-        for path in reversed(self._files()):
+    def _snapshot(self) -> list[tuple[Path, int]]:
+        """Each daily file and its size right now. Call it under the lock: the files only ever grow by whole lines, so the first `size` bytes of each are
+        exactly the log as of this moment, and can be read later without holding the lock."""
+        out: list[tuple[Path, int]] = []
+        for path in self._files():
+            with contextlib.suppress(OSError):
+                out.append((path, path.stat().st_size))
+        return out
+
+    def entries_desc(self, snapshot: list[tuple[Path, int]] | None = None) -> Iterator[dict[str, Any]]:
+        """Entries newest first. With a snapshot, only the bytes that existed when it was taken (so a concurrent append is not seen)."""
+        files: list[tuple[Path, int | None]] = [(p, None) for p in reversed(self._files())] if snapshot is None else list(reversed(snapshot))
+        for path, size in files:
             try:
-                lines = path.read_text(encoding="utf-8").splitlines()
+                if size is None:
+                    lines = path.read_text(encoding="utf-8").splitlines()
+                else:
+                    with open(path, "rb") as fh:
+                        lines = fh.read(size).decode("utf-8", "replace").splitlines()
             except OSError:
                 continue
             for line in reversed(lines):
@@ -554,19 +569,22 @@ class CallLog:
         return self._query_unlocked(tool=tool, client=client, since=since, limit=limit, before_seq=before_seq)
 
     def query_with_head(self, *, tool: str | None = None, client: str | None = None, since: str | None = None, limit: int = 50, before_seq: int | None = None) -> dict[str, Any]:
-        """The page and the log's head from ONE locked snapshot: no append can land between reading the entries and reading the head, so for an
-        unfiltered request the head is always the newest entry of the first page (or the page is empty and the head is the genesis)."""
+        """The page and the log's head from ONE snapshot: the head and the size of every file are taken together under the lock, and the page is read
+        from exactly those bytes after the lock is released. So no append can fall between them (for an unfiltered request the head is always the newest
+        entry of the first page, or the page is empty and the head is the genesis), and a large log never holds the writers' lock while it is parsed."""
         with self._locked():
             with contextlib.suppress(CallLogError, OSError):  # open denied/read summaries are written first, like flush(); a failure here changes nothing
                 self._flush_reads_locked(self._flush_suppressed_locked(self._head()))
-            head = self._head()                                 # read after the flush, in the same hold of the lock as the page
-            page = self._query_unlocked(tool=tool, client=client, since=since, limit=limit, before_seq=before_seq)
-            return {**page, "head": head}
+            head = self._head()                                 # read after the flush, in the same hold of the lock as the file sizes
+            snapshot = self._snapshot()
+        page = self._query_unlocked(tool=tool, client=client, since=since, limit=limit, before_seq=before_seq, snapshot=snapshot)
+        return {**page, "head": head}
 
-    def _query_unlocked(self, *, tool: str | None, client: str | None, since: str | None, limit: int, before_seq: int | None) -> dict[str, Any]:
+    def _query_unlocked(self, *, tool: str | None, client: str | None, since: str | None, limit: int, before_seq: int | None,
+                        snapshot: list[tuple[Path, int]] | None = None) -> dict[str, Any]:
         out: list[dict[str, Any]] = []
         more = False
-        for e in self.entries_desc():
+        for e in (self.entries_desc() if snapshot is None else self.entries_desc(snapshot)):
             if before_seq is not None and e.get("seq", 0) >= before_seq:
                 continue
             if since and str(e.get("ts", "")) < since:

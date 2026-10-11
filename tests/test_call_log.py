@@ -808,14 +808,14 @@ def _race_appends(monkeypatch, directory: Path):
     real = call_log.CallLog.entries_desc
     threads: list[threading.Thread] = []
 
-    def racing(self):
+    def racing(self, snapshot=None):
         def writer():
             call_log.CallLog(directory).append(_fields(99))
         t = threading.Thread(target=writer)
         t.start()
         threads.append(t)
         t.join(timeout=0.4)
-        items = list(real(self))
+        items = list(real(self) if snapshot is None else real(self, snapshot))
         t = threading.Thread(target=writer)
         t.start()
         threads.append(t)
@@ -840,6 +840,42 @@ def test_an_append_while_the_page_is_read_cannot_split_it_from_its_head(tmp_path
     finish()
     assert page["entries"][0]["seq"] == page["head"]["seq"] == 5 and page["head"]["entry_hash"] == page["entries"][0]["entry_hash"]
     assert log.head()["seq"] == 7                        # both appends did happen, just after the snapshot
+
+
+def test_reading_a_page_does_not_hold_the_writers_lock(tmp_path, monkeypatch):
+    """A big log is parsed AFTER the lock is released: a writer that arrives during the read finishes at once (it used to wait for the whole scan),
+    and its entry is simply not in the page, which is exactly the log as of the snapshot."""
+    log = call_log.CallLog(tmp_path / "nolock")
+    for i in range(5):
+        log.append(_fields(i))
+    real = call_log.CallLog.entries_desc
+    outcome = {}
+
+    def slow_read(self, snapshot=None):
+        t = threading.Thread(target=lambda: call_log.CallLog(tmp_path / "nolock").append(_fields(99)))
+        t.start()
+        t.join(timeout=3)
+        outcome["writer_blocked"] = t.is_alive()
+        yield from (real(self) if snapshot is None else real(self, snapshot))
+
+    monkeypatch.setattr(call_log.CallLog, "entries_desc", slow_read)
+    page = log.query_with_head(limit=50)
+    monkeypatch.setattr(call_log.CallLog, "entries_desc", real)
+    assert outcome["writer_blocked"] is False                                   # the lock was free while the page was read
+    assert page["entries"][0]["seq"] == page["head"]["seq"] == 5                # and the page still matches its head exactly
+    assert log.head()["seq"] == 6
+
+
+def test_a_snapshot_page_ignores_what_was_appended_after_it(tmp_path):
+    log = call_log.CallLog(tmp_path / "snapbytes")
+    for i in range(3):
+        log.append(_fields(i))
+    with log._locked():
+        snap = log._snapshot()
+    for i in range(4):
+        log.append(_fields(10 + i))
+    assert [e["seq"] for e in log.entries_desc(snap)] == [3, 2, 1]
+    assert [e["seq"] for e in log.entries_desc()][0] == 7
 
 
 def test_the_old_two_step_read_would_have_split_the_page_from_its_head(tmp_path, monkeypatch):
