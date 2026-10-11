@@ -781,7 +781,8 @@ def test_a_repeated_query_parameter_changes_the_witness_hash(jclient):
 
 
 @pytest.mark.parametrize("method,path", [("GET", "/api/jarvis/memory/bearer-secret-123"), ("GET", "/api/jarvis/memory/amul/artifacts/token-xyz-987"),
-                                          ("PATCH", "/api/jarvis/memory/bearer-secret-123"), ("DELETE", "/api/jarvis/memory/bearer-secret-123")])
+                                          ("PATCH", "/api/jarvis/memory/bearer-secret-123"), ("DELETE", "/api/jarvis/memory/bearer-secret-123"),
+                                          ("GET", "/api/jarvis/memory/watch"), ("GET", "/api/jarvis/memory/amul/artifacts/latest"), ("GET", "/api/jarvis/memory/serve")])
 def test_a_path_parameter_that_is_not_a_record_id_never_reaches_the_log(jclient, method, path):
     before = len(entries())
     jclient.request(method, path, headers=HDR, json={"subject": "x", "expected_version": 1} if method == "PATCH" else None)
@@ -789,6 +790,30 @@ def test_a_path_parameter_that_is_not_a_record_id_never_reaches_the_log(jclient,
     secret = path.rsplit("/", 1)[1]
     assert secret not in json.dumps(e) and "{id}" in e["route"] and e["route"] == e["tool"].split(" ", 1)[1] and e["target"] is None
     assert secret not in "".join(p.read_text() for p in log_dir().glob("calls-*.jsonl"))
+
+
+def test_a_literal_from_one_route_is_not_kept_in_another_routes_parameter_slot(jclient):
+    """`watch` is a literal of /external/watch only; as a path parameter of /memory/{id} it must be redacted. Position decides, not the word."""
+    before = len(entries())
+    jclient.get("/api/jarvis/memory/watch", headers=HDR)
+    jclient.get("/api/jarvis/memory/external/watch", headers=HDR)          # not a GET route, but the path still matches the table
+    jclient.get("/api/jarvis/memory/not/a/route/at/all-secret-77", headers=HDR)
+    got = entries()[before:]
+    assert [e["route"] for e in got] == ["/api/jarvis/memory/{id}", "/api/jarvis/memory/external/watch", "/api/jarvis/memory/{other}"]
+    assert "secret-77" not in json.dumps(got)
+
+
+def test_mixed_traffic_does_not_write_a_summary_per_read(jclient, monkeypatch):
+    """Alternating reads with a read-only tool call must not close the summary every time, or the cap bounds nothing."""
+    monkeypatch.setenv("JARVIS_CALL_LOG_READ_CAP_PER_MIN", "2")
+    for _ in range(15):
+        jclient.get("/api/jarvis/memory", headers=HDR)
+        tool(jclient, "emr_latest", {})
+    jclient.get("/api/jarvis/tools/calls?limit=1", headers=HDR)             # reading the log closes the open summary
+    got = entries()
+    assert [e["outcome"] for e in got].count("read_suppressed") == 1
+    assert sum(1 for e in got if e["method"] == "GET" and e["outcome"] == "ok") == 2 and len(got) == 2 + 15 + 1
+    assert [e for e in got if e["outcome"] == "read_suppressed"][0]["count"] == 13
 
 
 def test_real_record_ids_and_known_routes_keep_their_templates(jclient):

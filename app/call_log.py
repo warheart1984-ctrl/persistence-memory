@@ -447,7 +447,9 @@ class CallLog:
                             s["window_end"] = _ts(self._clock())
                             self._read_suppressed = s
                             return {"suppressed": True}
-                    else:  # anything that is not a read (a write above all) closes the open read summary first, so the order shows what came before it
+                    elif fields.get("tool") in WRITE_TOOLS or (fields.get("transport") == "http-api" and fields.get("method") not in (None, "GET", "HEAD", "OPTIONS")):
+                        # a write is an ordering boundary: it closes the open read summary first, so the log shows how many reads came before it.
+                        # Other calls (a read-only tool, say) do not: alternating them with reads would otherwise write one summary per read.
                         head = self._flush_reads_locked(head)
                 return self._append_locked(fields, head)
         except CallLogError:

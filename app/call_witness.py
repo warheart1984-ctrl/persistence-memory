@@ -30,14 +30,6 @@ from app.refusal import error_body, error_headers
 
 TOOLS_PREFIX = "/api/jarvis/tools/"
 MEMORY_PREFIX = "/api/jarvis/memory"
-# The literal path segments of the memory routes. Any other segment under /api/jarvis/memory is a path parameter (an id, an artifact id,
-# or whatever a caller typed): it is replaced by a placeholder and never written to the log.
-MEMORY_LITERALS = frozenset({
-    "board", "retrieve", "conflicts", "search", "latest", "unified", "external", "stats", "emr", "status", "excite", "reinforce", "correct",
-    "active", "stm", "context", "expand", "pipeline", "history", "verify", "resolve", "amul", "anchor", "artifacts", "lineage", "field",
-    "graph", "bfs", "shortest-path", "related", "components", "external-search", "promote", "ask", "remember", "forget", "describe",
-    "spatialize", "scan", "reindex", "prune", "watch", "stop", "serve",
-})
 OWN_PREFIXES = ("/api/jarvis/tools/calls",)  # the log's own endpoints are not tool calls
 READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 MAX_RESPONSE_BUFFER = 2 * 1024 * 1024
@@ -47,6 +39,16 @@ _ID_SEGMENTS = (
     (re.compile(r"^[0-9]+$"), "{n}"),
 )
 _CODE_SAFE = re.compile(r"[^A-Za-z0-9_:.\-]")
+# The route templates under /api/jarvis/memory (relative; "{id}" is any one segment). A path is templated by matching it position by position
+# against these, preferring the template with the most literal segments; a segment that lands on a "{id}" is a path parameter and is never
+# written (the target is recorded only if it really is a record id), and a path that matches nothing is logged as .../{other}.
+MEMORY_TEMPLATES = tuple(tuple(x for x in route.split("/") if x) for route in (
+    "", "board", "retrieve", "conflicts", "search", "latest", "unified", "promote", "external-search", "active", "stm", "stm/context", "stm/expand",
+    "pipeline", "history/verify", "{id}", "{id}/history", "{id}/resolve", "external/stats", "external/ask", "external/remember", "external/forget",
+    "external/describe", "external/spatialize", "external/scan", "external/reindex", "external/prune", "external/watch", "external/watch/stop",
+    "external/serve", "external/serve/stop", "emr/status", "emr/excite", "emr/reinforce", "emr/correct", "amul/anchor", "amul/artifacts/{id}",
+    "amul/lineage/{id}", "amul/field/status", "amul/field/verify", "graph/bfs", "graph/shortest-path", "graph/related", "graph/stats", "graph/components",
+))
 
 
 def normalize_route(path: str) -> tuple[str, str | None]:
@@ -63,17 +65,18 @@ def normalize_route(path: str) -> tuple[str, str | None]:
 
 
 def normalize_memory_route(path: str) -> tuple[str, str | None]:
-    """Route template for a path under /api/jarvis/memory: known literals stay, every other segment becomes {id}.
-    The target is only recorded when the segment really is a record id, so a typed-in secret never reaches the log."""
-    parts, target = [], None
-    for seg in path.split("/"):
-        if seg == "" or seg in ("api", "jarvis", "memory") or seg in MEMORY_LITERALS:
-            parts.append(seg)
+    """Route template for a path under /api/jarvis/memory, taken from the route table by position, never from the typed path."""
+    segs = [s for s in path[len(MEMORY_PREFIX):].split("/") if s]
+    best: tuple[str, ...] | None = None
+    for tpl in MEMORY_TEMPLATES:
+        if len(tpl) != len(segs) or any(p != "{id}" and p != s for p, s in zip(tpl, segs)):
             continue
-        if any(rx.match(seg) for rx, _ in _ID_SEGMENTS) and target is None:
-            target = seg
-        parts.append("{id}")
-    return "/".join(parts), target
+        if best is None or sum(p != "{id}" for p in tpl) > sum(p != "{id}" for p in best):
+            best = tpl
+    if best is None:
+        return MEMORY_PREFIX + "/{other}", None
+    target = next((s for p, s in zip(best, segs) if p == "{id}" and any(rx.match(s) for rx, _ in _ID_SEGMENTS)), None)
+    return "/".join([MEMORY_PREFIX, *best]), target
 
 
 def classify(method: str, path: str) -> dict[str, Any] | None:
