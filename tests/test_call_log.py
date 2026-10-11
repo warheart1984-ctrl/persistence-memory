@@ -176,16 +176,104 @@ def test_the_stdio_proxy_is_witnessed_as_mcp_stdio_with_its_self_reported_client
         thread.join(timeout=5)
 
 
-def test_non_get_calls_under_api_jarvis_are_logged_as_http_api_and_reads_are_not(jclient):
+def test_writes_under_api_jarvis_are_logged_as_http_api(jclient):
     before = len(entries())
     rec = add(jclient)
-    assert jclient.get("/api/jarvis/memory", headers=HDR).status_code == 200  # a GET read: not witnessed
     assert jclient.patch(f"/api/jarvis/memory/{rec['id']}", headers=HDR, json={"subject": "s", "expected_version": rec["version"]}).status_code == 200
     assert jclient.delete(f"/api/jarvis/memory/{rec['id']}", headers=HDR).status_code == 200
     got = entries()[before:]
     assert [(e["transport"], e["tool"]) for e in got] == [
         ("http-api", "POST /api/jarvis/memory"), ("http-api", "PATCH /api/jarvis/memory/{id}"), ("http-api", "DELETE /api/jarvis/memory/{id}")]
     assert [e["target"] for e in got][1:] == [rec["id"], rec["id"]] and all(e["outcome"] == "ok" for e in got)
+
+
+# ------------------------------------------------------------ 1b. GET reads of /api/jarvis/memory/* (issue #73)
+
+READ_PATHS = ["/api/jarvis/memory", "/api/jarvis/memory/{id}", "/api/jarvis/memory/latest?limit=3", "/api/jarvis/memory/search?query=record",
+              "/api/jarvis/memory/board", "/api/jarvis/memory/retrieve?query=record"]
+
+
+def test_every_memory_get_read_is_witnessed_with_its_route_target_and_client(jclient):
+    rec = add(jclient)
+    before = len(entries())
+    seen = []
+    for path in READ_PATHS:
+        r = jclient.get(path.replace("{id}", rec["id"]), headers={**HDR, "X-Jarvis-MCP-Client": "grok/1.2", "X-Jarvis-MCP-Transport": "stdio"})
+        assert r.status_code == 200, (path, r.text)
+        seen.append(r.headers.get("x-jarvis-call-seq"))
+    got = entries()[before:]
+    assert len(got) == len(READ_PATHS) and [str(e["seq"]) for e in got] == seen
+    assert all(e["method"] == "GET" and e["outcome"] == "ok" and e["transport"] == "mcp-stdio" and e["client_name"] == "grok" for e in got)
+    assert [e["tool"] for e in got] == ["GET /api/jarvis/memory", "GET /api/jarvis/memory/{id}", "GET /api/jarvis/memory/latest", "GET /api/jarvis/memory/search",
+                                        "GET /api/jarvis/memory/board", "GET /api/jarvis/memory/retrieve"]
+    assert got[1]["target"] == rec["id"] and got[0]["target"] is None
+
+
+def test_a_plain_http_read_is_http_api_and_its_query_is_hashed_never_stored(jclient):
+    add(jclient)
+    before = len(entries())
+    jclient.get("/api/jarvis/memory/search?query=UNIQUE-READ-MARKER-5d1", headers=HDR)
+    (e,) = entries()[before:]
+    assert e["transport"] == "http-api" and e["args_sha256"] and "UNIQUE-READ-MARKER-5d1" not in json.dumps(e)
+    assert call_log.args_hash({"query": "UNIQUE-READ-MARKER-5d1"}) == e["args_sha256"]
+
+
+def test_a_read_that_is_denied_or_missing_is_witnessed_with_its_outcome(jclient):
+    jclient.get("/api/jarvis/memory", headers={"X-API-Key": "wrong"})
+    jclient.get("/api/jarvis/memory/mem-000000000000", headers=HDR)
+    got = entries()
+    assert [(e["outcome"], e["status_code"]) for e in got] == [("denied", 401), ("error", 404)]
+
+
+def test_reads_outside_the_memory_routes_are_still_not_witnessed(jclient):
+    for path in ("/ready", "/api/jarvis/replay/state?limit=1", "/api/jarvis/tools", "/api/jarvis/tools/calls", "/api/jarvis/tools/calls/verify"):
+        jclient.get(path, headers=HDR)
+    assert entries() == []
+
+
+def test_turning_read_witnessing_off_leaves_writes_and_tools_witnessed(jclient, monkeypatch):
+    monkeypatch.setenv("JARVIS_CALL_LOG_READS", "0")
+    rec = add(jclient)
+    assert jclient.get("/api/jarvis/memory", headers=HDR).status_code == 200
+    assert jclient.get(f"/api/jarvis/memory/{rec['id']}", headers=HDR).status_code == 200
+    tool(jclient, "emr_latest", {})
+    assert [e["tool"] for e in entries()] == ["POST /api/jarvis/memory", "emr_latest"]
+
+
+def test_a_flood_of_reads_is_capped_and_rolled_into_one_read_suppressed_entry(jclient, monkeypatch):
+    monkeypatch.setenv("JARVIS_CALL_LOG_READ_CAP_PER_MIN", "5")
+    for _ in range(20):
+        assert jclient.get("/api/jarvis/memory/latest?limit=1", headers=HDR).status_code == 200
+    page = jclient.get("/api/jarvis/tools/calls?limit=200", headers=HDR).json()   # reading the log flushes the open summary
+    reads = [e for e in page["entries"] if e["outcome"] == "ok"]
+    summary = [e for e in page["entries"] if e["outcome"] == "read_suppressed"]
+    assert len(reads) == 5 and len(summary) == 1
+    assert summary[0]["count"] == 15 and summary[0]["error_code"] == "SUPPRESSED:15" and summary[0]["window_start"] and summary[0]["window_end"]
+    assert jclient.get("/api/jarvis/tools/calls/verify", headers=HDR).json()["ok"] is True
+
+
+def test_a_write_closes_the_open_read_summary_first_so_the_order_shows_what_preceded_it(jclient, monkeypatch):
+    monkeypatch.setenv("JARVIS_CALL_LOG_READ_CAP_PER_MIN", "2")
+    for _ in range(6):
+        jclient.get("/api/jarvis/memory", headers=HDR)
+    add(jclient)
+    got = entries()
+    assert [e["outcome"] for e in got] == ["ok", "ok", "read_suppressed", "ok"] and got[2]["count"] == 4 and got[3]["tool"] == "POST /api/jarvis/memory"
+
+
+def test_the_read_cap_does_not_throttle_tool_calls_or_writes(jclient, monkeypatch):
+    monkeypatch.setenv("JARVIS_CALL_LOG_READ_CAP_PER_MIN", "1")
+    for _ in range(4):
+        tool(jclient, "emr_latest", {})
+    for _ in range(3):
+        add(jclient)
+    assert [e["outcome"] for e in entries()] == ["ok"] * 7
+
+
+def test_a_failing_log_never_blocks_a_read(jclient, monkeypatch):
+    monkeypatch.setattr(call_log.CallLog, "_append_locked", lambda self, *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+    r = jclient.get("/api/jarvis/memory", headers=HDR)
+    assert r.status_code == 200 and r.headers.get("x-jarvis-call-log") == "degraded"
 
 
 def test_the_logs_own_endpoints_and_the_catalog_are_not_logged(jclient):
@@ -532,6 +620,7 @@ def test_a_read_fails_open_with_a_degraded_flag_and_a_write_fails_closed_then_re
 
 
 def test_an_append_that_fails_after_a_write_committed_keeps_the_real_result_and_blocks_further_writes(jclient, monkeypatch):
+    monkeypatch.setenv("JARVIS_CALL_LOG_READS", "0")  # this test counts unlogged WRITES; its probe reads are not part of that count
     log = call_log.get_call_log()
     original = call_log.CallLog.append
 
@@ -620,8 +709,21 @@ def lockable_log_dir(jclient):
 
 
 @posix_user_only
-def test_scenario_a_unwritable_directory_still_leaves_a_gap_entry_after_recovery(jclient, lockable_log_dir):
+def test_reads_served_during_an_outage_are_counted_in_the_gap_entry(jclient, lockable_log_dir):
+    lockable_log_dir.lock_dir()
+    for _ in range(3):
+        r = jclient.get("/api/jarvis/memory", headers=HDR)
+        assert r.status_code == 200 and r.headers.get("x-jarvis-call-log") == "degraded"      # fail open: the read is served
+    lockable_log_dir.unlock()
+    add(jclient)
+    gaps = [e for e in entries() if e["outcome"] == "gap"]
+    assert len(gaps) == 1 and gaps[0]["count"] == 3
+
+
+@posix_user_only
+def test_scenario_a_unwritable_directory_still_leaves_a_gap_entry_after_recovery(jclient, lockable_log_dir, monkeypatch):
     """The DEGRADED file lives in the directory that cannot be written, so the outage must also be remembered in memory."""
+    monkeypatch.setenv("JARVIS_CALL_LOG_READS", "0")  # the probe reads are not what this counts (see the reads-during-an-outage test)
     n0 = _record_count(jclient)
     lockable_log_dir.lock_dir()
     r = tool(jclient, "emr_latest")  # a read: served anyway, but it cannot be logged
@@ -637,8 +739,9 @@ def test_scenario_a_unwritable_directory_still_leaves_a_gap_entry_after_recovery
 
 
 @posix_user_only
-def test_scenario_b_an_unwritable_log_file_refuses_the_first_write_instead_of_committing_it_unlogged(jclient, lockable_log_dir):
+def test_scenario_b_an_unwritable_log_file_refuses_the_first_write_instead_of_committing_it_unlogged(jclient, lockable_log_dir, monkeypatch):
     """The directory looks writable, but today's file is not: the preflight must notice, so the write is refused, not committed."""
+    monkeypatch.setenv("JARVIS_CALL_LOG_READS", "0")
     n0 = _record_count(jclient)
     lockable_log_dir.lock_file()
     w = jclient.post("/api/jarvis/memory", headers=HDR, json=_write_body("b1"))

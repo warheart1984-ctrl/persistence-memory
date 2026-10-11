@@ -13,9 +13,17 @@ from the store, so logging can never change the ledger's state root, history or 
 | `tools/call` on `POST /mcp` | `mcp-http` | one entry per call, including every call in a batch, unknown tools and denied calls |
 | every **non-GET** call under `/api/jarvis/` (`POST`/`PATCH`/`DELETE` on `/memory`, `/blocks/seal`, `/replay/receipts`, ...) | `http-api` | `tool` is `"METHOD /route/{id}"`, `target` is the record id in the path |
 
+| every **GET** read of `/api/jarvis/memory` and `/api/jarvis/memory/*` (`/{id}`, `/latest`, `/search`, `/retrieve`, `/board`) | `http-api`, or `mcp-stdio` from a stdio adapter (Grok's `ledger_stdio.py` sends the stdio header and its client name) | `tool` is `"GET /route/{id}"`; the query is hashed like any argument, never stored |
+
 Denied (`401`/`403`) and failed calls are logged too, including requests the API-key check rejects before the route runs.
 
-**Not witnessed (v1):** `GET` reads of `/api/jarvis/memory/*` (high volume: hooks, soak; tracked in the follow-up issue), the log's own
+Reads are high volume (the sessionStart hook, `ping_memoryboard.py`, soak runs), so they are **capped, never dropped silently**: up to
+`JARVIS_CALL_LOG_READ_CAP_PER_MIN` (default 600, per process per minute) are written one by one; the rest of that minute is rolled into one
+`read_suppressed` entry (`tool: "(read calls)"`, `count`, `window_start`, `window_end`). A write, or the next read in a new minute, closes the
+open summary, so the order of the log shows how many reads came before a write. `JARVIS_CALL_LOG_READS=0` turns read witnessing off (writes and
+tool calls stay witnessed). A read served while the log cannot be written is counted in the recovery `gap` entry like any other served call.
+
+**Not witnessed:** GET reads outside `/api/jarvis/memory` (`/replay/*`, `/blocks`, the nx routes), the log's own
 endpoints, `/ready` and `/health`. The general memory API (`/api/jarvis/memory`) is the live ledger's real write path (MCP writes are
 off on live), which is why its writes are in scope.
 
@@ -23,7 +31,7 @@ off on live), which is why its writes are in scope.
 
 `seq`, `ts` (UTC), `prev_hash`, `entry_hash` (sha256 of the canonical JSON of the entry without this field), `transport`,
 `client_name`, `client_version`, `client_self_reported: true`, `tenant`, `tool`, `route`, `method`, `target`, `args_sha256`, `outcome`
-(`ok` | `denied` | `error` | `denied_suppressed` | `gap`), `error_code`, `status_code`, `result_digest` (when the tool returned one),
+(`ok` | `denied` | `error` | `denied_suppressed` | `read_suppressed` | `gap`), `error_code`, `status_code`, `result_digest` (when the tool returned one),
 `duration_ms`.
 
 * **Never stored:** raw arguments, API keys, headers, tokens. `args_sha256` is over the canonical JSON (sorted keys, compact), so key
@@ -76,6 +84,8 @@ off on live), which is why its writes are in scope.
 | `JARVIS_CALL_LOG_DIR` | `<dir of JARVIS_STORE_PATH>/call-log` | |
 | `JARVIS_CALL_LOG_RETAIN_DAYS` | `90` | |
 | `JARVIS_CALL_LOG_DENIED_CAP_PER_MIN` | `60` | |
+| `JARVIS_CALL_LOG_READS` | on whenever the call log is on | `0` stops witnessing memory GET reads |
+| `JARVIS_CALL_LOG_READ_CAP_PER_MIN` | `600` | reads beyond this a minute are summarised in one `read_suppressed` entry |
 
 ## Honest limits
 

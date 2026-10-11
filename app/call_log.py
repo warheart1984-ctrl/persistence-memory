@@ -72,7 +72,7 @@ FILE_RE = re.compile(r"^calls-(\d{8})\.jsonl$")
 MIN_FREE_BYTES = 1 << 20
 WRITE_TOOLS = frozenset({"emr_remember", "emr_upsert"})
 TRANSPORTS = ("mcp-stdio", "mcp-http", "http-tool", "http-api")
-OUTCOMES = ("ok", "denied", "error", "denied_suppressed", "gap")
+OUTCOMES = ("ok", "denied", "error", "denied_suppressed", "read_suppressed", "gap")
 
 
 class CallLogError(Exception):
@@ -114,6 +114,19 @@ def denied_cap_per_minute() -> int:
         return max(1, int((os.environ.get("JARVIS_CALL_LOG_DENIED_CAP_PER_MIN") or "").strip() or 60))
     except ValueError:
         return 60
+
+
+def read_cap_per_minute() -> int:
+    """GET reads of /api/jarvis/memory/* are witnessed one by one up to this many a minute (per process); the rest are rolled into one summary."""
+    try:
+        return max(1, int((os.environ.get("JARVIS_CALL_LOG_READ_CAP_PER_MIN") or "").strip() or 600))
+    except ValueError:
+        return 600
+
+
+def reads_enabled() -> bool:
+    """Whether memory GET reads are witnessed at all (JARVIS_CALL_LOG_READS, default on whenever the call log is on)."""
+    return (os.environ.get("JARVIS_CALL_LOG_READS") or "1").strip().lower() not in ("0", "false", "no", "off")
 
 
 # --------------------------------------------------------------------------------------------------------- helpers
@@ -177,6 +190,8 @@ class CallLog:
         self._outage: dict[str, Any] | None = None  # unlogged/refused calls kept in memory, so a gap can be recorded even if the DEGRADED file cannot be written
         self._suppressed: dict[str, Any] | None = None  # the open denied-flood window for this process
         self._denied_window: tuple[str, int] = ("", 0)
+        self._read_suppressed: dict[str, Any] | None = None  # the open read-flood window (same idea, for memory GET reads)
+        self._read_window: tuple[str, int] = ("", 0)
 
     # ----- paths
     @property
@@ -419,6 +434,21 @@ class CallLog:
                         return {"suppressed": True}
                 else:
                     head = self._flush_suppressed_locked(head)
+                    if fields.get("method") == "GET" and fields.get("transport") != "http-tool":  # a memory read: capped, never silently dropped
+                        window = self._clock().strftime("%Y-%m-%dT%H:%M")
+                        if self._read_window[0] != window:
+                            head = self._flush_reads_locked(head)
+                            self._read_window = (window, 0)
+                        count = self._read_window[1] + 1
+                        self._read_window = (window, count)
+                        if count > read_cap_per_minute():
+                            s = self._read_suppressed or {"window_start": _ts(self._clock()), "count": 0}
+                            s["count"] += 1
+                            s["window_end"] = _ts(self._clock())
+                            self._read_suppressed = s
+                            return {"suppressed": True}
+                    else:  # anything that is not a read (a write above all) closes the open read summary first, so the order shows what came before it
+                        head = self._flush_reads_locked(head)
                 return self._append_locked(fields, head)
         except CallLogError:
             raise
@@ -438,11 +468,24 @@ class CallLog:
         entry = self._append_locked(fields, head)
         return {"seq": entry["seq"], "entry_hash": entry["entry_hash"]}
 
+    def _flush_reads_locked(self, head: dict[str, Any]) -> dict[str, Any]:
+        s, self._read_suppressed = self._read_suppressed, None
+        if not s:
+            return head
+        fields = {
+            "transport": "http-api", "client_name": None, "client_version": None, "client_self_reported": True, "tenant": "operator",
+            "tool": "(read calls)", "route": None, "method": "GET", "target": None, "args_sha256": args_hash({"suppressed": s["count"]}),
+            "outcome": "read_suppressed", "error_code": f"SUPPRESSED:{s['count']}", "status_code": None, "result_digest": None, "duration_ms": 0,
+            "window_start": s["window_start"], "window_end": s["window_end"], "count": s["count"],
+        }
+        entry = self._append_locked(fields, head)
+        return {"seq": entry["seq"], "entry_hash": entry["entry_hash"]}
+
     def flush(self) -> None:
-        """Write any open 'denied_suppressed' summary now (the read endpoints call this so readers see it)."""
+        """Write any open 'denied_suppressed' / 'read_suppressed' summary now (the read endpoints call this so readers see it)."""
         with contextlib.suppress(CallLogError, OSError):
             with self._locked():
-                self._flush_suppressed_locked(self._head())
+                self._flush_reads_locked(self._flush_suppressed_locked(self._head()))
 
     def record(self, fields: dict[str, Any]) -> dict[str, Any] | None:
         """Append, applying the failure policy: never raises.  Returns the entry, or None if it could not be written."""

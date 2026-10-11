@@ -5,7 +5,11 @@ What is witnessed:
 * every non-GET call under ``/api/jarvis/`` (transport ``http-api``),
 * every ``tools/call`` on ``/mcp`` (transport ``mcp-http``), one entry per call even when a request carries a batch.
 
-Not witnessed (documented in docs/call_log.md): GET reads of ``/api/jarvis/memory/*``, the log's own endpoints, and health/ready.
+* every GET read of ``/api/jarvis/memory`` and ``/api/jarvis/memory/*`` (transport ``http-api``, or ``mcp-stdio`` from a stdio adapter), up to
+  JARVIS_CALL_LOG_READ_CAP_PER_MIN a minute; beyond that the reads are counted into one ``read_suppressed`` summary entry, never dropped silently.
+  JARVIS_CALL_LOG_READS=0 turns read witnessing off.
+
+Not witnessed (documented in docs/call_log.md): the log's own endpoints, health/ready, and GET reads outside ``/api/jarvis/memory``.
 
 Client identity is whatever the client says about itself (``clientInfo`` on MCP initialize, the ``X-Jarvis-MCP-Client`` header, or the
 User-Agent); the server records it labelled as self-reported.  The entry is appended BEFORE the response is sent, so a client that
@@ -25,6 +29,7 @@ from app import call_log
 from app.refusal import error_body, error_headers
 
 TOOLS_PREFIX = "/api/jarvis/tools/"
+MEMORY_PREFIX = "/api/jarvis/memory"
 OWN_PREFIXES = ("/api/jarvis/tools/calls",)  # the log's own endpoints are not tool calls
 READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 MAX_RESPONSE_BUFFER = 2 * 1024 * 1024
@@ -56,6 +61,9 @@ def classify(method: str, path: str) -> dict[str, Any] | None:
     if path.startswith(TOOLS_PREFIX):
         name = path[len(TOOLS_PREFIX):].strip("/") or "(none)"
         return {"kind": "tool", "tool": name[:64], "route": path, "target": None, "write": name in call_log.WRITE_TOOLS}
+    if method == "GET" and (path == MEMORY_PREFIX or path.startswith(MEMORY_PREFIX + "/")) and call_log.reads_enabled():
+        route, target = normalize_route(path)
+        return {"kind": "api", "tool": f"GET {route}", "route": route, "target": target, "write": False}
     if path.startswith("/api/jarvis/") and method not in READ_METHODS:
         route, target = normalize_route(path)
         write = (route == "/api/jarvis/memory" and method == "POST") or (route == "/api/jarvis/memory/{id}" and method in ("PATCH", "PUT", "DELETE"))

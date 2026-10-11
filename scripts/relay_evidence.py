@@ -303,7 +303,7 @@ def call_log_section(raw: dict[str, Any], agents: list[dict[str, Any]]) -> dict[
         })
     seen: dict[tuple[str, str, str], dict[str, Any]] = {}
     for e in entries:
-        if e.get("outcome") in ("gap", "denied_suppressed"):
+        if e.get("outcome") in ("gap", "denied_suppressed", "read_suppressed"):
             continue
         key = (str(e.get("client_name") or "(none)"), str(e.get("client_version") or ""), str(e.get("transport")))
         row = seen.setdefault(key, {"client_name": key[0], "client_version": key[1], "transport": key[2], "calls": 0, "tools": set(), "last_ts": e.get("ts")})
