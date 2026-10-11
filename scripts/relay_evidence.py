@@ -228,7 +228,7 @@ def call_log_section(raw: dict[str, Any], agents: list[dict[str, Any]]) -> dict[
     if not all_ok and not filt_ok:
         status = all_raw.get("http_status") if all_raw else filt.get("http_status")
         return {"available": False, "reason": f"GET /api/jarvis/tools/calls returned HTTP {status} (the call log is not deployed, is switched off, or this key may not read it)",
-                "head": None, "chain_ok": None, "per_agent": [], "clients_seen": [], "coverage": None, "truncated": None, "pages_read": 0, "snapshot_head_seq": None, "newer_entries_not_included": 0}
+                "head": None, "chain_ok": None, "per_agent": [], "clients_seen": [], "coverage": None, "truncated": None, "pages_read": 0, "snapshot_head_seq": None, "newer_entries_not_included": 0, "retention_pruned": False, "oldest_seq_read": None, "gaps": [], "degraded_now": None, "agent_view_complete": False}
     # ONE snapshot feeds both the coverage statement and the per-agent table: the unfiltered read, or (only if that failed) the filtered fallback.
     primary = all_raw["body"] if all_ok else filt["body"]
     entries = primary.get("entries") or []
@@ -253,6 +253,26 @@ def call_log_section(raw: dict[str, Any], agents: list[dict[str, Any]]) -> dict[
         coverage += (f"; complete only THROUGH seq {snapshot} (the newest entry read): {newer} newer entr{'y was' if newer == 1 else 'ies were'} "
                      f"written while this report was being read, up to head seq {verify_head}, and are not included")
         coverage = coverage.replace("complete: all", "through seq %d: all" % snapshot, 1) if coverage.startswith("complete: all") else coverage
+    # What the log itself says about what it does NOT contain: pruned history (retention) and calls served while it could not be written (gaps).
+    gap_entries = [e for e in entries if e.get("outcome") == "gap"]
+    gaps = [{"seq": e.get("seq"), "window_start": e.get("window_start"), "window_end": e.get("window_end"), "unlogged_calls": int(e.get("count") or 0), "refused_writes": int(e.get("refused") or 0)} for e in gap_entries]
+    degraded_now = verify.get("degraded") or None
+    oldest_seq = entries[-1].get("seq") if entries and isinstance(entries[-1], dict) and isinstance(entries[-1].get("seq"), int) else None
+    anchor = verify.get("anchor") or None
+    retention_pruned = bool(all_ok and not truncated and (anchor or (isinstance(oldest_seq, int) and oldest_seq > 1)))
+    caveats: list[str] = []
+    if retention_pruned:
+        gone = (int(anchor["seq"]) if anchor and isinstance(anchor.get("seq"), int) else (oldest_seq - 1))
+        coverage = coverage.replace("complete: all", "complete for the retained log only: all", 1).replace("through seq", "through seq", 1)
+        caveats.append(f"entries up to seq {gone} were removed by the log's retention and are not available, so older client names and calls cannot be checked")
+    if gaps:
+        n_unlogged = sum(g["unlogged_calls"] for g in gaps)
+        caveats.append(f"the log records {len(gaps)} gap(s) in which {n_unlogged} call(s) were served but not logged (and {sum(g['refused_writes'] for g in gaps)} write(s) refused): a call in a gap window is not in this log")
+    if degraded_now:
+        caveats.append(f"the log is degraded right now ({degraded_now.get('unlogged', 0)} call(s) served but not yet logged, {degraded_now.get('refused', 0)} write(s) refused)")
+    if caveats:
+        coverage += "; " + "; ".join(caveats)
+    agent_view_partial = bool(truncated or retention_pruned or gaps or degraded_now)
     per_agent = []
     matched_names: set[str] = set()
     for a in agents:
@@ -265,7 +285,7 @@ def call_log_section(raw: dict[str, Any], agents: list[dict[str, Any]]) -> dict[
             "matched_on": needles,
             "witnessed_emr_latest_calls": len(hits),
             "latest": ({k: hits[0].get(k) for k in ("seq", "ts", "transport", "client_name", "client_version", "outcome", "result_digest", "tenant")} if hits else None),
-            "note": "server-witnessed; the client name is self-reported" if hits else ("no emr_latest call from a client whose name contains any of " + ", ".join(repr(n) for n in needles) + " is in the part of the server's log that was read (it may have called under another name, before the log existed, or not at all: see the list of every client name the log saw)" + (" - and that view is PARTIAL" if truncated else "")),
+            "note": "server-witnessed; the client name is self-reported" if hits else ("no emr_latest call from a client whose name contains any of " + ", ".join(repr(n) for n in needles) + " is in the part of the server's log that was read (it may have called under another name, before the log existed, or not at all: see the list of every client name the log saw)" + (" - and this view is NOT complete: " + "; ".join((["it is PARTIAL"] if truncated else []) + caveats) if agent_view_partial else "")),
         })
     seen: dict[tuple[str, str, str], dict[str, Any]] = {}
     for e in entries:
@@ -278,6 +298,7 @@ def call_log_section(raw: dict[str, Any], agents: list[dict[str, Any]]) -> dict[
         row["last_ts"] = max(str(row["last_ts"]), str(e.get("ts")))
     clients_seen = sorted(({**r, "tools": sorted(r["tools"]), "matched_an_agent": r["client_name"] in matched_names} for r in seen.values()), key=lambda r: (-r["calls"], r["client_name"]))
     return {"available": True, "reason": None, "head": verify.get("head"), "chain_ok": verify.get("ok"), "problems": verify.get("problems"), "per_agent": per_agent, "clients_seen": clients_seen, "coverage": coverage, "truncated": truncated, "pages_read": pages, "snapshot_head_seq": snapshot, "newer_entries_not_included": newer,
+            "retention_pruned": retention_pruned, "oldest_seq_read": oldest_seq, "gaps": gaps, "degraded_now": degraded_now, "agent_view_complete": not agent_view_partial,
             "log_files": verify.get("files"), "entries_total": verify.get("entries")}
 
 
@@ -410,6 +431,12 @@ def render_markdown(ev: dict[str, Any], printout: str) -> str:
             else:
                 L.append(f"| {a['agent']} | 0 | - | - | - | {_esc(a['note'])} |")
         L.append("")
+        if cl.get("gaps") or cl.get("degraded_now"):
+            L += ["**Gaps in the call log (calls served but not logged):**", ""]
+            L += [f"- seq {g['seq']}: {g['unlogged_calls']} unlogged call(s), {g['refused_writes']} refused write(s), window {g['window_start']} to {g['window_end']}" for g in cl.get("gaps", [])]
+            if cl.get("degraded_now"):
+                L.append(f"- degraded right now: {cl['degraded_now']}")
+            L += ["", "A zero count for an agent in a gap window is not proof the agent made no call.", ""]
         if cl.get("clients_seen"):
             L += [f"Every client name the log saw (coverage: {cl.get('coverage')}; self-reported, so a name is a claim and not an identity). The last column says whether it was counted for one of the agents above. Rows named `relay-evidence` are this report's own read-only calls:", "",
                   "| Client name / version | Transport | Calls | Tools | Last seen | Matched an agent above |", "|---|---|---|---|---|---|"]

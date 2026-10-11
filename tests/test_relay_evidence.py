@@ -438,10 +438,10 @@ def test_with_no_concurrent_writes_the_snapshot_equals_the_head_and_nothing_is_m
 def test_the_agent_table_is_built_from_the_same_unfiltered_snapshot_as_the_coverage(rel):
     """An agent's call that landed between a filtered and an unfiltered read must not show as 'no call' next to a 'complete' claim."""
     older_filtered = {"entries": [call_entry(3, "opencode-x")], "pages": 1, "truncated": False}
-    later_all = {"entries": [call_entry(5, "cursor-x"), call_entry(4, "codex-x", transport="mcp-stdio"), call_entry(3, "opencode-x")], "pages": 1, "truncated": False, "head_seq": 5}
+    later_all = {"entries": [call_entry(3, "cursor-x"), call_entry(2, "codex-x", transport="mcp-stdio"), call_entry(1, "opencode-x")], "pages": 1, "truncated": False, "head_seq": 3}
     later_all["entries"][1]["tool"] = "emr_recall"  # a different tool must not count as an emr_latest call
     raw = {"calls_emr_latest": {"http_status": 200, "body": older_filtered}, "calls_all": {"http_status": 200, "body": later_all},
-           "calls_verify": {"http_status": 200, "body": {"ok": True, "head": {"seq": 5, "entry_hash": "h" * 64}, "files": ["f"], "entries": 5, "problems": []}}}
+           "calls_verify": {"http_status": 200, "body": {"ok": True, "head": {"seq": 3, "entry_hash": "h" * 64}, "files": ["f"], "entries": 3, "problems": []}}}
     section = rel.call_log_section(raw, [{"agent": "Cursor"}, {"agent": "Codex"}, {"agent": "OpenCode"}])
     by = {a["agent"]: a["witnessed_emr_latest_calls"] for a in section["per_agent"]}
     assert by == {"Cursor": 1, "Codex": 0, "OpenCode": 1}  # Cursor's call is only in the unfiltered snapshot; Codex's entry is emr_recall
@@ -502,3 +502,52 @@ def test_a_persistent_mismatch_snapshots_what_was_read_and_counts_the_rest_as_ne
     section = rel.call_log_section(raw, [])
     assert section["snapshot_head_seq"] == 10 and section["newer_entries_not_included"] == 2
     assert section["coverage"].startswith("through seq 10: all 10 log entries") and "2 newer entries were written" in section["coverage"]
+
+
+# ------------------------------------------- what the log says it does NOT contain: retention-pruned history and gaps
+
+
+def _section(rel, entries, *, anchor=None, degraded=None, agents=None, head=None):
+    body = {"entries": entries, "pages": 1, "truncated": False, "head_seq": entries[0]["seq"] if entries else 0}
+    raw = {"calls_all": {"http_status": 200, "body": body},
+           "calls_verify": {"http_status": 200, "body": {"ok": True, "head": {"seq": head or (entries[0]["seq"] if entries else 0), "entry_hash": "h" * 64}, "files": ["f"], "entries": len(entries),
+                                                         "problems": [], "anchor": anchor, "degraded": degraded}}}
+    return rel.call_log_section(raw, agents or [{"agent": "Kilo"}])
+
+
+def test_a_log_pruned_by_retention_is_complete_only_for_what_was_retained(rel):
+    entries = [call_entry(9, "opencode-x"), call_entry(8, "cursor-x"), call_entry(7, "codex-x")]  # the log now starts at seq 7
+    section = _section(rel, entries, anchor={"seq": 6, "entry_hash": "a" * 64, "file": "calls-20260101.jsonl", "deleted_at": "2026-10-11T00:00:00Z"})
+    assert section["retention_pruned"] is True and section["oldest_seq_read"] == 7 and section["agent_view_complete"] is False
+    assert section["coverage"].startswith("complete for the retained log only: all 3 log entries") and "up to seq 6 were removed by the log's retention" in section["coverage"]
+    assert "NOT complete" in section["per_agent"][0]["note"] and "retention" in section["per_agent"][0]["note"]
+    assert _section(rel, entries)["retention_pruned"] is True  # no anchor field, but the oldest seq is above 1: same conclusion
+
+
+def test_a_log_that_starts_at_seq_one_is_not_called_pruned(rel):
+    section = _section(rel, [call_entry(2, "opencode-x"), call_entry(1, "cursor-x")])
+    assert section["retention_pruned"] is False and section["agent_view_complete"] is True and section["coverage"].startswith("complete: all 2 log entries")
+
+
+def test_gap_entries_are_kept_and_make_the_agent_view_incomplete(rel):
+    gap = {**call_entry(3, None), "tool": "(call-log)", "outcome": "gap", "count": 2, "refused": 1, "window_start": "2026-10-11T00:10:00.000000Z", "window_end": "2026-10-11T00:12:00.000000Z"}
+    section = _section(rel, [gap, call_entry(2, "opencode-x"), call_entry(1, "cursor-x")])
+    assert section["gaps"] == [{"seq": 3, "window_start": gap["window_start"], "window_end": gap["window_end"], "unlogged_calls": 2, "refused_writes": 1}]
+    assert section["agent_view_complete"] is False and "2 call(s) were served but not logged" in section["coverage"]
+    assert "a call in a gap window is not in this log" in section["per_agent"][0]["note"]
+    assert "(none)" not in {r["client_name"] for r in section["clients_seen"]}  # a gap is not a client
+
+
+def test_a_log_that_is_degraded_right_now_says_so(rel):
+    section = _section(rel, [call_entry(1, "cursor-x")], degraded={"since": "2026-10-11T01:00:00Z", "unlogged": 4, "refused": 2})
+    assert section["degraded_now"]["unlogged"] == 4 and section["agent_view_complete"] is False and "degraded right now (4 call(s)" in section["coverage"]
+
+
+def test_the_markdown_lists_the_gaps_and_warns_a_zero_is_not_proof(rel):
+    gap = {**call_entry(2, None), "tool": "(call-log)", "outcome": "gap", "count": 3, "refused": 0, "window_start": "2026-10-11T00:10:00.000000Z", "window_end": "2026-10-11T00:12:00.000000Z"}
+    section = _section(rel, [gap, call_entry(1, "cursor-x")])
+    raw = {**canned(), "calls_all": {"http_status": 200, "body": {"entries": [gap, call_entry(1, "cursor-x")], "pages": 1, "truncated": False}}}
+    ev = rel.build_evidence(raw, rel.run_checks(canned(), OLD, NEW, NEW, None), {"agents": [{"agent": "Kilo"}], "summary": "s"}, "http://x", [], {"old": OLD, "new": NEW, "receipt": RECEIPT})
+    ev["call_log"] = section
+    md = rel.render_markdown(ev, "p")
+    assert "Gaps in the call log" in md and "seq 2: 3 unlogged call(s)" in md and "not proof the agent made no call" in md
