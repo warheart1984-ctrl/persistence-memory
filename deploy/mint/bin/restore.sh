@@ -88,8 +88,15 @@ expected_counts="$(grep -E "$count_re" "$BACKUP_DIR/$base.counts" | LC_ALL=C sor
 [ "$restored_counts" = "$expected_counts" ] \
   || die "row counts after restore differ from the backup set (restored: $(echo "$restored_counts" | tr '\n' ' ') expected: $(echo "$expected_counts" | tr '\n' ' ')). App NOT started."
 
-if ! diff_out="$(diff <(anchors_from_db) "$BACKUP_DIR/$base.anchors")"; then
+if ! diff_out="$(diff <(anchors_from_db) <(anchors_db_part "$BACKUP_DIR/$base.anchors"))"; then
   die "chain-head anchors after restore differ from the backup set. App NOT started. $(echo "$diff_out" | head -3 | tr '\n' ';')"
+fi
+
+# the call log restored from the archive must still contain the head this set and every earlier set anchored. A warning, not a stop:
+# the ledger is what the restore is for, and an operator restoring in an emergency should not be blocked by the log.
+if ! cl_out="$(anchors_calllog_gate "$BACKUP_DIR/$base.data.tar" "$BACKUP_DIR/$base.anchors" $(anchors_earlier_sets "$BACKUP_DIR" "$base") 2>&1)"; then
+  log WARN "call log does not match its anchors: $(echo "$cl_out" | head -3 | tr '\n' ';')"
+  notify "Jarvis ledger: restored call log does not match its anchors" "$(echo "$cl_out" | head -3 | tr '\n' ';')" critical
 fi
 
 tenants="$(pg_exec psql -X -At -d jarvis -c "select distinct tenant_key from jarvis.record_history order by 1")"

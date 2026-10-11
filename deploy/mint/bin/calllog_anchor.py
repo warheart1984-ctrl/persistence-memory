@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""Anchor the call log's head in the backup anchors (issue #74).  Standard library plus app/call_log.py, read-only.
+
+The call log is a hash chain, so editing a line is detectable, but anyone who can write its directory can rebuild the whole
+chain, or cut trailing lines off, and it still verifies.  A head (seq + entry hash) kept OUTSIDE that directory, in every backup
+set's anchors and in the offsite copies, catches both: a later log must still contain the entry that an earlier anchor named.
+
+    calllog_anchor.py head  DIR                  print "calllog|<seq>|<entry_hash>" (nothing if there is no log); exit 3 if the chain has problems
+    calllog_anchor.py check DIR ANCHORS_FILE...  every "calllog|seq|hash" line of the given anchors files must still be in DIR's chain
+
+It never writes, and it does not use CallLog.verify() because that flushes (it can append a gap entry), which would change the head.
+Exit codes: 0 fine, 1 an anchored entry is missing or different (the log was truncated or rebuilt), 2 usage, 3 the chain itself is broken.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+from app.call_log import GENESIS, entry_hash_of  # noqa: E402
+
+FILE_RE = re.compile(r"^calls-(\d{8})\.jsonl$")
+LINE_RE = re.compile(r"^calllog\|(\d+)\|([0-9a-f]{64})$")
+
+
+def walk(directory: Path):
+    """Yield (seq, entry_hash) in order, and collect chain problems.  Returns (entries, problems, retention_anchor)."""
+    problems: list[str] = []
+    entries: dict[int, str] = {}
+    prev_hash, prev_seq = GENESIS, 0
+    anchor = None
+    try:
+        anchor = json.loads((directory / "anchor.json").read_text(encoding="utf-8"))
+        prev_hash, prev_seq = str(anchor["entry_hash"]), int(anchor["seq"])
+    except (OSError, ValueError, KeyError):
+        anchor = None
+    files = sorted((p for p in directory.iterdir() if FILE_RE.match(p.name)), key=lambda p: p.name) if directory.is_dir() else []
+    for path in files:
+        for n, line in enumerate(path.read_text(encoding="utf-8", errors="replace").split("\n"), start=1):
+            if not line.strip():
+                continue
+            try:
+                e = json.loads(line)
+                seq, h, prev = int(e["seq"]), str(e["entry_hash"]), str(e["prev_hash"])
+            except (ValueError, KeyError, TypeError):
+                problems.append(f"{path.name}:{n} not a valid entry")
+                continue
+            if entry_hash_of(e) != h:
+                problems.append(f"{path.name}:{n} entry {seq} was edited (hash does not match)")
+            if seq != prev_seq + 1:
+                problems.append(f"{path.name}:{n} entry {seq} follows {prev_seq} (a line was deleted, inserted or reordered)")
+            if prev != prev_hash:
+                problems.append(f"{path.name}:{n} entry {seq} does not link to the entry before it")
+            entries[seq] = h
+            prev_hash, prev_seq = h, seq
+    return entries, problems, anchor
+
+
+def anchored(files: list[str]) -> list[tuple[str, int, str]]:
+    out = []
+    for f in files:
+        try:
+            lines = Path(f).read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        out += [(Path(f).name, int(m.group(1)), m.group(2)) for m in (LINE_RE.match(line) for line in lines) if m]
+    return out
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 3 or argv[1] not in ("head", "check"):
+        print(__doc__, file=sys.stderr)
+        return 2
+    entries, problems, anchor = walk(Path(argv[2]))
+    if argv[1] == "head":
+        for p in problems:
+            print(f"call log chain problem: {p}", file=sys.stderr)
+        if entries:
+            seq = max(entries)
+            print(f"calllog|{seq}|{entries[seq]}")
+        return 3 if problems else 0
+    bad = 0
+    for p in problems:
+        print(f"call log chain problem: {p}", file=sys.stderr)
+    head = max(entries) if entries else 0
+    for source, seq, h in anchored(argv[3:]):
+        if seq in entries:
+            if entries[seq] != h:
+                print(f"{source}: call log entry {seq} is not the one anchored (rebuilt or edited)", file=sys.stderr)
+                bad = 1
+        elif anchor and seq <= int(anchor["seq"]):
+            if seq == int(anchor["seq"]) and str(anchor["entry_hash"]) != h:
+                print(f"{source}: the retention anchor at seq {seq} differs from the one anchored", file=sys.stderr)
+                bad = 1
+            # older than the retention window: those files were pruned on purpose, nothing left to compare
+        elif seq > head:
+            print(f"{source}: anchored head {seq} is beyond this log's head {head} (the log was truncated or is older)", file=sys.stderr)
+            bad = 1
+        else:
+            print(f"{source}: call log entry {seq} is missing (the log was rebuilt or lines removed)", file=sys.stderr)
+            bad = 1
+    return 1 if bad else (3 if problems else 0)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

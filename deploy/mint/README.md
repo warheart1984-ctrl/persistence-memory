@@ -171,6 +171,12 @@ notification. `jarvisctl down` leaves a marker so a stop on purpose is respected
   A new set must still contain every block of the last set with the same hash: a removed block, or blocks re-sealed after
   a rewritten history, quarantines the dump and raises the same alert. The database alone cannot see either of those.
   `jarvisctl drill --prove-detection` proves it too, by removing the newest block from the scratch copy.
+* **Call-log head anchor (#74):** the anchors also carry `calllog|<seq>|<entry_hash>`, the head of the call log in the archived `/data`
+  (read by `bin/calllog_anchor.py`, read-only, so it never moves the head). It is not part of the database comparison. Every new set must
+  still contain the head the previous set recorded; `restore` (a warning) and `drill` (a failure) check the set's own archive against
+  its anchor and against **every earlier set's** anchor. A log cut short, or rebuilt with a perfectly valid chain, no longer contains
+  what an earlier anchor (and the offsite copies) named. A mismatch raises a critical alert at backup time but the set is still published:
+  the ledger backup matters more than the log, and the next set would otherwise stay blocked. Sets taken before this have no line and pass.
 * **Retention:** newest 48, one per day for 14 days, one per week for 12 weeks. Anchors, `quarantine/` and
   `pre-restore-*` dumps are never pruned.
 * **`/data` (AMUL field, STM overlay, RAG files)** is archived in every set; those files are not in Postgres.

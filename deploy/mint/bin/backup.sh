@@ -102,6 +102,28 @@ pg_exec pg_dumpall --globals-only > "$tmp/$base.globals.sql" || die "pg_dumpall 
 docker run --rm -v "$VOL_DATA":/data:ro --entrypoint tar "$APP_IMAGE" -cf - -C /data . > "$tmp/$base.data.tar" \
   || die "could not archive the appdata volume"
 
+# 6a. the call log's head, read out of the archive just made: one more anchor line (calllog|<seq>|<entry_hash>). It must still
+#     contain the head the previous set recorded, or the log was truncated or rebuilt. The ledger is not at stake, so a problem here
+#     alarms loudly but the set is still published (the database anchors above are the ones that quarantine).
+cl_dir="$tmp/calllog-check"; mkdir -p "$cl_dir"
+tar -xf "$tmp/$base.data.tar" -C "$cl_dir" ./call-log 2>/dev/null || true
+if [ -d "$cl_dir/call-log" ]; then
+  cl_rc=0; cl_line="$(python3 "$CALLLOG_ANCHOR_PY" head "$cl_dir/call-log" 2>"$tmp/calllog.err")" || cl_rc=$?
+  [ -z "$cl_line" ] || { printf '%s\n' "$cl_line" >> "$tmp/$base.anchors"; LC_ALL=C sort -o "$tmp/$base.anchors" "$tmp/$base.anchors"; }
+  cl_problem="$(cat "$tmp/calllog.err")"
+  if [ -n "$prev_anchors" ] && grep -q '^calllog|' "$prev_anchors"; then
+    python3 "$CALLLOG_ANCHOR_PY" check "$cl_dir/call-log" "$prev_anchors" 2>>"$tmp/calllog.err" || cl_rc=1
+    cl_problem="$(cat "$tmp/calllog.err")"
+  fi
+  if [ "$cl_rc" -ne 0 ]; then
+    log ERROR "call log: $(printf '%s' "$cl_problem" | head -3 | tr '\n' ';')"
+    notify "Jarvis ledger: CALL LOG DOES NOT MATCH ITS ANCHOR" "$(printf '%s' "$cl_problem" | head -3 | tr '\n' ';')" critical
+  else
+    log INFO "call log head anchored: $cl_line"
+  fi
+fi
+rm -rf "$cl_dir"
+
 # 6b. custody scan of the plain parts and the appdata archive (the dump's data was scanned in 3b)
 if ! custody_problem="$(custody_check_set "$tmp" "$base")"; then
   notify "Jarvis ledger: PRIVATE KEY IN A BACKUP" "$custody_problem" critical
@@ -110,7 +132,8 @@ fi
 
 # 7. long-lived anchors log (tiny, never pruned): only when something changed, each entry hash-chained to the last
 last_log="$(ls -1 "$BACKUP_DIR"/anchors/anchors-*.txt 2>/dev/null | LC_ALL=C sort | tail -1 || true)"
-if [ -z "$last_log" ] || ! diff -q <(grep -v '^#' "$last_log") "$tmp/$base.anchors" >/dev/null 2>&1; then
+# (the call-log line moves with every call, so it does not by itself start a new entry; an entry carries whatever head the set had)
+if [ -z "$last_log" ] || ! diff -q <(grep -v '^#' "$last_log" | grep -v '^calllog|') <(anchors_db_part "$tmp/$base.anchors") >/dev/null 2>&1; then
   { printf '# prev_sha256=%s\n' "$( [ -n "$last_log" ] && anchor_file_sha "$last_log" || echo 0 )"
     printf '# taken=%s\n' "$(now_utc)"
     cat "$tmp/$base.anchors"; } > "$tmp/anchors-$ts.txt"

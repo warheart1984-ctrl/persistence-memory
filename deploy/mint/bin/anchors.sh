@@ -8,6 +8,7 @@
 #   head|<tenant>|<record id>|<last_seq>|<last_hash>|<deleted t/f>
 #   counter|<tenant>|<last_seq>
 #   block|<tenant>|<height>|<last_seq>|<block_hash>        (schema v6+: every sealed Continuity Block)
+#   calllog|<seq>|<entry_hash>                              (the call log's head, from the appdata volume; see calllog_anchor.py)
 #   att|<tenant>|<signer_seq>|<attestation_hash>           (schema v7+: every attestation in the signing log)
 #   trust|<tenant>|<stmt_seq>|<statement_hash>             (schema v7+: every root-signed trust statement, cosigns included)
 # shellcheck shell=bash
@@ -55,6 +56,36 @@ anchors_live_psql() { pg_exec psql -X -At -d jarvis "$@"; }
 
 # anchors_from_db : read from the running database (as the postgres superuser, which RLS does not bind).
 anchors_from_db() { anchors_collect anchors_live_psql; }
+
+# ---- the call log's head (issue #74) ------------------------------------------------------------------------------------------
+# One more anchor line, "calllog|<seq>|<entry_hash>", comes from the appdata volume (the call log's files), not the database. The
+# database comparisons (restore, drill) therefore look at anchors_db_part; the call log is checked by anchors_calllog_gate against
+# the set's own data.tar and against the head every EARLIER set recorded, so a log that was cut short or rebuilt between backups
+# no longer contains what an earlier anchor (and the offsite copies) named. See docs/call_log.md.
+CALLLOG_ANCHOR_PY="$(dirname "${BASH_SOURCE[0]}")/calllog_anchor.py"
+
+# anchors_db_part FILE : the anchor lines that come from the database (everything but the call-log head).
+anchors_db_part() { grep -v '^calllog|' "$1" || true; }
+
+# anchors_earlier_sets DIR BASE : the anchors files of the sets taken before BASE, oldest first.
+anchors_earlier_sets() { ls -1 "$1"/jarvis-*.anchors 2>/dev/null | LC_ALL=C sort | awk -v cur="$1/$2.anchors" '$0 < cur'; }
+
+# anchors_calllog_gate TAR SET_ANCHORS [EARLIER_ANCHORS...] : the call log inside TAR (a data.tar) must still contain the head that
+# SET_ANCHORS names and the head of every earlier set. Prints a line per problem and returns 1 if there is one. A set from before the
+# call log was anchored (no calllog line anywhere) has nothing to check and passes.
+anchors_calllog_gate() {
+  local tar="$1" set_anchors="$2" d rc=0; shift 2
+  grep -qh '^calllog|' "$set_anchors" "$@" 2>/dev/null || return 0
+  d="$(mktemp -d)"
+  tar -xf "$tar" -C "$d" ./call-log 2>/dev/null || true
+  if [ ! -d "$d/call-log" ]; then
+    echo "the appdata archive has no call log, but an anchor names one"; rc=1
+  else
+    python3 "$CALLLOG_ANCHOR_PY" check "$d/call-log" "$set_anchors" "$@" || rc=1
+  fi
+  rm -rf "$d"
+  return "$rc"
+}
 
 # anchors_tip_blocks FILE : "<tenant>|<height>|<block_hash>" for each tenant's newest block named in an anchors file
 # (nothing for a set taken before schema v6). The drill replays the restored copy at exactly these blocks.
