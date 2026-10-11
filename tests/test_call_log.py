@@ -579,3 +579,142 @@ def test_the_relay_report_section_reads_the_real_log_and_labels_client_names_sel
     assert by["Devin"]["witnessed_emr_latest_calls"] == 2 and by["Devin"]["latest"]["client_version"] == "1.1"
     assert by["OpenCode"]["witnessed_emr_latest_calls"] == 1 and by["Cursor"]["witnessed_emr_latest_calls"] == 0
     assert all(k["method"] == "GET" for k in client.calls) and KEY not in json.dumps(client.calls)
+
+
+# ------------------------------------------------- 13. outage scenarios found by the throwaway drill (permission failures)
+
+posix_user_only = pytest.mark.skipif(sys.platform == "win32" or (hasattr(os, "geteuid") and os.geteuid() == 0), reason="needs POSIX permissions enforced on a non-root user")
+
+
+def _write_body(tag):
+    return {"content": f"probe {tag}", "source_agent": "t", "session_id": "s", "type": "decision", "subject": f"probe-{tag}",
+            "evidence": [{"kind": "deploy-report", "ref": "drill", "note": "outage scenario"}]}
+
+
+def _record_count(client):
+    return len(client.get("/api/jarvis/memory?limit=200", headers=HDR).json()["memories"])
+
+
+@pytest.fixture
+def lockable_log_dir(jclient):
+    """A log with one entry in it, and a way to make the directory (A) or only today's file (B) unwritable, then restore it."""
+    tool(jclient, "emr_latest")  # creates the directory, today's file and the lock file
+    d = log_dir()
+    today = next(d.glob("calls-*.jsonl"))
+
+    def lock_dir():
+        for p in d.iterdir():
+            os.chmod(p, 0o400)
+        os.chmod(d, 0o500)
+
+    def lock_file():
+        os.chmod(today, 0o400)
+
+    def unlock():
+        os.chmod(d, 0o700)
+        for p in d.iterdir():
+            os.chmod(p, 0o600)
+
+    yield type("L", (), {"lock_dir": staticmethod(lock_dir), "lock_file": staticmethod(lock_file), "unlock": staticmethod(unlock)})
+    unlock()
+
+
+@posix_user_only
+def test_scenario_a_unwritable_directory_still_leaves_a_gap_entry_after_recovery(jclient, lockable_log_dir):
+    """The DEGRADED file lives in the directory that cannot be written, so the outage must also be remembered in memory."""
+    n0 = _record_count(jclient)
+    lockable_log_dir.lock_dir()
+    r = tool(jclient, "emr_latest")  # a read: served anyway, but it cannot be logged
+    assert r.status_code == 200 and r.headers.get("x-jarvis-call-log") == "degraded"
+    w = jclient.post("/api/jarvis/memory", headers=HDR, json=_write_body("a1"))
+    assert w.status_code == 503 and w.json()["reason"] == "CALL_LOG_UNAVAILABLE" and _record_count(jclient) == n0
+    lockable_log_dir.unlock()
+    assert jclient.post("/api/jarvis/memory", headers=HDR, json=_write_body("a2")).status_code == 200
+    gaps = [e for e in entries() if e["outcome"] == "gap"]
+    assert len(gaps) == 1, "the calls made during the outage left no trace in the log"
+    assert gaps[0]["count"] == 1 and gaps[0]["refused"] == 1 and gaps[0]["window_start"] and "REFUSED_WRITES:1" in gaps[0]["error_code"]
+    assert call_log.get_call_log().verify()["ok"] is True and call_log.get_call_log().degraded() is None
+
+
+@posix_user_only
+def test_scenario_b_an_unwritable_log_file_refuses_the_first_write_instead_of_committing_it_unlogged(jclient, lockable_log_dir):
+    """The directory looks writable, but today's file is not: the preflight must notice, so the write is refused, not committed."""
+    n0 = _record_count(jclient)
+    lockable_log_dir.lock_file()
+    w = jclient.post("/api/jarvis/memory", headers=HDR, json=_write_body("b1"))
+    assert w.status_code == 503, "the first write committed without being logged"
+    assert w.json()["reason"] == "CALL_LOG_UNAVAILABLE" and _record_count(jclient) == n0
+    lockable_log_dir.unlock()
+    assert jclient.post("/api/jarvis/memory", headers=HDR, json=_write_body("b2")).status_code == 200
+    gaps = [e for e in entries() if e["outcome"] == "gap"]
+    assert len(gaps) == 1 and gaps[0]["count"] == 0 and gaps[0]["refused"] == 1  # an outage with nothing served unlogged is still recorded
+    assert call_log.get_call_log().verify()["ok"] is True
+
+
+def test_the_gap_counts_served_but_unlogged_calls_separately_from_refused_writes(tmp_path):
+    log = call_log.CallLog(tmp_path / "gapcount")
+    log._mark_degraded("disk full", unlogged=1)
+    log._mark_degraded("disk full", unlogged=0, refused=1)
+    log._mark_degraded("disk full", unlogged=0, refused=1)
+    state = log.degraded()
+    assert (state["unlogged"], state["refused"]) == (1, 2)
+    log.append(_fields())  # recovery: the gap entry comes first, then the call
+    first, second = entries_in(log)
+    assert first["outcome"] == "gap" and (first["count"], first["refused"]) == (1, 2) and second["tool"] == "emr_latest"
+    assert log.degraded() is None and log.verify()["ok"] is True
+
+
+def entries_in(log):
+    return [e for e in reversed(list(log.entries_desc()))]
+
+
+def test_workers_sharing_a_log_record_one_gap_not_one_per_worker(tmp_path):
+    """Two workers refuse writes during the same outage; after recovery the shared record produces exactly one gap with the summed counts."""
+    shared = tmp_path / "shared"
+    w1, w2 = call_log.CallLog(shared), call_log.CallLog(shared)
+    w1._mark_degraded("today's file is read-only", unlogged=0, refused=1)
+    w2._mark_degraded("today's file is read-only", unlogged=0, refused=1)
+    w2._mark_degraded("today's file is read-only", unlogged=1, refused=0)
+    w1.append(_fields(1))  # recovery on worker 1: it writes the gap and clears the shared record
+    w2.append(_fields(2))  # worker 2 must not replay a stale copy of the same outage
+    gaps = [e for e in reversed(list(w1.entries_desc())) if e["outcome"] == "gap"]
+    assert len(gaps) == 1, f"{len(gaps)} gap entries for one outage"
+    assert (gaps[0]["count"], gaps[0]["refused"]) == (1, 2)
+    assert w1.degraded() is None and w2.degraded() is None and w1.verify()["ok"] is True
+
+
+def test_unpersisted_increments_are_added_to_the_shared_count_not_max_merged(tmp_path, monkeypatch):
+    """Worker A fails to persist one call; worker B (which can write the file) records more.  Three calls happened, so the total is three."""
+    shared = tmp_path / "disjoint"
+    a, b = call_log.CallLog(shared), call_log.CallLog(shared)
+    b._mark_degraded("file unwritable for B? no: B persists", unlogged=1)  # file: unlogged=1
+    monkeypatch.setattr(a, "_locked", lambda: (_ for _ in ()).throw(OSError("A cannot persist")))
+    a._mark_degraded("A cannot write the directory", unlogged=1)  # A keeps a delta of 1 in memory
+    assert a.degraded()["unlogged"] == 2  # file 1 + A's delta 1
+    b._mark_degraded("B persists another", unlogged=1)  # file: unlogged=2
+    assert a.degraded()["unlogged"] == 3, "max() would have reported 2 for three calls"
+    monkeypatch.undo()
+    a.append(_fields())
+    gap = [e for e in reversed(list(a.entries_desc())) if e["outcome"] == "gap"]
+    assert len(gap) == 1 and gap[0]["count"] == 3 and a.degraded() is None
+
+
+def test_concurrent_threads_do_not_lose_counts_when_the_outage_cannot_be_persisted(tmp_path, monkeypatch):
+    log = call_log.CallLog(tmp_path / "threads")
+    monkeypatch.setattr(log, "_locked", lambda: (_ for _ in ()).throw(OSError("directory unwritable")))
+    for name in ("_combine", "_merge"):  # widen the read-modify-write window whichever name the implementation uses
+        original = getattr(call_log.CallLog, name, None)
+        if original is not None:
+            monkeypatch.setattr(call_log.CallLog, name, staticmethod(lambda *a, _o=original, **k: (time.sleep(0.002), _o(*a, **k))[1]), raising=False)
+
+    def work():
+        for _ in range(10):
+            log._mark_degraded("down", unlogged=1, refused=1)
+
+    threads = [threading.Thread(target=work) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    state = log.degraded()
+    assert (state["unlogged"], state["refused"]) == (80, 80), state
