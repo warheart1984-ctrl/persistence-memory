@@ -871,24 +871,25 @@ def test_read_summaries_keep_their_tenant_and_transport_and_each_tenant_has_its_
 def test_reads_of_different_records_or_artifacts_have_different_witness_hashes(jclient):
     a, b = add(jclient, "first record"), add(jclient, "second record")
     before = len(entries())
-    for path in (f"/api/jarvis/memory/{a['id']}", f"/api/jarvis/memory/{b['id']}", "/api/jarvis/memory/amul/artifacts/art-0a1b2c3d4e5f-r1", "/api/jarvis/memory/amul/artifacts/art-3d4e5f6a7b8c-r12",
+    for path in (f"/api/jarvis/memory/{a['id']}", f"/api/jarvis/memory/{b['id']}", "/api/jarvis/memory/amul/artifacts/art-0a1b2c3d4e5f-s1", "/api/jarvis/memory/amul/artifacts/art-3d4e5f6a7b8c-e12",
                  "/api/jarvis/memory/bearer-secret-123", "/api/jarvis/memory/bearer-secret-456"):
         jclient.get(path, headers=HDR)
     got = entries()[before:]
     assert len({e["args_sha256"] for e in got}) == 6                                                   # every path argument is in the fingerprint
-    assert [e["target"] for e in got] == [a["id"], b["id"], "art-0a1b2c3d4e5f-r1", "art-3d4e5f6a7b8c-r12", None, None]  # artifact ids are recognised as ids; typed text is not
+    assert [e["target"] for e in got] == [a["id"], b["id"], "art-0a1b2c3d4e5f-s1", "art-3d4e5f6a7b8c-e12", None, None]  # artifact ids are recognised as ids; typed text is not
     assert "bearer-secret" not in json.dumps(got)
     assert got[0]["args_sha256"] == call_log.args_hash({"args": {}, "path": [a["id"]]})                 # hashed, never stored
 
 
 def test_only_the_generated_artifact_id_grammar_is_recorded_as_a_target(jclient):
     before = len(entries())
-    for path in ("/api/jarvis/memory/amul/artifacts/art-0a1b2c3d4e5f-r1", "/api/jarvis/memory/amul/artifacts/art-deadbeef-bearersecret",
-                 "/api/jarvis/memory/amul/artifacts/art-0a1b2c3d4e5f-bearersecret", "/api/jarvis/memory/amul/artifacts/art-0a1b2c3d4e5fabcdef-r1"):
+    for path in ("/api/jarvis/memory/amul/artifacts/art-0a1b2c3d4e5f-s1", "/api/jarvis/memory/amul/artifacts/art-deadbeef-bearersecret",
+                 "/api/jarvis/memory/amul/artifacts/art-0a1b2c3d4e5f-bearersecret", "/api/jarvis/memory/amul/artifacts/art-0a1b2c3d4e5fabcdef-s1",
+                 "/api/jarvis/memory/amul/artifacts/art-0a1b2c3d4e5f-Z123", "/api/jarvis/memory/amul/artifacts/art-0a1b2c3d4e5f-r1"):
         jclient.get(path, headers=HDR)
     got = entries()[before:]
-    assert [e["target"] for e in got] == ["art-0a1b2c3d4e5f-r1", None, None, None]
-    assert "bearersecret" not in json.dumps(got) and "abcdef-r1" not in json.dumps(got)
+    assert [e["target"] for e in got] == ["art-0a1b2c3d4e5f-s1", None, None, None, None, None]
+    assert "bearersecret" not in json.dumps(got) and "abcdef-s1" not in json.dumps(got) and "Z123" not in json.dumps(got)
 
 
 def test_failed_reads_are_never_swallowed_by_the_read_cap(fixed_minute, jclient, monkeypatch):
@@ -953,7 +954,19 @@ def test_a_body_over_the_limit_is_refused_with_413_before_it_is_buffered_and_the
     status, receives, _ = _drive(app_calls, "POST", "/api/jarvis/memory", chunks)
     assert status == 413 and app_calls == [] and receives <= 4
     got = entries()
-    assert [(e["outcome"], e["status_code"], e["error_code"]) for e in got] == [("error", 413, "REQUEST_TOO_LARGE")] * 2
+    assert [(e["outcome"], e["status_code"], e["error_code"]) for e in got] == [("denied", 413, "REQUEST_TOO_LARGE")] * 2
+
+
+def test_a_flood_of_oversized_requests_cannot_make_the_log_write_without_limit(fixed_minute, jclient, monkeypatch):
+    """The 413 happens before authentication, so it shares the denied-call cap: past it the refusals are only counted."""
+    monkeypatch.setenv("JARVIS_CALL_LOG_MAX_BODY_BYTES", "2048")
+    monkeypatch.setenv("JARVIS_CALL_LOG_DENIED_CAP_PER_MIN", "3")
+    for _ in range(12):
+        status, _, _ = _drive([], "POST", "/api/jarvis/memory", [b"x"], headers=[("content-length", "99999")])
+        assert status == 413
+    jclient.get("/api/jarvis/tools/calls?limit=1", headers=HDR)                  # reading the log closes the open summary
+    got = entries()
+    assert [e["outcome"] for e in got].count("denied") == 3 and [e["count"] for e in got if e["outcome"] == "denied_suppressed"] == [9]
 
 
 def test_a_413_carries_the_call_seq_and_the_stdio_transport(jclient, monkeypatch):

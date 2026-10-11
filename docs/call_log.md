@@ -15,7 +15,7 @@ from the store, so logging can never change the ledger's state root, history or 
 
 | every **GET** read of `/api/jarvis/memory` and `/api/jarvis/memory/*` (`/{id}`, `/latest`, `/search`, `/retrieve`, `/board`) | `http-api`, or `mcp-stdio` from a stdio adapter (Grok's `ledger_stdio.py` sends the stdio header and its client name) | `tool` is `"GET /route/{id}"`; the query is hashed like any argument, never stored |
 
-Denied (`401`/`403`) and failed calls are logged too, including requests the API-key check rejects before the route runs.
+Denied (`401`/`403`) and failed calls are logged too, including requests the API-key check rejects before the route runs. A request whose body is over `JARVIS_CALL_LOG_MAX_BODY_BYTES` is refused with 413 before the app can authenticate it, so it is logged as `denied` (`REQUEST_TOO_LARGE`) and shares the denied-call cap.
 
 Only successful reads are ever summarised: a failed read (404, 500) is always written on its own, with its route, status and error code. Reads are high volume (the sessionStart hook, `ping_memoryboard.py`, soak runs), so they are **capped, never dropped silently**: up to
 `JARVIS_CALL_LOG_READ_CAP_PER_MIN` (default 600, per process per minute **per tenant**) are written one by one; the rest of that minute is rolled into one

@@ -49,8 +49,8 @@ _ID_SEGMENTS = (
 )
 _CODE_SAFE = re.compile(r"[^A-Za-z0-9_:.\-]")
 # What a path parameter must look like, exactly as the app generates it, to be recorded as a target (anything else is only ever hashed):
-# a memory id is mem-<12 hex> (app/store.py new_id), an AMUL artifact id is art-<12 hex>-<resolution letter><seq> (app/amul.py).
-_MEMORY_TARGETS = (re.compile(r"^mem-[0-9a-f]{12}$"), re.compile(r"^art-[0-9a-f]{12}-[A-Za-z][0-9]{1,9}$"))
+# a memory id is mem-<12 hex> (app/store.py new_id), an AMUL artifact id is art-<12 hex>-<s|d|e><seq> (app/amul.py: the resolution is summary, detail or evidence).
+_MEMORY_TARGETS = (re.compile(r"^mem-[0-9a-f]{12}$"), re.compile(r"^art-[0-9a-f]{12}-[sde][0-9]{1,9}$"))
 # The route templates under /api/jarvis/memory, per method (relative; "{id}" is any one segment). A path is templated by matching it position by
 # position against the templates of ITS method, preferring the one with the most literal segments: a route that exists only for POST (promote,
 # pipeline, external-search ...) is not a literal for a GET, which the app serves as a record lookup. A segment that lands on a "{id}" is a path
@@ -226,9 +226,11 @@ class CallWitnessMiddleware:
                 else:  # disconnect before the body arrived: nothing to serve
                     return
             if too_large:  # refused before it is buffered (or read further): nothing ran, and the refusal is witnessed
-                entry = log.record(call_log.make_fields(transport=_transport(plan, headers), tool=plan["tool"], args={}, outcome="error", started=started,
+                entry = log.record(call_log.make_fields(transport=_transport(plan, headers), tool=plan["tool"], args={}, outcome="denied", started=started,
                                                         client_header=headers.get("x-jarvis-mcp-client") or headers.get("user-agent"), tenant=scope.get("jarvis_tenant"),
                                                         error_code="REQUEST_TOO_LARGE", status_code=413, route=plan["route"], method=method, target=plan["target"]))
+                # (outcome "denied": this refusal happens before the app can authenticate the caller, so it goes through the same per-minute cap as
+                # denied calls, rolled into denied_suppressed; an unauthenticated flood of oversized requests cannot make the log write without limit)
                 payload = json.dumps(error_body(413, f"the request body is larger than {limit} bytes", code="payload_too_large", reason="REQUEST_TOO_LARGE")).encode()
                 await send({"type": "http.response.start", "status": 413, "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(payload)).encode()),
                                                                                      (b"connection", b"close"), *_witness_headers(entry)]})
