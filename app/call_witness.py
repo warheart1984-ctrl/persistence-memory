@@ -18,6 +18,7 @@ has the answer can already find its call in the log.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -37,7 +38,7 @@ MAX_RESPONSE_BUFFER = 2 * 1024 * 1024
 
 
 def max_body_bytes() -> int:
-    """The largest request body the witness will buffer (JARVIS_CALL_LOG_MAX_BODY_BYTES, default 4 MiB); a larger one is refused with 413."""
+    """The most of a request body the witness buffers (JARVIS_CALL_LOG_MAX_BODY_BYTES, default 4 MiB); the rest of a larger one streams through, hashed."""
     try:
         return max(1024, int((os.environ.get("JARVIS_CALL_LOG_MAX_BODY_BYTES") or "").strip() or 4 * 1024 * 1024))
     except ValueError:
@@ -169,10 +170,25 @@ def _witness_headers(entry: dict[str, Any] | None) -> list[tuple[bytes, bytes]]:
     return [(b"x-jarvis-call-log", b"degraded")] if entry is None else []
 
 
-def witness_args(plan: dict[str, Any], body_bytes: bytes, query_string: bytes) -> Any:
+class BodyStream:
+    """A request body too big to buffer: only its length and sha256 are kept, as the app reads it."""
+
+    def __init__(self) -> None:
+        self._h = hashlib.sha256()
+        self.size = 0
+
+    def add(self, chunk: bytes) -> None:
+        self._h.update(chunk)
+        self.size += len(chunk)
+
+    def as_args(self) -> dict[str, Any]:
+        return {"_streamed_body_sha256": self._h.hexdigest(), "_streamed_body_bytes": self.size}
+
+
+def witness_args(plan: dict[str, Any], body_bytes: bytes | None, query_string: bytes, stream: "BodyStream | None" = None) -> Any:
     """What the argument hash is taken over: the body and query, plus the path parameters (hashed, never stored) so that a read of one record
     or artifact is not indistinguishable from a read of another. A route with no path parameter hashes exactly as before."""
-    args = request_args(_json_or_none(body_bytes), query_string)
+    args = request_args(stream.as_args() if stream is not None else _json_or_none(body_bytes or b""), query_string)
     params = plan.get("path_params")
     return {"args": args, "path": params} if params else args
 
@@ -202,49 +218,55 @@ class CallWitnessMiddleware:
         started = time.perf_counter()
 
         headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers", [])}
+        stream: BodyStream | None = None  # set only when the body is too big to buffer
         if method in READ_METHODS:
             # A read has no body worth witnessing: do not buffer one (nothing a client sends here may grow this process), pass the request through as it came.
             body_bytes = b""
             replay = receive
         else:
+            # Buffer the body only up to a bound (the witness needs it to hash the arguments). A larger body is NOT refused (that would impose a
+            # smaller limit than the API's own on routes such as bulk document import): what has been read is replayed, the rest streams through to
+            # the app untouched while it is hashed on the way, so this process never holds more than the bound.
             limit = max_body_bytes()
-            declared = headers.get("content-length", "")
-            too_large = declared.isdigit() and int(declared) > limit
             chunks: list[bytes] = []
             received = 0
-            while not too_large:
+            complete = False
+            while True:
                 message = await receive()
-                if message["type"] == "http.request":
-                    chunk = message.get("body", b"")
-                    received += len(chunk)
-                    if received > limit:
-                        too_large = True
-                        break
-                    chunks.append(chunk)
-                    if not message.get("more_body"):
-                        break
-                else:  # disconnect before the body arrived: nothing to serve
+                if message["type"] != "http.request":  # disconnect before the body arrived: nothing to serve
                     return
-            if too_large:  # refused before it is buffered (or read further): nothing ran, and the refusal is witnessed
-                entry = log.record(call_log.make_fields(transport=_transport(plan, headers), tool=plan["tool"], args={}, outcome="denied", started=started,
-                                                        client_header=headers.get("x-jarvis-mcp-client") or headers.get("user-agent"), tenant=scope.get("jarvis_tenant"),
-                                                        error_code="REQUEST_TOO_LARGE", status_code=413, route=plan["route"], method=method, target=plan["target"]))
-                # (outcome "denied": this refusal happens before the app can authenticate the caller, so it goes through the same per-minute cap as
-                # denied calls, rolled into denied_suppressed; an unauthenticated flood of oversized requests cannot make the log write without limit)
-                payload = json.dumps(error_body(413, f"the request body is larger than {limit} bytes", code="payload_too_large", reason="REQUEST_TOO_LARGE")).encode()
-                await send({"type": "http.response.start", "status": 413, "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(payload)).encode()),
-                                                                                     (b"connection", b"close"), *_witness_headers(entry)]})
-                await send({"type": "http.response.body", "body": payload})
-                return
-            body_bytes = b"".join(chunks)
-            replayed = False
+                chunk = message.get("body", b"")
+                chunks.append(chunk)
+                received += len(chunk)
+                if not message.get("more_body"):
+                    complete = True
+                    break
+                if received > limit:
+                    break
+            if complete:
+                body_bytes = b"".join(chunks)
+                replayed = False
 
-            async def replay():
-                nonlocal replayed
-                if not replayed:
-                    replayed = True
-                    return {"type": "http.request", "body": body_bytes, "more_body": False}
-                return await receive()
+                async def replay():
+                    nonlocal replayed
+                    if not replayed:
+                        replayed = True
+                        return {"type": "http.request", "body": body_bytes, "more_body": False}
+                    return await receive()
+            else:
+                body_bytes = None
+                stream = BodyStream()
+                for c in chunks:
+                    stream.add(c)
+                pending = list(chunks)
+
+                async def replay():
+                    if pending:
+                        return {"type": "http.request", "body": pending.pop(0), "more_body": True}
+                    message = await receive()
+                    if message["type"] == "http.request":
+                        stream.add(message.get("body", b""))
+                    return message
 
         if plan["write"]:
             try:
@@ -280,7 +302,7 @@ class CallWitnessMiddleware:
                     # too big to hold: stream it, logged without a digest, but still BEFORE its headers are released
                     overflow = True
                     entry = log.record(call_log.make_fields(
-                        transport=_transport(plan, headers), tool=plan["tool"], args=witness_args(plan, body_bytes, scope.get("query_string", b"")),
+                        transport=_transport(plan, headers), tool=plan["tool"], args=witness_args(plan, body_bytes, scope.get("query_string", b""), stream),
                         outcome=_outcome(status), started=started, client_header=headers.get("x-jarvis-mcp-client") or headers.get("user-agent"),
                         tenant=scope.get("jarvis_tenant"), error_code=_code(status, None), status_code=status, route=plan["route"], method=method, target=plan["target"]))
                     logged = True
@@ -308,7 +330,7 @@ class CallWitnessMiddleware:
             client_header = headers.get("x-jarvis-mcp-client") or headers.get("user-agent")
             transport = _transport(plan, headers)
             fields = call_log.make_fields(
-                transport=transport, tool=plan["tool"], args=witness_args(plan, body_bytes, scope.get("query_string", b"")), outcome=_outcome(status),
+                transport=transport, tool=plan["tool"], args=witness_args(plan, body_bytes, scope.get("query_string", b""), stream), outcome=_outcome(status),
                 started=started, client_header=client_header, tenant=scope.get("jarvis_tenant"), error_code=_code(status, parsed), status_code=status,
                 result_digest=digest, route=plan["route"], method=method, target=plan["target"],
             )
@@ -325,7 +347,7 @@ class CallWitnessMiddleware:
             await self.app(scope, replay, capture)
         except Exception:
             if not logged:  # (an overflow or finished response was already witnessed)
-                log.record(call_log.make_fields(transport=_transport(plan, headers), tool=plan["tool"], args=witness_args(plan, body_bytes, scope.get("query_string", b"")),
+                log.record(call_log.make_fields(transport=_transport(plan, headers), tool=plan["tool"], args=witness_args(plan, body_bytes, scope.get("query_string", b""), stream),
                                                 outcome="error", started=started, client_header=headers.get("x-jarvis-mcp-client") or headers.get("user-agent"),
                                                 tenant=scope.get("jarvis_tenant"), error_code="INTERNAL", status_code=500, route=plan["route"], method=method, target=plan["target"]))
             raise

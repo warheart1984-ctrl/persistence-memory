@@ -15,7 +15,7 @@ from the store, so logging can never change the ledger's state root, history or 
 
 | every **GET** read of `/api/jarvis/memory` and `/api/jarvis/memory/*` (`/{id}`, `/latest`, `/search`, `/retrieve`, `/board`) | `http-api`, or `mcp-stdio` from a stdio adapter (Grok's `ledger_stdio.py` sends the stdio header and its client name) | `tool` is `"GET /route/{id}"`; the query is hashed like any argument, never stored |
 
-Denied (`401`/`403`) and failed calls are logged too, including requests the API-key check rejects before the route runs. A request whose body is over `JARVIS_CALL_LOG_MAX_BODY_BYTES` is refused with 413 before the app can authenticate it, so it is logged as `denied` (`REQUEST_TOO_LARGE`) and shares the denied-call cap.
+Denied (`401`/`403`) and failed calls are logged too, including requests the API-key check rejects before the route runs.
 
 Only successful reads are ever summarised: a failed read (404, 500) is always written on its own, with its route, status and error code. Reads are high volume (the sessionStart hook, `ping_memoryboard.py`, soak runs), so they are **capped, never dropped silently**: up to
 `JARVIS_CALL_LOG_READ_CAP_PER_MIN` (default 600, per process per minute **per tenant**) are written one by one; the rest of that minute is rolled into one
@@ -84,7 +84,7 @@ off on live), which is why its writes are in scope.
 | `JARVIS_CALL_LOG_DIR` | `<dir of JARVIS_STORE_PATH>/call-log` | |
 | `JARVIS_CALL_LOG_RETAIN_DAYS` | `90` | |
 | `JARVIS_CALL_LOG_DENIED_CAP_PER_MIN` | `60` | |
-| `JARVIS_CALL_LOG_MAX_BODY_BYTES` | `4194304` | the largest request body the witness will buffer; a larger one is refused with 413 (and the refusal is logged). GET/HEAD/OPTIONS bodies are never buffered |
+| `JARVIS_CALL_LOG_MAX_BODY_BYTES` | `4194304` | the most of a request body the witness buffers (to hash its arguments). A bigger body is **not refused**: what was read is replayed and the rest streams through to the app untouched, hashed as it goes (`_streamed_body_sha256` / `_streamed_body_bytes` in the argument hash, covering what the app read). GET/HEAD/OPTIONS bodies are never buffered |
 | `JARVIS_CALL_LOG_READS` | on whenever the call log is on | `0` stops witnessing memory GET reads |
 | `JARVIS_CALL_LOG_READ_CAP_PER_MIN` | `600` | reads beyond this a minute are summarised in one `read_suppressed` entry |
 
