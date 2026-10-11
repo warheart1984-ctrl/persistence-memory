@@ -152,6 +152,7 @@ def fetch_all_calls(client: ReadOnlyClient, **filters: Any) -> tuple[int, Any]:
     entries: list[dict[str, Any]] = []
     cursor: str | None = None
     pages = 0
+    head_seq: int | None = None  # the log's head when the first page was read: everything newer is outside this snapshot
     while pages < MAX_CALL_PAGES:
         query = {**filters, "limit": 200, **({"cursor": cursor} if cursor else {})}
         status, body = client.get("/api/jarvis/tools/calls", **query)
@@ -159,13 +160,16 @@ def fetch_all_calls(client: ReadOnlyClient, **filters: Any) -> tuple[int, Any]:
             if pages == 0:
                 return status, body  # the very first page failed: report it as it came
             # a LATER page failed: keep what was read, but this is not the whole log, and the caller must say so
-            return 200, {"entries": entries, "pages": pages, "truncated": True, "error": f"page {pages + 1} failed with HTTP {status}"}
+            return 200, {"entries": entries, "pages": pages, "truncated": True, "head_seq": head_seq, "error": f"page {pages + 1} failed with HTTP {status}"}
+        if pages == 0:
+            head = body.get("head")
+            head_seq = int(head["seq"]) if isinstance(head, dict) and isinstance(head.get("seq"), int) else None
         entries += list(body.get("entries") or [])
         pages += 1
         cursor = body.get("next_cursor")
         if not cursor:
             break
-    return 200, {"entries": entries, "pages": pages, "truncated": bool(cursor)}
+    return 200, {"entries": entries, "pages": pages, "truncated": bool(cursor), "head_seq": head_seq}
 
 
 def gather(client: ReadOnlyClient, old_id: str, new_id: str, receipt_id: str) -> dict[str, Any]:
@@ -205,7 +209,7 @@ def call_log_section(raw: dict[str, Any], agents: list[dict[str, Any]]) -> dict[
     verify = (raw.get("calls_verify") or {}).get("body") or {}
     if calls.get("http_status") != 200 or not isinstance(calls.get("body"), dict):
         return {"available": False, "reason": f"GET /api/jarvis/tools/calls returned HTTP {calls.get('http_status')} (the call log is not deployed, is switched off, or this key may not read it)",
-                "head": None, "chain_ok": None, "per_agent": [], "clients_seen": [], "coverage": None, "truncated": None, "pages_read": 0}
+                "head": None, "chain_ok": None, "per_agent": [], "clients_seen": [], "coverage": None, "truncated": None, "pages_read": 0, "snapshot_head_seq": None, "newer_entries_not_included": 0}
     entries = calls["body"].get("entries") or []
     all_raw = raw.get("calls_all") or {}
     all_ok = all_raw.get("http_status") == 200 and isinstance(all_raw.get("body"), dict)
@@ -222,6 +226,15 @@ def call_log_section(raw: dict[str, Any], agents: list[dict[str, Any]]) -> dict[
         coverage = f"PARTIAL: only the newest {n_all} log entries ({pages} pages) were read; older entries, and so older client names, are not in this report{why}"
     else:
         coverage = f"complete: all {n_all} log entries ({pages} page(s)) were read"
+    snapshot = all_body_cov.get("head_seq") if all_ok else None
+    if snapshot is None:
+        snapshot = calls["body"].get("head_seq")
+    verify_head = ((verify.get("head") or {}).get("seq")) if isinstance(verify.get("head"), dict) else None
+    newer = (verify_head - snapshot) if isinstance(verify_head, int) and isinstance(snapshot, int) and verify_head > snapshot else 0
+    if newer:
+        coverage += (f"; complete only THROUGH seq {snapshot} (the log head when reading began): {newer} newer entr{'y was' if newer == 1 else 'ies were'} "
+                     f"written while this report was being read, up to head seq {verify_head}, and are not included")
+        coverage = coverage.replace("complete: all", "through seq %d: all" % snapshot, 1) if coverage.startswith("complete: all") else coverage
     per_agent = []
     matched_names: set[str] = set()
     for a in agents:
@@ -247,7 +260,7 @@ def call_log_section(raw: dict[str, Any], agents: list[dict[str, Any]]) -> dict[
         row["tools"].add(str(e.get("tool")))
         row["last_ts"] = max(str(row["last_ts"]), str(e.get("ts")))
     clients_seen = sorted(({**r, "tools": sorted(r["tools"]), "matched_an_agent": r["client_name"] in matched_names} for r in seen.values()), key=lambda r: (-r["calls"], r["client_name"]))
-    return {"available": True, "reason": None, "head": verify.get("head"), "chain_ok": verify.get("ok"), "problems": verify.get("problems"), "per_agent": per_agent, "clients_seen": clients_seen, "coverage": coverage, "truncated": truncated, "pages_read": pages,
+    return {"available": True, "reason": None, "head": verify.get("head"), "chain_ok": verify.get("ok"), "problems": verify.get("problems"), "per_agent": per_agent, "clients_seen": clients_seen, "coverage": coverage, "truncated": truncated, "pages_read": pages, "snapshot_head_seq": snapshot, "newer_entries_not_included": newer,
             "log_files": verify.get("files"), "entries_total": verify.get("entries")}
 
 
