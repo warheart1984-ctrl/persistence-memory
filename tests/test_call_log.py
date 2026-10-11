@@ -884,28 +884,32 @@ def test_a_snapshot_that_cannot_open_a_file_fails_instead_of_dropping_it(tmp_pat
             log._snapshot()
 
 
-def test_a_windows_style_snapshot_copies_the_bytes_so_nothing_is_open_and_retention_cannot_break_the_page(tmp_path, monkeypatch):
-    """Windows cannot unlink an open file, so there the snapshot copies each file's bytes while the lock is held: no handle stays open for retention to trip
-    over, nothing can be deleted from under the page, no reopen can fail, and close() works on what it holds."""
-    monkeypatch.setenv("JARVIS_CALL_LOG_RETAIN_DAYS", "2")
+def test_on_windows_the_page_is_read_under_the_lock_with_no_pinned_handles_and_no_copies(tmp_path, monkeypatch):
+    """Windows cannot unlink an open file and copying every retained file could exhaust memory, so there the page is read lazily while the lock is held: a
+    writer that arrives during the read waits, nothing is open afterwards, nothing is copied, and the page still matches its head exactly."""
     monkeypatch.setattr(call_log, "_pin_by_handle", lambda: False)
-    day = [1]
-    log = call_log.CallLog(tmp_path / "winlike", clock=lambda: datetime(2026, 10, day[0], 12, tzinfo=timezone.utc))
-    log.append(_fields(0))
-    day[0] = 2
-    log.append(_fields(1))
-    day[0] = 8
-    log.append(_fields(2))
-    with log._locked():
-        snap = log._snapshot()
-    assert len(snap.files) == 3 and all(type(fh).__name__ == "BytesIO" for _, _, fh in snap.files)     # copies, not open files
-    day[0] = 9
-    log.append(_fields(3))                                                  # retention unlinks the old files: nothing holds them open, so it can
-    assert [p.name for p in log._files()] == ["calls-20261008.jsonl", "calls-20261009.jsonl"]
-    assert [e["seq"] for e in log.entries_desc(snap)] == [3, 2, 1]
-    snap.close()                                                            # (used to raise AttributeError on a missing handle)
-    snap.close()                                                            # and is idempotent
-    assert snap.files == []
+    log = call_log.CallLog(tmp_path / "winlike")
+    for i in range(5):
+        log.append(_fields(i))
+    taken = []
+    real_snapshot = call_log.CallLog._snapshot
+    monkeypatch.setattr(call_log.CallLog, "_snapshot", lambda self: taken.append(1) or real_snapshot(self))   # must never be called on this path
+    real = call_log.CallLog.entries_desc
+    state = {}
+
+    def racing(self, snapshot=None):
+        t = threading.Thread(target=lambda: call_log.CallLog(tmp_path / "winlike").append(_fields(99)))
+        t.start()
+        t.join(timeout=0.4)
+        state["writer_waited"] = t.is_alive()                  # the lock is held for the whole page: the writer cannot get in
+        yield from (real(self) if snapshot is None else real(self, snapshot))
+
+    monkeypatch.setattr(call_log.CallLog, "entries_desc", racing)
+    page = log.query_with_head(limit=50)
+    monkeypatch.setattr(call_log.CallLog, "entries_desc", real)
+    assert state["writer_waited"] is True and taken == []
+    assert page["entries"][0]["seq"] == page["head"]["seq"] == 5
+    assert log.head()["seq"] == 6
 
 
 def test_close_tolerates_a_snapshot_entry_with_no_handle(tmp_path):

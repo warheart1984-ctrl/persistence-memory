@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
-import io
 import json
 import logging
 import os
@@ -198,7 +197,7 @@ def split_client(header: str | None) -> tuple[str | None, str | None]:
 
 
 def _pin_by_handle() -> bool:
-    """Linux keeps each snapshotted file open (an unlinked file stays readable); Windows cannot, so it copies the bytes instead."""
+    """Linux keeps each snapshotted file open (an unlinked file stays readable) and reads the page after releasing the lock; Windows cannot do either."""
     return os.name != "nt"
 
 
@@ -563,14 +562,7 @@ class CallLog:
         for path in self._files():
             try:
                 fh = open(path, "rb")
-                if not _pin_by_handle():
-                    # Windows cannot unlink a file that is open (no delete-sharing for ordinary handles), so pinning would make retention fail inside an
-                    # append. Copy the bytes while the lock is held instead: nothing is left open, nothing can be deleted from under the page, and no later
-                    # reopen can fail. (The cost, reading under the lock, is the old behaviour; the servers run on Linux.)
-                    with fh:
-                        data = fh.read()
-                    fh = io.BytesIO(data)
-                snap.files.append((path, len(fh.getbuffer()) if isinstance(fh, io.BytesIO) else os.fstat(fh.fileno()).st_size, fh))
+                snap.files.append((path, os.fstat(fh.fileno()).st_size, fh))
             except FileNotFoundError:
                 continue  # retention removed it between listing and opening: it is simply not part of the log any more
             except OSError as exc:
@@ -616,6 +608,13 @@ class CallLog:
             with contextlib.suppress(CallLogError, OSError):  # open denied/read summaries are written first, like flush(); a failure here changes nothing
                 self._flush_reads_locked(self._flush_suppressed_locked(self._head()))
             head = self._head()                                 # read after the flush, in the same hold of the lock as the file sizes
+            if not _pin_by_handle():
+                # Windows cannot unlink an open file (no delete-sharing for ordinary handles), so a pinned handle would make retention fail inside an append,
+                # and copying every retained file into memory could exhaust it. There the page is read lazily WHILE the lock is held: nothing is pinned,
+                # nothing is copied, nothing can be deleted from under the page (retention runs inside an append, which needs this lock). It stalls writers
+                # for the length of the read, which was the behaviour before the snapshot; the servers run on Linux, where the lock is released first.
+                page = self._query_unlocked(tool=tool, client=client, since=since, limit=limit, before_seq=before_seq)
+                return {**page, "head": head}
             snapshot = self._snapshot()
         try:
             page = self._query_unlocked(tool=tool, client=client, since=since, limit=limit, before_seq=before_seq, snapshot=snapshot)
