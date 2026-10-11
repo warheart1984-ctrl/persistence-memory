@@ -30,6 +30,14 @@ from app.refusal import error_body, error_headers
 
 TOOLS_PREFIX = "/api/jarvis/tools/"
 MEMORY_PREFIX = "/api/jarvis/memory"
+# The literal path segments of the memory routes. Any other segment under /api/jarvis/memory is a path parameter (an id, an artifact id,
+# or whatever a caller typed): it is replaced by a placeholder and never written to the log.
+MEMORY_LITERALS = frozenset({
+    "board", "retrieve", "conflicts", "search", "latest", "unified", "external", "stats", "emr", "status", "excite", "reinforce", "correct",
+    "active", "stm", "context", "expand", "pipeline", "history", "verify", "resolve", "amul", "anchor", "artifacts", "lineage", "field",
+    "graph", "bfs", "shortest-path", "related", "components", "external-search", "promote", "ask", "remember", "forget", "describe",
+    "spatialize", "scan", "reindex", "prune", "watch", "stop", "serve",
+})
 OWN_PREFIXES = ("/api/jarvis/tools/calls",)  # the log's own endpoints are not tool calls
 READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 MAX_RESPONSE_BUFFER = 2 * 1024 * 1024
@@ -54,6 +62,20 @@ def normalize_route(path: str) -> tuple[str, str | None]:
     return "/".join(parts), target
 
 
+def normalize_memory_route(path: str) -> tuple[str, str | None]:
+    """Route template for a path under /api/jarvis/memory: known literals stay, every other segment becomes {id}.
+    The target is only recorded when the segment really is a record id, so a typed-in secret never reaches the log."""
+    parts, target = [], None
+    for seg in path.split("/"):
+        if seg == "" or seg in ("api", "jarvis", "memory") or seg in MEMORY_LITERALS:
+            parts.append(seg)
+            continue
+        if any(rx.match(seg) for rx, _ in _ID_SEGMENTS) and target is None:
+            target = seg
+        parts.append("{id}")
+    return "/".join(parts), target
+
+
 def classify(method: str, path: str) -> dict[str, Any] | None:
     """What to log for this request, or None if it is not witnessed."""
     if any(path == p or path.startswith(p + "/") for p in OWN_PREFIXES):
@@ -62,10 +84,10 @@ def classify(method: str, path: str) -> dict[str, Any] | None:
         name = path[len(TOOLS_PREFIX):].strip("/") or "(none)"
         return {"kind": "tool", "tool": name[:64], "route": path, "target": None, "write": name in call_log.WRITE_TOOLS}
     if method == "GET" and (path == MEMORY_PREFIX or path.startswith(MEMORY_PREFIX + "/")) and call_log.reads_enabled():
-        route, target = normalize_route(path)
+        route, target = normalize_memory_route(path)
         return {"kind": "api", "tool": f"GET {route}", "route": route, "target": target, "write": False}
     if path.startswith("/api/jarvis/") and method not in READ_METHODS:
-        route, target = normalize_route(path)
+        route, target = normalize_memory_route(path) if (path == MEMORY_PREFIX or path.startswith(MEMORY_PREFIX + "/")) else normalize_route(path)
         write = (route == "/api/jarvis/memory" and method == "POST") or (route == "/api/jarvis/memory/{id}" and method in ("PATCH", "PUT", "DELETE"))
         return {"kind": "api", "tool": f"{method} {route}", "route": route, "target": target, "write": write}
     return None
@@ -95,8 +117,21 @@ def _json_or_none(raw: bytes) -> Any:
         return {"_unparseable_body_sha256": call_log.sha256_hex(raw)}  # still a stable fingerprint, never the content
 
 
+def _query_dict(query_string: bytes) -> dict[str, Any] | None:
+    """The query as the app sees it: a key given more than once keeps every value, in order (``?t=a&t=b`` is not ``?t=b``)."""
+    if not query_string:
+        return None
+    out: dict[str, Any] = {}
+    for key, value in parse_qsl(query_string.decode("latin-1"), keep_blank_values=True):
+        if key in out:
+            out[key] = [*out[key], value] if isinstance(out[key], list) else [out[key], value]
+        else:
+            out[key] = value
+    return out
+
+
 def request_args(body: Any, query_string: bytes) -> Any:
-    query = dict(parse_qsl(query_string.decode("latin-1"), keep_blank_values=True)) if query_string else None
+    query = _query_dict(query_string)
     if body is not None and query:
         return {"body": body, "query": query}
     return body if body is not None else (query or {})

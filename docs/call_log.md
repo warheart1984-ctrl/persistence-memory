@@ -21,7 +21,7 @@ Reads are high volume (the sessionStart hook, `ping_memoryboard.py`, soak runs),
 `JARVIS_CALL_LOG_READ_CAP_PER_MIN` (default 600, per process per minute) are written one by one; the rest of that minute is rolled into one
 `read_suppressed` entry (`tool: "(read calls)"`, `count`, `window_start`, `window_end`). A write, or the next read in a new minute, closes the
 open summary, so the order of the log shows how many reads came before a write. `JARVIS_CALL_LOG_READS=0` turns read witnessing off (writes and
-tool calls stay witnessed). A read served while the log cannot be written is counted in the recovery `gap` entry like any other served call.
+tool calls stay witnessed). A read served while the log cannot be written is counted in the recovery `gap` entry like any other served call. An open summary is written when the app shuts down gracefully; it is kept in memory until then, so a hard crash can lose the count of the reads suppressed in the last minute (the individual entries before the cap are already on disk). A summary whose append fails keeps its count and is written by the next flush. Path parameters that are not record ids (anything typed into a route) are replaced by `{id}` and never written; a query key given twice keeps both values, in order, in the argument hash.
 
 **Not witnessed:** GET reads outside `/api/jarvis/memory` (`/replay/*`, `/blocks`, the nx routes), the log's own
 endpoints, `/ready` and `/health`. The general memory API (`/api/jarvis/memory`) is the live ledger's real write path (MCP writes are

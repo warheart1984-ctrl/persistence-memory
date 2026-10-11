@@ -708,6 +708,79 @@ def lockable_log_dir(jclient):
     unlock()
 
 
+def _read_fields(i=0):
+    f = call_log.make_fields(transport="http-api", tool="GET /api/jarvis/memory", args={"i": i}, outcome="ok", started=time.perf_counter(), route="/api/jarvis/memory", method="GET")
+    return f
+
+
+def _denied_fields(i=0):
+    return call_log.make_fields(transport="http-api", tool="GET /api/jarvis/memory", args={"i": i}, outcome="denied", started=time.perf_counter(), status_code=401, route="/api/jarvis/memory", method="GET")
+
+
+@pytest.mark.parametrize("kind,make,summary_outcome", [("reads", _read_fields, "read_suppressed"), ("denied", _denied_fields, "denied_suppressed")])
+def test_a_summary_whose_append_failed_keeps_its_count_and_is_written_later(tmp_path, monkeypatch, kind, make, summary_outcome):
+    monkeypatch.setenv("JARVIS_CALL_LOG_READ_CAP_PER_MIN", "1")
+    monkeypatch.setenv("JARVIS_CALL_LOG_DENIED_CAP_PER_MIN", "1")
+    log = call_log.CallLog(tmp_path / "keep")
+    for i in range(5):
+        log.record(make(i))                                              # one entry, four suppressed
+    real = call_log.CallLog._append_locked
+    monkeypatch.setattr(call_log.CallLog, "_append_locked", lambda self, *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+    log.flush()                                                          # the volume is full: nothing can be written (flush swallows it)
+    log.flush()
+    monkeypatch.setattr(call_log.CallLog, "_append_locked", real)
+    log.flush()                                                          # the volume is back: the very same count is written now
+    summary = [e for e in log.query(limit=50)["entries"] if e["outcome"] == summary_outcome]
+    assert len(summary) == 1 and summary[0]["count"] == 4
+    assert log.verify()["ok"] is True
+
+
+def test_open_summaries_are_written_when_the_app_shuts_down(monkeypatch):
+    monkeypatch.setenv("JARVIS_API_KEY", KEY)
+    monkeypatch.delenv("JARVIS_ALLOW_UNAUTHENTICATED", raising=False)
+    monkeypatch.setenv("JARVIS_MEMORY_WRITE_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_CALL_LOG_READ_CAP_PER_MIN", "2")
+    with TestClient(app, raise_server_exceptions=False) as c:
+        for _ in range(7):
+            assert c.get("/api/jarvis/memory", headers=HDR).status_code == 200
+        assert [e["outcome"] for e in entries()] == ["ok", "ok"]          # the other five exist only in memory until something closes them
+    got = entries()                                                       # leaving the client ran the app's shutdown
+    assert [e["outcome"] for e in got] == ["ok", "ok", "read_suppressed"] and got[2]["count"] == 5
+
+
+def test_a_repeated_query_parameter_changes_the_witness_hash(jclient):
+    add(jclient)
+    before = len(entries())
+    jclient.get("/api/jarvis/memory/active?trajectory=a&trajectory=b", headers=HDR)
+    jclient.get("/api/jarvis/memory/active?trajectory=b", headers=HDR)
+    jclient.get("/api/jarvis/memory/active?trajectory=b&trajectory=a", headers=HDR)
+    two, one, swapped = entries()[before:]
+    assert len({two["args_sha256"], one["args_sha256"], swapped["args_sha256"]}) == 3                  # values and their order are part of the fingerprint
+    assert two["args_sha256"] == call_log.args_hash({"trajectory": ["a", "b"]})
+    assert one["args_sha256"] == call_log.args_hash({"trajectory": "b"})                               # a single value hashes exactly as before
+
+
+@pytest.mark.parametrize("method,path", [("GET", "/api/jarvis/memory/bearer-secret-123"), ("GET", "/api/jarvis/memory/amul/artifacts/token-xyz-987"),
+                                          ("PATCH", "/api/jarvis/memory/bearer-secret-123"), ("DELETE", "/api/jarvis/memory/bearer-secret-123")])
+def test_a_path_parameter_that_is_not_a_record_id_never_reaches_the_log(jclient, method, path):
+    before = len(entries())
+    jclient.request(method, path, headers=HDR, json={"subject": "x", "expected_version": 1} if method == "PATCH" else None)
+    (e,) = entries()[before:]
+    secret = path.rsplit("/", 1)[1]
+    assert secret not in json.dumps(e) and "{id}" in e["route"] and e["route"] == e["tool"].split(" ", 1)[1] and e["target"] is None
+    assert secret not in "".join(p.read_text() for p in log_dir().glob("calls-*.jsonl"))
+
+
+def test_real_record_ids_and_known_routes_keep_their_templates(jclient):
+    rec = add(jclient)
+    before = len(entries())
+    for path in (f"/api/jarvis/memory/{rec['id']}", f"/api/jarvis/memory/{rec['id']}/history", "/api/jarvis/memory/latest", "/api/jarvis/memory/amul/field/status"):
+        jclient.get(path, headers=HDR)
+    got = entries()[before:]
+    assert [e["route"] for e in got] == ["/api/jarvis/memory/{id}", "/api/jarvis/memory/{id}/history", "/api/jarvis/memory/latest", "/api/jarvis/memory/amul/field/status"]
+    assert [e["target"] for e in got] == [rec["id"], rec["id"], None, None]
+
+
 @posix_user_only
 def test_reads_served_during_an_outage_are_counted_in_the_gap_entry(jclient, lockable_log_dir):
     lockable_log_dir.lock_dir()

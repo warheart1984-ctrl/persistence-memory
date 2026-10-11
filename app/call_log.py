@@ -456,7 +456,7 @@ class CallLog:
             raise CallLogError(f"call log write failed: {exc}") from None
 
     def _flush_suppressed_locked(self, head: dict[str, Any]) -> dict[str, Any]:
-        s, self._suppressed = self._suppressed, None
+        s = self._suppressed
         if not s:
             return head
         fields = {
@@ -466,10 +466,11 @@ class CallLog:
             "window_start": s["window_start"], "window_end": s["window_end"], "count": s["count"],
         }
         entry = self._append_locked(fields, head)
+        self._suppressed = None  # only once the summary is durably in the log: a failed append keeps the count for the next flush
         return {"seq": entry["seq"], "entry_hash": entry["entry_hash"]}
 
     def _flush_reads_locked(self, head: dict[str, Any]) -> dict[str, Any]:
-        s, self._read_suppressed = self._read_suppressed, None
+        s = self._read_suppressed
         if not s:
             return head
         fields = {
@@ -479,6 +480,7 @@ class CallLog:
             "window_start": s["window_start"], "window_end": s["window_end"], "count": s["count"],
         }
         entry = self._append_locked(fields, head)
+        self._read_suppressed = None  # only once the summary is durably in the log (a failed append keeps the count)
         return {"seq": entry["seq"], "entry_hash": entry["entry_hash"]}
 
     def flush(self) -> None:
