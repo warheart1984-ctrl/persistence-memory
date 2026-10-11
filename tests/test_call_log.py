@@ -1048,6 +1048,69 @@ def test_the_snapshot_wait_is_always_a_finite_bounded_number(monkeypatch, raw, e
     assert value == expected and math.isfinite(value)
 
 
+class CountingFile(__import__("io").BytesIO):
+    """A file that counts how many bytes were read from it."""
+    read_bytes = 0
+
+    def read(self, n=-1):
+        data = super().read(n)
+        self.read_bytes += len(data)
+        return data
+
+
+@pytest.mark.parametrize("chunk", [1, 2, 3, 7, 16, 64, 4096])
+@pytest.mark.parametrize("content", [b"", b"\n", b"a", b"a\n", b"a\nb", b"a\nb\n", b"\n\na\n\n", b"line-one\nline-two\nline-three\n", b"x" * 100 + b"\n" + b"y" * 3 + b"\nz",
+                                     b"no newline at all", b"\r\nwith cr\r\n"])
+def test_reverse_lines_is_exactly_the_lines_backwards_at_any_block_size(content, chunk):
+    expected = list(reversed(content.split(b"\n"))) if content else []
+    if content.endswith(b"\n"):
+        expected = expected[1:]                                      # the empty text after a final newline is not a line
+    got = list(call_log.reverse_lines(__import__("io").BytesIO(content), len(content), chunk))
+    assert [g for g in got if g] == [e for e in expected if e]       # (empty lines are skipped by the reader anyway: compare the non-empty ones, in order)
+    assert b"".join(sorted(got)) == b"".join(sorted(e for e in expected if e))   # and nothing is lost or duplicated
+
+
+def test_reverse_lines_honours_the_size_and_ignores_what_came_after_it():
+    data = b"one\ntwo\nthree\nfour\n"
+    assert list(call_log.reverse_lines(__import__("io").BytesIO(data), len(b"one\ntwo\nthree\n"), 4)) == [b"three", b"two", b"one"]
+
+
+def test_a_page_of_one_entry_reads_one_block_not_the_whole_file():
+    """The newest daily file is unbounded: a limit=1 read, repeated by several concurrent readers, must not each hold a full decoded copy of it."""
+    lines = [json.dumps({"seq": i, "pad": "p" * 80}).encode() for i in range(1, 5001)]
+    data = b"\n".join(lines) + b"\n"                                  # ~450 KB
+    fh = CountingFile(data)
+    first = next(call_log.reverse_lines(fh, len(data), 8192))
+    assert json.loads(first)["seq"] == 5000
+    assert fh.read_bytes <= 2 * 8192 < len(data) / 20                  # one block (two at most), not 450 KB
+    fh2 = CountingFile(data)
+    taken = [json.loads(x)["seq"] for _, x in zip(range(300), call_log.reverse_lines(fh2, len(data), 8192))]
+    assert taken == list(range(5000, 4700, -1)) and fh2.read_bytes < len(data) / 4
+
+
+def test_entries_desc_stops_reading_the_file_once_the_page_is_full(tmp_path, monkeypatch):
+    log = call_log.CallLog(tmp_path / "bigfile")
+    for i in range(400):
+        log.append(_fields(i))
+    size = next(log._files()[0].parent.glob("calls-*.jsonl")).stat().st_size
+    seen = []
+    real = call_log.reverse_lines
+
+    class Spy:
+        def __init__(self, fh):
+            self.fh = fh
+        def seek(self, n):
+            return self.fh.seek(n)
+        def read(self, n=-1):
+            data = self.fh.read(n)
+            seen.append(len(data))
+            return data
+
+    monkeypatch.setattr(call_log, "reverse_lines", lambda fh, sz, chunk=None: real(Spy(fh), sz, 2048))
+    page = log.query(limit=1)
+    assert [e["seq"] for e in page["entries"]] == [400] and sum(seen) < size / 4
+
+
 def test_a_snapshot_page_ignores_what_was_appended_after_it(tmp_path):
     log = call_log.CallLog(tmp_path / "snapbytes")
     for i in range(3):

@@ -238,6 +238,26 @@ def snapshot_wait_seconds() -> float:
     return min(60.0, max(0.0, value))
 
 
+REVERSE_CHUNK = 64 * 1024
+
+
+def reverse_lines(fh, size: int, chunk: int | None = None) -> Iterator[bytes]:
+    """The lines of the first `size` bytes of `fh`, NEWEST (last) first, reading backwards in `chunk`-sized blocks. A page that needs one entry reads one
+    block, not the whole (unbounded) daily file, so concurrent readers hold a block each rather than a full decoded copy of the file. A line longer than a
+    block is assembled across blocks; the text before the first newline is yielded last; blank lines are not yielded and an empty file yields nothing."""
+    chunk = chunk or REVERSE_CHUNK
+    pos, carry = size, b""
+    while pos > 0:
+        step = min(chunk, pos)
+        pos -= step
+        fh.seek(pos)
+        parts = (fh.read(step) + carry).split(b"\n")
+        carry = parts[0]                      # may be the end of an earlier line: it is completed by the next block back
+        yield from (line for line in reversed(parts[1:]) if line)      # (blank lines, and the empty text after a final newline, are not entries)
+    if carry:
+        yield carry
+
+
 def _pin_by_handle() -> bool:
     """Linux keeps each snapshotted file open (an unlinked file stays readable) and reads the page after releasing the lock; Windows cannot do either."""
     return os.name != "nt"
@@ -625,26 +645,28 @@ class CallLog:
         else:
             sources = [(p, size, fh) for p, size, fh in reversed(snapshot.files)]
         for path, size, fh in sources:
+            opened = None
             try:
-                if fh is not None:
-                    fh.seek(0)
-                    lines = fh.read(size).decode("utf-8", "replace").splitlines()
-                elif size is not None:  # an older file of a snapshot, not pinned: reopened now, read up to the size it had
-                    with open(path, "rb") as reopened:
-                        lines = reopened.read(size).decode("utf-8", "replace").splitlines()
-                else:
-                    lines = path.read_text(encoding="utf-8").splitlines()
+                if fh is None:                  # not pinned (an older file of a snapshot, or no snapshot at all): open it now, read up to the size it had
+                    opened = fh = open(path, "rb")
+                    if size is None:
+                        size = os.fstat(fh.fileno()).st_size
+                for raw in reverse_lines(fh, size):
+                    line = raw.decode("utf-8", "replace")
+                    if not line.strip():
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except ValueError:
+                        continue
+                    yield entry
             except OSError as exc:
                 if snapshot is not None:
                     raise CallLogError(f"a file of the snapshot could not be read ({exc.__class__.__name__}); retry") from None
                 continue
-            for line in reversed(lines):
-                if not line.strip():
-                    continue
-                try:
-                    yield json.loads(line)
-                except ValueError:
-                    continue
+            finally:
+                if opened is not None:
+                    opened.close()
 
     def query(self, *, tool: str | None = None, client: str | None = None, since: str | None = None, limit: int = 50, before_seq: int | None = None) -> dict[str, Any]:
         self.flush()
