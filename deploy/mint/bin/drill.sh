@@ -74,7 +74,13 @@ expected="$(grep -E "$count_re" "$BACKUP_DIR/$base.counts" | LC_ALL=C sort)"
 [ "$restored" = "$expected" ] || die "DRILL FAILED: restored row counts differ from the backup set"
 
 scratch_anchors() { anchors_collect scratch_psql; }
-diff <(scratch_anchors) "$BACKUP_DIR/$base.anchors" >/dev/null || die "DRILL FAILED: restored anchors differ from the backup set"
+diff <(scratch_anchors) <(anchors_db_part "$BACKUP_DIR/$base.anchors") >/dev/null || die "DRILL FAILED: restored anchors differ from the backup set"
+if cl_out="$(anchors_calllog_gate "$BACKUP_DIR/$base.data.tar" "$BACKUP_DIR/$base.anchors" $(anchors_earlier_sets "$BACKUP_DIR" "$base") 2>&1)"; then
+  grep -q '^calllog|' "$BACKUP_DIR/$base.anchors" && log INFO "drill: the call log in the archive holds the head the set anchored and the heads of $(anchors_earlier_sets "$BACKUP_DIR" "$base" | wc -l) earlier set(s)" \
+    || log INFO "drill: this set has no call-log anchor (taken before the call log was anchored)"
+else
+  die "DRILL FAILED: the call log does not match its anchors: $(echo "$cl_out" | head -3 | tr '\n' ';')"
+fi
 
 verify_scratch() {
   local t rc=0
@@ -187,7 +193,7 @@ if [ "$prove" -eq 1 ]; then
     # the anchor must notice a removed newest block, which nothing inside the database can
     scratch_psql -c "ALTER TABLE jarvis.blocks DISABLE TRIGGER blocks_no_delete" >/dev/null
     scratch_psql -c "DELETE FROM jarvis.blocks WHERE height = (SELECT max(height) FROM jarvis.blocks)" >/dev/null
-    if diff <(scratch_anchors) "$BACKUP_DIR/$base.anchors" >/dev/null; then die "DRILL FAILED: removing the newest block was NOT detected by the anchors"; fi
+    if diff <(scratch_anchors) <(anchors_db_part "$BACKUP_DIR/$base.anchors") >/dev/null; then die "DRILL FAILED: removing the newest block was NOT detected by the anchors"; fi
     log INFO "drill: removing the newest block of the scratch copy was detected by the anchors, as it must be"
   else
     log WARN "drill: block anchor proof skipped (no sealed blocks yet)"
