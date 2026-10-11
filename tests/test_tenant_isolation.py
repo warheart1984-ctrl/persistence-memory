@@ -241,10 +241,18 @@ def world(client):
     artifact = created[0]
     client.post("/api/jarvis/memory/emr/excite", headers=h("alice"), json={"query": SEARCH, "session_key": "default", "theta_promote": 0.0})
     client.post("/api/jarvis/memory/board", headers=h("alice"), json={"summary": f"alice board {MARK}"})
+    reinforced = client.post("/api/jarvis/memory/emr/reinforce", headers=h("alice"), json={
+        "memory_ids": [first["id"]], "outcome": {"signal": "positive", "source": "user", "outcome_id": f"outcome-{MARK}"}})
+    assert reinforced.status_code == 200, reinforced.text                          # alice now has reinforcement state, which the status view reports
     return {"first": first["id"], "second": second["id"], "third": third["id"], "artifact": artifact}
 
 
-VOLATILE = {"tenant", "result_digest", "ledger_head", "path", "head", "ts", "created_at", "updated_at", "generated_at", "checked_at", "duration_ms"}
+VOLATILE = {"tenant", "result_digest", "ledger_head", "head", "ts", "created_at", "updated_at", "generated_at", "checked_at", "duration_ms"}
+# Fields dropped for ONE case only. `path` is no longer masked everywhere: a server path in a response is something to see (two of them are known gaps below).
+CASE_VOLATILE = {"amul-status": {"path"}}                 # the AMUL field's own directory, which holds the tenant's hash and so differs between any two tenants
+# Cases that currently DO leak across tenants. They are excluded from the generic comparison and pinned by a strict xfail below, so the day they are fixed
+# the xfail flips and the case is promoted back into the generic test.
+KNOWN_LEAKS = {"emr-status"}
 GENERATED = {"id", "content_sha256", "version"}   # a write that succeeds returns an id, a hash and a clock of its own: expected to differ between two calls
 
 
@@ -439,9 +447,9 @@ def strip(obj):
     return obj
 
 
-def _body(resp):
+def _body(resp, case: str = ""):
     try:
-        return strip(resp.json())
+        return _drop(strip(resp.json()), CASE_VOLATILE.get(case, set()))
     except ValueError:
         return resp.text
 
@@ -450,6 +458,8 @@ def test_a_second_tenant_sees_nothing_of_the_first(client, world):
     """Bob has written nothing, so every read must look exactly like a brand-new tenant's: that also catches aggregate-only leaks (counts, sizes) that carry no id."""
     failures = []
     for case, (method, path, body) in sorted(LIST_CASES.items()):
+        if case in KNOWN_LEAKS:
+            continue
         r = client.request(method, path, headers=h("bob"), json=body)
         empty = client.request(method, path, headers=h("carol-who-never-wrote"), json=body)
         if r.status_code not in (200, 404, 501):
@@ -459,8 +469,8 @@ def test_a_second_tenant_sees_nothing_of_the_first(client, world):
             assert_nothing_of_alices(r, world)
         except AssertionError as exc:
             failures.append(f"{case}: {exc}")
-        if (r.status_code, _body(r)) != (empty.status_code, _body(empty)):
-            failures.append(f"{case}: bob's response differs from a brand-new tenant's:\n   bob   {r.status_code} {str(_body(r))[:200]}\n   empty {empty.status_code} {str(_body(empty))[:200]}")
+        if (r.status_code, _body(r, case)) != (empty.status_code, _body(empty, case)):
+            failures.append(f"{case}: bob's response differs from a brand-new tenant's:\n   bob   {r.status_code} {str(_body(r, case))[:200]}\n   empty {empty.status_code} {str(_body(empty, case))[:200]}")
     assert not failures, "\n".join(failures)
 
 
@@ -611,3 +621,19 @@ def test_every_tenant_data_route_is_exercised_by_a_cross_tenant_case():
     assert not missing, f"tenant-data routes with no cross-tenant case (add one to id_cases, LIST_CASES or MUTATION_CASES): {missing}"
     stray = sorted(k for k in exercised if k not in REGISTRY)
     assert not stray, f"cases that hit routes the registry does not know: {stray}"
+
+
+@pytest.mark.xfail(strict=True, reason="REAL LEAK: EMR reinforcement state is a process-global map keyed by memory id only (app/emr.py _REINFORCEMENT, one shared sidecar file), "
+                                       "and GET /api/jarvis/memory/emr/status reports every tenant's entries, including memory ids and outcome ids")
+def test_emr_status_does_not_show_another_tenants_reinforcement(client, world):
+    r = client.get("/api/jarvis/memory/emr/status", headers=h("bob"))
+    assert r.status_code == 200
+    assert MARK not in r.text and world["first"] not in r.text, "bob can read alice's reinforcement state"
+    empty = client.get("/api/jarvis/memory/emr/status", headers=h("carol-who-never-wrote"))
+    assert _body(r) == _body(empty)
+
+
+@pytest.mark.xfail(strict=True, reason="GAP: the EMR status shows the server's filesystem path of the dynamics sidecar (dynamics.sidecar.path = data/emr-dynamics.json) to any tenant")
+def test_a_tenant_is_not_told_the_emr_sidecar_path(client):
+    r = client.get("/api/jarvis/memory/emr/status", headers=h("bob"))
+    assert "data/" not in r.text and "emr-dynamics" not in r.text
