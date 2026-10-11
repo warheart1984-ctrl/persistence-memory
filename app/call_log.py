@@ -478,6 +478,8 @@ class CallLog:
         pending = (self._suppressed or {}).get("count", 0) + (self._read_suppressed or {}).get("count", 0)
         if pending:
             self._mark_degraded("shutdown: the open denied/read summaries could not be written", unlogged=pending)
+            if self._outage:  # the DEGRADED file could not be written either (the directory or volume itself is failing): nothing on that volume can hold the count
+                _log.error("call log shutdown: %s calls (denied/read summaries) could not be recorded anywhere on the log volume and are lost; this line is their only trace", pending)
             self._suppressed = self._read_suppressed = None
 
     def _flush_reads_locked(self, head: dict[str, Any]) -> dict[str, Any]:
@@ -496,9 +498,13 @@ class CallLog:
 
     def flush(self) -> None:
         """Write any open 'denied_suppressed' / 'read_suppressed' summary now (the read endpoints call this so readers see it)."""
-        with contextlib.suppress(CallLogError, OSError):
+        try:
             with self._locked():
                 self._flush_reads_locked(self._flush_suppressed_locked(self._head()))
+        except (CallLogError, OSError) as exc:
+            if self._suppressed or self._read_suppressed:
+                # the counts are kept for the next flush, but the log is in trouble now: say so in verify/query (no unlogged calls are added; they are still pending)
+                self._mark_degraded(f"could not write the open summaries: {exc}", unlogged=0)
 
     def record(self, fields: dict[str, Any]) -> dict[str, Any] | None:
         """Append, applying the failure policy: never raises.  Returns the entry, or None if it could not be written."""

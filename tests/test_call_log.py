@@ -68,6 +68,19 @@ def jclient(monkeypatch):
         yield c
 
 
+@pytest.fixture
+def fixed_minute(monkeypatch):
+    """A call log whose clock does not move: the per-minute caps and windows cannot straddle a real minute boundary mid-test."""
+    fixed = datetime.now(timezone.utc).replace(second=30, microsecond=0)
+    real = call_log.CallLog.__init__
+
+    def init(self, directory, *, clock=None, **kw):
+        real(self, directory, clock=clock or (lambda: fixed), **kw)
+
+    monkeypatch.setattr(call_log.CallLog, "__init__", init)
+    call_log.reset_for_tests()
+
+
 def log_dir() -> Path:
     return call_log.log_dir()
 
@@ -240,7 +253,7 @@ def test_turning_read_witnessing_off_leaves_writes_and_tools_witnessed(jclient, 
     assert [e["tool"] for e in entries()] == ["POST /api/jarvis/memory", "emr_latest"]
 
 
-def test_a_flood_of_reads_is_capped_and_rolled_into_one_read_suppressed_entry(jclient, monkeypatch):
+def test_a_flood_of_reads_is_capped_and_rolled_into_one_read_suppressed_entry(fixed_minute, jclient, monkeypatch):
     monkeypatch.setenv("JARVIS_CALL_LOG_READ_CAP_PER_MIN", "5")
     for _ in range(20):
         assert jclient.get("/api/jarvis/memory/latest?limit=1", headers=HDR).status_code == 200
@@ -252,7 +265,7 @@ def test_a_flood_of_reads_is_capped_and_rolled_into_one_read_suppressed_entry(jc
     assert jclient.get("/api/jarvis/tools/calls/verify", headers=HDR).json()["ok"] is True
 
 
-def test_a_write_closes_the_open_read_summary_first_so_the_order_shows_what_preceded_it(jclient, monkeypatch):
+def test_a_write_closes_the_open_read_summary_first_so_the_order_shows_what_preceded_it(fixed_minute, jclient, monkeypatch):
     monkeypatch.setenv("JARVIS_CALL_LOG_READ_CAP_PER_MIN", "2")
     for _ in range(6):
         jclient.get("/api/jarvis/memory", headers=HDR)
@@ -405,7 +418,7 @@ def test_denied_and_error_calls_are_logged(jclient):
     assert got[0]["status_code"] == 401 and got[1]["error_code"] == "LIMIT_OUT_OF_RANGE" and got[2]["transport"] == "mcp-http"
 
 
-def test_a_flood_of_denied_calls_is_capped_and_rolled_into_one_suppressed_entry(jclient, monkeypatch):
+def test_a_flood_of_denied_calls_is_capped_and_rolled_into_one_suppressed_entry(fixed_minute, jclient, monkeypatch):
     monkeypatch.setenv("JARVIS_CALL_LOG_DENIED_CAP_PER_MIN", "5")
     for _ in range(20):
         jclient.post("/api/jarvis/tools/emr_latest", headers={"X-API-Key": "wrong"}, json={})
@@ -718,7 +731,7 @@ def _denied_fields(i=0):
 
 
 @pytest.mark.parametrize("kind,make,summary_outcome", [("reads", _read_fields, "read_suppressed"), ("denied", _denied_fields, "denied_suppressed")])
-def test_a_summary_whose_append_failed_keeps_its_count_and_is_written_later(tmp_path, monkeypatch, kind, make, summary_outcome):
+def test_a_summary_whose_append_failed_keeps_its_count_and_is_written_later(fixed_minute, tmp_path, monkeypatch, kind, make, summary_outcome):
     monkeypatch.setenv("JARVIS_CALL_LOG_READ_CAP_PER_MIN", "1")
     monkeypatch.setenv("JARVIS_CALL_LOG_DENIED_CAP_PER_MIN", "1")
     log = call_log.CallLog(tmp_path / "keep")
@@ -735,7 +748,7 @@ def test_a_summary_whose_append_failed_keeps_its_count_and_is_written_later(tmp_
     assert log.verify()["ok"] is True
 
 
-def test_a_shutdown_flush_that_fails_leaves_the_counts_as_unlogged_for_the_next_process(tmp_path, monkeypatch):
+def test_a_shutdown_flush_that_fails_leaves_the_counts_as_unlogged_for_the_next_process(fixed_minute, tmp_path, monkeypatch):
     monkeypatch.setenv("JARVIS_CALL_LOG_READ_CAP_PER_MIN", "1")
     monkeypatch.setenv("JARVIS_CALL_LOG_DENIED_CAP_PER_MIN", "1")
     d = tmp_path / "shut"
@@ -755,7 +768,38 @@ def test_a_shutdown_flush_that_fails_leaves_the_counts_as_unlogged_for_the_next_
     assert len(gaps) == 1 and gaps[0]["count"] == 5 and nxt.verify()["ok"] is True
 
 
-def test_open_summaries_are_written_when_the_app_shuts_down(monkeypatch):
+def test_a_failed_summary_flush_shows_up_as_degraded_in_verify_and_query_and_is_written_later(fixed_minute, tmp_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_CALL_LOG_READ_CAP_PER_MIN", "1")
+    log = call_log.CallLog(tmp_path / "fl")
+    for i in range(4):
+        log.record(_read_fields(i))                                      # 3 suppressed
+    real = call_log.CallLog._append_locked
+    monkeypatch.setattr(call_log.CallLog, "_append_locked", lambda self, *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+    v = log.verify()                                                     # verify flushes first, and the flush fails
+    assert v["degraded"] and "summaries" in v["degraded"]["last_error"] and v["degraded"]["unlogged"] == 0
+    monkeypatch.setattr(call_log.CallLog, "_append_locked", real)
+    page = log.query(limit=50)                                           # the volume is back: the same count is written now
+    summary = [e for e in page["entries"] if e["outcome"] == "read_suppressed"]
+    assert len(summary) == 1 and summary[0]["count"] == 3
+    log.record(_fields(1))                                               # the next ordinary call writes the recovery gap entry and clears the latch
+    gaps = [e for e in log.query(limit=50)["entries"] if e["outcome"] == "gap"]
+    assert len(gaps) == 1 and gaps[0]["count"] == 0 and log.degraded() is None and log.verify()["ok"] is True
+
+
+def test_a_shutdown_with_an_unwritable_log_volume_leaves_the_counts_in_the_app_log(fixed_minute, tmp_path, monkeypatch, caplog):
+    """When even the DEGRADED file cannot be written, nothing on the volume can hold the count: the only trace left is an ERROR in the app's own log."""
+    monkeypatch.setenv("JARVIS_CALL_LOG_READ_CAP_PER_MIN", "1")
+    log = call_log.CallLog(tmp_path / "gone")
+    for i in range(4):
+        log.record(_read_fields(i))                                      # 3 suppressed
+    monkeypatch.setattr(call_log.CallLog, "_append_locked", lambda self, *a, **k: (_ for _ in ()).throw(OSError("read-only volume")))
+    monkeypatch.setattr(call_log.CallLog, "_locked", lambda self: (_ for _ in ()).throw(OSError("read-only volume")))
+    with caplog.at_level("ERROR", logger="jarvis.call_log"):
+        log.flush_for_shutdown()
+    assert any("3 calls" in r.getMessage() and "only trace" in r.getMessage() for r in caplog.records)
+
+
+def test_open_summaries_are_written_when_the_app_shuts_down(fixed_minute, monkeypatch):
     monkeypatch.setenv("JARVIS_API_KEY", KEY)
     monkeypatch.delenv("JARVIS_ALLOW_UNAUTHENTICATED", raising=False)
     monkeypatch.setenv("JARVIS_MEMORY_WRITE_ENABLED", "true")
@@ -818,7 +862,7 @@ def test_the_route_template_depends_on_the_method_not_only_the_path(jclient):
     assert not any(w in json.dumps(got[:3]) for w in ("promote", "pipeline", "external-search"))
 
 
-def test_mixed_traffic_does_not_write_a_summary_per_read(jclient, monkeypatch):
+def test_mixed_traffic_does_not_write_a_summary_per_read(fixed_minute, jclient, monkeypatch):
     """Alternating reads with a read-only tool call must not close the summary every time, or the cap bounds nothing."""
     monkeypatch.setenv("JARVIS_CALL_LOG_READ_CAP_PER_MIN", "2")
     for _ in range(15):
