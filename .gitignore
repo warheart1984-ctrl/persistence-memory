@@ -15,3 +15,4 @@ build/
 data/emr-embeddings.json
 data/emr-embed-model/
 data/call-log/
+data/drift-log/

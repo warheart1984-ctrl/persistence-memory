@@ -39,6 +39,7 @@ def test_tool_catalog_includes_three_tools():
         "emr_recall",
         "emr_latest",
         "emr_search_ledger",
+        "emr_drift_check",
         "search",
         "fetch",
         "emr_search",

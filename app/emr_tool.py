@@ -392,7 +392,7 @@ def _function_schema(mcp_tool: dict[str, Any]) -> dict[str, Any]:
 
 def tool_catalog() -> dict[str, Any]:
     """Exported tool catalog for agent hosts (recall + gated writes)."""
-    from mcp_server.protocol import EMR_LATEST_TOOL, EMR_SEARCH_LEDGER_TOOL
+    from mcp_server.protocol import EMR_DRIFT_CHECK_TOOL, EMR_LATEST_TOOL, EMR_SEARCH_LEDGER_TOOL
 
     return {
         "schema": "emr-tool-catalog-v1",
@@ -400,6 +400,7 @@ def tool_catalog() -> dict[str, Any]:
             EMR_RECALL_TOOL_SCHEMA,
             _function_schema(EMR_LATEST_TOOL),
             _function_schema(EMR_SEARCH_LEDGER_TOOL),
+            _function_schema(EMR_DRIFT_CHECK_TOOL),
             EMR_SEARCH_TOOL_SCHEMA,
             EMR_FETCH_TOOL_SCHEMA,
             EMR_SEARCH_ALIAS_SCHEMA,
@@ -411,6 +412,7 @@ def tool_catalog() -> dict[str, Any]:
             "emr_recall": "read",
             "emr_latest": "read (newest-first discovery, no id or keyword needed)",
             "emr_search_ledger": "read (ranked word search over ledger records)",
+            "emr_drift_check": "read (checks an agent summary against ledger records; operator only; writes only to the drift log)",
             "search": "read (OpenAI company knowledge)",
             "fetch": "read (OpenAI company knowledge)",
             "emr_search": "read (alias of search)",

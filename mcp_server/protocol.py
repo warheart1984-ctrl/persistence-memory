@@ -321,10 +321,40 @@ EMR_UPSERT_TOOL: dict[str, Any] = {
     },
 }
 
+EMR_DRIFT_CHECK_TOOL: dict[str, Any] = {
+    "name": "emr_drift_check",
+    "description": (
+        "Check an agent's summary of ledger records against the records themselves. Give the summary text and the ids of the records it was written "
+        "from; every factual claim comes back supported, contradicted (with the record field that disagrees) or unsupported, plus an overall verdict "
+        "(pass, drift, unverified) and a deterministic check_digest. No model is used. Operator only. It never changes a record: the result is "
+        "appended to a separate drift log, not to the ledger."
+    ),
+    "annotations": {
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "summary": {"type": "string", "minLength": 1, "maxLength": 20000},
+            "records": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 20},
+            "claims": {"type": "array", "maxItems": 200, "items": {"type": "object", "properties": {"text": {"type": "string"}, "cites": {"type": "array", "items": {"type": "string"}}}, "required": ["text"]}},
+            "client": {"type": "string", "description": "who wrote the summary (self-reported), used to find its calls in the call log"},
+            "served_digest": {"type": "string", "description": "the result_digest the agent was shown, if any"},
+            "served_content_sha256": {"type": "object", "additionalProperties": {"type": "string"}},
+        },
+        "required": ["records"],
+        "additionalProperties": False,
+    },
+}
+
 MCP_TOOLS: list[dict[str, Any]] = [
     EMR_RECALL_TOOL,
     EMR_LATEST_TOOL,
     EMR_SEARCH_LEDGER_TOOL,
+    EMR_DRIFT_CHECK_TOOL,
     SEARCH_TOOL,
     FETCH_TOOL,
     EMR_SEARCH_TOOL,
@@ -399,7 +429,7 @@ def _initialize_result(params: dict[str, Any] | None) -> dict[str, Any]:
             "Use search/fetch (or emr_search/emr_fetch) for OpenAI deep-research style "
             "company knowledge — read-only, citation URLs on every result. "
             "Use emr_latest to find the newest memory records with no id or keyword. "
-            "Use emr_search_ledger for ranked word search over the ledger's own records. "
+            "Use emr_search_ledger for ranked word search over the ledger's own records. Use emr_drift_check (operator only) to check an agent's summary against the records it cites. "
             "Use emr_recall for governed Continuity Ledger recall bundles (may abstain). "
             "Use emr_remember / emr_upsert only when the user explicitly asked to store "
             "or update memory (user_requested=true); writes are draft-only and may be "

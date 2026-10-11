@@ -143,6 +143,7 @@ def call_emr_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         "emr_recall": "emr_recall",
         "emr_latest": "emr_latest",
         "emr_search_ledger": "emr_search_ledger",
+        "emr_drift_check": "emr_drift_check",
         "emr_remember": "emr_remember",
         "emr_upsert": "emr_upsert",
         "search": "search",

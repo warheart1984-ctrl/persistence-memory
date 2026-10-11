@@ -76,6 +76,7 @@ def test_mcp_tools_list():
         "emr_recall",
         "emr_latest",
         "emr_search_ledger",
+        "emr_drift_check",
         "search",
         "fetch",
         "emr_search",

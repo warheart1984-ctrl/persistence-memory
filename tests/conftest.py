@@ -39,6 +39,18 @@ def _call_log_isolated(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _drift_log_isolated(monkeypatch, tmp_path):
+    """The drift log never writes into the repo's data/ during tests: each test gets its own directory, with the watcher on."""
+    from app import drift
+
+    monkeypatch.setenv("JARVIS_DRIFT_LOG_DIR", str(tmp_path / "drift-log"))
+    monkeypatch.setenv("JARVIS_DRIFT_CHECK_ENABLED", "1")
+    drift.reset_for_tests()
+    yield
+    drift.reset_for_tests()
+
+
+@pytest.fixture(autouse=True)
 def _no_desktop_popups(monkeypatch):
     """The deploy-script tests provoke real failures (a refused key, a missing endpoint). lib.sh's notify() falls back to the
     operator's live session bus, so without this every full run popped "Jarvis ledger: seal failed" on the desktop."""
