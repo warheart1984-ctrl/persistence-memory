@@ -116,6 +116,14 @@ def denied_cap_per_minute() -> int:
         return 60
 
 
+def _is_rest_write(fields: dict[str, Any]) -> bool:
+    """A state-changing REST call (POST/PATCH/PUT/DELETE on an API route), whatever transport carried it: a stdio adapter sends its REST writes with
+    the stdio label, and they are as much an ordering boundary as a plain HTTP one. A tool route (/api/jarvis/tools/*, POST by convention) is not."""
+    if fields.get("method") in (None, "GET", "HEAD", "OPTIONS"):
+        return False
+    return not str(fields.get("route") or "").startswith("/api/jarvis/tools/")
+
+
 def read_cap_per_minute() -> int:
     """GET reads of /api/jarvis/memory/* are witnessed one by one up to this many a minute (per process); the rest are rolled into one summary."""
     try:
@@ -450,7 +458,7 @@ class CallLog:
                             s["window_end"] = _ts(self._clock())
                             self._read_suppressed[key] = s
                             return {"suppressed": True}
-                    elif fields.get("tool") in WRITE_TOOLS or (fields.get("transport") == "http-api" and fields.get("method") not in (None, "GET", "HEAD", "OPTIONS")):
+                    elif fields.get("tool") in WRITE_TOOLS or _is_rest_write(fields):
                         # a write is an ordering boundary: it closes the open read summary first, so the log shows how many reads came before it.
                         # Other calls (a read-only tool, say) do not: alternating them with reads would otherwise write one summary per read.
                         head = self._flush_reads_locked(head)

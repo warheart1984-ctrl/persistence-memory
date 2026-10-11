@@ -274,6 +274,22 @@ def test_a_write_closes_the_open_read_summary_first_so_the_order_shows_what_prec
     assert [e["outcome"] for e in got] == ["ok", "ok", "read_suppressed", "ok"] and got[2]["count"] == 4 and got[3]["tool"] == "POST /api/jarvis/memory"
 
 
+def _stdio(tool, method, route):
+    return call_log.make_fields(transport="mcp-stdio", tool=tool, args={}, outcome="ok", started=time.perf_counter(), route=route, method=method, client_name="grok")
+
+
+def test_a_stdio_rest_write_closes_the_read_summary_but_a_stdio_tool_call_does_not(fixed_minute, tmp_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_CALL_LOG_READ_CAP_PER_MIN", "1")
+    log = call_log.CallLog(tmp_path / "stdio")
+    for i in range(4):
+        log.record(call_log.make_fields(transport="mcp-stdio", tool="GET /api/jarvis/memory", args={"i": i}, outcome="ok", started=time.perf_counter(), route="/api/jarvis/memory", method="GET"))
+    log.record(_stdio("emr_latest", "POST", "/api/jarvis/tools/emr_latest"))      # a read-only tool through the same adapter: the summary stays open
+    assert [e["outcome"] for e in log.entries_desc()] == ["ok", "ok"]            # (entries_desc does not flush; query() would close the summary itself)
+    log.record(_stdio("POST /api/jarvis/memory", "POST", "/api/jarvis/memory"))   # a REST write through the same adapter: the boundary
+    got = [(e["outcome"], e["tool"]) for e in list(log.entries_desc())[::-1]]
+    assert got == [("ok", "GET /api/jarvis/memory"), ("ok", "emr_latest"), ("read_suppressed", "(read calls)"), ("ok", "POST /api/jarvis/memory")]
+
+
 def test_the_read_cap_does_not_throttle_tool_calls_or_writes(jclient, monkeypatch):
     monkeypatch.setenv("JARVIS_CALL_LOG_READ_CAP_PER_MIN", "1")
     for _ in range(4):
