@@ -72,7 +72,7 @@ FILE_RE = re.compile(r"^calls-(\d{8})\.jsonl$")
 MIN_FREE_BYTES = 1 << 20
 WRITE_TOOLS = frozenset({"emr_remember", "emr_upsert"})
 TRANSPORTS = ("mcp-stdio", "mcp-http", "http-tool", "http-api")
-OUTCOMES = ("ok", "denied", "error", "denied_suppressed", "gap")
+OUTCOMES = ("ok", "denied", "error", "denied_suppressed", "read_suppressed", "gap")
 
 
 class CallLogError(Exception):
@@ -114,6 +114,35 @@ def denied_cap_per_minute() -> int:
         return max(1, int((os.environ.get("JARVIS_CALL_LOG_DENIED_CAP_PER_MIN") or "").strip() or 60))
     except ValueError:
         return 60
+
+
+# The REST routes that write ledger records (create_memory / update_memory / delete_memory in app/main.py): POST /memory, the promotion of an nx-search
+# result, the memory pipeline that materialises a record, and PATCH/PUT/DELETE of a record. POST /memory/external-search is NOT here: it writes only
+# when its auto_promote flag is set, which the log (it stores no arguments) cannot see, and without the flag it only reads.
+LEDGER_WRITE_ROUTES = frozenset({
+    ("POST", "/api/jarvis/memory"), ("POST", "/api/jarvis/memory/promote"), ("POST", "/api/jarvis/memory/pipeline"),
+    ("PATCH", "/api/jarvis/memory/{id}"), ("PUT", "/api/jarvis/memory/{id}"), ("DELETE", "/api/jarvis/memory/{id}"),
+})
+
+
+def _is_rest_write(fields: dict[str, Any]) -> bool:
+    """A ledger write over REST (POST /memory, PATCH/PUT/DELETE /memory/{id}), whatever transport carried it: a stdio adapter sends it with the
+    stdio label, and it is as much an ordering boundary as a plain HTTP one. It is matched by route, not by method alone: many POST endpoints
+    (graph/bfs, rag/query, the tool routes) only read, and treating them as writes would let mixed traffic write a summary per read."""
+    return (fields.get("method"), fields.get("route")) in LEDGER_WRITE_ROUTES
+
+
+def read_cap_per_minute() -> int:
+    """GET reads of /api/jarvis/memory/* are witnessed one by one up to this many a minute (per process); the rest are rolled into one summary."""
+    try:
+        return max(1, int((os.environ.get("JARVIS_CALL_LOG_READ_CAP_PER_MIN") or "").strip() or 600))
+    except ValueError:
+        return 600
+
+
+def reads_enabled() -> bool:
+    """Whether memory GET reads are witnessed at all (JARVIS_CALL_LOG_READS, default on whenever the call log is on)."""
+    return (os.environ.get("JARVIS_CALL_LOG_READS") or "1").strip().lower() not in ("0", "false", "no", "off")
 
 
 # --------------------------------------------------------------------------------------------------------- helpers
@@ -177,6 +206,8 @@ class CallLog:
         self._outage: dict[str, Any] | None = None  # unlogged/refused calls kept in memory, so a gap can be recorded even if the DEGRADED file cannot be written
         self._suppressed: dict[str, Any] | None = None  # the open denied-flood window for this process
         self._denied_window: tuple[str, int] = ("", 0)
+        self._read_suppressed: dict[tuple[str, str], dict[str, Any]] = {}  # open read-flood summaries, one per (tenant, transport)
+        self._read_window: tuple[str, dict[str, int]] = ("", {})  # the minute, and how many reads each tenant has had in it
 
     # ----- paths
     @property
@@ -419,6 +450,26 @@ class CallLog:
                         return {"suppressed": True}
                 else:
                     head = self._flush_suppressed_locked(head)
+                    if fields.get("method") == "GET" and fields.get("transport") != "http-tool" and fields.get("outcome") == "ok":
+                        # a successful memory read: capped, never silently dropped. A failed read (404, 500) is evidence of something wrong and is never summarised.
+                        window = self._clock().strftime("%Y-%m-%dT%H:%M")
+                        if self._read_window[0] != window:
+                            head = self._flush_reads_locked(head)
+                            self._read_window = (window, {})
+                        tenant = str(fields.get("tenant") or "operator")
+                        counts = self._read_window[1]  # the cap is per tenant, so a busy tenant cannot use up the others' reads
+                        counts[tenant] = counts.get(tenant, 0) + 1
+                        if counts[tenant] > read_cap_per_minute():
+                            key = (tenant, str(fields.get("transport") or "http-api"))  # and a summary never mixes tenants or transports
+                            s = self._read_suppressed.get(key) or {"window_start": _ts(self._clock()), "count": 0}
+                            s["count"] += 1
+                            s["window_end"] = _ts(self._clock())
+                            self._read_suppressed[key] = s
+                            return {"suppressed": True}
+                    elif fields.get("outcome") == "ok" and (fields.get("tool") in WRITE_TOOLS or _is_rest_write(fields)):
+                        # a write is an ordering boundary: it closes the open read summary first, so the log shows how many reads came before it.
+                        # Other calls (a read-only tool, say) do not: alternating them with reads would otherwise write one summary per read.
+                        head = self._flush_reads_locked(head)
                 return self._append_locked(fields, head)
         except CallLogError:
             raise
@@ -426,7 +477,7 @@ class CallLog:
             raise CallLogError(f"call log write failed: {exc}") from None
 
     def _flush_suppressed_locked(self, head: dict[str, Any]) -> dict[str, Any]:
-        s, self._suppressed = self._suppressed, None
+        s = self._suppressed
         if not s:
             return head
         fields = {
@@ -436,13 +487,44 @@ class CallLog:
             "window_start": s["window_start"], "window_end": s["window_end"], "count": s["count"],
         }
         entry = self._append_locked(fields, head)
+        self._suppressed = None  # only once the summary is durably in the log: a failed append keeps the count for the next flush
         return {"seq": entry["seq"], "entry_hash": entry["entry_hash"]}
 
+    def flush_for_shutdown(self) -> None:
+        """Last chance to write the open summaries. If that fails, the process is about to exit with their counts only in memory, so the
+        counts are recorded as unlogged calls in the DEGRADED state; the next process then writes them into a gap entry."""
+        self.flush()
+        pending = (self._suppressed or {}).get("count", 0) + sum(s["count"] for s in self._read_suppressed.values())
+        if pending:
+            self._mark_degraded("shutdown: the open denied/read summaries could not be written", unlogged=pending)
+            if self._outage:  # the DEGRADED file could not be written either (the directory or volume itself is failing): nothing on that volume can hold the count
+                _log.error("call log shutdown: %s calls (denied/read summaries) could not be recorded anywhere on the log volume and are lost; this line is their only trace", pending)
+            self._suppressed, self._read_suppressed = None, {}
+
+    def _flush_reads_locked(self, head: dict[str, Any]) -> dict[str, Any]:
+        for key in sorted(self._read_suppressed):
+            s = self._read_suppressed[key]
+            tenant, transport = key
+            fields = {
+                "transport": transport, "client_name": None, "client_version": None, "client_self_reported": True, "tenant": tenant,
+                "tool": "(read calls)", "route": None, "method": "GET", "target": None, "args_sha256": args_hash({"suppressed": s["count"]}),
+                "outcome": "read_suppressed", "error_code": f"SUPPRESSED:{s['count']}", "status_code": None, "result_digest": None, "duration_ms": 0,
+                "window_start": s["window_start"], "window_end": s["window_end"], "count": s["count"],
+            }
+            entry = self._append_locked(fields, head)
+            del self._read_suppressed[key]  # only once the summary is durably in the log (a failed append keeps the count)
+            head = {"seq": entry["seq"], "entry_hash": entry["entry_hash"]}
+        return head
+
     def flush(self) -> None:
-        """Write any open 'denied_suppressed' summary now (the read endpoints call this so readers see it)."""
-        with contextlib.suppress(CallLogError, OSError):
+        """Write any open 'denied_suppressed' / 'read_suppressed' summary now (the read endpoints call this so readers see it)."""
+        try:
             with self._locked():
-                self._flush_suppressed_locked(self._head())
+                self._flush_reads_locked(self._flush_suppressed_locked(self._head()))
+        except (CallLogError, OSError) as exc:
+            if self._suppressed or self._read_suppressed:
+                # the counts are kept for the next flush, but the log is in trouble now: say so in verify/query (no unlogged calls are added; they are still pending)
+                self._mark_degraded(f"could not write the open summaries: {exc}", unlogged=0)
 
     def record(self, fields: dict[str, Any]) -> dict[str, Any] | None:
         """Append, applying the failure policy: never raises.  Returns the entry, or None if it could not be written."""
@@ -484,7 +566,7 @@ class CallLog:
                 more = True
                 break
             out.append(e)
-        return {"entries": out, "next_cursor": str(out[-1]["seq"]) if (more and out) else None}
+        return {"entries": out, "next_cursor": str(out[-1]["seq"]) if (more and out) else None, "degraded": self.degraded()}
 
     def verify(self) -> dict[str, Any]:
         """Walk the chain across files: seq contiguous, prev_hash links, entry_hash recomputes.  Never raises."""

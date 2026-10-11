@@ -68,6 +68,19 @@ def jclient(monkeypatch):
         yield c
 
 
+@pytest.fixture
+def fixed_minute(monkeypatch):
+    """A call log whose clock does not move: the per-minute caps and windows cannot straddle a real minute boundary mid-test."""
+    fixed = datetime.now(timezone.utc).replace(second=30, microsecond=0)
+    real = call_log.CallLog.__init__
+
+    def init(self, directory, *, clock=None, **kw):
+        real(self, directory, clock=clock or (lambda: fixed), **kw)
+
+    monkeypatch.setattr(call_log.CallLog, "__init__", init)
+    call_log.reset_for_tests()
+
+
 def log_dir() -> Path:
     return call_log.log_dir()
 
@@ -176,16 +189,182 @@ def test_the_stdio_proxy_is_witnessed_as_mcp_stdio_with_its_self_reported_client
         thread.join(timeout=5)
 
 
-def test_non_get_calls_under_api_jarvis_are_logged_as_http_api_and_reads_are_not(jclient):
+def test_writes_under_api_jarvis_are_logged_as_http_api(jclient):
     before = len(entries())
     rec = add(jclient)
-    assert jclient.get("/api/jarvis/memory", headers=HDR).status_code == 200  # a GET read: not witnessed
     assert jclient.patch(f"/api/jarvis/memory/{rec['id']}", headers=HDR, json={"subject": "s", "expected_version": rec["version"]}).status_code == 200
     assert jclient.delete(f"/api/jarvis/memory/{rec['id']}", headers=HDR).status_code == 200
     got = entries()[before:]
     assert [(e["transport"], e["tool"]) for e in got] == [
         ("http-api", "POST /api/jarvis/memory"), ("http-api", "PATCH /api/jarvis/memory/{id}"), ("http-api", "DELETE /api/jarvis/memory/{id}")]
     assert [e["target"] for e in got][1:] == [rec["id"], rec["id"]] and all(e["outcome"] == "ok" for e in got)
+
+
+# ------------------------------------------------------------ 1b. GET reads of /api/jarvis/memory/* (issue #73)
+
+READ_PATHS = ["/api/jarvis/memory", "/api/jarvis/memory/{id}", "/api/jarvis/memory/latest?limit=3", "/api/jarvis/memory/search?query=record",
+              "/api/jarvis/memory/board", "/api/jarvis/memory/retrieve?query=record"]
+
+
+def test_every_memory_get_read_is_witnessed_with_its_route_target_and_client(jclient):
+    rec = add(jclient)
+    before = len(entries())
+    seen = []
+    for path in READ_PATHS:
+        r = jclient.get(path.replace("{id}", rec["id"]), headers={**HDR, "X-Jarvis-MCP-Client": "grok/1.2", "X-Jarvis-MCP-Transport": "stdio"})
+        assert r.status_code == 200, (path, r.text)
+        seen.append(r.headers.get("x-jarvis-call-seq"))
+    got = entries()[before:]
+    assert len(got) == len(READ_PATHS) and [str(e["seq"]) for e in got] == seen
+    assert all(e["method"] == "GET" and e["outcome"] == "ok" and e["transport"] == "mcp-stdio" and e["client_name"] == "grok" for e in got)
+    assert [e["tool"] for e in got] == ["GET /api/jarvis/memory", "GET /api/jarvis/memory/{id}", "GET /api/jarvis/memory/latest", "GET /api/jarvis/memory/search",
+                                        "GET /api/jarvis/memory/board", "GET /api/jarvis/memory/retrieve"]
+    assert got[1]["target"] == rec["id"] and got[0]["target"] is None
+
+
+def test_a_plain_http_read_is_http_api_and_its_query_is_hashed_never_stored(jclient):
+    add(jclient)
+    before = len(entries())
+    jclient.get("/api/jarvis/memory/search?query=UNIQUE-READ-MARKER-5d1", headers=HDR)
+    (e,) = entries()[before:]
+    assert e["transport"] == "http-api" and e["args_sha256"] and "UNIQUE-READ-MARKER-5d1" not in json.dumps(e)
+    assert call_log.args_hash({"query": "UNIQUE-READ-MARKER-5d1"}) == e["args_sha256"]
+
+
+def test_a_read_that_is_denied_or_missing_is_witnessed_with_its_outcome(jclient):
+    jclient.get("/api/jarvis/memory", headers={"X-API-Key": "wrong"})
+    jclient.get("/api/jarvis/memory/mem-000000000000", headers=HDR)
+    got = entries()
+    assert [(e["outcome"], e["status_code"]) for e in got] == [("denied", 401), ("error", 404)]
+
+
+def test_reads_outside_the_memory_routes_are_still_not_witnessed(jclient):
+    for path in ("/ready", "/api/jarvis/replay/state?limit=1", "/api/jarvis/tools", "/api/jarvis/tools/calls", "/api/jarvis/tools/calls/verify"):
+        jclient.get(path, headers=HDR)
+    assert entries() == []
+
+
+def test_turning_read_witnessing_off_leaves_writes_and_tools_witnessed(jclient, monkeypatch):
+    monkeypatch.setenv("JARVIS_CALL_LOG_READS", "0")
+    rec = add(jclient)
+    assert jclient.get("/api/jarvis/memory", headers=HDR).status_code == 200
+    assert jclient.get(f"/api/jarvis/memory/{rec['id']}", headers=HDR).status_code == 200
+    tool(jclient, "emr_latest", {})
+    assert [e["tool"] for e in entries()] == ["POST /api/jarvis/memory", "emr_latest"]
+
+
+def test_a_flood_of_reads_is_capped_and_rolled_into_one_read_suppressed_entry(fixed_minute, jclient, monkeypatch):
+    monkeypatch.setenv("JARVIS_CALL_LOG_READ_CAP_PER_MIN", "5")
+    for _ in range(20):
+        assert jclient.get("/api/jarvis/memory/latest?limit=1", headers=HDR).status_code == 200
+    page = jclient.get("/api/jarvis/tools/calls?limit=200", headers=HDR).json()   # reading the log flushes the open summary
+    reads = [e for e in page["entries"] if e["outcome"] == "ok"]
+    summary = [e for e in page["entries"] if e["outcome"] == "read_suppressed"]
+    assert len(reads) == 5 and len(summary) == 1
+    assert summary[0]["count"] == 15 and summary[0]["error_code"] == "SUPPRESSED:15" and summary[0]["window_start"] and summary[0]["window_end"]
+    assert jclient.get("/api/jarvis/tools/calls/verify", headers=HDR).json()["ok"] is True
+
+
+def test_a_write_closes_the_open_read_summary_first_so_the_order_shows_what_preceded_it(fixed_minute, jclient, monkeypatch):
+    monkeypatch.setenv("JARVIS_CALL_LOG_READ_CAP_PER_MIN", "2")
+    for _ in range(6):
+        jclient.get("/api/jarvis/memory", headers=HDR)
+    add(jclient)
+    got = entries()
+    assert [e["outcome"] for e in got] == ["ok", "ok", "read_suppressed", "ok"] and got[2]["count"] == 4 and got[3]["tool"] == "POST /api/jarvis/memory"
+
+
+def _stdio(tool, method, route):
+    return call_log.make_fields(transport="mcp-stdio", tool=tool, args={}, outcome="ok", started=time.perf_counter(), route=route, method=method, client_name="grok")
+
+
+def test_a_stdio_rest_write_closes_the_read_summary_but_a_stdio_tool_call_does_not(fixed_minute, tmp_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_CALL_LOG_READ_CAP_PER_MIN", "1")
+    log = call_log.CallLog(tmp_path / "stdio")
+    for i in range(4):
+        log.record(call_log.make_fields(transport="mcp-stdio", tool="GET /api/jarvis/memory", args={"i": i}, outcome="ok", started=time.perf_counter(), route="/api/jarvis/memory", method="GET"))
+    log.record(_stdio("emr_latest", "POST", "/api/jarvis/tools/emr_latest"))      # a read-only tool through the same adapter: the summary stays open
+    assert [e["outcome"] for e in log.entries_desc()] == ["ok", "ok"]            # (entries_desc does not flush; query() would close the summary itself)
+    log.record(_stdio("POST /api/jarvis/memory", "POST", "/api/jarvis/memory"))   # a REST write through the same adapter: the boundary
+    got = [(e["outcome"], e["tool"]) for e in list(log.entries_desc())[::-1]]
+    assert got == [("ok", "GET /api/jarvis/memory"), ("ok", "emr_latest"), ("read_suppressed", "(read calls)"), ("ok", "POST /api/jarvis/memory")]
+
+
+def test_a_read_only_post_endpoint_does_not_close_the_read_summary(fixed_minute, tmp_path, monkeypatch):
+    """graph/bfs, rag/query and the like are POST but only read: alternating them with reads must not write a summary per read."""
+    monkeypatch.setenv("JARVIS_CALL_LOG_READ_CAP_PER_MIN", "1")
+    log = call_log.CallLog(tmp_path / "ro")
+    for i in range(8):
+        log.record(call_log.make_fields(transport="http-api", tool="GET /api/jarvis/memory", args={"i": i}, outcome="ok", started=time.perf_counter(), route="/api/jarvis/memory", method="GET"))
+        log.record(_stdio("POST /api/jarvis/memory/graph/bfs", "POST", "/api/jarvis/memory/graph/bfs"))
+        log.record(_stdio("POST /api/jarvis/rag/query", "POST", "/api/jarvis/rag/query"))
+    assert [e["outcome"] for e in log.entries_desc()].count("read_suppressed") == 0       # nothing closed the summary yet
+    log.record(_stdio("DELETE /api/jarvis/memory/{id}", "DELETE", "/api/jarvis/memory/{id}"))
+    got = [e for e in log.entries_desc() if e["outcome"] == "read_suppressed"]
+    assert len(got) == 1 and got[0]["count"] == 7
+
+
+@pytest.mark.parametrize("method,route,closes", [("POST", "/api/jarvis/memory/promote", True), ("POST", "/api/jarvis/memory/pipeline", True), ("POST", "/api/jarvis/memory", True),
+                                                  ("PUT", "/api/jarvis/memory/{id}", True), ("POST", "/api/jarvis/memory/external-search", False),
+                                                  ("POST", "/api/jarvis/memory/graph/bfs", False), ("POST", "/api/jarvis/rag/query", False)])
+def test_which_rest_routes_close_the_read_summary(fixed_minute, tmp_path, monkeypatch, method, route, closes):
+    monkeypatch.setenv("JARVIS_CALL_LOG_READ_CAP_PER_MIN", "1")
+    log = call_log.CallLog(tmp_path / "which")
+    for i in range(3):
+        log.record(_read_fields(i))                                             # 1 written, 2 suppressed
+    log.record(call_log.make_fields(transport="http-api", tool=f"{method} {route}", args={}, outcome="ok", started=time.perf_counter(), route=route, method=method))
+    assert [e["outcome"] for e in log.entries_desc()].count("read_suppressed") == (1 if closes else 0)
+
+
+def test_a_failed_write_is_not_an_ordering_boundary(fixed_minute, tmp_path, monkeypatch):
+    """A PATCH that 404s or a write tool that errors changed nothing; alternating them with reads must not write a summary per read."""
+    monkeypatch.setenv("JARVIS_CALL_LOG_READ_CAP_PER_MIN", "1")
+    log = call_log.CallLog(tmp_path / "fw")
+    for i in range(6):
+        log.record(call_log.make_fields(transport="http-api", tool="GET /api/jarvis/memory", args={"i": i}, outcome="ok", started=time.perf_counter(), route="/api/jarvis/memory", method="GET"))
+        log.record(call_log.make_fields(transport="http-api", tool="PATCH /api/jarvis/memory/{id}", args={}, outcome="error", started=time.perf_counter(), status_code=404,
+                                        route="/api/jarvis/memory/{id}", method="PATCH"))
+        log.record(call_log.make_fields(transport="http-tool", tool="emr_remember", args={}, outcome="error", started=time.perf_counter(), status_code=422,
+                                        route="/api/jarvis/tools/emr_remember", method="POST"))
+    assert [e["outcome"] for e in log.entries_desc()].count("read_suppressed") == 0
+    log.record(call_log.make_fields(transport="http-api", tool="PATCH /api/jarvis/memory/{id}", args={}, outcome="ok", started=time.perf_counter(), route="/api/jarvis/memory/{id}", method="PATCH"))
+    assert [e["count"] for e in log.entries_desc() if e["outcome"] == "read_suppressed"] == [5]
+
+
+def test_the_query_result_says_when_the_log_is_degraded_by_a_failed_summary_flush(fixed_minute, tmp_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_CALL_LOG_READ_CAP_PER_MIN", "1")
+    log = call_log.CallLog(tmp_path / "qd")
+    for i in range(3):
+        log.record(_read_fields(i))
+    assert log.query(limit=10)["degraded"] is None                               # the first query flushes the summary: healthy
+    for i in range(3):
+        log.record(_read_fields(i))
+    real = call_log.CallLog._append_locked
+    monkeypatch.setattr(call_log.CallLog, "_append_locked", lambda self, *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+    page = log.query(limit=10)
+    assert page["degraded"] and "summaries" in page["degraded"]["last_error"]
+    monkeypatch.setattr(call_log.CallLog, "_append_locked", real)
+
+
+def test_the_calls_endpoint_passes_the_degraded_state_through(jclient):
+    add(jclient)
+    body = jclient.get("/api/jarvis/tools/calls?limit=10", headers=HDR).json()
+    assert "degraded" in body and body["degraded"] is None
+
+
+def test_the_read_cap_does_not_throttle_tool_calls_or_writes(jclient, monkeypatch):
+    monkeypatch.setenv("JARVIS_CALL_LOG_READ_CAP_PER_MIN", "1")
+    for _ in range(4):
+        tool(jclient, "emr_latest", {})
+    for _ in range(3):
+        add(jclient)
+    assert [e["outcome"] for e in entries()] == ["ok"] * 7
+
+
+def test_a_failing_log_never_blocks_a_read(jclient, monkeypatch):
+    monkeypatch.setattr(call_log.CallLog, "_append_locked", lambda self, *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+    r = jclient.get("/api/jarvis/memory", headers=HDR)
+    assert r.status_code == 200 and r.headers.get("x-jarvis-call-log") == "degraded"
 
 
 def test_the_logs_own_endpoints_and_the_catalog_are_not_logged(jclient):
@@ -317,7 +496,7 @@ def test_denied_and_error_calls_are_logged(jclient):
     assert got[0]["status_code"] == 401 and got[1]["error_code"] == "LIMIT_OUT_OF_RANGE" and got[2]["transport"] == "mcp-http"
 
 
-def test_a_flood_of_denied_calls_is_capped_and_rolled_into_one_suppressed_entry(jclient, monkeypatch):
+def test_a_flood_of_denied_calls_is_capped_and_rolled_into_one_suppressed_entry(fixed_minute, jclient, monkeypatch):
     monkeypatch.setenv("JARVIS_CALL_LOG_DENIED_CAP_PER_MIN", "5")
     for _ in range(20):
         jclient.post("/api/jarvis/tools/emr_latest", headers={"X-API-Key": "wrong"}, json={})
@@ -532,6 +711,7 @@ def test_a_read_fails_open_with_a_degraded_flag_and_a_write_fails_closed_then_re
 
 
 def test_an_append_that_fails_after_a_write_committed_keeps_the_real_result_and_blocks_further_writes(jclient, monkeypatch):
+    monkeypatch.setenv("JARVIS_CALL_LOG_READS", "0")  # this test counts unlogged WRITES; its probe reads are not part of that count
     log = call_log.get_call_log()
     original = call_log.CallLog.append
 
@@ -619,9 +799,427 @@ def lockable_log_dir(jclient):
     unlock()
 
 
+def _read_fields(i=0):
+    f = call_log.make_fields(transport="http-api", tool="GET /api/jarvis/memory", args={"i": i}, outcome="ok", started=time.perf_counter(), route="/api/jarvis/memory", method="GET")
+    return f
+
+
+def _denied_fields(i=0):
+    return call_log.make_fields(transport="http-api", tool="GET /api/jarvis/memory", args={"i": i}, outcome="denied", started=time.perf_counter(), status_code=401, route="/api/jarvis/memory", method="GET")
+
+
+@pytest.mark.parametrize("kind,make,summary_outcome", [("reads", _read_fields, "read_suppressed"), ("denied", _denied_fields, "denied_suppressed")])
+def test_a_summary_whose_append_failed_keeps_its_count_and_is_written_later(fixed_minute, tmp_path, monkeypatch, kind, make, summary_outcome):
+    monkeypatch.setenv("JARVIS_CALL_LOG_READ_CAP_PER_MIN", "1")
+    monkeypatch.setenv("JARVIS_CALL_LOG_DENIED_CAP_PER_MIN", "1")
+    log = call_log.CallLog(tmp_path / "keep")
+    for i in range(5):
+        log.record(make(i))                                              # one entry, four suppressed
+    real = call_log.CallLog._append_locked
+    monkeypatch.setattr(call_log.CallLog, "_append_locked", lambda self, *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+    log.flush()                                                          # the volume is full: nothing can be written (flush swallows it)
+    log.flush()
+    monkeypatch.setattr(call_log.CallLog, "_append_locked", real)
+    log.flush()                                                          # the volume is back: the very same count is written now
+    summary = [e for e in log.query(limit=50)["entries"] if e["outcome"] == summary_outcome]
+    assert len(summary) == 1 and summary[0]["count"] == 4
+    assert log.verify()["ok"] is True
+
+
+def test_a_shutdown_flush_that_fails_leaves_the_counts_as_unlogged_for_the_next_process(fixed_minute, tmp_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_CALL_LOG_READ_CAP_PER_MIN", "1")
+    monkeypatch.setenv("JARVIS_CALL_LOG_DENIED_CAP_PER_MIN", "1")
+    d = tmp_path / "shut"
+    log = call_log.CallLog(d)
+    for i in range(4):
+        log.record(_read_fields(i))                                      # 1 written, 3 suppressed
+    for i in range(3):
+        log.record(_denied_fields(i))                                    # 1 written, 2 suppressed
+    real = call_log.CallLog._append_locked
+    monkeypatch.setattr(call_log.CallLog, "_append_locked", lambda self, *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+    log.flush_for_shutdown()                                             # the volume is full as the app exits
+    monkeypatch.setattr(call_log.CallLog, "_append_locked", real)
+    assert log.degraded()["unlogged"] == 5 and "shutdown" in log.degraded()["last_error"]
+    nxt = call_log.CallLog(d)                                            # the next process
+    nxt.record(_read_fields(99))
+    gaps = [e for e in nxt.query(limit=50)["entries"] if e["outcome"] == "gap"]
+    assert len(gaps) == 1 and gaps[0]["count"] == 5 and nxt.verify()["ok"] is True
+
+
+def test_a_failed_summary_flush_shows_up_as_degraded_in_verify_and_query_and_is_written_later(fixed_minute, tmp_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_CALL_LOG_READ_CAP_PER_MIN", "1")
+    log = call_log.CallLog(tmp_path / "fl")
+    for i in range(4):
+        log.record(_read_fields(i))                                      # 3 suppressed
+    real = call_log.CallLog._append_locked
+    monkeypatch.setattr(call_log.CallLog, "_append_locked", lambda self, *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+    v = log.verify()                                                     # verify flushes first, and the flush fails
+    assert v["degraded"] and "summaries" in v["degraded"]["last_error"] and v["degraded"]["unlogged"] == 0
+    monkeypatch.setattr(call_log.CallLog, "_append_locked", real)
+    page = log.query(limit=50)                                           # the volume is back: the same count is written now
+    summary = [e for e in page["entries"] if e["outcome"] == "read_suppressed"]
+    assert len(summary) == 1 and summary[0]["count"] == 3
+    log.record(_fields(1))                                               # the next ordinary call writes the recovery gap entry and clears the latch
+    gaps = [e for e in log.query(limit=50)["entries"] if e["outcome"] == "gap"]
+    assert len(gaps) == 1 and gaps[0]["count"] == 0 and log.degraded() is None and log.verify()["ok"] is True
+
+
+def test_a_shutdown_with_an_unwritable_log_volume_leaves_the_counts_in_the_app_log(fixed_minute, tmp_path, monkeypatch, caplog):
+    """When even the DEGRADED file cannot be written, nothing on the volume can hold the count: the only trace left is an ERROR in the app's own log."""
+    monkeypatch.setenv("JARVIS_CALL_LOG_READ_CAP_PER_MIN", "1")
+    log = call_log.CallLog(tmp_path / "gone")
+    for i in range(4):
+        log.record(_read_fields(i))                                      # 3 suppressed
+    monkeypatch.setattr(call_log.CallLog, "_append_locked", lambda self, *a, **k: (_ for _ in ()).throw(OSError("read-only volume")))
+    monkeypatch.setattr(call_log.CallLog, "_locked", lambda self: (_ for _ in ()).throw(OSError("read-only volume")))
+    with caplog.at_level("ERROR", logger="jarvis.call_log"):
+        log.flush_for_shutdown()
+    assert any("3 calls" in r.getMessage() and "only trace" in r.getMessage() for r in caplog.records)
+
+
+def test_open_summaries_are_written_when_the_app_shuts_down(fixed_minute, monkeypatch):
+    monkeypatch.setenv("JARVIS_API_KEY", KEY)
+    monkeypatch.delenv("JARVIS_ALLOW_UNAUTHENTICATED", raising=False)
+    monkeypatch.setenv("JARVIS_MEMORY_WRITE_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_CALL_LOG_READ_CAP_PER_MIN", "2")
+    with TestClient(app, raise_server_exceptions=False) as c:
+        for _ in range(7):
+            assert c.get("/api/jarvis/memory", headers=HDR).status_code == 200
+        assert [e["outcome"] for e in entries()] == ["ok", "ok"]          # the other five exist only in memory until something closes them
+    got = entries()                                                       # leaving the client ran the app's shutdown
+    assert [e["outcome"] for e in got] == ["ok", "ok", "read_suppressed"] and got[2]["count"] == 5
+
+
+def test_a_repeated_query_parameter_changes_the_witness_hash(jclient):
+    add(jclient)
+    before = len(entries())
+    jclient.get("/api/jarvis/memory/active?trajectory=a&trajectory=b", headers=HDR)
+    jclient.get("/api/jarvis/memory/active?trajectory=b", headers=HDR)
+    jclient.get("/api/jarvis/memory/active?trajectory=b&trajectory=a", headers=HDR)
+    two, one, swapped = entries()[before:]
+    assert len({two["args_sha256"], one["args_sha256"], swapped["args_sha256"]}) == 3                  # values and their order are part of the fingerprint
+    assert two["args_sha256"] == call_log.args_hash({"trajectory": ["a", "b"]})
+    assert one["args_sha256"] == call_log.args_hash({"trajectory": "b"})                               # a single value hashes exactly as before
+
+
+@pytest.mark.parametrize("method,path", [("GET", "/api/jarvis/memory/bearer-secret-123"), ("GET", "/api/jarvis/memory/amul/artifacts/token-xyz-987"),
+                                          ("PATCH", "/api/jarvis/memory/bearer-secret-123"), ("DELETE", "/api/jarvis/memory/bearer-secret-123"),
+                                          ("GET", "/api/jarvis/memory/watch"), ("GET", "/api/jarvis/memory/amul/artifacts/latest"), ("GET", "/api/jarvis/memory/serve")])
+def test_a_path_parameter_that_is_not_a_record_id_never_reaches_the_log(jclient, method, path):
+    before = len(entries())
+    jclient.request(method, path, headers=HDR, json={"subject": "x", "expected_version": 1} if method == "PATCH" else None)
+    (e,) = entries()[before:]
+    secret = path.rsplit("/", 1)[1]
+    assert secret not in json.dumps(e) and "{id}" in e["route"] and e["route"] == e["tool"].split(" ", 1)[1] and e["target"] is None
+    assert secret not in "".join(p.read_text() for p in log_dir().glob("calls-*.jsonl"))
+
+
+def test_a_literal_from_one_route_is_not_kept_in_another_routes_parameter_slot(jclient):
+    """`watch` is a literal of /external/watch only; as a path parameter of /memory/{id} it must be redacted. Position decides, not the word."""
+    before = len(entries())
+    jclient.get("/api/jarvis/memory/watch", headers=HDR)
+    jclient.get("/api/jarvis/memory/external/stats", headers=HDR)           # a real GET route with two literals
+    jclient.get("/api/jarvis/memory/not/a/route/at/all-secret-77", headers=HDR)
+    got = entries()[before:]
+    assert [e["route"] for e in got] == ["/api/jarvis/memory/{id}", "/api/jarvis/memory/external/stats", "/api/jarvis/memory/{other}"]
+    assert "secret-77" not in json.dumps(got)
+
+
+def _tenant_read(tenant, transport, i=0):
+    f = call_log.make_fields(transport=transport, tool="GET /api/jarvis/memory", args={"i": i}, outcome="ok", started=time.perf_counter(), route="/api/jarvis/memory", method="GET", tenant=tenant)
+    return f
+
+
+def test_read_summaries_keep_their_tenant_and_transport_and_each_tenant_has_its_own_cap(fixed_minute, tmp_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_CALL_LOG_READ_CAP_PER_MIN", "2")
+    log = call_log.CallLog(tmp_path / "tenants")
+    for i in range(6):
+        log.record(_tenant_read("operator", "http-api", i))                  # a busy caller: 2 written, 4 suppressed
+    for i in range(3):
+        log.record(_tenant_read("tenant-b", "mcp-stdio", i))                 # another tenant: its own cap, so 2 written, 1 suppressed
+    log.record(_tenant_read("tenant-c", "http-api"))                         # and a quiet one is never summarised
+    got = log.query(limit=50)["entries"][::-1]
+    written = [(e["tenant"], e["transport"]) for e in got if e["outcome"] == "ok"]
+    assert written.count(("operator", "http-api")) == 2 and written.count(("tenant-b", "mcp-stdio")) == 2 and written.count(("tenant-c", "http-api")) == 1
+    summaries = {(e["tenant"], e["transport"]): e["count"] for e in log.query(limit=50)["entries"] if e["outcome"] == "read_suppressed"}
+    assert summaries == {("operator", "http-api"): 4, ("tenant-b", "mcp-stdio"): 1}                     # attributed to who made the calls, not to the operator
+    assert log.verify()["ok"] is True
+
+
+def test_reads_of_different_records_or_artifacts_have_different_witness_hashes(jclient):
+    a, b = add(jclient, "first record"), add(jclient, "second record")
+    before = len(entries())
+    for path in (f"/api/jarvis/memory/{a['id']}", f"/api/jarvis/memory/{b['id']}", "/api/jarvis/memory/amul/artifacts/art-0a1b2c3d4e5f-s1", "/api/jarvis/memory/amul/artifacts/art-3d4e5f6a7b8c-e12",
+                 "/api/jarvis/memory/bearer-secret-123", "/api/jarvis/memory/bearer-secret-456"):
+        jclient.get(path, headers=HDR)
+    got = entries()[before:]
+    assert len({e["args_sha256"] for e in got}) == 6                                                   # every path argument is in the fingerprint
+    assert [e["target"] for e in got] == [a["id"], b["id"], "art-0a1b2c3d4e5f-s1", "art-3d4e5f6a7b8c-e12", None, None]  # artifact ids are recognised as ids; typed text is not
+    assert "bearer-secret" not in json.dumps(got)
+    assert got[0]["args_sha256"] == call_log.args_hash({"args": {}, "path": [a["id"]]})                 # hashed, never stored
+
+
+def test_only_the_generated_artifact_id_grammar_is_recorded_as_a_target(jclient):
+    before = len(entries())
+    for path in ("/api/jarvis/memory/amul/artifacts/art-0a1b2c3d4e5f-s1", "/api/jarvis/memory/amul/artifacts/art-deadbeef-bearersecret",
+                 "/api/jarvis/memory/amul/artifacts/art-0a1b2c3d4e5f-bearersecret", "/api/jarvis/memory/amul/artifacts/art-0a1b2c3d4e5fabcdef-s1",
+                 "/api/jarvis/memory/amul/artifacts/art-0a1b2c3d4e5f-Z123", "/api/jarvis/memory/amul/artifacts/art-0a1b2c3d4e5f-r1"):
+        jclient.get(path, headers=HDR)
+    got = entries()[before:]
+    assert [e["target"] for e in got] == ["art-0a1b2c3d4e5f-s1", None, None, None, None, None]
+    assert "bearersecret" not in json.dumps(got) and "abcdef-s1" not in json.dumps(got) and "Z123" not in json.dumps(got)
+
+
+def test_failed_reads_are_never_swallowed_by_the_read_cap(fixed_minute, jclient, monkeypatch):
+    """After the cap, successful reads are summarised, but a failed one (404) keeps its route, status and error code."""
+    monkeypatch.setenv("JARVIS_CALL_LOG_READ_CAP_PER_MIN", "2")
+    for _ in range(5):
+        jclient.get("/api/jarvis/memory", headers=HDR)
+    r = jclient.get("/api/jarvis/memory/mem-000000000000", headers=HDR)
+    assert r.status_code == 404
+    jclient.get("/api/jarvis/tools/calls?limit=1", headers=HDR)                        # closes the open summary
+    got = entries()
+    failed = [e for e in got if e["outcome"] == "error"]
+    assert len(failed) == 1 and failed[0]["status_code"] == 404 and failed[0]["route"] == "/api/jarvis/memory/{id}" and failed[0]["error_code"]
+    assert [e["count"] for e in got if e["outcome"] == "read_suppressed"] == [3]
+
+
+def _drive(app_calls, method, path, chunks, headers=(), response=(b"{}",), info=None):
+    """Run the real witness middleware over a dummy app and a scripted body. The dummy app reads the whole body (as a real app would) and
+    records it in `info`. Returns (status, receive calls the middleware made, response headers)."""
+    import asyncio
+    from app.call_witness import CallWitnessMiddleware
+
+    info = {} if info is None else info
+    received = []
+    sent = []
+
+    async def receive():
+        received.append(1)
+        if not chunks:
+            return {"type": "http.request", "body": b"", "more_body": False}
+        c = chunks.pop(0)
+        return {"type": "http.request", "body": c, "more_body": bool(chunks)}
+
+    async def send(m):
+        sent.append(m)
+
+    async def dummy(scope, rcv, snd):
+        app_calls.append(1)
+        info["receives_before_app_read"] = len(received)
+        seen = bytearray()
+        if method not in ("GET", "HEAD", "OPTIONS"):
+            while True:
+                m = await rcv()
+                seen += m.get("body", b"")
+                if not m.get("more_body"):
+                    break
+        info["app_saw"] = bytes(seen)
+        await snd({"type": "http.response.start", "status": 200, "headers": []})
+        for i, piece in enumerate(response):
+            await snd({"type": "http.response.body", "body": piece, "more_body": i < len(response) - 1})
+
+    scope = {"type": "http", "method": method, "path": path, "query_string": b"", "headers": [(k.encode(), v.encode()) for k, v in headers]}
+    asyncio.run(CallWitnessMiddleware(dummy)(scope, receive, send))
+    start = next(m for m in sent if m["type"] == "http.response.start")
+    return start["status"], len(received), {k.decode(): v.decode() for k, v in start["headers"]}
+
+
+def test_a_read_is_witnessed_without_its_body_ever_being_buffered(jclient):
+    app_calls = []
+    big = [b"x" * 65536 for _ in range(40)]                                  # 2.5 MiB of body on a GET
+    status, receives, _ = _drive(app_calls, "GET", "/api/jarvis/memory", big)
+    assert status == 200 and app_calls == [1] and receives == 0              # the middleware never read it; the app got the request untouched
+    assert [e["tool"] for e in entries()] == ["GET /api/jarvis/memory"]
+
+
+def test_a_response_too_big_to_buffer_is_witnessed_before_its_headers_are_released(jclient):
+    big = [b"y" * (1024 * 1024) for _ in range(3)]                           # 3 MiB, past the 2 MiB buffer
+    status, _, hdrs = _drive([], "GET", "/api/jarvis/memory", [], response=big)
+    (e,) = entries()
+    assert status == 200 and hdrs["x-jarvis-call-seq"] == str(e["seq"]) and e["outcome"] == "ok" and e["result_digest"] is None
+
+
+def test_one_huge_response_chunk_is_never_copied_into_the_witness_buffer(jclient, monkeypatch):
+    """The size is checked before a chunk is copied: a 3 MiB single-chunk body must add nothing to the buffer (and a small one still does)."""
+    from app import call_witness
+    copied = []
+
+    class Spy(bytearray):
+        def extend(self, data):
+            copied.append(len(data))
+            super().extend(data)
+
+    monkeypatch.setattr(call_witness, "bytearray", Spy, raising=False)
+    _drive([], "GET", "/api/jarvis/memory", [], response=[b"z" * (3 * 1024 * 1024)])
+    assert copied == []
+    _drive([], "GET", "/api/jarvis/memory", [], response=[b"{}"])
+    assert copied == [2]
+
+
+def test_only_the_exact_generated_id_grammars_are_recorded_as_a_target(jclient):
+    rec = add(jclient)
+    before = len(entries())
+    for path in ("/api/jarvis/memory/123456789", "/api/jarvis/memory/mem-" + "a" * 64, "/api/jarvis/memory/mem-abc123", "/api/jarvis/memory/mem-0123456789abcdef",
+                 f"/api/jarvis/memory/{rec['id']}"):
+        jclient.get(path, headers=HDR)
+    got = entries()[before:]
+    assert [e["target"] for e in got] == [None, None, None, None, rec["id"]]
+    assert "123456789" not in json.dumps(got[:4]) and "a" * 64 not in json.dumps(got) and "0123456789abcdef" not in json.dumps(got)
+
+
+def test_a_big_response_whose_witness_failed_says_degraded_in_its_headers(jclient, monkeypatch):
+    monkeypatch.setattr(call_log.CallLog, "_append_locked", lambda self, *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+    big = [b"y" * (1024 * 1024) for _ in range(3)]
+    status, _, hdrs = _drive([], "GET", "/api/jarvis/memory", [], response=big)
+    assert status == 200 and hdrs.get("x-jarvis-call-log") == "degraded"
+
+
+def test_a_body_over_the_limit_is_not_refused_it_streams_through_to_the_app_and_is_hashed(jclient, monkeypatch):
+    """No smaller API contract: a big body (say a bulk document import) reaches the app complete; the witness buffers only up to its bound
+    and records the sha256 and size of what the app read."""
+    import hashlib
+    monkeypatch.setenv("JARVIS_CALL_LOG_MAX_BODY_BYTES", "2048")
+    body = [bytes([65 + i % 26]) * 1000 for i in range(50)]                    # 50 KB in 1 KB chunks
+    whole = b"".join(body)
+    info = {}
+    status, _, _ = _drive([], "POST", "/api/jarvis/memory", list(body), headers=[("content-length", str(len(whole)))], info=info)
+    assert status == 200 and info["app_saw"] == whole                          # the app got every byte, in order
+    assert info["receives_before_app_read"] <= 4                               # the witness read only a little past its bound before handing over
+    (e,) = entries()
+    assert e["outcome"] == "ok" and e["args_sha256"] == call_log.args_hash({"_streamed_body_sha256": hashlib.sha256(whole).hexdigest(), "_streamed_body_bytes": len(whole)})
+
+
+def test_one_giant_final_message_is_streamed_not_retained_either(jclient, monkeypatch):
+    """A server may deliver the whole body in one last http.request: it is over the bound, so it takes the streaming path (hashed, not retained)."""
+    import hashlib
+    monkeypatch.setenv("JARVIS_CALL_LOG_MAX_BODY_BYTES", "2048")
+    giant = b"g" * (3 * 1024 * 1024)
+    info = {}
+    status, receives, _ = _drive([], "POST", "/api/jarvis/memory", [giant], info=info)
+    assert status == 200 and info["app_saw"] == giant and receives == 1
+    (e,) = entries()
+    assert e["args_sha256"] == call_log.args_hash({"_streamed_body_sha256": hashlib.sha256(giant).hexdigest(), "_streamed_body_bytes": len(giant)})
+
+
+def test_a_failure_while_a_big_response_is_still_streaming_is_recorded(jclient):
+    import asyncio
+    from app.call_witness import CallWitnessMiddleware
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(m):
+        pass
+
+    async def breaks_midway(scope, rcv, snd):
+        await snd({"type": "http.response.start", "status": 200, "headers": []})
+        await snd({"type": "http.response.body", "body": b"y" * (3 * 1024 * 1024), "more_body": True})   # past the buffer: witnessed now, as 200 ok
+        raise RuntimeError("the database went away")
+
+    scope = {"type": "http", "method": "GET", "path": "/api/jarvis/memory", "query_string": b"", "headers": []}
+    with pytest.raises(RuntimeError):
+        asyncio.run(CallWitnessMiddleware(breaks_midway)(scope, receive, send))
+    got = entries()
+    assert [(e["outcome"], e["error_code"]) for e in got] == [("ok", None), ("error", "STREAMING_FAILED")]
+
+
+def test_the_streamed_hash_covers_only_what_the_app_read(jclient, monkeypatch):
+    """An app that answers without reading the rest (an early auth failure, say) leaves a hash of what it did read."""
+    import hashlib
+    monkeypatch.setenv("JARVIS_CALL_LOG_MAX_BODY_BYTES", "2048")
+    from app.call_witness import CallWitnessMiddleware
+    import asyncio
+    chunks = [b"x" * 1000 for _ in range(20)]
+    sent = []
+
+    async def receive():
+        c = chunks.pop(0)
+        return {"type": "http.request", "body": c, "more_body": bool(chunks)}
+
+    async def send(m):
+        sent.append(m)
+
+    async def impatient(scope, rcv, snd):
+        await snd({"type": "http.response.start", "status": 401, "headers": []})
+        await snd({"type": "http.response.body", "body": b"{}"})
+
+    scope = {"type": "http", "method": "POST", "path": "/api/jarvis/memory", "query_string": b"", "headers": []}
+    asyncio.run(CallWitnessMiddleware(impatient)(scope, receive, send))
+    (e,) = entries()
+    assert e["outcome"] == "denied" and e["status_code"] == 401
+    assert e["args_sha256"] == call_log.args_hash({"_streamed_body_sha256": hashlib.sha256(b"x" * 3000).hexdigest(), "_streamed_body_bytes": 3000})  # the 3 chunks the witness had read
+
+
+def test_a_body_under_the_limit_is_still_replayed_to_the_app(jclient, monkeypatch):
+    monkeypatch.setenv("JARVIS_CALL_LOG_MAX_BODY_BYTES", "2048")
+    rec = add(jclient, "a record well under the limit")
+    assert rec["content"] == "a record well under the limit"
+    assert [e["tool"] for e in entries()] == ["POST /api/jarvis/memory"] and entries()[0]["outcome"] == "ok"
+
+
+def test_a_route_with_no_path_parameter_hashes_exactly_as_before(jclient):
+    add(jclient)
+    before = len(entries())
+    jclient.get("/api/jarvis/memory/latest?limit=2", headers=HDR)
+    (e,) = entries()[before:]
+    assert e["args_sha256"] == call_log.args_hash({"limit": "2"})
+
+
+def test_the_route_template_depends_on_the_method_not_only_the_path(jclient):
+    """`promote`, `pipeline` and `external-search` are POST-only: a GET of the same path is served as a record lookup and must be templated as one."""
+    rec = add(jclient)
+    before = len(entries())
+    for path in ("/api/jarvis/memory/promote", "/api/jarvis/memory/pipeline", "/api/jarvis/memory/external-search"):
+        jclient.get(path, headers=HDR)                                      # 404 record lookups
+    jclient.post("/api/jarvis/memory/promote", headers=HDR, json={})
+    jclient.post(f"/api/jarvis/memory/{rec['id']}", headers=HDR, json={})  # not a route at all for POST
+    got = entries()[before:]
+    assert [e["route"] for e in got[:3]] == ["/api/jarvis/memory/{id}"] * 3 and all(e["target"] is None and e["method"] == "GET" for e in got[:3])
+    assert got[3]["route"] == "/api/jarvis/memory/promote" and got[3]["method"] == "POST"
+    assert got[4]["route"] == "/api/jarvis/memory/{other}"
+    assert not any(w in json.dumps(got[:3]) for w in ("promote", "pipeline", "external-search"))
+
+
+def test_mixed_traffic_does_not_write_a_summary_per_read(fixed_minute, jclient, monkeypatch):
+    """Alternating reads with a read-only tool call must not close the summary every time, or the cap bounds nothing."""
+    monkeypatch.setenv("JARVIS_CALL_LOG_READ_CAP_PER_MIN", "2")
+    for _ in range(15):
+        jclient.get("/api/jarvis/memory", headers=HDR)
+        tool(jclient, "emr_latest", {})
+    jclient.get("/api/jarvis/tools/calls?limit=1", headers=HDR)             # reading the log closes the open summary
+    got = entries()
+    assert [e["outcome"] for e in got].count("read_suppressed") == 1
+    assert sum(1 for e in got if e["method"] == "GET" and e["outcome"] == "ok") == 2 and len(got) == 2 + 15 + 1
+    assert [e for e in got if e["outcome"] == "read_suppressed"][0]["count"] == 13
+
+
+def test_real_record_ids_and_known_routes_keep_their_templates(jclient):
+    rec = add(jclient)
+    before = len(entries())
+    for path in (f"/api/jarvis/memory/{rec['id']}", f"/api/jarvis/memory/{rec['id']}/history", "/api/jarvis/memory/latest", "/api/jarvis/memory/amul/field/status"):
+        jclient.get(path, headers=HDR)
+    got = entries()[before:]
+    assert [e["route"] for e in got] == ["/api/jarvis/memory/{id}", "/api/jarvis/memory/{id}/history", "/api/jarvis/memory/latest", "/api/jarvis/memory/amul/field/status"]
+    assert [e["target"] for e in got] == [rec["id"], rec["id"], None, None]
+
+
 @posix_user_only
-def test_scenario_a_unwritable_directory_still_leaves_a_gap_entry_after_recovery(jclient, lockable_log_dir):
+def test_reads_served_during_an_outage_are_counted_in_the_gap_entry(jclient, lockable_log_dir):
+    lockable_log_dir.lock_dir()
+    for _ in range(3):
+        r = jclient.get("/api/jarvis/memory", headers=HDR)
+        assert r.status_code == 200 and r.headers.get("x-jarvis-call-log") == "degraded"      # fail open: the read is served
+    lockable_log_dir.unlock()
+    add(jclient)
+    gaps = [e for e in entries() if e["outcome"] == "gap"]
+    assert len(gaps) == 1 and gaps[0]["count"] == 3
+
+
+@posix_user_only
+def test_scenario_a_unwritable_directory_still_leaves_a_gap_entry_after_recovery(jclient, lockable_log_dir, monkeypatch):
     """The DEGRADED file lives in the directory that cannot be written, so the outage must also be remembered in memory."""
+    monkeypatch.setenv("JARVIS_CALL_LOG_READS", "0")  # the probe reads are not what this counts (see the reads-during-an-outage test)
     n0 = _record_count(jclient)
     lockable_log_dir.lock_dir()
     r = tool(jclient, "emr_latest")  # a read: served anyway, but it cannot be logged
@@ -637,8 +1235,9 @@ def test_scenario_a_unwritable_directory_still_leaves_a_gap_entry_after_recovery
 
 
 @posix_user_only
-def test_scenario_b_an_unwritable_log_file_refuses_the_first_write_instead_of_committing_it_unlogged(jclient, lockable_log_dir):
+def test_scenario_b_an_unwritable_log_file_refuses_the_first_write_instead_of_committing_it_unlogged(jclient, lockable_log_dir, monkeypatch):
     """The directory looks writable, but today's file is not: the preflight must notice, so the write is refused, not committed."""
+    monkeypatch.setenv("JARVIS_CALL_LOG_READS", "0")
     n0 = _record_count(jclient)
     lockable_log_dir.lock_file()
     w = jclient.post("/api/jarvis/memory", headers=HDR, json=_write_body("b1"))

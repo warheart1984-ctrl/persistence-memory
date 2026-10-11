@@ -140,7 +140,9 @@ async def lifespan(app: FastAPI):
     app.state.nx_background = {"watch": None, "serve": None}
     app.state.nx_background_lock = threading.Lock()
     yield
-    # Cleanup on shutdown
+    # Cleanup on shutdown: persist any open call-log summary (suppressed denied calls / reads), so a restart never drops their count
+    if call_log.enabled():
+        call_log.get_call_log().flush_for_shutdown()
     for name, proc in app.state.nx_background.items():
         if proc and proc.poll() is None:
             proc.terminate()
