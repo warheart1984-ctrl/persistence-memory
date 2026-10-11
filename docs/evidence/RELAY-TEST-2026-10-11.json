@@ -1,6 +1,6 @@
 {
   "report": "Six-agent relay test on the call-log build, 2026-10-11",
-  "generated_at": "2026-10-11T00:44:20Z",
+  "generated_at": "2026-10-11T00:58:08Z",
   "source": {
     "base_url": "http://127.0.0.1:8011",
     "script": "scripts/relay_evidence.py",
@@ -26,7 +26,8 @@
     "Neither Devin nor Kilo appears under its own name in the server log as of this read. Either one of them is the 'rmcp' client and the other has not called emr_latest through the MCP bridge yet (or its proxy has not been updated), or neither is. Calls recorded as 'Python-urllib' are plain HTTP, not the MCP bridge; some are this report's own earlier dry run, the rest cannot be attributed.",
     "'Newest record is mem-c42330528ad5' is a point-in-time check; the report records the history seq and the call-log head it was read at.",
     "The self-heal restart that happened during the previous (v8/v9) deploy did not recur in this deploy: the pause flag was held until the new app was healthy, and the alerts log has no entry since the deploy started.",
-    "The call log's head hash printed in this report should be copied off the box, and into the next ledger record that is written (anyone who can write the log directory can rebuild a whole chain; trailing entries can be truncated without breaking it)."
+    "The call log's head hash printed in this report should be copied off the box, and into the next ledger record that is written (anyone who can write the log directory can rebuild a whole chain; trailing entries can be truncated without breaking it).",
+    "Calls from 'Python-urllib/3.12' (seq 2-7 before this run's reruns, and seq 23-24 at 00:56Z) are plain HTTP, not the MCP bridge, and carry no agent name. The operator attributes seq 23-24 to Kilo. Kilo's MCP connection works ('connected' in its own status) but was not the path used. To make such calls attributable, a script can send the header X-Jarvis-MCP-Client: <agent>/<version> (self-reported, like every client name here)."
   ],
   "checks": [
     {
@@ -82,7 +83,7 @@
     {
       "check": "call_log_chain_verifies",
       "result": "PASS",
-      "detail": "call log entries=21 head seq=21 problems=[]"
+      "detail": "call log entries=28 head seq=28 problems=[]"
     }
   ],
   "all_checks_pass": true,
@@ -123,11 +124,11 @@
     },
     {
       "agent": "Kilo",
-      "entry_status": "no output pasted for this run",
+      "entry_status": "operator says Kilo made calls; the server log cannot attribute them",
       "newest_id": null,
       "result_digest": null,
       "aliases": [],
-      "notes": "Kilo's ledger connection was added on 2026-10-10 (config copied from OpenCode's entry); this is its first relay run."
+      "notes": "Kilo's own CLI reports 'continuity-ledger connected' (the MCP server starts), and no project or global config overrides it. Kilo's first rerun did not use the MCP: it fetched /openapi.json over HTTP at 00:54:04Z. After a second rerun the log shows emr_latest (no arguments, digest 3bed25d2...) at 00:56:28Z and emr_fetch at 00:56:34Z, both from client 'Python-urllib/3.12' over transport http-tool, i.e. a Python script talking HTTP, not the MCP bridge. The operator attributes those calls to Kilo; the log cannot, because 'Python-urllib' is a library name that any script uses. The calls are server-witnessed; who made them is the operator's statement, not the server's."
     },
     {
       "agent": "Claude",
@@ -144,8 +145,8 @@
     "available": true,
     "reason": null,
     "head": {
-      "seq": 21,
-      "entry_hash": "a5ed81f7fef025e8827912ff6548f926cc3d876ab990e6a3abd7cd825c2e2475"
+      "seq": 28,
+      "entry_hash": "1608d64aed4568a8096965435708aeb7add3c8c57f1ebf748a7a9fba03e15eb7"
     },
     "chain_ok": true,
     "problems": [],
@@ -249,26 +250,26 @@
     ],
     "clients_seen": [
       {
+        "client_name": "relay-evidence",
+        "client_version": "1",
+        "transport": "http-tool",
+        "calls": 9,
+        "tools": [
+          "emr_latest"
+        ],
+        "last_ts": "2026-10-11T00:58:08.024685Z",
+        "matched_an_agent": false
+      },
+      {
         "client_name": "Python-urllib",
         "client_version": "3.12",
         "transport": "http-tool",
-        "calls": 6,
+        "calls": 8,
         "tools": [
           "emr_fetch",
           "emr_latest"
         ],
-        "last_ts": "2026-10-11T00:29:58.579976Z",
-        "matched_an_agent": false
-      },
-      {
-        "client_name": "relay-evidence",
-        "client_version": "1",
-        "transport": "http-tool",
-        "calls": 6,
-        "tools": [
-          "emr_latest"
-        ],
-        "last_ts": "2026-10-11T00:44:19.946981Z",
+        "last_ts": "2026-10-11T00:56:34.706749Z",
         "matched_an_agent": false
       },
       {
@@ -287,12 +288,12 @@
         "client_name": "rmcp",
         "client_version": "3.1.0",
         "transport": "mcp-stdio",
-        "calls": 2,
+        "calls": 3,
         "tools": [
           "emr_latest",
           "fetch"
         ],
-        "last_ts": "2026-10-11T00:42:12.685688Z",
+        "last_ts": "2026-10-11T00:58:01.216899Z",
         "matched_an_agent": false
       },
       {
@@ -305,6 +306,17 @@
         ],
         "last_ts": "2026-10-11T00:18:27.357524Z",
         "matched_an_agent": true
+      },
+      {
+        "client_name": "curl",
+        "client_version": "8.5.0",
+        "transport": "http-api",
+        "calls": 1,
+        "tools": [
+          "POST /api/jarvis/blocks/seal"
+        ],
+        "last_ts": "2026-10-11T00:55:56.192937Z",
+        "matched_an_agent": false
       },
       {
         "client_name": "cursor-vscode",
@@ -329,13 +341,13 @@
         "matched_an_agent": true
       }
     ],
-    "coverage": "complete: all 21 log entries (1 page(s)) were read",
+    "coverage": "complete: all 28 log entries (1 page(s)) were read",
     "truncated": false,
     "pages_read": 1,
     "log_files": [
       "calls-20261011.jsonl"
     ],
-    "entries_total": 21
+    "entries_total": 28
   },
   "requests_made": [
     {
@@ -1683,6 +1695,111 @@
             "client_self_reported": true,
             "client_version": "1",
             "duration_ms": 21,
+            "entry_hash": "1608d64aed4568a8096965435708aeb7add3c8c57f1ebf748a7a9fba03e15eb7",
+            "error_code": null,
+            "method": "POST",
+            "outcome": "ok",
+            "prev_hash": "1b7416cf6e392eeb439e89fa6573a149ac6126b4b45a3f53178abb8d69fd6cc8",
+            "result_digest": "f6d994c9c5e04ab1a7cfbf60b6c9fa5fd60d1ade270abf4141552d642639038f",
+            "route": "/api/jarvis/tools/emr_latest",
+            "seq": 28,
+            "status_code": 200,
+            "target": null,
+            "tenant": "operator",
+            "tool": "emr_latest",
+            "transport": "http-tool",
+            "ts": "2026-10-11T00:58:08.024685Z"
+          },
+          {
+            "args_sha256": "dd752d3829d7f1a088ae165ef64035f7e61adb0b39a6ba7d3d782eae0dc960fb",
+            "client_name": "relay-evidence",
+            "client_self_reported": true,
+            "client_version": "1",
+            "duration_ms": 20,
+            "entry_hash": "1b7416cf6e392eeb439e89fa6573a149ac6126b4b45a3f53178abb8d69fd6cc8",
+            "error_code": null,
+            "method": "POST",
+            "outcome": "ok",
+            "prev_hash": "2e6cad991289f681dbe4574d5e4ca3f16e246b8595396cb39181b5945f73af68",
+            "result_digest": "1d178845bfd853029e098353ba23d3a90d8d6f8f0e61e647b5191dd79d1b2ab3",
+            "route": "/api/jarvis/tools/emr_latest",
+            "seq": 27,
+            "status_code": 200,
+            "target": null,
+            "tenant": "operator",
+            "tool": "emr_latest",
+            "transport": "http-tool",
+            "ts": "2026-10-11T00:58:07.957440Z"
+          },
+          {
+            "args_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+            "client_name": "relay-evidence",
+            "client_self_reported": true,
+            "client_version": "1",
+            "duration_ms": 6,
+            "entry_hash": "2e6cad991289f681dbe4574d5e4ca3f16e246b8595396cb39181b5945f73af68",
+            "error_code": null,
+            "method": "POST",
+            "outcome": "ok",
+            "prev_hash": "44b69d2d6b8bbdf5161decf6ed28e86e56cc46e1359a65a719f7c5ed41a5cd1c",
+            "result_digest": "3bed25d21d893e8ae248b0be92bf6e541c89a3dca84671861cb725392c39f6ae",
+            "route": "/api/jarvis/tools/emr_latest",
+            "seq": 26,
+            "status_code": 200,
+            "target": null,
+            "tenant": "operator",
+            "tool": "emr_latest",
+            "transport": "http-tool",
+            "ts": "2026-10-11T00:58:07.885714Z"
+          },
+          {
+            "args_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+            "client_name": "rmcp",
+            "client_self_reported": true,
+            "client_version": "3.1.0",
+            "duration_ms": 21,
+            "entry_hash": "44b69d2d6b8bbdf5161decf6ed28e86e56cc46e1359a65a719f7c5ed41a5cd1c",
+            "error_code": null,
+            "method": "POST",
+            "outcome": "ok",
+            "prev_hash": "e2ee9bca84b39046c7053f2752af315dda1f03977b901f48f4290095640b6536",
+            "result_digest": "3bed25d21d893e8ae248b0be92bf6e541c89a3dca84671861cb725392c39f6ae",
+            "route": "/api/jarvis/tools/emr_latest",
+            "seq": 25,
+            "status_code": 200,
+            "target": null,
+            "tenant": "operator",
+            "tool": "emr_latest",
+            "transport": "mcp-stdio",
+            "ts": "2026-10-11T00:58:01.216899Z"
+          },
+          {
+            "args_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+            "client_name": "Python-urllib",
+            "client_self_reported": true,
+            "client_version": "3.12",
+            "duration_ms": 22,
+            "entry_hash": "98deae8cd37f335987b60d1f935597190d013211fb74448072e64cb149d9695f",
+            "error_code": null,
+            "method": "POST",
+            "outcome": "ok",
+            "prev_hash": "fce2cc72d11b90a796cad95fed9ad45103adb7ea4171015bfdc2766a25e0730b",
+            "result_digest": "3bed25d21d893e8ae248b0be92bf6e541c89a3dca84671861cb725392c39f6ae",
+            "route": "/api/jarvis/tools/emr_latest",
+            "seq": 23,
+            "status_code": 200,
+            "target": null,
+            "tenant": "operator",
+            "tool": "emr_latest",
+            "transport": "http-tool",
+            "ts": "2026-10-11T00:56:28.661511Z"
+          },
+          {
+            "args_sha256": "a1a1069b2341607e2915fbf9680325ed94640395be9f15bcaf0fff807ef7568b",
+            "client_name": "relay-evidence",
+            "client_self_reported": true,
+            "client_version": "1",
+            "duration_ms": 21,
             "entry_hash": "a5ed81f7fef025e8827912ff6548f926cc3d876ab990e6a3abd7cd825c2e2475",
             "error_code": null,
             "method": "POST",
@@ -2022,6 +2139,153 @@
       "http_status": 200,
       "body": {
         "entries": [
+          {
+            "args_sha256": "a1a1069b2341607e2915fbf9680325ed94640395be9f15bcaf0fff807ef7568b",
+            "client_name": "relay-evidence",
+            "client_self_reported": true,
+            "client_version": "1",
+            "duration_ms": 21,
+            "entry_hash": "1608d64aed4568a8096965435708aeb7add3c8c57f1ebf748a7a9fba03e15eb7",
+            "error_code": null,
+            "method": "POST",
+            "outcome": "ok",
+            "prev_hash": "1b7416cf6e392eeb439e89fa6573a149ac6126b4b45a3f53178abb8d69fd6cc8",
+            "result_digest": "f6d994c9c5e04ab1a7cfbf60b6c9fa5fd60d1ade270abf4141552d642639038f",
+            "route": "/api/jarvis/tools/emr_latest",
+            "seq": 28,
+            "status_code": 200,
+            "target": null,
+            "tenant": "operator",
+            "tool": "emr_latest",
+            "transport": "http-tool",
+            "ts": "2026-10-11T00:58:08.024685Z"
+          },
+          {
+            "args_sha256": "dd752d3829d7f1a088ae165ef64035f7e61adb0b39a6ba7d3d782eae0dc960fb",
+            "client_name": "relay-evidence",
+            "client_self_reported": true,
+            "client_version": "1",
+            "duration_ms": 20,
+            "entry_hash": "1b7416cf6e392eeb439e89fa6573a149ac6126b4b45a3f53178abb8d69fd6cc8",
+            "error_code": null,
+            "method": "POST",
+            "outcome": "ok",
+            "prev_hash": "2e6cad991289f681dbe4574d5e4ca3f16e246b8595396cb39181b5945f73af68",
+            "result_digest": "1d178845bfd853029e098353ba23d3a90d8d6f8f0e61e647b5191dd79d1b2ab3",
+            "route": "/api/jarvis/tools/emr_latest",
+            "seq": 27,
+            "status_code": 200,
+            "target": null,
+            "tenant": "operator",
+            "tool": "emr_latest",
+            "transport": "http-tool",
+            "ts": "2026-10-11T00:58:07.957440Z"
+          },
+          {
+            "args_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+            "client_name": "relay-evidence",
+            "client_self_reported": true,
+            "client_version": "1",
+            "duration_ms": 6,
+            "entry_hash": "2e6cad991289f681dbe4574d5e4ca3f16e246b8595396cb39181b5945f73af68",
+            "error_code": null,
+            "method": "POST",
+            "outcome": "ok",
+            "prev_hash": "44b69d2d6b8bbdf5161decf6ed28e86e56cc46e1359a65a719f7c5ed41a5cd1c",
+            "result_digest": "3bed25d21d893e8ae248b0be92bf6e541c89a3dca84671861cb725392c39f6ae",
+            "route": "/api/jarvis/tools/emr_latest",
+            "seq": 26,
+            "status_code": 200,
+            "target": null,
+            "tenant": "operator",
+            "tool": "emr_latest",
+            "transport": "http-tool",
+            "ts": "2026-10-11T00:58:07.885714Z"
+          },
+          {
+            "args_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+            "client_name": "rmcp",
+            "client_self_reported": true,
+            "client_version": "3.1.0",
+            "duration_ms": 21,
+            "entry_hash": "44b69d2d6b8bbdf5161decf6ed28e86e56cc46e1359a65a719f7c5ed41a5cd1c",
+            "error_code": null,
+            "method": "POST",
+            "outcome": "ok",
+            "prev_hash": "e2ee9bca84b39046c7053f2752af315dda1f03977b901f48f4290095640b6536",
+            "result_digest": "3bed25d21d893e8ae248b0be92bf6e541c89a3dca84671861cb725392c39f6ae",
+            "route": "/api/jarvis/tools/emr_latest",
+            "seq": 25,
+            "status_code": 200,
+            "target": null,
+            "tenant": "operator",
+            "tool": "emr_latest",
+            "transport": "mcp-stdio",
+            "ts": "2026-10-11T00:58:01.216899Z"
+          },
+          {
+            "args_sha256": "b24e18a70ec2b1bcb85613441ab9f698e1176eacb19913782cac818488283b25",
+            "client_name": "Python-urllib",
+            "client_self_reported": true,
+            "client_version": "3.12",
+            "duration_ms": 11,
+            "entry_hash": "e2ee9bca84b39046c7053f2752af315dda1f03977b901f48f4290095640b6536",
+            "error_code": null,
+            "method": "POST",
+            "outcome": "ok",
+            "prev_hash": "98deae8cd37f335987b60d1f935597190d013211fb74448072e64cb149d9695f",
+            "result_digest": null,
+            "route": "/api/jarvis/tools/emr_fetch",
+            "seq": 24,
+            "status_code": 200,
+            "target": null,
+            "tenant": "operator",
+            "tool": "emr_fetch",
+            "transport": "http-tool",
+            "ts": "2026-10-11T00:56:34.706749Z"
+          },
+          {
+            "args_sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+            "client_name": "Python-urllib",
+            "client_self_reported": true,
+            "client_version": "3.12",
+            "duration_ms": 22,
+            "entry_hash": "98deae8cd37f335987b60d1f935597190d013211fb74448072e64cb149d9695f",
+            "error_code": null,
+            "method": "POST",
+            "outcome": "ok",
+            "prev_hash": "fce2cc72d11b90a796cad95fed9ad45103adb7ea4171015bfdc2766a25e0730b",
+            "result_digest": "3bed25d21d893e8ae248b0be92bf6e541c89a3dca84671861cb725392c39f6ae",
+            "route": "/api/jarvis/tools/emr_latest",
+            "seq": 23,
+            "status_code": 200,
+            "target": null,
+            "tenant": "operator",
+            "tool": "emr_latest",
+            "transport": "http-tool",
+            "ts": "2026-10-11T00:56:28.661511Z"
+          },
+          {
+            "args_sha256": "80eb6a3f04273ff5137d233576d17bff1e9064ca18eda08b4dafc49b08c45ef6",
+            "client_name": "curl",
+            "client_self_reported": true,
+            "client_version": "8.5.0",
+            "duration_ms": 9,
+            "entry_hash": "fce2cc72d11b90a796cad95fed9ad45103adb7ea4171015bfdc2766a25e0730b",
+            "error_code": null,
+            "method": "POST",
+            "outcome": "ok",
+            "prev_hash": "a5ed81f7fef025e8827912ff6548f926cc3d876ab990e6a3abd7cd825c2e2475",
+            "result_digest": null,
+            "route": "/api/jarvis/blocks/seal",
+            "seq": 22,
+            "status_code": 200,
+            "target": null,
+            "tenant": "operator",
+            "tool": "POST /api/jarvis/blocks/seal",
+            "transport": "http-api",
+            "ts": "2026-10-11T00:55:56.192937Z"
+          },
           {
             "args_sha256": "a1a1069b2341607e2915fbf9680325ed94640395be9f15bcaf0fff807ef7568b",
             "client_name": "relay-evidence",
@@ -2472,14 +2736,14 @@
       "http_status": 200,
       "body": {
         "ok": true,
-        "entries": 21,
+        "entries": 28,
         "files": [
           "calls-20261011.jsonl"
         ],
         "problems": [],
         "head": {
-          "seq": 21,
-          "entry_hash": "a5ed81f7fef025e8827912ff6548f926cc3d876ab990e6a3abd7cd825c2e2475"
+          "seq": 28,
+          "entry_hash": "1608d64aed4568a8096965435708aeb7add3c8c57f1ebf748a7a9fba03e15eb7"
         },
         "anchor": null,
         "degraded": null,

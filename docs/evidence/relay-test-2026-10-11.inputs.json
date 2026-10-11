@@ -8,7 +8,8 @@
     "Neither Devin nor Kilo appears under its own name in the server log as of this read. Either one of them is the 'rmcp' client and the other has not called emr_latest through the MCP bridge yet (or its proxy has not been updated), or neither is. Calls recorded as 'Python-urllib' are plain HTTP, not the MCP bridge; some are this report's own earlier dry run, the rest cannot be attributed.",
     "'Newest record is mem-c42330528ad5' is a point-in-time check; the report records the history seq and the call-log head it was read at.",
     "The self-heal restart that happened during the previous (v8/v9) deploy did not recur in this deploy: the pause flag was held until the new app was healthy, and the alerts log has no entry since the deploy started.",
-    "The call log's head hash printed in this report should be copied off the box, and into the next ledger record that is written (anyone who can write the log directory can rebuild a whole chain; trailing entries can be truncated without breaking it)."
+    "The call log's head hash printed in this report should be copied off the box, and into the next ledger record that is written (anyone who can write the log directory can rebuild a whole chain; trailing entries can be truncated without breaking it).",
+    "Calls from 'Python-urllib/3.12' (seq 2-7 before this run's reruns, and seq 23-24 at 00:56Z) are plain HTTP, not the MCP bridge, and carry no agent name. The operator attributes seq 23-24 to Kilo. Kilo's MCP connection works ('connected' in its own status) but was not the path used. To make such calls attributable, a script can send the header X-Jarvis-MCP-Client: <agent>/<version> (self-reported, like every client name here)."
   ],
   "agents": [
     {
@@ -47,11 +48,11 @@
     },
     {
       "agent": "Kilo",
-      "entry_status": "no output pasted for this run",
+      "entry_status": "operator says Kilo made calls; the server log cannot attribute them",
       "newest_id": null,
       "result_digest": null,
       "aliases": [],
-      "notes": "Kilo's ledger connection was added on 2026-10-10 (config copied from OpenCode's entry); this is its first relay run."
+      "notes": "Kilo's own CLI reports 'continuity-ledger connected' (the MCP server starts), and no project or global config overrides it. Kilo's first rerun did not use the MCP: it fetched /openapi.json over HTTP at 00:54:04Z. After a second rerun the log shows emr_latest (no arguments, digest 3bed25d2...) at 00:56:28Z and emr_fetch at 00:56:34Z, both from client 'Python-urllib/3.12' over transport http-tool, i.e. a Python script talking HTTP, not the MCP bridge. The operator attributes those calls to Kilo; the log cannot, because 'Python-urllib' is a library name that any script uses. The calls are server-witnessed; who made them is the operator's statement, not the server's."
     },
     {
       "agent": "Claude",
