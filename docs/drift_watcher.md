@@ -63,7 +63,9 @@ state root and history on every check (a read-only checker would become a writer
 derived commentary on an agent's text; and machine output would add noise to recall. An entry holds the summary's hash and length, the verdict,
 counts, the `check_digest`, the record ids, the matched call-log seqs, the tenant, the self-reported client, and the **contradicted or unsupported
 clauses** (each truncated to 300 characters). It never holds the whole summary, and never supported or skipped text. If the log cannot be written the
-verdict is still returned (the ledger is not at stake) and the log is flagged degraded.
+verdict is still returned (the ledger is not at stake) and the log is flagged degraded. The response says so: `drift_log` is `"ok"` when the check
+was recorded (with its `drift_log_seq`) and `"degraded"` when it was not (`drift_log_seq` is `null`, and `warnings` gains a line), so an outage is never
+silent. When the log recovers it records a gap entry for the unlogged checks.
 
 Operator-only readers: `GET /api/jarvis/drift/log` and `GET /api/jarvis/drift/log/verify`.
 

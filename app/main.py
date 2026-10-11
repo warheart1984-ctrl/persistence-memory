@@ -994,6 +994,10 @@ def _run_drift(body: Any, client_header: str | None) -> dict[str, Any]:
     result["call_log"] = matches
     entry = drift.get_drift_log().record(drift.log_entry(result, request_, tenant=current_tenant_key(), client_header=client_header, matches=matches))
     result["drift_log_seq"] = entry["seq"] if entry and "seq" in entry else None
+    # a quiet outage is the thing to avoid: the verdict is still served (the ledger is not at stake), but the caller is told this check left no trace
+    result["drift_log"] = "ok" if result["drift_log_seq"] is not None else "degraded"
+    if result["drift_log"] == "degraded":
+        result.setdefault("warnings", []).append("drift log unavailable: this check was not recorded in the drift log")
     return result
 
 
