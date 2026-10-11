@@ -289,3 +289,82 @@ def test_every_client_name_in_the_log_is_listed_and_unmatched_ones_are_flagged(r
     ev["call_log"] = section
     md = rel.render_markdown(ev, "printout")
     assert "Every client name the log saw" in md and "| mystery-client/1.0 | mcp-stdio | 1 | emr_latest |" in md and "**no**" in md
+
+
+# ------------------------------------------------------------------------------ pagination of the call-log reads
+
+
+def paged_log(n, *, old_name="oldest-client"):
+    """A fake call-log endpoint with n entries (seq n..1, newest first); only the very oldest entries carry old_name."""
+    rows = [{**call_entry(1, old_name if seq <= 5 else "newer-client"), "seq": seq, "ts": f"2026-10-10T{(seq // 3600) % 24:02d}:{(seq // 60) % 60:02d}:{seq % 60:02d}.000000Z"} for seq in range(n, 0, -1)]
+
+    def transport(method, url, headers, body):
+        from urllib.parse import parse_qs, urlparse
+
+        parsed = urlparse(url)
+        q = {k: v[0] for k, v in parse_qs(parsed.query).items()}
+        assert method == "GET" and parsed.path == "/api/jarvis/tools/calls" and "X-API-Key" in headers
+        limit = int(q.get("limit", 50))
+        before = int(q["cursor"]) if "cursor" in q else None
+        pool = [r for r in rows if (before is None or r["seq"] < before) and (not q.get("tool") or r["tool"] == q["tool"])]
+        page = pool[:limit]
+        more = len(pool) > limit
+        return 200, json.dumps({"entries": page, "next_cursor": str(page[-1]["seq"]) if more else None}).encode()
+
+    return rows, transport
+
+
+def test_every_page_of_the_log_is_read_so_an_old_client_name_is_not_hidden(rel):
+    rows, transport = paged_log(450)
+    client = rel.ReadOnlyClient("http://x", KEY, transport)
+    status, body = rel.fetch_all_calls(client)
+    assert status == 200 and len(body["entries"]) == 450 and body["pages"] == 3 and body["truncated"] is False
+    assert [e["seq"] for e in body["entries"]] == list(range(450, 0, -1))  # no duplicates, no gaps, newest first
+    assert [c["query"] for c in client.calls] == [{"limit": 200}, {"limit": 200, "cursor": "251"}, {"limit": 200, "cursor": "51"}]
+    raw = {"calls_emr_latest": {"http_status": 200, "body": body}, "calls_all": {"http_status": 200, "body": body},
+           "calls_verify": {"http_status": 200, "body": {"ok": True, "head": {"seq": 450, "entry_hash": "h" * 64}, "files": ["f"], "entries": 450, "problems": []}}}
+    section = rel.call_log_section(raw, [{"agent": "Oldest"}, {"agent": "Nobody"}])
+    names = {r["client_name"] for r in section["clients_seen"]}
+    assert names == {"oldest-client", "newer-client"}  # the old name only appears on page 3
+    assert {a["agent"]: a["witnessed_emr_latest_calls"] for a in section["per_agent"]} == {"Oldest": 5, "Nobody": 0}
+    assert section["truncated"] is False and section["coverage"].startswith("complete: all 450 log entries (3 page(s))")
+
+
+def test_hitting_the_page_cap_is_reported_as_a_partial_view(rel, monkeypatch):
+    monkeypatch.setattr(rel, "MAX_CALL_PAGES", 2)
+    rows, transport = paged_log(450)
+    client = rel.ReadOnlyClient("http://x", KEY, transport)
+    status, body = rel.fetch_all_calls(client)
+    assert status == 200 and len(body["entries"]) == 400 and body["pages"] == 2 and body["truncated"] is True
+    raw = {"calls_emr_latest": {"http_status": 200, "body": body}, "calls_all": {"http_status": 200, "body": body},
+           "calls_verify": {"http_status": 200, "body": {"ok": True, "head": {"seq": 450, "entry_hash": "h" * 64}, "files": ["f"], "entries": 450, "problems": []}}}
+    section = rel.call_log_section(raw, [{"agent": "Oldest"}])
+    assert section["truncated"] is True and section["coverage"].startswith("PARTIAL: only the newest 400 log entries")
+    assert "oldest-client" not in {r["client_name"] for r in section["clients_seen"]}  # honestly missing, and said to be
+    assert "PARTIAL" in section["per_agent"][0]["note"]
+    ev = rel.build_evidence(raw, rel.run_checks(canned(), OLD, NEW, NEW, None), {"agents": [{"agent": "Oldest"}], "summary": "s"}, "http://x", [], {"old": OLD, "new": NEW, "receipt": RECEIPT})
+    assert "PARTIAL: only the newest 400" in rel.render_markdown(ev, "p")
+
+
+def test_a_failure_on_the_first_page_is_reported_unchanged(rel):
+    client = rel.ReadOnlyClient("http://x", KEY, lambda *a: (404, b'{"detail":"switched off"}'))
+    assert rel.fetch_all_calls(client) == (404, {"detail": "switched off"})
+    assert len(client.calls) == 1
+
+
+def test_the_markdown_does_not_paste_the_whole_log_into_the_raw_section(rel):
+    rows, transport = paged_log(450)
+    client = rel.ReadOnlyClient("http://x", KEY, transport)
+    status, body = rel.fetch_all_calls(client)
+    raw = {**canned(), "calls_emr_latest": {"http_status": status, "body": body}, "calls_all": {"http_status": status, "body": body},
+           "calls_verify": {"http_status": 200, "body": {"ok": True, "head": {"seq": 450, "entry_hash": "h" * 64}, "files": ["f"], "entries": 450, "problems": []}}}
+    ev = rel.build_evidence(raw, rel.run_checks(raw, OLD, NEW, NEW, None), {"agents": [], "summary": "s"}, "http://x", [], {"old": OLD, "new": NEW, "receipt": RECEIPT})
+    md = rel.render_markdown(ev, "p")
+    assert md.count('"seq":') < 120 and "entries_omitted_from_this_listing" in md and len(md) < 120_000
+
+
+def test_the_script_identifies_itself_to_the_servers_call_log(rel):
+    seen = {}
+    client = rel.ReadOnlyClient("http://x", KEY, lambda m, u, h, b: (seen.update(h) or (200, b"{}")))
+    client.tool("emr_latest", {})
+    assert seen["X-Jarvis-MCP-Client"] == "relay-evidence/1" and seen["X-API-Key"] == KEY
