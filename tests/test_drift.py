@@ -377,7 +377,18 @@ def test_a_drift_log_that_cannot_be_written_never_blocks_the_verdict(jclient, pa
     old, new = pair
     monkeypatch.setattr(call_log.CallLog, "_append_locked", lambda self, *a, **k: (_ for _ in ()).throw(OSError("disk full")))
     r = jclient.post("/api/jarvis/drift/check", headers=HDR, json={"summary": "Codex deployed main 792e99b.", "records": [new["id"]]})
-    assert r.status_code == 200 and r.json()["verdict"] == "drift" and r.json()["drift_log_seq"] is None
+    body = r.json()
+    assert r.status_code == 200 and body["verdict"] == "drift" and body["drift_log_seq"] is None
+    assert body["drift_log"] == "degraded" and any("drift log unavailable" in w for w in body["warnings"])
+    t = jclient.post("/api/jarvis/tools/emr_drift_check", headers=HDR, json={"summary": "Codex deployed main 792e99b.", "records": [new["id"]]})
+    assert t.status_code == 200 and "degraded" in t.text
+
+
+def test_a_logged_check_says_the_drift_log_is_ok(jclient, pair):
+    old, new = pair
+    body = check(jclient, "Codex deployed main 792e99b.", [new["id"]])
+    assert body["drift_log"] == "ok" and body["drift_log_seq"] is not None
+    assert not any("drift log unavailable" in w for w in body.get("warnings", []))
 
 
 def test_the_flag_off_means_a_404_and_no_files(jclient, pair, monkeypatch):
