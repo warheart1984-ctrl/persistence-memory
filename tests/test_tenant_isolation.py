@@ -188,12 +188,25 @@ def test_every_served_route_is_classified_and_every_classification_is_served():
     assert not known - served, f"classified routes that are no longer served (remove them): {sorted(known - served)}"
 
 
+def route_of(method: str, concrete_path: str) -> tuple[str, str] | None:
+    """The registry key (method, route template) that a concrete request path resolves to, using the app's own router."""
+    from starlette.routing import Match
+
+    scope = {"type": "http", "method": method, "path": concrete_path.split("?", 1)[0], "root_path": "", "query_string": b"", "headers": []}
+    for route in app.routes:
+        match, _ = route.matches(scope)
+        if match == Match.FULL:
+            return method, route.path
+    return None
+
+
 # ----------------------------------------------------------------------------------------------------------------- fixtures
 @pytest.fixture
 def client(monkeypatch):
     monkeypatch.setenv("JARVIS_AUTH_MODE", "oauth")
     monkeypatch.setenv("JARVIS_PUBLIC_BASE_URL", "https://memory.example")
     monkeypatch.setenv("JARVIS_MEMORY_WRITE_ENABLED", "true")
+    monkeypatch.setenv("JARVIS_MCP_WRITE_ENABLED", "true")        # the write tools must be past their gate, or their isolation is never exercised
     monkeypatch.setenv("JARVIS_CURSOR_HMAC_KEY", "isolation-matrix-cursor-key-0123456789")
     monkeypatch.delenv("JARVIS_API_KEY", raising=False)
 
@@ -232,12 +245,28 @@ def world(client):
     return {"first": first["id"], "second": second["id"], "third": third["id"], "artifact": artifact}
 
 
+VOLATILE = {"tenant", "result_digest", "ledger_head", "path", "head", "ts", "created_at", "updated_at", "generated_at", "checked_at", "duration_ms"}
+GENERATED = {"id", "content_sha256", "version"}   # a write that succeeds returns an id, a hash and a clock of its own: expected to differ between two calls
+
+
 def norm(resp, *ids: str) -> tuple[int, str]:
-    """(status, body with the ids that were asked about masked), so two responses can be compared for indistinguishability."""
-    text = resp.text
-    for i, x in enumerate(ids):
+    """(status, body with the ids that were asked about masked and the fields a successful write generates dropped), so two responses can be compared for
+    indistinguishability."""
+    try:
+        text = json.dumps(_drop(resp.json(), VOLATILE | GENERATED), sort_keys=True)
+    except ValueError:
+        text = resp.text
+    for x in ids:
         text = text.replace(x, "<ID>")
     return resp.status_code, text
+
+
+def _drop(obj, keys):
+    if isinstance(obj, dict):
+        return {k: _drop(v, keys) for k, v in obj.items() if k not in keys}
+    if isinstance(obj, list):
+        return [_drop(v, keys) for v in obj]
+    return obj
 
 
 def assert_nothing_of_alices(resp, world=None, asked: tuple[str, ...] = ()):
@@ -304,6 +333,7 @@ def test_the_neutral_catalog_is_identical_for_every_tenant(client, who):
 
 # ------------------------------------------------------------------------------ id-addressed routes: "not yours" is "not found"
 BODY = {"content": "bob writes this", "source_agent": "t", "session_id": "s", "type": "fact"}
+APPROVED = {"user_requested": True, "user_statement": "the operator asked for this write"}   # what the write tools require beyond the gate flag
 
 
 def id_cases(i: str, art: str | None) -> dict[str, tuple[str, str, dict | None]]:
@@ -321,10 +351,15 @@ def id_cases(i: str, art: str | None) -> dict[str, tuple[str, str, dict | None]]
         "stm-expand": ("POST", "/api/jarvis/memory/stm/expand", {"memory_id": i}),
         "reinforce": ("POST", "/api/jarvis/memory/emr/reinforce", {"memory_ids": [i]}),
         "supersede-api": ("POST", "/api/jarvis/memory", {**BODY, "supersedes": i}),
-        "supersede-tool": ("POST", "/api/jarvis/tools/emr_remember", {**BODY, "supersedes": i}),
+        "supersede-tool": ("POST", "/api/jarvis/tools/emr_remember", {**BODY, **APPROVED, "supersedes": i}),
         "tool-fetch": ("POST", "/api/jarvis/tools/fetch", {"id": i}),
         "tool-emr_fetch": ("POST", "/api/jarvis/tools/emr_fetch", {"id": i}),
-        "tool-upsert": ("POST", "/api/jarvis/tools/emr_upsert", {**BODY, "id": i}),
+        "amul-artifact": ("GET", f"/api/jarvis/memory/amul/artifacts/{art or GHOST_ARTIFACT}", None),
+        # evidence objects can only be created with the operator key today (a tenant gets 403), so there is no tenant evidence to cross: both ids are well-formed
+        # and unknown, and the case proves the read path answers a tenant the same way every time and leaks nothing. Cross-tenant evidence becomes testable with phase 1.
+        "evidence-get": ("GET", f"/api/jarvis/evidence/eo:sha256:{'0' * 64}", None),
+        "evidence-verify": ("GET", f"/api/jarvis/evidence/eo:sha256:{'0' * 64}/verify", None),
+        "tool-upsert": ("POST", "/api/jarvis/tools/emr_upsert", {**BODY, **APPROVED, "id": i}),
     }
 
 
@@ -379,6 +414,7 @@ LIST_CASES = {
     "emr-status": ("GET", "/api/jarvis/memory/emr/status", None),
     "board": ("GET", "/api/jarvis/memory/board", None),
     "amul-status": ("GET", "/api/jarvis/memory/amul/field/status", None),
+    "history-verify": ("GET", "/api/jarvis/memory/history/verify", None),            # 501 on the JSON store, a per-tenant verification on Postgres
     "tool-search": ("POST", "/api/jarvis/tools/search", {"query": SEARCH}),
     "tool-emr_search": ("POST", "/api/jarvis/tools/emr_search", {"query": SEARCH}),
     "tool-emr_search_ledger": ("POST", "/api/jarvis/tools/emr_search_ledger", {"query": SEARCH}),
@@ -388,18 +424,44 @@ LIST_CASES = {
 }
 
 
+def strip(obj):
+    """Drop the fields that legitimately differ between two tenants (their own hash, digests, clocks) so the rest can be compared."""
+    if isinstance(obj, dict):
+        return {k: strip(v) for k, v in obj.items() if k not in VOLATILE}
+    if isinstance(obj, list):
+        return [strip(v) for v in obj]
+    return obj
+
+
+def _body(resp):
+    try:
+        return strip(resp.json())
+    except ValueError:
+        return resp.text
+
+
 def test_a_second_tenant_sees_nothing_of_the_first(client, world):
+    """Bob has written nothing, so every read must look exactly like a brand-new tenant's: that also catches aggregate-only leaks (counts, sizes) that carry no id."""
     failures = []
     for case, (method, path, body) in sorted(LIST_CASES.items()):
         r = client.request(method, path, headers=h("bob"), json=body)
-        if r.status_code not in (200, 404):
+        empty = client.request(method, path, headers=h("carol-who-never-wrote"), json=body)
+        if r.status_code not in (200, 404, 501):
             failures.append(f"{case}: {r.status_code} {r.text[:160]}")
             continue
         try:
             assert_nothing_of_alices(r, world)
         except AssertionError as exc:
             failures.append(f"{case}: {exc}")
+        if (r.status_code, _body(r)) != (empty.status_code, _body(empty)):
+            failures.append(f"{case}: bob's response differs from a brand-new tenant's:\n   bob   {r.status_code} {str(_body(r))[:200]}\n   empty {empty.status_code} {str(_body(empty))[:200]}")
     assert not failures, "\n".join(failures)
+
+
+def test_the_aggregate_reads_are_not_vacuous_alice_sees_her_own_counts(client, world):
+    stats = client.get("/api/jarvis/memory/graph/stats", headers=h("alice")).json()
+    assert stats["node_count"] >= 3, stats
+    assert client.get("/api/jarvis/memory/graph/stats", headers=h("carol-who-never-wrote")).json()["node_count"] == 0
 
 
 def test_the_same_reads_do_return_alices_data_to_alice(client, world):
@@ -410,6 +472,46 @@ def test_the_same_reads_do_return_alices_data_to_alice(client, world):
         if not (r.status_code == 200 and (MARK in r.text or world["first"] in r.text or world["third"] in r.text)):
             failures.append(f"{case}: control read found nothing: {r.text[:160]}")
     assert not failures, "\n".join(failures)
+
+
+MUTATION_CASES = {
+    "board-post": ("POST", "/api/jarvis/memory/board", {"summary": "bob overwrote it"}),
+    "board-patch": ("PATCH", "/api/jarvis/memory/board", {"summary": "bob overwrote it"}),
+    "stm-clear": ("DELETE", "/api/jarvis/memory/stm", None),
+    "emr-excite": ("POST", "/api/jarvis/memory/emr/excite", {"query": SEARCH, "session_key": "default", "theta_promote": 0.0}),
+    "emr-correct": ("POST", "/api/jarvis/memory/emr/correct", {"memory_ids": [GHOST], "note": "bob corrects"}),
+    "amul-verify": ("POST", "/api/jarvis/memory/amul/field/verify", {}),
+}
+
+
+def _alice_state(client, world):
+    return {"records": _alice_snapshot(client, world), "board": client.get("/api/jarvis/memory/board", headers=h("alice")).text,
+            "stm": client.get("/api/jarvis/memory/stm/context", headers=h("alice")).text, "graph": client.get("/api/jarvis/memory/graph/stats", headers=h("alice")).text}
+
+
+def test_bob_s_writes_that_are_not_addressed_by_id_change_nothing_of_alices(client, world):
+    before = _alice_state(client, world)
+    failures = []
+    for case, (method, path, body) in sorted(MUTATION_CASES.items()):
+        r = client.request(method, path, headers=h("bob"), json=body)
+        if r.status_code >= 500:
+            failures.append(f"{case}: {r.status_code} {r.text[:120]}")
+        try:
+            assert_nothing_of_alices(r, world)
+        except AssertionError as exc:
+            failures.append(f"{case}: {exc}")
+        if _alice_state(client, world) != before:
+            failures.append(f"{case}: changed alice's state")
+    assert not failures, "\n".join(failures)
+
+
+def test_the_write_tools_are_open_so_their_isolation_is_really_exercised(client, world):
+    """The id cases above only mean something if the write tools get past their gate (flag on, user_requested): an ordinary write by bob must be accepted."""
+    for tool_name, body in (("emr_remember", {**BODY, **APPROVED}), ("emr_upsert", {**BODY, **APPROVED, "id": GHOST})):
+        r = client.post(f"/api/jarvis/tools/{tool_name}", headers=h("bob-control"), json=body)
+        assert "disabled" not in r.text and "user_requested" not in r.text, f"{tool_name} is still behind its gate: {r.text[:200]}"
+    ok = client.post("/api/jarvis/tools/emr_remember", headers=h("bob-control"), json={**BODY, **APPROVED})
+    assert ok.status_code == 200 and ok.json().get("accepted") is True, ok.text[:300]
 
 
 def test_bob_cannot_change_alices_short_term_memory_or_board(client, world):
@@ -487,3 +589,20 @@ def test_a_tenant_cannot_spend_the_shared_inference_backend(client):
 def test_a_tenant_is_not_told_the_servers_filesystem_layout(client):
     r = client.get("/api/jarvis/memory/amul/field/status", headers=h("bob"))
     assert "data/" not in r.text and "/tenants/" not in r.text
+
+
+def test_every_tenant_data_route_is_exercised_by_a_cross_tenant_case():
+    """The registry alone only says a route was classified. A route classified `tenant-data` must also be hit by at least one of the cases in this file, so it
+    cannot enter the registry (or stay in it) without a test that crosses tenants."""
+    exercised = set()
+    for i, art in ((GHOST, GHOST_ARTIFACT), ("mem-111111111111", "art-111111111111-s1")):
+        exercised |= {route_of(m, p) for m, p, _ in id_cases(i, art).values()}
+    exercised |= {route_of(m, p) for m, p, _ in LIST_CASES.values()}
+    exercised |= {route_of(m, p) for m, p, _ in MUTATION_CASES.values()}
+    exercised |= {("POST", "/api/jarvis/tools/emr_remember"), ("POST", "/mcp")}
+    exercised.discard(None)
+    isolated = {k for k, (cls, _) in REGISTRY.items() if cls == ISOLATED}
+    missing = sorted(isolated - exercised)
+    assert not missing, f"tenant-data routes with no cross-tenant case (add one to id_cases, LIST_CASES or MUTATION_CASES): {missing}"
+    stray = sorted(k for k in exercised if k not in REGISTRY)
+    assert not stray, f"cases that hit routes the registry does not know: {stray}"
