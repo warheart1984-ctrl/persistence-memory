@@ -281,7 +281,10 @@ def call_log_section(raw: dict[str, Any], agents: list[dict[str, Any]]) -> dict[
     if caveats:
         coverage += "; " + "; ".join(caveats)
     if chain_unverified:
-        coverage = "UNVERIFIED LOG: " + coverage.replace("complete for the retained log only: all", "all", 1).replace("complete: all", "all", 1).replace("through seq", "through seq", 1)
+        # no sentence of an unverified log may still claim completeness, whichever earlier branch wrote it
+        for claim, plain in (("complete for the retained log only: all", "all"), ("complete: all", "all"), ("complete only THROUGH seq", "read only THROUGH seq")):
+            coverage = coverage.replace(claim, plain)
+        coverage = "UNVERIFIED LOG: " + coverage
     agent_view_partial = bool(truncated or retention_pruned or gaps or degraded_now or chain_unverified)
     per_agent = []
     matched_names: set[str] = set()

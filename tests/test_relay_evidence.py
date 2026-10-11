@@ -576,3 +576,21 @@ def test_a_log_whose_chain_check_failed_is_never_called_complete(rel):
     good = {**base, "calls_verify": {"http_status": 200, "body": {"ok": True, "head": {"seq": 3, "entry_hash": "h" * 64}, "files": ["f"], "entries": 3, "problems": []}}}
     ok = rel.call_log_section(good, [{"agent": "Kilo"}])
     assert ok["chain_verified"] is True and ok["agent_view_complete"] is True and ok["coverage"].startswith("complete: all 3 log entries")
+
+
+def test_an_unverified_log_with_newer_entries_makes_no_completeness_claim_anywhere_in_the_coverage(rel):
+    """Both caveats at once: entries arrived during the read AND the chain check failed. No 'complete' may survive in the coverage line."""
+    entries = [call_entry(3, "opencode-x"), call_entry(2, "codex-x"), call_entry(1, "cursor-x")]
+    raw = {"calls_all": {"http_status": 200, "body": {"entries": entries, "pages": 1, "truncated": False, "head_seq": 3}},
+           "calls_verify": {"http_status": 200, "body": {"ok": False, "head": {"seq": 5, "entry_hash": "h" * 64}, "files": ["f"], "entries": 5,
+                                                         "problems": [{"file": "f", "line": 2, "problem": "edited"}]}}}
+    section = rel.call_log_section(raw, [{"agent": "Kilo"}])
+    assert section["newer_entries_not_included"] == 2 and section["chain_verified"] is False
+    assert section["coverage"].startswith("UNVERIFIED LOG: ") and "complete" not in section["coverage"], section["coverage"]
+    assert "read only THROUGH seq 3" in section["coverage"] and "2 newer entries were written" in section["coverage"]
+    # and the same for a log pruned by retention that also fails its chain check
+    pruned = {**raw, "calls_all": {"http_status": 200, "body": {"entries": [call_entry(9, "a"), call_entry(8, "b")], "pages": 1, "truncated": False, "head_seq": 9}},
+              "calls_verify": {"http_status": 200, "body": {"ok": False, "head": {"seq": 9, "entry_hash": "h" * 64}, "files": ["f"], "entries": 2, "problems": [{"p": 1}],
+                                                            "anchor": {"seq": 7, "entry_hash": "a" * 64}}}}
+    s2 = rel.call_log_section(pruned, [{"agent": "Kilo"}])
+    assert s2["retention_pruned"] is True and s2["coverage"].startswith("UNVERIFIED LOG: ") and "complete" not in s2["coverage"], s2["coverage"]
