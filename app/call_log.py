@@ -458,7 +458,7 @@ class CallLog:
                             s["window_end"] = _ts(self._clock())
                             self._read_suppressed[key] = s
                             return {"suppressed": True}
-                    elif fields.get("tool") in WRITE_TOOLS or _is_rest_write(fields):
+                    elif fields.get("outcome") == "ok" and (fields.get("tool") in WRITE_TOOLS or _is_rest_write(fields)):
                         # a write is an ordering boundary: it closes the open read summary first, so the log shows how many reads came before it.
                         # Other calls (a read-only tool, say) do not: alternating them with reads would otherwise write one summary per read.
                         head = self._flush_reads_locked(head)
