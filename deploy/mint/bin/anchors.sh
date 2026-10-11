@@ -81,7 +81,7 @@ anchors_calllog_gate() {
   if [ ! -d "$d/call-log" ]; then
     echo "the appdata archive has no call log, but an anchor names one"; rc=1
   else
-    python3 "$CALLLOG_ANCHOR_PY" check "$d/call-log" "$set_anchors" "$@" || rc=1
+    python3 "$CALLLOG_ANCHOR_PY" check "$d/call-log" --own "$set_anchors" "$@" || rc=1
   fi
   rm -rf "$d"
   return "$rc"

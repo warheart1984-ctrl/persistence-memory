@@ -6,7 +6,10 @@ chain, or cut trailing lines off, and it still verifies.  A head (seq + entry ha
 set's anchors and in the offsite copies, catches both: a later log must still contain the entry that an earlier anchor named.
 
     calllog_anchor.py head  DIR                  print "calllog|<seq>|<entry_hash>" (nothing if there is no log); exit 3 if the chain has problems
-    calllog_anchor.py check DIR ANCHORS_FILE...  every "calllog|seq|hash" line of the given anchors files must still be in DIR's chain
+    calllog_anchor.py check DIR [--own FILE]... ANCHORS_FILE...
+                                                 every "calllog|seq|hash" line of the given anchors files must still be in DIR's chain.
+                                                 A file given as --own is checked too, but never counts as a TRUSTED comparison: it was
+                                                 produced from this very log, so it only proves the log matches itself.
 
 It never writes, and it does not use CallLog.verify() because that flushes (it can append a gap entry), which would change the head.
 Exit codes: 0 fine, 1 an anchored entry is missing or different (the log was truncated or rebuilt), 2 usage, 3 the chain itself is broken.
@@ -82,14 +85,14 @@ def set_age(name: str) -> timedelta | None:
     return datetime.now(timezone.utc) - taken
 
 
-def anchored(files: list[str]) -> list[tuple[str, int, str, timedelta | None]]:
+def anchored(files: list[str]) -> list[tuple[str, str, int, str, timedelta | None]]:
     out = []
     for f in files:
         try:
             lines = Path(f).read_text(encoding="utf-8").splitlines()
         except OSError:
             continue
-        out += [(Path(f).name, int(m.group(1)), m.group(2), set_age(Path(f).name)) for m in (LINE_RE.match(line) for line in lines) if m]
+        out += [(f, Path(f).name, int(m.group(1)), m.group(2), set_age(Path(f).name)) for m in (LINE_RE.match(line) for line in lines) if m]
     return out
 
 
@@ -110,11 +113,26 @@ def main(argv: list[str]) -> int:
         print(f"call log chain problem: {p}", file=sys.stderr)
     head = max(entries) if entries else 0
     cutoff = timedelta(days=retain_days() + RETENTION_MARGIN_DAYS)
-    for source, seq, h, age in anchored(argv[3:]):
+    matched = 0                                  # anchors found in the log with the same hash: the only trusted comparisons
+    waived: list[str] = []
+    own: set[str] = set()
+    files: list[str] = []
+    rest = iter(argv[3:])
+    for a in rest:
+        if a == "--own":
+            f = next(rest, None)
+            if f:
+                own.add(f)
+                files.append(f)
+        else:
+            files.append(a)
+    for path, source, seq, h, age in anchored(files):
         if seq in entries:
             if entries[seq] != h:
                 print(f"{source}: call log entry {seq} is not the one anchored (rebuilt or edited)", file=sys.stderr)
                 bad = 1
+            elif path not in own:
+                matched += 1
         elif anchor and seq <= int(anchor["seq"]) and age is not None and age > cutoff:
             # Retention deletes whole files older than the window, so an anchor taken longer ago than that may legitimately be gone.
             # anchor.json sits in the directory an attacker can write, so it never excuses an anchor from INSIDE the window: a forged
@@ -122,12 +140,19 @@ def main(argv: list[str]) -> int:
             if seq == int(anchor["seq"]) and str(anchor["entry_hash"]) != h:
                 print(f"{source}: the retention anchor at seq {seq} differs from the one anchored", file=sys.stderr)
                 bad = 1
+            else:
+                waived.append(source)
         elif seq > head:
             print(f"{source}: anchored head {seq} is beyond this log's head {head} (the log was truncated or is older)", file=sys.stderr)
             bad = 1
         else:
             print(f"{source}: call log entry {seq} is missing (the log was rebuilt or lines removed)", file=sys.stderr)
             bad = 1
+    if waived and not matched:
+        # every anchor handed in was old enough to be excused, so nothing trusted was compared at all (backups were interrupted for
+        # longer than the retention window): a forged retention anchor could be hiding a rebuilt log, so do not excuse them
+        print(f"{waived[0]}: no anchor inside the retention window could be compared with the log, so the old anchors cannot be excused", file=sys.stderr)
+        bad = 1
     return 1 if bad else (3 if problems else 0)
 
 
