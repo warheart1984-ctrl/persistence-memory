@@ -447,6 +447,18 @@ def strip(obj):
     return obj
 
 
+def _values_of(obj, key: str):
+    """Every value stored under `key`, at any depth."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k == key:
+                yield v
+            yield from _values_of(v, key)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _values_of(v, key)
+
+
 def _body(resp, case: str = ""):
     try:
         return _drop(strip(resp.json()), CASE_VOLATILE.get(case, set()))
@@ -603,7 +615,8 @@ def test_a_tenant_cannot_spend_the_shared_inference_backend(client):
 @pytest.mark.xfail(strict=True, reason="GAP: the AMUL field status shows the server's filesystem path (data/tenants/<hash>/...) to the tenant")
 def test_a_tenant_is_not_told_the_servers_filesystem_layout(client):
     r = client.get("/api/jarvis/memory/amul/field/status", headers=h("bob"))
-    assert "data/" not in r.text and "/tenants/" not in r.text
+    leaked = [v for v in _values_of(r.json(), "path") if isinstance(v, str) and v]
+    assert not leaked, f"the status shows server paths: {leaked}"
 
 
 def test_every_tenant_data_route_is_exercised_by_a_cross_tenant_case():
@@ -636,4 +649,5 @@ def test_emr_status_does_not_show_another_tenants_reinforcement(client, world):
 @pytest.mark.xfail(strict=True, reason="GAP: the EMR status shows the server's filesystem path of the dynamics sidecar (dynamics.sidecar.path = data/emr-dynamics.json) to any tenant")
 def test_a_tenant_is_not_told_the_emr_sidecar_path(client):
     r = client.get("/api/jarvis/memory/emr/status", headers=h("bob"))
-    assert "data/" not in r.text and "emr-dynamics" not in r.text
+    leaked = [v for v in _values_of(r.json(), "path") if isinstance(v, str) and v]
+    assert not leaked, f"the status shows server paths: {leaked}"      # (only the `path` fields: the response legitimately says "emr-dynamics-v1" elsewhere)
