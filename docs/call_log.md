@@ -73,6 +73,9 @@ off on live), which is why its writes are in scope.
 
 * `GET /api/jarvis/tools/calls?tool=&client=&since=&limit=1..200&cursor=` newest first; `next_cursor` for the next page. The response
   says `provenance: server-witnessed` and `client_names: self-reported`.
+* `GET /api/jarvis/tools/calls` returns the page **and the head from one locked snapshot** (the log's lock is held across both reads), so for an
+  unfiltered request the head is always the newest entry of the first page; no append can land between them. On a later page (`cursor`) the
+  head is still the log's current head.
 * `GET /api/jarvis/tools/calls/verify` walks the chain across files and returns `ok`, `problems`, the `head` (`seq`, `entry_hash`),
   `anchor`, `degraded` and `gaps_recorded`. Edited, deleted, inserted and reordered lines all fail it.
 
