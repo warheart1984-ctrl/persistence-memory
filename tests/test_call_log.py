@@ -977,6 +977,34 @@ def test_a_response_too_big_to_buffer_is_witnessed_before_its_headers_are_releas
     assert status == 200 and hdrs["x-jarvis-call-seq"] == str(e["seq"]) and e["outcome"] == "ok" and e["result_digest"] is None
 
 
+def test_one_huge_response_chunk_is_never_copied_into_the_witness_buffer(jclient, monkeypatch):
+    """The size is checked before a chunk is copied: a 3 MiB single-chunk body must add nothing to the buffer (and a small one still does)."""
+    from app import call_witness
+    copied = []
+
+    class Spy(bytearray):
+        def extend(self, data):
+            copied.append(len(data))
+            super().extend(data)
+
+    monkeypatch.setattr(call_witness, "bytearray", Spy, raising=False)
+    _drive([], "GET", "/api/jarvis/memory", [], response=[b"z" * (3 * 1024 * 1024)])
+    assert copied == []
+    _drive([], "GET", "/api/jarvis/memory", [], response=[b"{}"])
+    assert copied == [2]
+
+
+def test_only_the_exact_generated_id_grammars_are_recorded_as_a_target(jclient):
+    rec = add(jclient)
+    before = len(entries())
+    for path in ("/api/jarvis/memory/123456789", "/api/jarvis/memory/mem-" + "a" * 64, "/api/jarvis/memory/mem-abc123", "/api/jarvis/memory/mem-0123456789abcdef",
+                 f"/api/jarvis/memory/{rec['id']}"):
+        jclient.get(path, headers=HDR)
+    got = entries()[before:]
+    assert [e["target"] for e in got] == [None, None, None, None, rec["id"]]
+    assert "123456789" not in json.dumps(got[:4]) and "a" * 64 not in json.dumps(got) and "0123456789abcdef" not in json.dumps(got)
+
+
 def test_a_big_response_whose_witness_failed_says_degraded_in_its_headers(jclient, monkeypatch):
     monkeypatch.setattr(call_log.CallLog, "_append_locked", lambda self, *a, **k: (_ for _ in ()).throw(OSError("disk full")))
     big = [b"y" * (1024 * 1024) for _ in range(3)]

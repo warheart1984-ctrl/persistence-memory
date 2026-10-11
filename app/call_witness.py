@@ -46,9 +46,11 @@ _ID_SEGMENTS = (
     (re.compile(r"^mem-[0-9a-f]+$"), "{id}"),
     (re.compile(r"^eo:sha256:[0-9a-f]+$"), "{eo}"),
     (re.compile(r"^[0-9]+$"), "{n}"),
-    (re.compile(r"^art-[0-9a-f]{12}-[A-Za-z][0-9]{1,9}$"), "{art}"),  # exactly what app/amul.py generates: art-<12 hex>-<resolution letter><seq>
 )
 _CODE_SAFE = re.compile(r"[^A-Za-z0-9_:.\-]")
+# What a path parameter must look like, exactly as the app generates it, to be recorded as a target (anything else is only ever hashed):
+# a memory id is mem-<12 hex> (app/store.py new_id), an AMUL artifact id is art-<12 hex>-<resolution letter><seq> (app/amul.py).
+_MEMORY_TARGETS = (re.compile(r"^mem-[0-9a-f]{12}$"), re.compile(r"^art-[0-9a-f]{12}-[A-Za-z][0-9]{1,9}$"))
 # The route templates under /api/jarvis/memory, per method (relative; "{id}" is any one segment). A path is templated by matching it position by
 # position against the templates of ITS method, preferring the one with the most literal segments: a route that exists only for POST (promote,
 # pipeline, external-search ...) is not a literal for a GET, which the app serves as a record lookup. A segment that lands on a "{id}" is a path
@@ -78,7 +80,7 @@ def normalize_memory_route(method: str, path: str) -> tuple[str, str | None, lis
     if best is None:
         return MEMORY_PREFIX + "/{other}", None, segs
     params = [s for p, s in zip(best, segs) if p == "{id}"]
-    target = next((s for s in params if any(rx.match(s) for rx, _ in _ID_SEGMENTS)), None)
+    target = next((s for s in params if any(rx.match(s) for rx in _MEMORY_TARGETS)), None)
     return "/".join([MEMORY_PREFIX, *best]), target, params
 
 
@@ -272,9 +274,8 @@ class CallWitnessMiddleware:
             held.append(message)
             if message["type"] == "http.response.body":
                 chunk = message.get("body", b"")
-                buffered += len(chunk)
-                resp_body.extend(chunk)
-                if buffered > MAX_RESPONSE_BUFFER:  # too big to hold: stream it, logged without a digest, but still BEFORE its headers are released
+                if buffered + len(chunk) > MAX_RESPONSE_BUFFER:  # checked BEFORE copying the chunk, so one huge body is never duplicated here
+                    # too big to hold: stream it, logged without a digest, but still BEFORE its headers are released
                     overflow = True
                     entry = log.record(call_log.make_fields(
                         transport=_transport(plan, headers), tool=plan["tool"], args=witness_args(plan, body_bytes, scope.get("query_string", b"")),
@@ -287,6 +288,8 @@ class CallWitnessMiddleware:
                         await send(m)
                     held.clear()
                     return
+                buffered += len(chunk)
+                resp_body.extend(chunk)
                 if not message.get("more_body"):
                     await finish()
 
