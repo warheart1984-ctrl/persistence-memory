@@ -8,7 +8,7 @@ Continuity lives in ledger records, not in chat transcripts; the service itself 
 
 One ledger runs in Docker on a private Linux box at **`127.0.0.1:8011`** (PostgreSQL row store, schema **v9**). Nothing is
 reachable from the network; the PC and the agents reach it through an SSH tunnel. Deployment, operations and the rehearsed
-restore are in [`deploy/mint/README.md`](deploy/mint/README.md). **This table describes the deployed build**, which is `main` as of 2026-10-10 (`792e99b`, schema v9);
+restore are in [`deploy/mint/README.md`](deploy/mint/README.md). **This table describes the deployed build**, which is `main` as of 2026-10-11 (`5a8d756`, schema v9);
 anything merged after that day is not deployed until the next deploy.
 
 | Capability | Status |
@@ -115,5 +115,5 @@ database URL or that opt-in the service answers 503 rather than creating a ledge
 
 `docs/CCS_CHARTER.md` and `docs/LEDGER_TO_CCS_MAPPING.md` (what is declared versus built) · `docs/CONSTITUTIONAL_BOUNDARY_CLAUSE.md` ·
 `docs/CONTINUITY_LEDGER_SOC.md` · `docs/CONSTITUTIONAL_MEMORY_CONTRACT.md` · `docs/EMR_RECALL_PROTOCOL.md` · `docs/ADAPTER_CONSUMERS.md` ·
-`docs/chaos/CL_CHAOS_100x.md` (the throwaway-stack hammer and its first report) · `docs/POSTGRES.md` · `docs/call_log.md` (the server-side tool-call log, off on the live box until its deploy step) · `docs/drift_watcher.md` (checks an agent's summary against the records it cites; deterministic, no model; off on the live box until its deploy step) · `docs/CLAUSE_V_HYGIENE.md` · `docs/EVIDENCE_OBJECTS.md` · `docs/CONTINUITY_BLOCKS.md` · `docs/REPLAY_CONTRACTS.md` · `docs/SIGNATURES.md` · `docs/SIGNING_RUNBOOK.md` ·
+`docs/chaos/CL_CHAOS_100x.md` (the throwaway-stack hammer and its first report) · `docs/POSTGRES.md` · `docs/call_log.md` (the server-side tool-call log; on in the live box since 2026-10-11) · `docs/drift_watcher.md` (checks an agent's summary against the records it cites; deterministic, no model; operator-only; on in the live box since 2026-10-11) · `docs/CLAUSE_V_HYGIENE.md` · `docs/EVIDENCE_OBJECTS.md` · `docs/CONTINUITY_BLOCKS.md` · `docs/REPLAY_CONTRACTS.md` · `docs/SIGNATURES.md` · `docs/SIGNING_RUNBOOK.md` ·
 `SECURITY.md`.
