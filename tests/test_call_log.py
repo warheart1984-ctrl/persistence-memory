@@ -866,6 +866,46 @@ def test_reading_a_page_does_not_hold_the_writers_lock(tmp_path, monkeypatch):
     assert log.head()["seq"] == 6
 
 
+def test_a_snapshot_that_cannot_open_a_file_fails_instead_of_dropping_it(tmp_path, monkeypatch):
+    """Descriptor exhaustion (EMFILE) or a permission error must not look like a missing file: the page would lack that file and every later one."""
+    log = call_log.CallLog(tmp_path / "emfile")
+    for i in range(3):
+        log.append(_fields(i))
+    real_open = open
+
+    def failing_open(path, *a, **k):
+        if str(path).endswith(".jsonl"):
+            raise OSError(24, "Too many open files")
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr("builtins.open", failing_open)
+    with pytest.raises(call_log.CallLogError, match="could not snapshot"):
+        with log._locked():
+            log._snapshot()
+
+
+def test_a_page_whose_snapshot_lost_a_file_raises_and_the_endpoint_says_retry(fixed_minute, tmp_path, monkeypatch):
+    """The no-pinned-handle path (Windows): if retention removes a file before the page is read, the read fails loudly."""
+    log = call_log.CallLog(tmp_path / "winlike")
+    for i in range(3):
+        log.append(_fields(i))
+    with log._locked():
+        snap = log._snapshot()
+    path, size, fh = snap.files[0]
+    fh.close()
+    snap.files[0] = (path, size, None)                # as if pinning is unavailable
+    path.unlink()
+    with pytest.raises(call_log.CallLogError, match="retry"):
+        list(log.entries_desc(snap))
+
+
+def test_the_calls_endpoint_answers_503_retry_when_the_snapshot_cannot_be_read(jclient, monkeypatch):
+    add(jclient)
+    monkeypatch.setattr(call_log.CallLog, "query_with_head", lambda self, **k: (_ for _ in ()).throw(call_log.CallLogError("a file of the snapshot could not be read")))
+    r = jclient.get("/api/jarvis/tools/calls", headers=HDR)
+    assert r.status_code == 503 and "retry" in r.json()["detail"]
+
+
 def test_a_snapshot_page_ignores_what_was_appended_after_it(tmp_path):
     log = call_log.CallLog(tmp_path / "snapbytes")
     for i in range(3):

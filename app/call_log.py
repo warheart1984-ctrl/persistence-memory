@@ -555,10 +555,19 @@ class CallLog:
         snap = Snapshot()
         for path in self._files():
             try:
-                fh = open(path, "rb")
-            except OSError:
-                continue
-            snap.files.append((path, os.fstat(fh.fileno()).st_size, fh))
+                if os.name == "nt":
+                    # Windows cannot unlink a file that is open (no delete-sharing for ordinary handles): pinning would make retention fail inside an
+                    # append. Remember the size only; if retention removes the file before the page is read, the read fails loudly (see entries_desc).
+                    snap.files.append((path, path.stat().st_size, None))
+                else:
+                    fh = open(path, "rb")
+                    snap.files.append((path, os.fstat(fh.fileno()).st_size, fh))
+            except FileNotFoundError:
+                continue  # retention removed it between listing and opening: it is simply not part of the log any more
+            except OSError as exc:
+                # anything else (descriptor limit, permissions) must NOT look like a missing file: the page would silently lack this file and every later one
+                snap.close()
+                raise CallLogError(f"could not snapshot the call log ({exc.__class__.__name__}: {exc})") from None
         return snap
 
     def entries_desc(self, snapshot: "Snapshot | None" = None) -> Iterator[dict[str, Any]]:
@@ -569,12 +578,17 @@ class CallLog:
             sources = [(p, size, fh) for p, size, fh in reversed(snapshot.files)]
         for path, size, fh in sources:
             try:
-                if fh is None:
-                    lines = path.read_text(encoding="utf-8").splitlines()
-                else:
+                if fh is not None:
                     fh.seek(0)
                     lines = fh.read(size).decode("utf-8", "replace").splitlines()
-            except OSError:
+                elif size is not None:  # a snapshot without a pinned handle (Windows): the file must still be there, or the page would be incomplete
+                    with open(path, "rb") as reopened:
+                        lines = reopened.read(size).decode("utf-8", "replace").splitlines()
+                else:
+                    lines = path.read_text(encoding="utf-8").splitlines()
+            except OSError as exc:
+                if snapshot is not None:
+                    raise CallLogError(f"a file of the snapshot could not be read ({exc.__class__.__name__}); retry") from None
                 continue
             for line in reversed(lines):
                 if not line.strip():
