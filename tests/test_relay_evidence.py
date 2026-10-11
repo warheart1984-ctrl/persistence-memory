@@ -309,7 +309,8 @@ def paged_log(n, *, old_name="oldest-client"):
         pool = [r for r in rows if (before is None or r["seq"] < before) and (not q.get("tool") or r["tool"] == q["tool"])]
         page = pool[:limit]
         more = len(pool) > limit
-        return 200, json.dumps({"entries": page, "next_cursor": str(page[-1]["seq"]) if more else None}).encode()
+        head = {"seq": max(r["seq"] for r in rows), "entry_hash": "h" * 64}
+        return 200, json.dumps({"entries": page, "next_cursor": str(page[-1]["seq"]) if more else None, "head": head}).encode()
 
     return rows, transport
 
@@ -404,3 +405,35 @@ def test_a_failure_on_a_later_page_keeps_what_was_read_and_says_it_is_partial(re
     section = rel.call_log_section(raw, [{"agent": "Oldest"}])
     assert section["coverage"].startswith("PARTIAL: only the newest 400") and "page 3 failed with HTTP 500" in section["coverage"]
     assert "oldest-client" not in {r["client_name"] for r in section["clients_seen"]}
+
+
+def test_entries_written_while_the_report_is_read_are_counted_not_hidden_behind_a_complete_claim(rel):
+    rows, transport = paged_log(450)
+    calls_made = []
+
+    def racing(method, url, headers, body):
+        calls_made.append(url)
+        out = transport(method, url, headers, body)
+        if len(calls_made) == 1:  # right after the first page, two other clients write
+            rows[:0] = [{**call_entry(1, "late-client"), "seq": 452}, {**call_entry(1, "late-client"), "seq": 451}]
+        return out
+
+    client = rel.ReadOnlyClient("http://x", KEY, racing)
+    status, body = rel.fetch_all_calls(client)
+    assert status == 200 and body["head_seq"] == 450 and body["truncated"] is False and len(body["entries"]) == 450  # a snapshot through seq 450
+    raw = {"calls_emr_latest": {"http_status": 200, "body": body}, "calls_all": {"http_status": 200, "body": body},
+           "calls_verify": {"http_status": 200, "body": {"ok": True, "head": {"seq": 452, "entry_hash": "h" * 64}, "files": ["f"], "entries": 452, "problems": []}}}
+    section = rel.call_log_section(raw, [{"agent": "Oldest"}])
+    assert section["snapshot_head_seq"] == 450 and section["newer_entries_not_included"] == 2
+    assert section["coverage"].startswith("through seq 450: all 450 log entries") and "2 newer entries were written while this report was being read" in section["coverage"]
+    assert "head seq 452" in section["coverage"] and "late-client" not in {r["client_name"] for r in section["clients_seen"]}
+
+
+def test_with_no_concurrent_writes_the_snapshot_equals_the_head_and_nothing_is_missing(rel):
+    rows, transport = paged_log(30)
+    client = rel.ReadOnlyClient("http://x", KEY, transport)
+    status, body = rel.fetch_all_calls(client)
+    raw = {"calls_emr_latest": {"http_status": 200, "body": body}, "calls_all": {"http_status": 200, "body": body},
+           "calls_verify": {"http_status": 200, "body": {"ok": True, "head": {"seq": 30, "entry_hash": "h" * 64}, "files": ["f"], "entries": 30, "problems": []}}}
+    section = rel.call_log_section(raw, [])
+    assert section["newer_entries_not_included"] == 0 and section["coverage"].startswith("complete: all 30 log entries")
