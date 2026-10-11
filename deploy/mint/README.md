@@ -20,7 +20,7 @@ Windows PC ──ssh -L──►  127.0.0.1:8011  ─►  app (non-root, read-on
 * **Data:** 59 records imported from the PC's `jarvis-store.json` with `pg_import` on 2026-10-05 (manifest in
   `~/jarvis-ledger/state/import-manifest.json`), plus one record migrated from the old service
   (`mem-da3ddefda22a`, copied from `mem-79f9aa7e7e44`). Since then agents have written their own records through the API: **62 live records at
-  history seq 137 on 2026-10-11** (the ledger's own counts, `jarvisctl verify` / `GET /api/jarvis/replay/state`, are the source of truth).
+  history seq 137 on 2026-10-11** (`jarvisctl replay state`, i.e. `GET /api/jarvis/replay/state`, reports the live count and is the source of truth).
 * **The old service on 8001 is retired:** `persistence-memory.service` is stopped and disabled. Its data
   (`~/.local/share/persistence-memory/`) and `~/.config/persistence-memory/memory.env` are untouched, and
   `~/persistence-memory` is pinned at `d5157ba`. To bring it back:
@@ -38,7 +38,7 @@ Windows PC ──ssh -L──►  127.0.0.1:8011  ─►  app (non-root, read-on
 * **Deployed on 2026-10-11:** no schema change (still **v9**). The server-side **call log** (`docs/call_log.md`; on, `JARVIS_CALL_LOG_ENABLED=1`, in the appdata
   volume and so in the backups) and the **drift watcher** (`docs/drift_watcher.md`; on, `JARVIS_DRIFT_CHECK_ENABLED=1`, operator-only, results go to its own
   log, never to the ledger); `main` at `5a8d756`, an app-only swap. The rollback is the `pre-drift` image tags (remove the flag line, recreate the app only).
-  Merged since and **not deployed yet**: the call-log head anchor in the backup anchors (`bin/calllog_anchor.py`, `docs/call_log.md`).
+  Merged since and **awaiting a deploy**: the call-log head anchor in the backup anchors (`bin/calllog_anchor.py`, `docs/call_log.md`).
 * **Shelved, though the code is deployed:** signatures. The signer, the witness tool and the custody guards are on the box but unused: no key has been made, no key
   ceremony done, the sign timer is off, and nothing on the box is signed (`JARVIS_SIGNATURES=warn`, empty trust roots). Read "Signatures
   (schema v7)" below before turning anything on, and take a backup first.
@@ -219,14 +219,15 @@ block) is installed by `install-units.sh` and **enabled on the live box** (since
 (`state/seal.last_ok`); remove that file after turning the timer off on purpose. `jarvisctl verify` reports how many entries
 are still unsealed and warns when the oldest is more than 24 hours old.
 
-### Upgrading a schema version and rolling back (written for v6; the same rule held for v7, v8 and v9)
+### Upgrading a schema version and rolling back (written for v6; the same rule held for v7 and v8, and for crossing V8 back from v9)
 
 Backup first (`jarvisctl backup`, then `jarvisctl drill`), then pull and `jarvisctl up` (v5 to v6, additive). The code checks the
 schema version exactly, so **v5 code refuses a v6 database and v6 code refuses a v5 one: rolling back means checking out the old
 code and restoring the backup taken before the upgrade** (writes made after it are lost). After such a rollback the newer
 backup sets and anchors no longer fit the restored database (their blocks "vanished"), so move the newer `jarvis-*` sets and the
 newer `anchors/anchors-*.txt` files aside before the next backup, or it will quarantine its dump. The box is at **v9** now (v6 on 2026-10-06, v7 on
-2026-10-08, v8 and v9 on 2026-10-10); V8 has no down-migration, so the way back across it is the named backup restored under the `pre-v8v9` images.
+2026-10-08, v8 and v9 on 2026-10-10). V8 has no down-migration, so the way back across it is the named backup restored under the `pre-v8v9` images. V9 alone
+does have one: run `app.pg_schema.V9_ROLLBACK` as the migration role in one transaction and deploy the V8 code (`docs/ledger_search.md`), which keeps every write made since.
 
 ### Signatures (schema v7)
 

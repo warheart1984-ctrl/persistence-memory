@@ -4,7 +4,7 @@ A governed, evidence-first memory ledger for AI agents, backed by PostgreSQL. It
 provenance, and proves it was not quietly changed. It does **not** decide what is true (`docs/CONTINUITY_LEDGER_SOC.md`).
 Continuity lives in ledger records, not in chat transcripts; the service itself is replaceable.
 
-## What is live on 8011 (last deployed 2026-10-10)
+## What is live on 8011 (last deployed 2026-10-11)
 
 One ledger runs in Docker on a private Linux box at **`127.0.0.1:8011`** (PostgreSQL row store, schema **v9**). Nothing is
 reachable from the network; the PC and the agents reach it through an SSH tunnel. Deployment, operations and the rehearsed
