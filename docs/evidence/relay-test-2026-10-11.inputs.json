@@ -1,0 +1,67 @@
+{
+  "title": "Six-agent relay test on the call-log build, 2026-10-11",
+  "summary": "After the app-only deploy of main (status/lifecycle fix and the server-side call log) the operator restarted the MCP connection in each agent and had each one call emr_latest with no arguments. This report has two parts that must not be mixed up. The results table and the call-log section are what scripts/relay_evidence.py itself read from the live ledger (read-only; the API key is never printed): the ledger's records and chain, and the SERVER's own log of which clients called emr_latest, when, over which transport, with which result_digest, and whether they passed arguments. Client names in that log are self-reported by the clients. The agent table is what the agents told the operator; for this run no agent output was pasted, so every entry says so and nothing from agents is counted as verified. Expected: every witnessed emr_latest call returns result_digest 3bed25d21d893e8ae248b0be92bf6e541c89a3dca84671861cb725392c39f6ae, the digest of the new response shape (it now covers each record's stored status and its lifecycle, so it differs from the 8d3d2abb... and e1e2f0da... values of the earlier run).",
+  "known_gaps": [
+    "The call log has existed only since the deploy (about 00:18Z on 2026-10-11); nothing before that was witnessed by the server. The earlier relay run (2026-10-10) can only be compared through the agents' own reports.",
+    "Client names are self-reported. A name in the log shows what the client called itself, not who was behind it. 'rmcp/3.1.0' (a Rust MCP client library name) made emr_latest and fetch calls over MCP stdio; it is one of Devin or Kilo, but the log cannot say which, and this report does not guess.",
+    "Cursor's emr_latest call (seq 13) and the 'rmcp/3.1.0' client's emr_latest call (seq 14) were not made with no arguments: the argument hash in the log equals the hash of exactly {\"limit\": 5}, so both asked for five records and correctly got a different digest (018d59bdeaaeb4976e97c73051fc5c1dffefa9c284df380f0b2ae4e59e0ee93a), the same for both. The OpenCode (seq 8), Codex (seq 10 and 11) and Claude (seq 1) calls used no arguments and returned 3bed25d2.... The log keeps only a hash of the arguments, never the arguments themselves.",
+    "Neither Devin nor Kilo appears under its own name in the server log as of this read. Either one of them is the 'rmcp' client and the other has not called emr_latest through the MCP bridge yet (or its proxy has not been updated), or neither is. Calls recorded as 'Python-urllib' are plain HTTP, not the MCP bridge; some are this report's own earlier dry run, the rest cannot be attributed.",
+    "'Newest record is mem-c42330528ad5' is a point-in-time check; the report records the history seq and the call-log head it was read at.",
+    "The self-heal restart that happened during the previous (v8/v9) deploy did not recur in this deploy: the pause flag was held until the new app was healthy, and the alerts log has no entry since the deploy started.",
+    "The call log's head hash printed in this report should be copied off the box, and into the next ledger record that is written (anyone who can write the log directory can rebuild a whole chain; trailing entries can be truncated without breaking it)."
+  ],
+  "agents": [
+    {
+      "agent": "Devin",
+      "entry_status": "no output pasted for this run",
+      "newest_id": null,
+      "result_digest": null,
+      "aliases": [],
+      "notes": "The operator said every agent ran the MCP call. Nothing from Devin was pasted, so only the server log speaks for it; see the call-log section."
+    },
+    {
+      "agent": "OpenCode",
+      "entry_status": "no output pasted for this run",
+      "newest_id": null,
+      "result_digest": null,
+      "aliases": [],
+      "notes": "As above. Its checkout on the PC was updated and its MCP connection restarted before this run (per the operator)."
+    },
+    {
+      "agent": "Codex",
+      "entry_status": "no output pasted for this run",
+      "newest_id": null,
+      "result_digest": null,
+      "aliases": [
+        "codex-mcp-client"
+      ],
+      "notes": "As above."
+    },
+    {
+      "agent": "Cursor",
+      "entry_status": "no output pasted for this run",
+      "newest_id": null,
+      "result_digest": null,
+      "aliases": [],
+      "notes": "As above. (No Cursor output was supplied in the earlier run either.)"
+    },
+    {
+      "agent": "Kilo",
+      "entry_status": "no output pasted for this run",
+      "newest_id": null,
+      "result_digest": null,
+      "aliases": [],
+      "notes": "Kilo's ledger connection was added on 2026-10-10 (config copied from OpenCode's entry); this is its first relay run."
+    },
+    {
+      "agent": "Claude",
+      "entry_status": "own call",
+      "newest_id": "mem-c42330528ad5",
+      "result_digest": null,
+      "aliases": [
+        "claude-code"
+      ],
+      "notes": "Claude has no MCP server configured on the PC, so its call is a curl from the Mint box with a self-reported client header (claude-code/deploy-check), made at the deploy check."
+    }
+  ]
+}

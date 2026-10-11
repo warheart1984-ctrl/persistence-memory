@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 CLIENT_NAME = "relay-evidence/1"
+EMPTY_ARGS_SHA256 = hashlib.sha256(b"{}").hexdigest()  # the call log's args_sha256 for a call made with no arguments
 MAX_CALL_PAGES = 50  # 200 entries per page: up to 10,000 log entries are read; past that the report says it is a partial view
 DEFAULT_BASE = "http://127.0.0.1:8011"
 DEFAULT_OLD_ID = "mem-1dc144c193a1"  # written by Codex
@@ -221,7 +222,8 @@ def call_log_section(raw: dict[str, Any], agents: list[dict[str, Any]]) -> dict[
             "agent": name,
             "matched_on": needles,
             "witnessed_emr_latest_calls": len(hits),
-            "latest": ({k: hits[0].get(k) for k in ("seq", "ts", "transport", "client_name", "client_version", "outcome", "result_digest", "tenant")} if hits else None),
+            "latest": ({**{k: hits[0].get(k) for k in ("seq", "ts", "transport", "client_name", "client_version", "outcome", "result_digest", "tenant")},
+                        "no_arguments": hits[0].get("args_sha256") == EMPTY_ARGS_SHA256} if hits else None),
             "note": "server-witnessed; the client name is self-reported" if hits else ("no emr_latest call from a client whose name contains any of " + ", ".join(repr(n) for n in needles) + " is in the part of the server's log that was read (it may have called under another name, before the log existed, or not at all: see the list of every client name the log saw)" + (" - and that view is PARTIAL" if truncated else "")),
         })
     seen: dict[tuple[str, str, str], dict[str, Any]] = {}
@@ -360,13 +362,13 @@ def render_markdown(ev: dict[str, Any], printout: str) -> str:
         head = cl.get("head") or {}
         L += [f"Call log chain verifies: **{cl['chain_ok']}** ({cl.get('entries_total')} entries in {len(cl.get('log_files') or [])} file(s)). "
               f"**Head: seq {head.get('seq')}, hash `{head.get('entry_hash')}`**. Record this off the box, and in the next ledger record that is written.", "",
-              "| Agent | Witnessed emr_latest calls | Latest: seq, time, transport | Client as it reported itself | result_digest | Outcome |", "|---|---|---|---|---|---|"]
+              "| Agent | Witnessed emr_latest calls | Latest: seq, time, transport | Client as it reported itself | result_digest | Called with no arguments | Outcome |", "|---|---|---|---|---|---|---|"]
         for a in cl["per_agent"]:
             e = a["latest"]
             if e:
-                L.append(f"| {a['agent']} | {a['witnessed_emr_latest_calls']} | {e['seq']}, {e['ts']}, {e['transport']} | {_esc(e['client_name'])}/{_esc(e['client_version'])} | `{e['result_digest']}` | {e['outcome']} |")
+                L.append(f"| {a['agent']} | {a['witnessed_emr_latest_calls']} | {e['seq']}, {e['ts']}, {e['transport']} | {_esc(e['client_name'])}/{_esc(e['client_version'])} | `{e['result_digest']}` | {'yes' if e.get('no_arguments') else 'no'} | {e['outcome']} |")
             else:
-                L.append(f"| {a['agent']} | 0 | - | - | - | {_esc(a['note'])} |")
+                L.append(f"| {a['agent']} | 0 | - | - | - | - | {_esc(a['note'])} |")
         L.append("")
         if cl.get("clients_seen"):
             L += [f"Every client name the log saw (coverage: {cl.get('coverage')}; self-reported, so a name is a claim and not an identity). The last column says whether it was counted for one of the agents above. Rows named `relay-evidence` are this report's own read-only calls:", "",
