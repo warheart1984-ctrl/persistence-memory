@@ -196,6 +196,19 @@ def split_client(header: str | None) -> tuple[str | None, str | None]:
 # -------------------------------------------------------------------------------------------------------- the log
 
 
+class Snapshot:
+    """The daily files of a log at one instant: (path, size, open handle). `close()` releases the handles."""
+
+    def __init__(self) -> None:
+        self.files: list[tuple[Path, int, Any]] = []
+
+    def close(self) -> None:
+        for _, _, fh in self.files:
+            with contextlib.suppress(OSError):
+                fh.close()
+        self.files = []
+
+
 class CallLog:
     def __init__(self, directory: Path, *, clock=_utc_now, file_prefix: str = "calls"):
         self.dir = Path(directory)
@@ -535,25 +548,32 @@ class CallLog:
             return None
 
     # ----- reading
-    def _snapshot(self) -> list[tuple[Path, int]]:
-        """Each daily file and its size right now. Call it under the lock: the files only ever grow by whole lines, so the first `size` bytes of each are
-        exactly the log as of this moment, and can be read later without holding the lock."""
-        out: list[tuple[Path, int]] = []
+    def _snapshot(self) -> "Snapshot":
+        """Each daily file, held open, and its size right now. Call it under the lock: the files only ever grow by whole lines, so the first `size` bytes of
+        each are exactly the log as of this moment, and can be read later without the lock. The open handles matter: if a later append rotates the log and
+        retention unlinks an older file, the handle still reads it, so the page is never missing a file the snapshot advertised. Close it when done."""
+        snap = Snapshot()
         for path in self._files():
-            with contextlib.suppress(OSError):
-                out.append((path, path.stat().st_size))
-        return out
-
-    def entries_desc(self, snapshot: list[tuple[Path, int]] | None = None) -> Iterator[dict[str, Any]]:
-        """Entries newest first. With a snapshot, only the bytes that existed when it was taken (so a concurrent append is not seen)."""
-        files: list[tuple[Path, int | None]] = [(p, None) for p in reversed(self._files())] if snapshot is None else list(reversed(snapshot))
-        for path, size in files:
             try:
-                if size is None:
+                fh = open(path, "rb")
+            except OSError:
+                continue
+            snap.files.append((path, os.fstat(fh.fileno()).st_size, fh))
+        return snap
+
+    def entries_desc(self, snapshot: "Snapshot | None" = None) -> Iterator[dict[str, Any]]:
+        """Entries newest first. With a snapshot, only the bytes that existed when it was taken (so a concurrent append is not seen)."""
+        if snapshot is None:
+            sources: list[tuple[Path, int | None, Any]] = [(p, None, None) for p in reversed(self._files())]
+        else:
+            sources = [(p, size, fh) for p, size, fh in reversed(snapshot.files)]
+        for path, size, fh in sources:
+            try:
+                if fh is None:
                     lines = path.read_text(encoding="utf-8").splitlines()
                 else:
-                    with open(path, "rb") as fh:
-                        lines = fh.read(size).decode("utf-8", "replace").splitlines()
+                    fh.seek(0)
+                    lines = fh.read(size).decode("utf-8", "replace").splitlines()
             except OSError:
                 continue
             for line in reversed(lines):
@@ -577,11 +597,14 @@ class CallLog:
                 self._flush_reads_locked(self._flush_suppressed_locked(self._head()))
             head = self._head()                                 # read after the flush, in the same hold of the lock as the file sizes
             snapshot = self._snapshot()
-        page = self._query_unlocked(tool=tool, client=client, since=since, limit=limit, before_seq=before_seq, snapshot=snapshot)
+        try:
+            page = self._query_unlocked(tool=tool, client=client, since=since, limit=limit, before_seq=before_seq, snapshot=snapshot)
+        finally:
+            snapshot.close()
         return {**page, "head": head}
 
     def _query_unlocked(self, *, tool: str | None, client: str | None, since: str | None, limit: int, before_seq: int | None,
-                        snapshot: list[tuple[Path, int]] | None = None) -> dict[str, Any]:
+                        snapshot: "Snapshot | None" = None) -> dict[str, Any]:
         out: list[dict[str, Any]] = []
         more = False
         for e in (self.entries_desc() if snapshot is None else self.entries_desc(snapshot)):

@@ -876,6 +876,28 @@ def test_a_snapshot_page_ignores_what_was_appended_after_it(tmp_path):
         log.append(_fields(10 + i))
     assert [e["seq"] for e in log.entries_desc(snap)] == [3, 2, 1]
     assert [e["seq"] for e in log.entries_desc()][0] == 7
+    snap.close()
+
+
+def test_a_snapshot_still_reads_a_file_that_retention_deleted_after_it_was_taken(tmp_path, monkeypatch):
+    """The page must not be missing a file the snapshot advertised: an append that rotates the log can unlink an older file while a page is being read."""
+    monkeypatch.setenv("JARVIS_CALL_LOG_RETAIN_DAYS", "2")
+    day = [1]
+    log = call_log.CallLog(tmp_path / "ret-snap", clock=lambda: datetime(2026, 10, day[0], 12, tzinfo=timezone.utc))
+    log.append(_fields(0))
+    day[0] = 2
+    log.append(_fields(1))
+    day[0] = 8
+    log.append(_fields(2))
+    with log._locked():
+        snap = log._snapshot()
+    assert len(snap.files) == 3
+    day[0] = 9
+    log.append(_fields(3))                                                  # rotates, and retention unlinks the day-1 and day-2 files
+    assert [p.name for p in log._files()] == ["calls-20261008.jsonl", "calls-20261009.jsonl"]
+    assert [e["seq"] for e in log.entries_desc(snap)] == [3, 2, 1]          # the snapshot still has all of its files, in full (seq 3 is day 8)
+    snap.close()
+    assert snap.files == []
 
 
 def test_the_old_two_step_read_would_have_split_the_page_from_its_head(tmp_path, monkeypatch):
