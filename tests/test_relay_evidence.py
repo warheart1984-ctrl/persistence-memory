@@ -223,8 +223,8 @@ def test_a_full_run_writes_both_reports_and_never_contains_the_key(rel, tmp_path
 # --------------------------------------------------------------------------------------- the call-log section
 
 
-def call_entry(seq, client, digest="d" * 64, transport="mcp-stdio"):
-    return {"seq": seq, "ts": f"2026-10-10T22:0{seq}:00.000000Z", "transport": transport, "client_name": client, "client_version": "1.0", "outcome": "ok",
+def call_entry(seq, client, digest="d" * 64, transport="mcp-stdio", args_sha256=None):
+    return {"args_sha256": args_sha256 or hashlib.sha256(b"{}").hexdigest(), "seq": seq, "ts": f"2026-10-10T22:0{seq}:00.000000Z", "transport": transport, "client_name": client, "client_version": "1.0", "outcome": "ok",
             "result_digest": digest, "tenant": "operator", "tool": "emr_latest"}
 
 
@@ -370,6 +370,13 @@ def test_the_script_identifies_itself_to_the_servers_call_log(rel):
     client.tool("emr_latest", {})
     assert seen["X-Jarvis-MCP-Client"] == "relay-evidence/1" and seen["X-API-Key"] == KEY
 
+
+def test_the_report_says_whether_the_witnessed_call_used_no_arguments(rel):
+    with_args = call_entry(2, "devin-x", args_sha256=hashlib.sha256(b'{"limit":3}').hexdigest())
+    raw = {"calls_emr_latest": {"http_status": 200, "body": {"entries": [call_entry(3, "cursor-x"), with_args]}},
+           "calls_verify": {"http_status": 200, "body": {"ok": True, "head": {"seq": 3, "entry_hash": "h" * 64}, "files": ["f"], "entries": 3, "problems": []}}}
+    by = {a["agent"]: a for a in rel.call_log_section(raw, [{"agent": "Cursor"}, {"agent": "Devin"}])["per_agent"]}
+    assert by["Cursor"]["latest"]["no_arguments"] is True and by["Devin"]["latest"]["no_arguments"] is False
 
 def test_a_failed_unfiltered_read_is_never_reported_as_complete(rel):
     entries = [call_entry(2, "opencode-x"), call_entry(1, "cursor-x")]
