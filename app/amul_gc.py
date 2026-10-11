@@ -156,7 +156,7 @@ def classify_retention(
     hot: list[str] = []
     cold: list[str] = []
     for rec in records:
-        state = emr._REINFORCEMENT.get(rec.id)
+        state = emr.get_reinforcement(rec.id)
         salience = state.salience if state else 0.0
         last_activity = max(
             (t for t in (_parse_iso(state.last_reinforced_at if state else None),

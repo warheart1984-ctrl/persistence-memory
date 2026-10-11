@@ -252,7 +252,7 @@ VOLATILE = {"tenant", "result_digest", "ledger_head", "head", "ts", "created_at"
 CASE_VOLATILE = {"amul-status": {"path"}}                 # the AMUL field's own directory, which holds the tenant's hash and so differs between any two tenants
 # Cases that currently DO leak across tenants. They are excluded from the generic comparison and pinned by a strict xfail below, so the day they are fixed
 # the xfail flips and the case is promoted back into the generic test.
-KNOWN_LEAKS = {"emr-status"}
+KNOWN_LEAKS: set[str] = set()
 GENERATED = {"id", "content_sha256", "version"}   # a write that succeeds returns an id, a hash and a clock of its own: expected to differ between two calls
 
 
@@ -636,17 +636,18 @@ def test_every_tenant_data_route_is_exercised_by_a_cross_tenant_case():
     assert not stray, f"cases that hit routes the registry does not know: {stray}"
 
 
-@pytest.mark.xfail(strict=True, reason="REAL LEAK: EMR reinforcement state is a process-global map keyed by memory id only (app/emr.py _REINFORCEMENT, one shared sidecar file), "
-                                       "and GET /api/jarvis/memory/emr/status reports every tenant's entries, including memory ids and outcome ids")
 def test_emr_status_does_not_show_another_tenants_reinforcement(client, world):
+    """(Was a strict xfail: the reinforcement overlay was one process-global map keyed by memory id.) Bob must see none of alice's entries, and exactly what a
+    brand-new tenant sees."""
     r = client.get("/api/jarvis/memory/emr/status", headers=h("bob"))
     assert r.status_code == 200
     assert MARK not in r.text and world["first"] not in r.text, "bob can read alice's reinforcement state"
     empty = client.get("/api/jarvis/memory/emr/status", headers=h("carol-who-never-wrote"))
     assert _body(r) == _body(empty)
+    own = client.get("/api/jarvis/memory/emr/status", headers=h("alice")).json()["dynamics"]
+    assert own["reinforced_particles"] == 1 and own["top"][0]["memory_id"] == world["first"]      # alice does see her own (so the check is not vacuous)
 
 
-@pytest.mark.xfail(strict=True, reason="GAP: the EMR status shows the server's filesystem path of the dynamics sidecar (dynamics.sidecar.path = data/emr-dynamics.json) to any tenant")
 def test_a_tenant_is_not_told_the_emr_sidecar_path(client):
     r = client.get("/api/jarvis/memory/emr/status", headers=h("bob"))
     leaked = [v for v in _values_of(r.json(), "path") if isinstance(v, str) and v]
