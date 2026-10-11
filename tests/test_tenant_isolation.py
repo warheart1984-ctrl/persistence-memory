@@ -574,15 +574,31 @@ def mcp_call(client, who, name, arguments):
     return r
 
 
+def _tool_result(resp):
+    """The JSON-RPC result of an MCP tools/call, refusing anything that is not a tool result at all (a transport or validation error proves nothing)."""
+    assert resp.status_code == 200, f"{resp.status_code} {resp.text[:200]}"
+    body = resp.json()
+    assert "error" not in body and "result" in body, f"not a tool result: {resp.text[:200]}"
+    return body["result"]
+
+
 def test_mcp_tools_call_cannot_tell_alices_id_from_a_nonexistent_one(client, world):
     failures = []
     for tool in ("emr_fetch", "fetch"):
-        theirs = mcp_call(client, f"bob-one-{tool}", tool, {"id": world["first"]})
-        nobodys = mcp_call(client, f"bob-two-{tool}", tool, {"id": GHOST})
-        if theirs.status_code != nobodys.status_code or norm(theirs, world["first"]) != norm(nobodys, GHOST):
-            failures.append(f"{tool}: {theirs.text[:200]} | {nobodys.text[:200]}")
+        # positive control: through this very tool, alice CAN fetch her record, so a refusal for bob is about tenancy and not about a broken tool
+        own = _tool_result(mcp_call(client, "alice", tool, {"id": world["first"]}))
+        if own.get("isError") or MARK not in json.dumps(own) or world["first"] not in json.dumps(own):
+            failures.append(f"{tool}: alice could not fetch her own record through MCP: {json.dumps(own)[:200]}")
+        theirs_resp = mcp_call(client, f"bob-one-{tool}", tool, {"id": world["first"]})
+        nobodys_resp = mcp_call(client, f"bob-two-{tool}", tool, {"id": GHOST})
+        theirs, nobodys = _tool_result(theirs_resp), _tool_result(nobodys_resp)
+        for who, res in (("alice's id", theirs), ("a nonexistent id", nobodys)):
+            if res.get("isError") is not True or "Memory not found" not in json.dumps(res):
+                failures.append(f"{tool}: bob's call with {who} was not the expected not-found result: {json.dumps(res)[:200]}")
+        if norm(theirs_resp, world["first"]) != norm(nobodys_resp, GHOST):
+            failures.append(f"{tool}: {theirs_resp.text[:200]} | {nobodys_resp.text[:200]}")
         try:
-            assert_nothing_of_alices(theirs, world, asked=(world["first"],))
+            assert_nothing_of_alices(theirs_resp, world, asked=(world["first"],))
         except AssertionError as exc:
             failures.append(f"{tool}: {exc}")
     assert not failures, "\n".join(failures)
