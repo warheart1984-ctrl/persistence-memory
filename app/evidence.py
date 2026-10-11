@@ -338,7 +338,7 @@ def require_operator_write() -> None:
     """Evidence Objects are created with the operator key only: never through an OAuth user token."""
     from app import auth
 
-    if auth.oauth_enabled():
+    if not auth.caller_is_operator():
         raise HTTPException(status_code=403, detail="Evidence Objects can be created with the operator key only")
     auth.require_memory_write()
 

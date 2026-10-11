@@ -29,10 +29,10 @@ from app.models import (
     SelectionProvenance,
     migrate_legacy_record,
 )
-from app.identity import current_tenant_key
+from app.identity import OPERATOR_TENANT, current_tenant_key, is_operator, multi_tenant_mode
 from app.ts import parse_utc
 from app.ledger_search import record_tokens as search_tokens
-from app.store_errors import StoreUnavailableError, StoreVersionConflict
+from app.store_errors import StoreUnavailableError, StoreVersionConflict, TenantUnresolvedError
 from app import clause_v
 from app import evidence as evidence_objects
 
@@ -663,9 +663,12 @@ def get_store(path: str | None = None) -> JarvisStore:
     """
     requested = path or os.getenv("JARVIS_STORE_PATH", "data/jarvis-store.json")
     tenant = current_tenant_key()
+    if tenant is None and multi_tenant_mode() and not is_operator():
+        # strict identity: no principal means no store, never the operator's. (The operator, authenticated as one, has no hashed tenant and keeps its namespace.)
+        raise TenantUnresolvedError("no tenant could be resolved for this request")
     database_url = (os.getenv("JARVIS_DATABASE_URL") or "").strip()
     if database_url:
-        database_tenant = tenant or "operator"
+        database_tenant = tenant or OPERATOR_TENANT
         mode = (os.getenv("JARVIS_PG_STORE") or "rows").strip().lower()
         if mode == "rows":
             schema = (os.getenv("JARVIS_DATABASE_SCHEMA") or "").strip() or None

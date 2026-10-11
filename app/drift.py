@@ -734,7 +734,7 @@ def log_entry(result: dict[str, Any], request: dict[str, Any], *, tenant: str | 
             "record": (c["findings"][0].get("record") if c["findings"] else None), "field": (c["findings"][0].get("field") if c["findings"] else None)}
            for c in result["claims"] if c["status"] != SUPPORTED]
     return {"transport": "http-api", "client_name": call_log.clean_client(name), "client_version": call_log.clean_client(version, 64), "client_self_reported": True,
-            "tenant": tenant or "operator", "tool": "emr_drift_check", "route": "/api/jarvis/drift/check", "method": "POST", "target": None,
+            "tenant": tenant or call_log.default_tenant_label(), "tool": "emr_drift_check", "route": "/api/jarvis/drift/check", "method": "POST", "target": None,
             "args_sha256": sha256_hex(request["summary"] or ""), "summary_chars": len(request["summary"] or ""), "records": request["records"],
             "outcome": "ok", "error_code": None, "status_code": 200, "result_digest": result["check_digest"], "duration_ms": result["duration_ms"],
             "verdict": result["verdict"], "counts": result["counts"], "findings": bad[:50], "call_log_seqs": [m["seq"] for m in matches.get("matches", [])]}

@@ -274,7 +274,7 @@ def test_no_or_wrong_credentials_get_authority_denied(client, headers):
 
 def test_an_unresolved_tenant_is_refused_never_served_unscoped(client):
     add(client)
-    with patch("app.main.oauth_enabled", return_value=True), patch("app.main.current_tenant_key", return_value=None):
+    with patch("app.main.request_tenant", return_value=None):   # no identity resolved: refused, never served from an unscoped store
         r = client.get(URL, headers=HDR)
     assert r.status_code == 403
     assert r.json()["code"] == "denied" and r.json()["reason"] == "TENANT_UNRESOLVED"
