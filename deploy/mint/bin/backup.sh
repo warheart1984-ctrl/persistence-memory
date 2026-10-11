@@ -121,6 +121,10 @@ if [ -d "$cl_dir/call-log" ]; then
   else
     log INFO "call log head anchored: $cl_line"
   fi
+elif [ -n "$prev_anchors" ] && grep -q '^calllog|' "$prev_anchors"; then
+  # the previous set anchored a call log and this archive has none: deleting the directory must not skip the check
+  log ERROR "call log: the archive has no call-log directory, but the previous set anchored one"
+  notify "Jarvis ledger: CALL LOG DOES NOT MATCH ITS ANCHOR" "the appdata archive has no call-log directory, but the previous set anchored a head" critical
 fi
 rm -rf "$cl_dir"
 

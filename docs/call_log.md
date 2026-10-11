@@ -83,7 +83,7 @@ off on live), which is why its writes are in scope.
   `verify` returns the head hash, so record it somewhere else (the relay evidence report does, and it goes into a ledger record when one is
   written); and **every hourly backup set anchors the head** (`calllog|<seq>|<entry_hash>` in its `.anchors`, kept in the offsite copies too).
   A later log must still contain the head every earlier set recorded, which `backup`, `restore` and `drill` check, so a truncation or a
-  rebuild between backups is caught at the next one. What it cannot catch: a change made and then hidden before the next backup anchors it
+  rebuild between backups is caught at the next one. `anchor.json` (the retention anchor) is in the same writable directory, so it only excuses anchors from sets older than the retention window (`JARVIS_CALL_LOG_RETAIN_DAYS` + 2 days), never a recent one. What it cannot catch: a change made and then hidden before the next backup anchors it
   (the window is one backup interval), and anyone who can also rewrite every earlier backup set and the offsite copies.
 * The log proves the **server** received a call. It cannot prove which agent or person was behind a client string.
 * The denied-flood cap is per process.

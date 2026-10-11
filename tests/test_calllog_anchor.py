@@ -12,7 +12,7 @@ import subprocess
 import sys
 import tarfile
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from app import call_log
@@ -167,17 +167,61 @@ def test_every_earlier_set_is_checked_not_only_the_newest(tmp_path):
     assert r.returncode == 1 and "a1.anchors" in r.stderr and "a2.anchors" in r.stderr     # both anchored heads no longer match
 
 
-def test_an_anchored_head_older_than_the_retention_window_is_not_a_false_alarm(tmp_path, monkeypatch):
+def set_named(tmp_path: Path, days_ago: float, line: str) -> Path:
+    """An anchors file named like a real backup set, taken `days_ago` days ago."""
+    taken = datetime.now(timezone.utc) - timedelta(days=days_ago)
+    return anchors_file(tmp_path, f"jarvis-{taken.strftime('%Y%m%dT%H%M%SZ')}.anchors", line)
+
+
+def retained_log(tmp_path: Path, monkeypatch) -> tuple[Path, str]:
     monkeypatch.setenv("JARVIS_CALL_LOG_RETAIN_DAYS", "2")
     d = tmp_path / "log"
     day = [1]
     log = call_log.CallLog(d, clock=lambda: datetime(2026, 10, day[0], 12, tzinfo=timezone.utc))
     log.append(fields(0))
-    old = anchors_file(tmp_path, "old.anchors", head_line(d))             # head at seq 1 on day 1
+    first = head_line(d)                                              # head at seq 1 on day 1
     for day[0] in range(2, 8):
         log.append(fields(day[0]))
     assert len(list(d.glob("calls-*.jsonl"))) <= 3 and (d / "anchor.json").exists()
+    return d, first
+
+
+def test_an_anchor_older_than_the_retention_window_is_not_a_false_alarm(tmp_path, monkeypatch):
+    d, first = retained_log(tmp_path, monkeypatch)
+    old = set_named(tmp_path, 30, first)                              # taken long before the (2 day) window: its entry was pruned on purpose
     assert run("head", d).returncode == 0 and run("check", d, old).returncode == 0
+
+
+def test_a_recent_anchor_is_never_excused_by_the_retention_anchor(tmp_path, monkeypatch):
+    """anchor.json is in the directory an attacker can write: a forged high one must not waive genuine external anchors."""
+    d = tmp_path / "log"
+    make_log(d, 6)
+    genuine = set_named(tmp_path, 0.01, head_line(d))
+    rebuild(d, 9, salt="zz")                                            # a different history with a valid chain...
+    first = next(iter(sorted(d.glob("calls-*.jsonl"))))
+    entries = [json.loads(x) for x in first.read_text().splitlines()]
+    # ...started after an invented high retention anchor, so every genuine anchor has seq <= anchor.seq
+    first.write_text("")
+    (d / "anchor.json").write_text(json.dumps({"seq": 500, "entry_hash": "f" * 64}))
+    prev = "f" * 64
+    out = []
+    for i, e in enumerate(entries):
+        e = {**e, "seq": 501 + i, "prev_hash": prev}
+        e["entry_hash"] = call_log.entry_hash_of(e)
+        prev = e["entry_hash"]
+        out.append(json.dumps(e, sort_keys=True, separators=(",", ":")))
+    first.write_text("\n".join(out) + "\n")
+    assert run("head", d).returncode == 0                               # the forged log verifies on its own
+    r = run("check", d, genuine)
+    assert r.returncode == 1 and "missing" in r.stderr
+
+
+def test_a_forged_retention_anchor_does_not_excuse_old_anchors_with_the_wrong_hash(tmp_path, monkeypatch):
+    d, first = retained_log(tmp_path, monkeypatch)
+    seq = json.loads((d / "anchor.json").read_text())["seq"]
+    wrong = set_named(tmp_path, 30, f"calllog|{seq}|{'e' * 64}")       # old enough to be excused, but names the retention seq with another hash
+    r = run("check", d, wrong)
+    assert r.returncode == 1 and "retention anchor" in r.stderr
 
 
 def test_a_set_with_no_call_log_line_is_not_checked(tmp_path):
@@ -322,3 +366,12 @@ def test_backup_publishes_a_clean_set_after_a_clean_set(tmp_path):
         log.append(fields(i))
     r, anchors = run_backup_step(tmp_path, make_tar(d, tmp_path / "t.tar"), prev)
     assert "NOTIFY" not in r.stdout and "call log head anchored: calllog|7|" in r.stdout and "calllog|7|" in anchors.read_text()
+
+
+def test_backup_raises_the_alarm_when_the_directory_vanished_after_an_earlier_anchor(tmp_path):
+    d = tmp_path / "log"
+    make_log(d, 3)
+    prev = anchors_file(tmp_path, "prev.anchors", head_line(d))
+    r, anchors = run_backup_step(tmp_path, make_tar(None, tmp_path / "t.tar"), prev)
+    assert r.returncode == 0 and "DONE" in r.stdout and "NOTIFY Jarvis ledger: CALL LOG DOES NOT MATCH ITS ANCHOR" in r.stdout
+    assert "calllog" not in anchors.read_text()
