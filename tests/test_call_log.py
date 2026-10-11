@@ -290,6 +290,41 @@ def test_a_stdio_rest_write_closes_the_read_summary_but_a_stdio_tool_call_does_n
     assert got == [("ok", "GET /api/jarvis/memory"), ("ok", "emr_latest"), ("read_suppressed", "(read calls)"), ("ok", "POST /api/jarvis/memory")]
 
 
+def test_a_read_only_post_endpoint_does_not_close_the_read_summary(fixed_minute, tmp_path, monkeypatch):
+    """graph/bfs, rag/query and the like are POST but only read: alternating them with reads must not write a summary per read."""
+    monkeypatch.setenv("JARVIS_CALL_LOG_READ_CAP_PER_MIN", "1")
+    log = call_log.CallLog(tmp_path / "ro")
+    for i in range(8):
+        log.record(call_log.make_fields(transport="http-api", tool="GET /api/jarvis/memory", args={"i": i}, outcome="ok", started=time.perf_counter(), route="/api/jarvis/memory", method="GET"))
+        log.record(_stdio("POST /api/jarvis/memory/graph/bfs", "POST", "/api/jarvis/memory/graph/bfs"))
+        log.record(_stdio("POST /api/jarvis/rag/query", "POST", "/api/jarvis/rag/query"))
+    assert [e["outcome"] for e in log.entries_desc()].count("read_suppressed") == 0       # nothing closed the summary yet
+    log.record(_stdio("DELETE /api/jarvis/memory/{id}", "DELETE", "/api/jarvis/memory/{id}"))
+    got = [e for e in log.entries_desc() if e["outcome"] == "read_suppressed"]
+    assert len(got) == 1 and got[0]["count"] == 7
+
+
+def test_the_query_result_says_when_the_log_is_degraded_by_a_failed_summary_flush(fixed_minute, tmp_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_CALL_LOG_READ_CAP_PER_MIN", "1")
+    log = call_log.CallLog(tmp_path / "qd")
+    for i in range(3):
+        log.record(_read_fields(i))
+    assert log.query(limit=10)["degraded"] is None                               # the first query flushes the summary: healthy
+    for i in range(3):
+        log.record(_read_fields(i))
+    real = call_log.CallLog._append_locked
+    monkeypatch.setattr(call_log.CallLog, "_append_locked", lambda self, *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+    page = log.query(limit=10)
+    assert page["degraded"] and "summaries" in page["degraded"]["last_error"]
+    monkeypatch.setattr(call_log.CallLog, "_append_locked", real)
+
+
+def test_the_calls_endpoint_passes_the_degraded_state_through(jclient):
+    add(jclient)
+    body = jclient.get("/api/jarvis/tools/calls?limit=10", headers=HDR).json()
+    assert "degraded" in body and body["degraded"] is None
+
+
 def test_the_read_cap_does_not_throttle_tool_calls_or_writes(jclient, monkeypatch):
     monkeypatch.setenv("JARVIS_CALL_LOG_READ_CAP_PER_MIN", "1")
     for _ in range(4):

@@ -117,11 +117,11 @@ def denied_cap_per_minute() -> int:
 
 
 def _is_rest_write(fields: dict[str, Any]) -> bool:
-    """A state-changing REST call (POST/PATCH/PUT/DELETE on an API route), whatever transport carried it: a stdio adapter sends its REST writes with
-    the stdio label, and they are as much an ordering boundary as a plain HTTP one. A tool route (/api/jarvis/tools/*, POST by convention) is not."""
-    if fields.get("method") in (None, "GET", "HEAD", "OPTIONS"):
-        return False
-    return not str(fields.get("route") or "").startswith("/api/jarvis/tools/")
+    """A ledger write over REST (POST /memory, PATCH/PUT/DELETE /memory/{id}), whatever transport carried it: a stdio adapter sends it with the
+    stdio label, and it is as much an ordering boundary as a plain HTTP one. It is matched by route, not by method alone: many POST endpoints
+    (graph/bfs, rag/query, the tool routes) only read, and treating them as writes would let mixed traffic write a summary per read."""
+    route, method = fields.get("route"), fields.get("method")
+    return (route == "/api/jarvis/memory" and method == "POST") or (route == "/api/jarvis/memory/{id}" and method in ("PATCH", "PUT", "DELETE"))
 
 
 def read_cap_per_minute() -> int:
@@ -558,7 +558,7 @@ class CallLog:
                 more = True
                 break
             out.append(e)
-        return {"entries": out, "next_cursor": str(out[-1]["seq"]) if (more and out) else None}
+        return {"entries": out, "next_cursor": str(out[-1]["seq"]) if (more and out) else None, "degraded": self.degraded()}
 
     def verify(self) -> dict[str, Any]:
         """Walk the chain across files: seq contiguous, prev_hash links, entry_hash recomputes.  Never raises."""
