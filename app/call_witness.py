@@ -19,6 +19,7 @@ has the answer can already find its call in the log.
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from collections import OrderedDict
@@ -33,6 +34,14 @@ MEMORY_PREFIX = "/api/jarvis/memory"
 OWN_PREFIXES = ("/api/jarvis/tools/calls",)  # the log's own endpoints are not tool calls
 READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 MAX_RESPONSE_BUFFER = 2 * 1024 * 1024
+
+
+def max_body_bytes() -> int:
+    """The largest request body the witness will buffer (JARVIS_CALL_LOG_MAX_BODY_BYTES, default 4 MiB); a larger one is refused with 413."""
+    try:
+        return max(1024, int((os.environ.get("JARVIS_CALL_LOG_MAX_BODY_BYTES") or "").strip() or 4 * 1024 * 1024))
+    except ValueError:
+        return 4 * 1024 * 1024
 _ID_SEGMENTS = (
     (re.compile(r"^mem-[0-9a-f]+$"), "{id}"),
     (re.compile(r"^eo:sha256:[0-9a-f]+$"), "{eo}"),
@@ -176,26 +185,49 @@ class CallWitnessMiddleware:
         log = call_log.get_call_log()
         started = time.perf_counter()
 
-        chunks: list[bytes] = []
-        while True:
-            message = await receive()
-            if message["type"] == "http.request":
-                chunks.append(message.get("body", b""))
-                if not message.get("more_body"):
-                    break
-            else:  # disconnect before the body arrived: nothing to serve
-                return
-        body_bytes = b"".join(chunks)
-        replayed = False
-
-        async def replay():
-            nonlocal replayed
-            if not replayed:
-                replayed = True
-                return {"type": "http.request", "body": body_bytes, "more_body": False}
-            return await receive()
-
         headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers", [])}
+        if method in READ_METHODS:
+            # A read has no body worth witnessing: do not buffer one (nothing a client sends here may grow this process), pass the request through as it came.
+            body_bytes = b""
+            replay = receive
+        else:
+            limit = max_body_bytes()
+            declared = headers.get("content-length", "")
+            too_large = declared.isdigit() and int(declared) > limit
+            chunks: list[bytes] = []
+            received = 0
+            while not too_large:
+                message = await receive()
+                if message["type"] == "http.request":
+                    chunk = message.get("body", b"")
+                    received += len(chunk)
+                    if received > limit:
+                        too_large = True
+                        break
+                    chunks.append(chunk)
+                    if not message.get("more_body"):
+                        break
+                else:  # disconnect before the body arrived: nothing to serve
+                    return
+            if too_large:  # refused before it is buffered (or read further): nothing ran, and the refusal is witnessed
+                log.record(call_log.make_fields(transport="http-tool" if plan["kind"] == "tool" else "http-api", tool=plan["tool"], args={}, outcome="error", started=started,
+                                                client_header=headers.get("x-jarvis-mcp-client") or headers.get("user-agent"), tenant=scope.get("jarvis_tenant"),
+                                                error_code="REQUEST_TOO_LARGE", status_code=413, route=plan["route"], method=method, target=plan["target"]))
+                payload = json.dumps(error_body(413, f"the request body is larger than {limit} bytes", code="payload_too_large", reason="REQUEST_TOO_LARGE")).encode()
+                await send({"type": "http.response.start", "status": 413, "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(payload)).encode()),
+                                                                                     (b"connection", b"close")]})
+                await send({"type": "http.response.body", "body": payload})
+                return
+            body_bytes = b"".join(chunks)
+            replayed = False
+
+            async def replay():
+                nonlocal replayed
+                if not replayed:
+                    replayed = True
+                    return {"type": "http.request", "body": body_bytes, "more_body": False}
+                return await receive()
+
         if plan["write"]:
             try:
                 log.preflight()

@@ -84,6 +84,7 @@ off on live), which is why its writes are in scope.
 | `JARVIS_CALL_LOG_DIR` | `<dir of JARVIS_STORE_PATH>/call-log` | |
 | `JARVIS_CALL_LOG_RETAIN_DAYS` | `90` | |
 | `JARVIS_CALL_LOG_DENIED_CAP_PER_MIN` | `60` | |
+| `JARVIS_CALL_LOG_MAX_BODY_BYTES` | `4194304` | the largest request body the witness will buffer; a larger one is refused with 413 (and the refusal is logged). GET/HEAD/OPTIONS bodies are never buffered |
 | `JARVIS_CALL_LOG_READS` | on whenever the call log is on | `0` stops witnessing memory GET reads |
 | `JARVIS_CALL_LOG_READ_CAP_PER_MIN` | `600` | reads beyond this a minute are summarised in one `read_suppressed` entry |
 

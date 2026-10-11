@@ -905,6 +905,62 @@ def test_failed_reads_are_never_swallowed_by_the_read_cap(fixed_minute, jclient,
     assert [e["count"] for e in got if e["outcome"] == "read_suppressed"] == [3]
 
 
+def _drive(app_calls, method, path, chunks, headers=()):
+    """Run the real witness middleware over a dummy app and a scripted body; returns (status, receive calls the middleware made, app saw the body)."""
+    import asyncio
+    from app.call_witness import CallWitnessMiddleware
+
+    received = []
+    sent = []
+
+    async def receive():
+        received.append(1)
+        if not chunks:
+            return {"type": "http.request", "body": b"", "more_body": False}
+        c = chunks.pop(0)
+        return {"type": "http.request", "body": c, "more_body": bool(chunks)}
+
+    async def send(m):
+        sent.append(m)
+
+    async def dummy(scope, rcv, snd):
+        app_calls.append(1)
+        await snd({"type": "http.response.start", "status": 200, "headers": []})
+        await snd({"type": "http.response.body", "body": b"{}"})
+
+    scope = {"type": "http", "method": method, "path": path, "query_string": b"", "headers": [(k.encode(), v.encode()) for k, v in headers]}
+    asyncio.run(CallWitnessMiddleware(dummy)(scope, receive, send))
+    return next(m["status"] for m in sent if m["type"] == "http.response.start"), len(received)
+
+
+def test_a_read_is_witnessed_without_its_body_ever_being_buffered(jclient):
+    app_calls = []
+    big = [b"x" * 65536 for _ in range(40)]                                  # 2.5 MiB of body on a GET
+    status, receives = _drive(app_calls, "GET", "/api/jarvis/memory", big)
+    assert status == 200 and app_calls == [1] and receives == 0              # the middleware never read it; the app got the request untouched
+    assert [e["tool"] for e in entries()] == ["GET /api/jarvis/memory"]
+
+
+def test_a_body_over_the_limit_is_refused_with_413_before_it_is_buffered_and_the_refusal_is_witnessed(jclient, monkeypatch):
+    monkeypatch.setenv("JARVIS_CALL_LOG_MAX_BODY_BYTES", "2048")
+    app_calls = []
+    status, receives = _drive(app_calls, "POST", "/api/jarvis/memory", [b"x" * 100], headers=[("content-length", "100000")])
+    assert status == 413 and app_calls == [] and receives == 0               # the declared length alone was enough: nothing was read
+    app_calls.clear()
+    chunks = [b"x" * 1000 for _ in range(1000)]                              # no declared length: read at most a little past the limit
+    status, receives = _drive(app_calls, "POST", "/api/jarvis/memory", chunks)
+    assert status == 413 and app_calls == [] and receives <= 4
+    got = entries()
+    assert [(e["outcome"], e["status_code"], e["error_code"]) for e in got] == [("error", 413, "REQUEST_TOO_LARGE")] * 2
+
+
+def test_a_body_under_the_limit_is_still_replayed_to_the_app(jclient, monkeypatch):
+    monkeypatch.setenv("JARVIS_CALL_LOG_MAX_BODY_BYTES", "2048")
+    rec = add(jclient, "a record well under the limit")
+    assert rec["content"] == "a record well under the limit"
+    assert [e["tool"] for e in entries()] == ["POST /api/jarvis/memory"] and entries()[0]["outcome"] == "ok"
+
+
 def test_a_route_with_no_path_parameter_hashes_exactly_as_before(jclient):
     add(jclient)
     before = len(entries())
