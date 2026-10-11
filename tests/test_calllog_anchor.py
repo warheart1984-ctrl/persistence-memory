@@ -237,6 +237,28 @@ def test_old_anchors_are_not_excused_when_no_recent_anchor_could_be_compared(tmp
     assert r.returncode == 1 and "cannot be excused" in r.stderr
 
 
+def test_the_sets_own_anchor_is_never_the_trusted_match(tmp_path, monkeypatch):
+    """Restore and drill hand in the set's own anchor, made from the very log being checked: it must not unlock the old-anchor waiver."""
+    d = tmp_path / "log"
+    make_log(d, 6)
+    only_old = set_named(tmp_path, 200, head_line(d))
+    rebuild(d, 9, salt="own")
+    first = next(iter(sorted(d.glob("calls-*.jsonl"))))
+    entries = [json.loads(x) for x in first.read_text().splitlines()]
+    (d / "anchor.json").write_text(json.dumps({"seq": 500, "entry_hash": "f" * 64}))
+    prev, out = "f" * 64, []
+    for i, e in enumerate(entries):
+        e = {**e, "seq": 501 + i, "prev_hash": prev}
+        e["entry_hash"] = call_log.entry_hash_of(e)
+        prev = e["entry_hash"]
+        out.append(json.dumps(e, sort_keys=True, separators=(",", ":")))
+    first.write_text("\n".join(out) + "\n")
+    own = set_named(tmp_path, 0.001, head_line(d))                      # taken from the forged log itself, so it matches it perfectly
+    assert run("check", d, "--own", own, only_old).returncode == 1       # the self-anchor does not count as trusted
+    r = gate(make_tar(d, tmp_path / "t.tar"), own, only_old)             # and through the real bash gate, as restore and drill call it
+    assert r.returncode == 1 and "cannot be excused" in r.stderr
+
+
 def test_old_anchors_are_excused_alongside_one_that_matched(tmp_path, monkeypatch):
     d, first = retained_log(tmp_path, monkeypatch)
     old = set_named(tmp_path, 30, first)
