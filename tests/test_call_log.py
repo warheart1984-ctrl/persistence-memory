@@ -905,8 +905,8 @@ def test_failed_reads_are_never_swallowed_by_the_read_cap(fixed_minute, jclient,
     assert [e["count"] for e in got if e["outcome"] == "read_suppressed"] == [3]
 
 
-def _drive(app_calls, method, path, chunks, headers=()):
-    """Run the real witness middleware over a dummy app and a scripted body; returns (status, receive calls the middleware made, app saw the body)."""
+def _drive(app_calls, method, path, chunks, headers=(), response=(b"{}",)):
+    """Run the real witness middleware over a dummy app and a scripted body; returns (status, receive calls the middleware made, response headers)."""
     import asyncio
     from app.call_witness import CallWitnessMiddleware
 
@@ -926,17 +926,19 @@ def _drive(app_calls, method, path, chunks, headers=()):
     async def dummy(scope, rcv, snd):
         app_calls.append(1)
         await snd({"type": "http.response.start", "status": 200, "headers": []})
-        await snd({"type": "http.response.body", "body": b"{}"})
+        for i, piece in enumerate(response):
+            await snd({"type": "http.response.body", "body": piece, "more_body": i < len(response) - 1})
 
     scope = {"type": "http", "method": method, "path": path, "query_string": b"", "headers": [(k.encode(), v.encode()) for k, v in headers]}
     asyncio.run(CallWitnessMiddleware(dummy)(scope, receive, send))
-    return next(m["status"] for m in sent if m["type"] == "http.response.start"), len(received)
+    start = next(m for m in sent if m["type"] == "http.response.start")
+    return start["status"], len(received), {k.decode(): v.decode() for k, v in start["headers"]}
 
 
 def test_a_read_is_witnessed_without_its_body_ever_being_buffered(jclient):
     app_calls = []
     big = [b"x" * 65536 for _ in range(40)]                                  # 2.5 MiB of body on a GET
-    status, receives = _drive(app_calls, "GET", "/api/jarvis/memory", big)
+    status, receives, _ = _drive(app_calls, "GET", "/api/jarvis/memory", big)
     assert status == 200 and app_calls == [1] and receives == 0              # the middleware never read it; the app got the request untouched
     assert [e["tool"] for e in entries()] == ["GET /api/jarvis/memory"]
 
@@ -944,14 +946,42 @@ def test_a_read_is_witnessed_without_its_body_ever_being_buffered(jclient):
 def test_a_body_over_the_limit_is_refused_with_413_before_it_is_buffered_and_the_refusal_is_witnessed(jclient, monkeypatch):
     monkeypatch.setenv("JARVIS_CALL_LOG_MAX_BODY_BYTES", "2048")
     app_calls = []
-    status, receives = _drive(app_calls, "POST", "/api/jarvis/memory", [b"x" * 100], headers=[("content-length", "100000")])
+    status, receives, _ = _drive(app_calls, "POST", "/api/jarvis/memory", [b"x" * 100], headers=[("content-length", "100000")])
     assert status == 413 and app_calls == [] and receives == 0               # the declared length alone was enough: nothing was read
     app_calls.clear()
     chunks = [b"x" * 1000 for _ in range(1000)]                              # no declared length: read at most a little past the limit
-    status, receives = _drive(app_calls, "POST", "/api/jarvis/memory", chunks)
+    status, receives, _ = _drive(app_calls, "POST", "/api/jarvis/memory", chunks)
     assert status == 413 and app_calls == [] and receives <= 4
     got = entries()
     assert [(e["outcome"], e["status_code"], e["error_code"]) for e in got] == [("error", 413, "REQUEST_TOO_LARGE")] * 2
+
+
+def test_a_413_carries_the_call_seq_and_the_stdio_transport(jclient, monkeypatch):
+    monkeypatch.setenv("JARVIS_CALL_LOG_MAX_BODY_BYTES", "2048")
+    status, _, hdrs = _drive([], "POST", "/api/jarvis/memory", [b"x"], headers=[("content-length", "99999"), ("x-jarvis-mcp-transport", "stdio"), ("x-jarvis-mcp-client", "grok/1")])
+    (e,) = entries()
+    assert status == 413 and hdrs["x-jarvis-call-seq"] == str(e["seq"]) and e["transport"] == "mcp-stdio" and e["client_name"] == "grok"
+
+
+def test_a_413_says_so_when_the_log_could_not_record_it(jclient, monkeypatch):
+    monkeypatch.setenv("JARVIS_CALL_LOG_MAX_BODY_BYTES", "2048")
+    monkeypatch.setattr(call_log.CallLog, "_append_locked", lambda self, *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+    status, _, hdrs = _drive([], "DELETE", "/api/jarvis/memory/mem-000000000000", [b"x"], headers=[("content-length", "99999")])
+    assert status == 413 and hdrs.get("x-jarvis-call-log") == "degraded" and "x-jarvis-call-seq" not in hdrs
+
+
+def test_a_response_too_big_to_buffer_is_witnessed_before_its_headers_are_released(jclient):
+    big = [b"y" * (1024 * 1024) for _ in range(3)]                           # 3 MiB, past the 2 MiB buffer
+    status, _, hdrs = _drive([], "GET", "/api/jarvis/memory", [], response=big)
+    (e,) = entries()
+    assert status == 200 and hdrs["x-jarvis-call-seq"] == str(e["seq"]) and e["outcome"] == "ok" and e["result_digest"] is None
+
+
+def test_a_big_response_whose_witness_failed_says_degraded_in_its_headers(jclient, monkeypatch):
+    monkeypatch.setattr(call_log.CallLog, "_append_locked", lambda self, *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+    big = [b"y" * (1024 * 1024) for _ in range(3)]
+    status, _, hdrs = _drive([], "GET", "/api/jarvis/memory", [], response=big)
+    assert status == 200 and hdrs.get("x-jarvis-call-log") == "degraded"
 
 
 def test_a_body_under_the_limit_is_still_replayed_to_the_app(jclient, monkeypatch):

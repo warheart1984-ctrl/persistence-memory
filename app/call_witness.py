@@ -153,6 +153,20 @@ def _query_dict(query_string: bytes) -> dict[str, Any] | None:
     return out
 
 
+def _transport(plan: dict[str, Any], headers: dict[str, str]) -> str:
+    """mcp-stdio when a stdio adapter says so, else http-tool / http-api: the same label on every path (completion, refusal, error, overflow)."""
+    if headers.get("x-jarvis-mcp-transport", "").strip().lower() == "stdio":
+        return "mcp-stdio"
+    return "http-tool" if plan["kind"] == "tool" else "http-api"
+
+
+def _witness_headers(entry: dict[str, Any] | None) -> list[tuple[bytes, bytes]]:
+    """The response header that tells the caller where its call is in the log, or that the log could not record it."""
+    if entry and "seq" in entry:
+        return [(b"x-jarvis-call-seq", str(entry["seq"]).encode())]
+    return [(b"x-jarvis-call-log", b"degraded")] if entry is None else []
+
+
 def witness_args(plan: dict[str, Any], body_bytes: bytes, query_string: bytes) -> Any:
     """What the argument hash is taken over: the body and query, plus the path parameters (hashed, never stored) so that a read of one record
     or artifact is not indistinguishable from a read of another. A route with no path parameter hashes exactly as before."""
@@ -210,12 +224,12 @@ class CallWitnessMiddleware:
                 else:  # disconnect before the body arrived: nothing to serve
                     return
             if too_large:  # refused before it is buffered (or read further): nothing ran, and the refusal is witnessed
-                log.record(call_log.make_fields(transport="http-tool" if plan["kind"] == "tool" else "http-api", tool=plan["tool"], args={}, outcome="error", started=started,
-                                                client_header=headers.get("x-jarvis-mcp-client") or headers.get("user-agent"), tenant=scope.get("jarvis_tenant"),
-                                                error_code="REQUEST_TOO_LARGE", status_code=413, route=plan["route"], method=method, target=plan["target"]))
+                entry = log.record(call_log.make_fields(transport=_transport(plan, headers), tool=plan["tool"], args={}, outcome="error", started=started,
+                                                        client_header=headers.get("x-jarvis-mcp-client") or headers.get("user-agent"), tenant=scope.get("jarvis_tenant"),
+                                                        error_code="REQUEST_TOO_LARGE", status_code=413, route=plan["route"], method=method, target=plan["target"]))
                 payload = json.dumps(error_body(413, f"the request body is larger than {limit} bytes", code="payload_too_large", reason="REQUEST_TOO_LARGE")).encode()
                 await send({"type": "http.response.start", "status": 413, "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(payload)).encode()),
-                                                                                     (b"connection", b"close")]})
+                                                                                     (b"connection", b"close"), *_witness_headers(entry)]})
                 await send({"type": "http.response.body", "body": payload})
                 return
             body_bytes = b"".join(chunks)
@@ -243,10 +257,11 @@ class CallWitnessMiddleware:
         buffered = 0
         status = 500
         overflow = False
+        logged = False
         resp_body = bytearray()
 
         async def capture(message):
-            nonlocal buffered, status, overflow
+            nonlocal buffered, status, overflow, logged
             if message["type"] == "http.response.start":
                 status = message["status"]
                 held.append(message)
@@ -259,16 +274,21 @@ class CallWitnessMiddleware:
                 chunk = message.get("body", b"")
                 buffered += len(chunk)
                 resp_body.extend(chunk)
-                if buffered > MAX_RESPONSE_BUFFER:  # too big to hold: stream it, log without a digest
+                if buffered > MAX_RESPONSE_BUFFER:  # too big to hold: stream it, logged without a digest, but still BEFORE its headers are released
                     overflow = True
+                    entry = log.record(call_log.make_fields(
+                        transport=_transport(plan, headers), tool=plan["tool"], args=witness_args(plan, body_bytes, scope.get("query_string", b"")),
+                        outcome=_outcome(status), started=started, client_header=headers.get("x-jarvis-mcp-client") or headers.get("user-agent"),
+                        tenant=scope.get("jarvis_tenant"), error_code=_code(status, None), status_code=status, route=plan["route"], method=method, target=plan["target"]))
+                    logged = True
                     for m in held:
+                        if m["type"] == "http.response.start":
+                            m = {**m, "headers": [*m.get("headers", []), *_witness_headers(entry)]}
                         await send(m)
                     held.clear()
                     return
                 if not message.get("more_body"):
                     await finish()
-
-        sent_seq: list[int] = []
 
         async def finish():
             digest = None
@@ -281,41 +301,31 @@ class CallWitnessMiddleware:
                 if isinstance(parsed, dict):
                     digest = parsed.get("result_digest")
             client_header = headers.get("x-jarvis-mcp-client") or headers.get("user-agent")
-            transport = "mcp-stdio" if headers.get("x-jarvis-mcp-transport", "").strip().lower() == "stdio" else ("http-tool" if plan["kind"] == "tool" else "http-api")
+            transport = _transport(plan, headers)
             fields = call_log.make_fields(
                 transport=transport, tool=plan["tool"], args=witness_args(plan, body_bytes, scope.get("query_string", b"")), outcome=_outcome(status),
                 started=started, client_header=client_header, tenant=scope.get("jarvis_tenant"), error_code=_code(status, parsed), status_code=status,
                 result_digest=digest, route=plan["route"], method=method, target=plan["target"],
             )
+            nonlocal logged
             entry = log.record(fields)
-            if entry and "seq" in entry:
-                sent_seq.append(entry["seq"])
+            logged = True
             for m in held:
                 if m["type"] == "http.response.start":
-                    hdrs = list(m.get("headers", []))
-                    if sent_seq:
-                        hdrs.append((b"x-jarvis-call-seq", str(sent_seq[0]).encode()))
-                    elif entry is None:
-                        hdrs.append((b"x-jarvis-call-log", b"degraded"))
-                    m = {**m, "headers": hdrs}
+                    m = {**m, "headers": [*m.get("headers", []), *_witness_headers(entry)]}
                 await send(m)
             held.clear()
 
         try:
             await self.app(scope, replay, capture)
         except Exception:
-            log.record(call_log.make_fields(transport="http-tool" if plan["kind"] == "tool" else "http-api", tool=plan["tool"], args=witness_args(plan, body_bytes, scope.get("query_string", b"")),
-                                            outcome="error", started=started, client_header=headers.get("x-jarvis-mcp-client") or headers.get("user-agent"),
-                                            tenant=scope.get("jarvis_tenant"), error_code="INTERNAL", status_code=500, route=plan["route"], method=method, target=plan["target"]))
+            if not logged:  # (an overflow or finished response was already witnessed)
+                log.record(call_log.make_fields(transport=_transport(plan, headers), tool=plan["tool"], args=witness_args(plan, body_bytes, scope.get("query_string", b"")),
+                                                outcome="error", started=started, client_header=headers.get("x-jarvis-mcp-client") or headers.get("user-agent"),
+                                                tenant=scope.get("jarvis_tenant"), error_code="INTERNAL", status_code=500, route=plan["route"], method=method, target=plan["target"]))
             raise
         if held:  # the app ended without a final body chunk
             await finish()
-        if overflow:
-            call_fields = call_log.make_fields(
-                transport="http-tool" if plan["kind"] == "tool" else "http-api", tool=plan["tool"], args=witness_args(plan, body_bytes, scope.get("query_string", b"")),
-                outcome=_outcome(status), started=started, client_header=headers.get("x-jarvis-mcp-client") or headers.get("user-agent"),
-                tenant=scope.get("jarvis_tenant"), error_code=_code(status, None), status_code=status, route=plan["route"], method=method, target=plan["target"])
-            log.record(call_fields)
 
 
 # ------------------------------------------------------------------------------------------------------------- MCP
