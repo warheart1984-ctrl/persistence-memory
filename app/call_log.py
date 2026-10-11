@@ -168,8 +168,10 @@ def split_client(header: str | None) -> tuple[str | None, str | None]:
 
 
 class CallLog:
-    def __init__(self, directory: Path, *, clock=_utc_now):
+    def __init__(self, directory: Path, *, clock=_utc_now, file_prefix: str = "calls"):
         self.dir = Path(directory)
+        self._prefix = file_prefix  # daily files are "<prefix>-YYYYMMDD.jsonl"; the default keeps the call log's names exactly as they were
+        self._file_re = re.compile(rf"^{re.escape(file_prefix)}-(\d{{8}})\.jsonl$")
         self._clock = clock
         self._tlock = threading.RLock()
         self._outage: dict[str, Any] | None = None  # unlogged/refused calls kept in memory, so a gap can be recorded even if the DEGRADED file cannot be written
@@ -179,20 +181,20 @@ class CallLog:
     # ----- paths
     @property
     def lock_path(self) -> Path:
-        return self.dir / ".lock"
+        return self.dir / (".lock" if self._prefix == "calls" else f".{self._prefix}.lock")
 
     @property
     def degraded_path(self) -> Path:
-        return self.dir / "DEGRADED"
+        return self.dir / ("DEGRADED" if self._prefix == "calls" else f"DEGRADED-{self._prefix}")
 
     @property
     def anchor_path(self) -> Path:
-        return self.dir / "anchor.json"
+        return self.dir / ("anchor.json" if self._prefix == "calls" else f"{self._prefix}-anchor.json")
 
     def _files(self) -> list[Path]:
         if not self.dir.is_dir():
             return []
-        return sorted((p for p in self.dir.iterdir() if FILE_RE.match(p.name)), key=lambda p: p.name)
+        return sorted((p for p in self.dir.iterdir() if self._file_re.match(p.name)), key=lambda p: p.name)
 
     def _open_private(self, path: Path, flags: int) -> int:
         return os.open(path, flags, 0o600)
@@ -326,7 +328,7 @@ class CallLog:
                 head = self._head()  # the log is readable and its tail parses
                 if not os.access(self.dir, os.W_OK):
                     raise CallLogError("the call-log directory is not writable")
-                today = self.dir / f"calls-{self._clock():%Y%m%d}.jsonl"
+                today = self.dir / f"{self._prefix}-{self._clock():%Y%m%d}.jsonl"
                 if today.exists() and not os.access(today, os.W_OK):
                     raise CallLogError("today's call-log file is not writable")
                 if shutil.disk_usage(self.dir).free < MIN_FREE_BYTES:
@@ -355,7 +357,7 @@ class CallLog:
         entry = {"seq": head["seq"] + 1, "ts": _ts(now), "prev_hash": head["entry_hash"], **fields}
         entry["entry_hash"] = entry_hash_of(entry)
         self._rotate_and_retain(now)
-        path = self.dir / f"calls-{now:%Y%m%d}.jsonl"
+        path = self.dir / f"{self._prefix}-{now:%Y%m%d}.jsonl"
         torn_prefix = b""
         with contextlib.suppress(OSError):
             if path.stat().st_size > 0:
@@ -373,7 +375,7 @@ class CallLog:
     def _rotate_and_retain(self, now: datetime) -> None:
         """Delete whole files older than the retention window; the last deleted entry's hash is kept as the chain's anchor."""
         cutoff = (now - timedelta(days=retain_days())).strftime("%Y%m%d")
-        old = [p for p in self._files() if FILE_RE.match(p.name).group(1) < cutoff]  # type: ignore[union-attr]
+        old = [p for p in self._files() if self._file_re.match(p.name).group(1) < cutoff]  # type: ignore[union-attr]
         files = self._files()
         if not old or len(old) >= len(files):
             return

@@ -101,7 +101,7 @@ from app.auth import (
     nx_allowed_roots,
 )
 from app.identity import current_tenant_key
-from app import call_log
+from app import call_log, drift
 from app.call_witness import CallWitnessMiddleware
 from app.oauth import protected_resource_metadata
 from app.public_security import cors_origins, public_security_middleware
@@ -260,6 +260,7 @@ def index():
                 "emr_recall": "POST /api/jarvis/tools/emr_recall",
                 "emr_latest": "POST /api/jarvis/tools/emr_latest",
                 "emr_search_ledger": "POST /api/jarvis/tools/emr_search_ledger",
+                "emr_drift_check": "POST /api/jarvis/tools/emr_drift_check (operator only)",
                 "search": "POST /api/jarvis/tools/search",
                 "fetch": "POST /api/jarvis/tools/fetch",
                 "emr_remember": "POST /api/jarvis/tools/emr_remember",
@@ -273,6 +274,7 @@ def index():
                     "search",
                     "emr_latest",
                     "emr_search_ledger",
+                    "emr_drift_check",
                     "fetch",
                     "emr_search",
                     "emr_fetch",
@@ -372,6 +374,7 @@ def health():
                 "search",
                 "emr_latest",
                 "emr_search_ledger",
+                "emr_drift_check",
                 "fetch",
                 "emr_search",
                 "emr_fetch",
@@ -385,6 +388,7 @@ def health():
             "emr_recall": "POST /api/jarvis/tools/emr_recall",
             "emr_latest": "POST /api/jarvis/tools/emr_latest",
             "emr_search_ledger": "POST /api/jarvis/tools/emr_search_ledger",
+            "emr_drift_check": "POST /api/jarvis/tools/emr_drift_check (operator only)",
             "search": "POST /api/jarvis/tools/search",
             "fetch": "POST /api/jarvis/tools/fetch",
             "emr_remember": "POST /api/jarvis/tools/emr_remember",
@@ -970,6 +974,59 @@ def tool_calls_verify():
     return call_log.get_call_log().verify()
 
 
+def require_drift_operator() -> None:
+    """The drift watcher reads records on the operator's behalf: an OAuth principal (a tenant) never uses it."""
+    if oauth_enabled():
+        raise LatestError(403, "denied", AUTHORITY_DENIED, "the drift watcher is operator-only")
+
+
+def _run_drift(body: Any, client_header: str | None) -> dict[str, Any]:
+    """Validate, check against the (tenant-scoped) store, match the call log, append to the drift log.  Never writes a ledger record."""
+    if not drift.enabled():
+        raise LatestError(404, "not_found", "DRIFT_CHECK_DISABLED", "the drift watcher is switched off (JARVIS_DRIFT_CHECK_ENABLED)")
+    try:
+        request_ = drift.validate_request(body)
+        result = drift.run_check(request_, get_store())
+    except drift.DriftInputError as exc:
+        raise LatestError(422, "invalid_request", exc.reason, exc.detail) from None
+    client_name = call_log.split_client(client_header)[0] if client_header else None
+    matches = drift.match_call_log(request_["records"], request_["client"] or client_name, request_["served_digest"])
+    result["call_log"] = matches
+    entry = drift.get_drift_log().record(drift.log_entry(result, request_, tenant=current_tenant_key(), client_header=client_header, matches=matches))
+    result["drift_log_seq"] = entry["seq"] if entry and "seq" in entry else None
+    return result
+
+
+@app.post("/api/jarvis/drift/check", dependencies=[Depends(require_emr_recall_api_key), Depends(require_drift_operator)])
+def drift_check(request: Request, body: dict[str, Any] = Body(default_factory=dict)):
+    """Check an agent's summary of ledger records against the records (deterministic, no model; see docs/drift_watcher.md)."""
+    return _run_drift(body, request.headers.get("x-jarvis-mcp-client") or request.headers.get("user-agent"))
+
+
+@app.get("/api/jarvis/drift/log", dependencies=[Depends(require_emr_recall_api_key), Depends(require_drift_operator)])
+def drift_log_entries(
+    client: str | None = Query(default=None, max_length=128),
+    since: str | None = Query(default=None, max_length=40),
+    limit: int = Query(default=50, ge=1, le=200),
+    cursor: str | None = Query(default=None, max_length=20),
+):
+    """The append-only drift log, newest first (the same hash-chained format as the call log)."""
+    if not drift.enabled():
+        raise LatestError(404, "not_found", "DRIFT_CHECK_DISABLED", "the drift watcher is switched off (JARVIS_DRIFT_CHECK_ENABLED)")
+    if cursor is not None and not cursor.isdigit():
+        raise HTTPException(status_code=422, detail="cursor must be the next_cursor from a previous page")
+    log = drift.get_drift_log()
+    page = log.query(client=client, since=since, limit=limit, before_seq=int(cursor) if cursor else None)
+    return {**page, "head": log.head(), "provenance": "drift log (not ledger records)"}
+
+
+@app.get("/api/jarvis/drift/log/verify", dependencies=[Depends(require_emr_recall_api_key), Depends(require_drift_operator)])
+def drift_log_verify():
+    if not drift.enabled():
+        raise LatestError(404, "not_found", "DRIFT_CHECK_DISABLED", "the drift watcher is switched off (JARVIS_DRIFT_CHECK_ENABLED)")
+    return drift.get_drift_log().verify()
+
+
 @app.post("/api/jarvis/tools/search", dependencies=[Depends(require_emr_recall_api_key)])
 def tool_search(body: EmrSearchRequest):
     """OpenAI company-knowledge search — read-only EMR recall → citation results."""
@@ -1002,6 +1059,12 @@ def tool_emr_search(body: EmrSearchRequest):
 def tool_emr_fetch(body: EmrFetchRequest):
     """Alias of ``fetch`` for hosts that namespace EMR tools."""
     return tool_fetch(body)
+
+
+@app.post("/api/jarvis/tools/emr_drift_check", dependencies=[Depends(require_emr_recall_api_key), Depends(require_drift_operator)])
+def tool_emr_drift_check(request: Request, body: dict[str, Any] | None = Body(default=None)):
+    """Read-only drift check (same implementation as POST /api/jarvis/drift/check)."""
+    return _run_drift(body or {}, request.headers.get("x-jarvis-mcp-client") or request.headers.get("user-agent"))
 
 
 @app.post("/api/jarvis/tools/emr_search_ledger", dependencies=[Depends(require_emr_recall_api_key)])
@@ -1856,6 +1919,10 @@ def _invoke_emr_tool_unguarded(name: str, arguments: dict) -> dict:
         return _run_latest(arguments, http=False)
     if name == "emr_search_ledger":
         return _run_search(arguments, http=False)
+    if name == "emr_drift_check":
+        if oauth_enabled():
+            raise ToolRefusal(DENIED, "the drift watcher is operator-only", AUTHORITY_DENIED)
+        return _run_drift(arguments, None)
     if name == "emr_recall":
         body = EmrRecallRequest.model_validate(arguments)
         return emr_recall(store, body).model_dump()
