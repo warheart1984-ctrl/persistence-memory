@@ -256,3 +256,20 @@ def test_the_stdio_proxy_posts_a_write_tool_with_the_ledger_key(monkeypatch):
     seen.clear()
     emr_stdio._http_post("/api/jarvis/tools/emr_latest", {})
     assert seen["auth"] == "Bearer the-recall-key"
+
+
+def test_a_recall_key_with_no_ledger_key_configured_stays_read_only(world, monkeypatch):
+    """Review finding: with EMR_RECALL_API_KEY set and JARVIS_API_KEY absent the recall key used to become the operator credential (writes, drift, the unscoped tool list)."""
+    client, mem_id = world
+    monkeypatch.delenv("JARVIS_API_KEY")
+    monkeypatch.setenv("JARVIS_MCP_WRITE_ENABLED", "true")
+    h = RECALL_FORMS["bearer"]
+    assert client.post("/api/jarvis/tools/emr_latest", headers=h, json={}).status_code == 200            # positive control: it still reads
+    assert {t["name"] for t in _rpc(client, h, "tools/list").json()["result"]["tools"]} == READ_TOOLS
+    for tool in ("emr_remember", "emr_upsert", "emr_drift_check"):
+        args = {"content": "RECALL ONLY WRITE PROBE", "source_agent": "p", "session_id": "s", "type": "fact", "id": mem_id, "summary": "s", "records": [mem_id]}
+        assert client.post(f"/api/jarvis/tools/{tool}", headers=h, json=args).status_code in (401, 403), tool
+        res = _rpc(client, h, "tools/call", {"name": tool, "arguments": args}).json()["result"]
+        assert res["isError"] is True and "not permitted" in res["content"][0]["text"], tool
+    assert client.get("/api/jarvis/tools/calls", headers=h).status_code in (401, 403)
+    assert [m.content for m in get_store().list_memories(limit=99)] == ["boundary probe record"]

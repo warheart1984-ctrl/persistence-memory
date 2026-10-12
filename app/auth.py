@@ -235,7 +235,7 @@ def credential_kind(authorization: str | None, x_emr_recall_key: str | None, x_a
         return "operator" if recall_match else None            # the old rule: on a public deployment the recall key is the operator credential
     if ledger is None:
         if recall:
-            return "operator" if recall_match else None        # no ledger key exists: the recall key is the only credential there is
+            return "recall" if recall_match else None          # still read-only with no ledger key configured: operator-only operations fail closed (nobody is the operator)
         return "operator" if allow_unauthenticated() else None
     if any(t and secrets.compare_digest(t, ledger) for t in (bearer, (x_api_key or "").strip())):   # (either one: see presented_ledger_candidates)
         return "operator"                                      # (the ledger key wins when both are presented)

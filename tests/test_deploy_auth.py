@@ -81,12 +81,12 @@ def test_health_reports_auth_flags(monkeypatch):
 
 
 def test_ledger_list_requires_key_when_read_protected(monkeypatch):
+    """A protected ledger read takes the LEDGER key. (Before the recall credential was scoped, the recall key opened it; it is read-only now and never opens a REST
+    ledger route, see docs/recall_credential.md and tests/test_recall_credential_boundary.py.)"""
     monkeypatch.setenv("EMR_RECALL_API_KEY", "secret-key")
+    monkeypatch.setenv("JARVIS_API_KEY", "ledger-key")
     monkeypatch.setenv("JARVIS_PROTECT_LEDGER_READ", "true")
-    resp = client.get("/api/jarvis/memory")
-    assert resp.status_code == 401
-    resp = client.get(
-        "/api/jarvis/memory",
-        headers={"Authorization": "Bearer secret-key"},
-    )
-    assert resp.status_code == 200
+    assert client.get("/api/jarvis/memory").status_code == 401
+    assert client.get("/api/jarvis/memory", headers={"Authorization": "Bearer secret-key"}).status_code == 401      # the recall key alone: refused
+    assert client.get("/api/jarvis/memory", headers={"X-API-Key": "ledger-key"}).status_code == 200
+    assert client.get("/api/jarvis/memory", headers={"Authorization": "Bearer ledger-key"}).status_code == 200
