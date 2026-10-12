@@ -193,3 +193,66 @@ def test_when_both_credentials_are_presented_the_ledger_key_wins(world):
     both = {"X-API-Key": LEDGER, "Authorization": f"Bearer {RECALL}"}
     assert client.get("/api/jarvis/tools/calls/verify", headers=both).status_code == 200
     assert {t["name"] for t in _rpc(client, both, "tools/list").json()["result"]["tools"]} == ALL_TOOLS
+
+
+# ----------------------------------------------------------------------------------------------------------- review findings on #101
+def test_with_protected_ledger_reads_the_ledger_key_still_reads_and_the_recall_key_still_cannot(world, monkeypatch):
+    """JARVIS_PROTECT_LEDGER_READ used to demand the RECALL key for GET /memory/*, so installing one broke a ledger-key reader."""
+    client, _ = world
+    monkeypatch.setenv("JARVIS_PROTECT_LEDGER_READ", "true")
+    for form, headers in LEDGER_FORMS.items():
+        assert client.get("/api/jarvis/memory", headers=headers).status_code == 200, form
+    for form, headers in RECALL_FORMS.items():
+        assert client.get("/api/jarvis/memory", headers=headers).status_code in (401, 403), form
+    assert client.get("/api/jarvis/memory").status_code in (401, 403)
+
+
+def test_the_ledger_key_wins_on_the_ledger_key_routes_too_even_behind_a_recall_bearer(world):
+    """Bearer = recall key, X-API-Key = ledger key: the middleware and the identity binding used to look only at the Bearer, so drift/nx/ledger routes said 401."""
+    client, mem_id = world
+    both = {"Authorization": f"Bearer {RECALL}", "X-API-Key": LEDGER}
+    assert client.get("/api/jarvis/drift/log", headers=both).status_code == 200
+    assert client.get("/api/jarvis/drift/log/verify", headers=both).status_code == 200
+    assert client.get("/api/jarvis/memory", headers=both).status_code == 200
+    assert client.post("/api/jarvis/drift/check", headers=both, json={"summary": "boundary probe record", "records": [mem_id]}).status_code == 200
+    wrong_ledger = {"Authorization": f"Bearer {RECALL}", "X-API-Key": "wrong"}                 # the recall key alone is still not enough there
+    assert client.get("/api/jarvis/drift/log", headers=wrong_ledger).status_code == 401
+    assert client.get("/api/jarvis/memory", headers=wrong_ledger).status_code == 401
+
+
+def test_the_stdio_proxy_sends_the_ledger_key_for_operator_tools_and_the_recall_key_for_reads(monkeypatch):
+    from mcp_server import emr_stdio
+
+    monkeypatch.delenv("JARVIS_API_KEY_FILE", raising=False)
+    monkeypatch.setenv("EMR_RECALL_API_KEY", "the-recall-key")
+    monkeypatch.setenv("JARVIS_API_KEY", "the-ledger-key")
+    for tool in sorted(READ_TOOLS):
+        assert emr_stdio.api_key(tool) == "the-recall-key", tool                                # least privilege for reads (and the old default)
+    for tool in ("emr_remember", "emr_upsert", "emr_drift_check"):
+        assert emr_stdio.api_key(tool) == "the-ledger-key", tool                                # the server refuses the recall key there
+    assert emr_stdio.api_key() == "the-recall-key"                                              # no tool named: the unchanged order
+    monkeypatch.delenv("JARVIS_API_KEY")
+    assert emr_stdio.api_key("emr_remember") == "the-recall-key"                                # only a recall key exists: nothing better to send
+
+
+def test_the_stdio_proxy_posts_a_write_tool_with_the_ledger_key(monkeypatch):
+    """End to end through _http_post: the Authorization header the proxy builds for emr_remember carries the ledger key."""
+    from mcp_server import emr_stdio
+
+    seen = {}
+
+    class _Resp:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return b"{}"
+
+    monkeypatch.setenv("JARVIS_MEMORYBOARD_URL", "http://127.0.0.1:8011")
+    monkeypatch.setenv("EMR_RECALL_API_KEY", "the-recall-key")
+    monkeypatch.setenv("JARVIS_API_KEY", "the-ledger-key")
+    monkeypatch.delenv("JARVIS_API_KEY_FILE", raising=False)
+    monkeypatch.setattr(emr_stdio.urllib.request, "urlopen", lambda req, timeout=0: seen.setdefault("auth", req.get_header("Authorization")) and _Resp())
+    emr_stdio._http_post("/api/jarvis/tools/emr_remember", {})
+    assert seen["auth"] == "Bearer the-ledger-key"
+    seen.clear()
+    emr_stdio._http_post("/api/jarvis/tools/emr_latest", {})
+    assert seen["auth"] == "Bearer the-recall-key"

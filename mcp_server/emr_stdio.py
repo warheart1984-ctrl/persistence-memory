@@ -23,6 +23,7 @@ from mcp_server.protocol import (
     EMR_REMEMBER_TOOL,
     EMR_UPSERT_TOOL,
     MCP_TOOLS,
+    RECALL_READ_TOOLS,
     dispatch_rpc,
 )
 
@@ -56,10 +57,12 @@ def _send(message: dict[str, Any]) -> None:
     sys.stdout.flush()
 
 
-def api_key() -> str:
+def api_key(tool: str | None = None) -> str:
     """The ledger API key, or "" when none is configured.
 
     Order: EMR_RECALL_API_KEY, JARVIS_API_KEY, then the first line of the file named by JARVIS_API_KEY_FILE.
+    For a tool OUTSIDE the recall-readable set (the writes, the drift check) the ledger credential comes first when there is one: the recall key is read-only
+    and the server refuses it there.
     A file that is NAMED but missing, unreadable or empty is an error, whatever else is set: the operator pointed
     at a credential that is not there, so nothing is sent (no request, no key, no empty key). A blank
     JARVIS_API_KEY_FILE counts as not named.
@@ -71,11 +74,11 @@ def api_key() -> str:
             from_file = read_key_file(path)  # UTF-8, UTF-8 with BOM and UTF-16 (what Windows tools write) all work
         except KeyFileError as exc:
             raise RuntimeError(f"JARVIS_API_KEY_FILE names {path!r}, which {exc}. Nothing was sent.") from None
-    return (
-        (os.environ.get("EMR_RECALL_API_KEY") or "").strip()
-        or (os.environ.get("JARVIS_API_KEY") or "").strip()
-        or from_file
-    )
+    recall = (os.environ.get("EMR_RECALL_API_KEY") or "").strip()
+    ledger = (os.environ.get("JARVIS_API_KEY") or "").strip() or from_file
+    if tool is not None and tool not in RECALL_READ_TOOLS and ledger:
+        return ledger
+    return recall or ledger
 
 
 # --- who is calling (self-reported; the ledger's call log records it as such) ------------------------------------------------
@@ -106,7 +109,7 @@ def _http_post(path: str, arguments: dict[str, Any]) -> dict[str, Any]:
     headers = {"Content-Type": "application/json", "Accept": "application/json",
                "X-Jarvis-MCP-Transport": "stdio", "X-Jarvis-MCP-Client": _client_header()}
     # Server accepts EMR_RECALL_API_KEY when set, else JARVIS_API_KEY; the key may come from JARVIS_API_KEY_FILE.
-    key = api_key()
+    key = api_key(path.rstrip("/").rsplit("/", 1)[-1] if "/tools/" in path else None)
     if key:
         if parsed.scheme != "https" and (parsed.hostname or "") not in ("127.0.0.1", "localhost", "::1"):
             raise RuntimeError(

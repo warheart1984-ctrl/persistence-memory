@@ -237,7 +237,7 @@ def credential_kind(authorization: str | None, x_emr_recall_key: str | None, x_a
         if recall:
             return "operator" if recall_match else None        # no ledger key exists: the recall key is the only credential there is
         return "operator" if allow_unauthenticated() else None
-    if any(t and secrets.compare_digest(t, ledger) for t in (bearer, (x_api_key or "").strip())):
+    if any(t and secrets.compare_digest(t, ledger) for t in (bearer, (x_api_key or "").strip())):   # (either one: see presented_ledger_candidates)
         return "operator"                                      # (the ledger key wins when both are presented)
     return "recall" if recall_match else None
 
@@ -373,10 +373,12 @@ async def ledger_read_protection_middleware(request: Request, call_next):
     if not ledger_read_protected():
         return await call_next(request)
     try:
-        verify_operator_api_key(
-            request.headers.get("authorization"),
-            request.headers.get("x-emr-recall-key"),
-        )
+        # The operator credential for a ledger read is the LEDGER key (the recall key is read-only and never opens a REST ledger route). On a public
+        # deployment the recall key stays the operator credential, as before.
+        if is_public_deployment() and not emr_recall_api_key():
+            raise HTTPException(status_code=503, detail="Public deployment requires EMR_RECALL_API_KEY")
+        if credential_kind(request.headers.get("authorization"), request.headers.get("x-emr-recall-key"), request.headers.get("x-api-key")) != "operator":
+            raise HTTPException(status_code=401, detail="Invalid or missing operator API key")
     except HTTPException as exc:
         return json_response(exc.status_code, exc.detail, headers=getattr(exc, "headers", None), path=request.url.path)
     return await call_next(request)
@@ -444,6 +446,19 @@ def extract_presented_key(request: Request) -> str | None:
     return None
 
 
+def presented_ledger_candidates(headers) -> list[str]:
+    """Every value a request offers as the ledger key: the Bearer token and X-API-Key. Either one being the ledger key is enough (a request may carry the
+    recall key as its Bearer and the ledger key in X-API-Key; the ledger key must win, in the middleware, the identity binding and credential_kind alike)."""
+    out = []
+    bearer = _extract_bearer(headers.get("authorization") or headers.get("Authorization"))
+    if bearer:
+        out.append(bearer)
+    header_key = (headers.get("x-api-key") or headers.get("X-API-Key") or "").strip()
+    if header_key:
+        out.append(header_key)
+    return out
+
+
 PUBLIC_PATHS = frozenset(
     {
         "/",
@@ -487,8 +502,7 @@ class ApiKeyMiddleware(BaseHTTPMiddleware):
 
         expected = configured_api_key()
         if expected is not None:
-            presented = extract_presented_key(request)
-            if presented is None or not secrets.compare_digest(presented, expected):
+            if not any(secrets.compare_digest(p, expected) for p in presented_ledger_candidates(request.headers)):
                 return json_response(401, "Invalid or missing API key", path=request.url.path)
             return await call_next(request)
 
@@ -531,13 +545,10 @@ def credential_is_operator(headers, path: str) -> bool:
                 return False
         elif is_public_deployment():
             return False
-        presented = bearer or (headers.get("x-api-key") or "").strip()
-    else:
-        presented = bearer or (headers.get("x-api-key") or "").strip()
     expected = configured_api_key()
     if expected is None:
         return allow_unauthenticated()
-    return bool(presented) and secrets.compare_digest(presented, expected)
+    return any(secrets.compare_digest(p, expected) for p in presented_ledger_candidates(headers))
 
 
 async def identity_middleware(request: Request, call_next):
