@@ -48,13 +48,14 @@ Every announcement SHALL state, at minimum:
 
 ## 4. Post-Run Report (required)
 
-For each probe, report exactly one of:
+For each probe, report exactly one of the four verdicts:
 
 | Verdict | Meaning |
 |---|---|
 | **BROKEN** | Exploit demonstrated, with commands + output. |
 | **HELD** | Attack attempted as stated, system refused as stated, with output. |
 | **NOT TRIED** | Listed probe that was not executed, with reason. |
+| **INCONCLUSIVE** | The probe was started but could not establish the system's behavior (a dependency failed, the request timed out, output was lost, the environment broke): neither BROKEN nor HELD can be said. Report the error and raw output. It SHALL NOT be counted as HELD, and it stays an open item until re-run (the chaos runner's `ERROR`/`SKIP` map here: `ERROR` is INCONCLUSIVE, `SKIP` is NOT TRIED). |
 
 Plus:
 
@@ -77,7 +78,8 @@ Plus:
 ## 5. Claim Discipline
 
 All findings carry a lawbook claim label: `asserted` (no output yet),
-`proven` (commands + output attached), `rejected` (disproven on review).
+`proven` (commands + output attached **and, for any HELD, independently re-derived** by someone other than the tester, per the evidence bundle in section 4),
+`rejected` (disproven on review). A HELD that cannot be independently re-derived stays `asserted`; an INCONCLUSIVE probe carries no label stronger than `asserted`.
 Unlabeled claims SHALL NOT be used for acceptance.
 
 ## 6. Doctrine Mapping
