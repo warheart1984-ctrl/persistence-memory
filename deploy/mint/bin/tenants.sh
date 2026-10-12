@@ -39,7 +39,12 @@ while [ $# -gt 0 ]; do
   shift
 done
 # `--tenants ''` is a selection of nobody, not an omitted option: it must never fall back to "every tenant"
-if [ "$tenants_given" -eq 1 ] && [ -z "$(printf '%s' "$tenants" | tr -d ' ,')" ]; then echo "--tenants was given but names no tenant" >&2; exit 2; fi
+# An explicit list is normalized first: names trimmed, blanks dropped, duplicates removed (" t_bob" is not "t_bob": pg_verify treats a tenant with no rows as an
+# intact empty ledger, so an untrimmed name would be reported verified while the real tenant was never checked).
+if [ "$tenants_given" -eq 1 ]; then
+  tenants="$(printf '%s' "$tenants" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | awk 'NF && !seen[$0]++' | paste -sd, -)"
+  if [ -z "$tenants" ]; then echo "--tenants was given but names no tenant" >&2; exit 2; fi
+fi
 # a flag that does not apply to the command is an error, never silently ignored (`seal --dry-run` must not seal; `sign --force` must not sign)
 case "$cmd" in
   list)   [ "$force" -eq 0 ] && [ "$dry" -eq 0 ] && [ -z "$tenants" ] || { echo "list takes no options" >&2; exit 2; } ;;

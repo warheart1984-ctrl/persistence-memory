@@ -19,7 +19,7 @@ from starlette.responses import JSONResponse, Response
 
 from app.public_security import is_public_deployment
 from app.refusal import json_response
-from app.identity import (OPERATOR_TENANT, current_principal, current_tenant_key, is_operator, multi_tenant_mode, operator_principal, reset_principal,
+from app.identity import (OPERATOR_TENANT, current_principal, current_tenant_key, in_operator_job, is_operator, multi_tenant_mode, operator_principal, reset_principal,
                           set_principal)
 from app.oauth import READ_SCOPE, WRITE_SCOPE, auth_mode, public_base_url, validate_access_token
 
@@ -268,6 +268,8 @@ def caller_is_operator() -> bool:
     """May this request use an operator-only surface?  An OAuth tenant never may.  In JARVIS_MULTI_TENANT mode the caller must also BE the operator (an
     authenticated operator principal): no identity is not the operator.  Outside that mode the shared-key deployment's rule holds: a request only gets here
     after the key middleware accepted it."""
+    if in_operator_job():          # the box's own per-tenant job (identity.acting_for), not a request: allowed in OAuth deployments too
+        return True
     if oauth_enabled():
         return False
     if multi_tenant_mode():

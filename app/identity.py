@@ -43,6 +43,12 @@ _principal: contextvars.ContextVar[Principal | None] = contextvars.ContextVar(
 _acting_tenant: contextvars.ContextVar[str | None] = contextvars.ContextVar("jarvis_acting_tenant", default=None)
 
 
+def in_operator_job() -> bool:
+    """True only inside ``acting_for``: the box's own per-tenant job, started by the operator. Set by nothing else, so no request can make it true (an OAuth
+    tenant's token certainly cannot); the operator-only gates honor it even when the deployment authenticates users with OAuth."""
+    return _acting_tenant.get() is not None
+
+
 @contextlib.contextmanager
 def acting_for(tenant: str):
     """Run code as the operator administering ONE tenant's ledger (the box's per-tenant jobs: seal, sign, verify).
@@ -50,9 +56,11 @@ def acting_for(tenant: str):
     Internal to a process that the operator started on the box: nothing in the HTTP stack ever sets it, and no request parameter, header or token can,
     so the public API still cannot be made to select a tenant. "operator" is the operator's own namespace (the default one)."""
     token = _acting_tenant.set(tenant)
+    principal_token = _principal.set(operator_principal())     # the operator's own process: the operator-only gates must pass for it, in strict mode too
     try:
         yield
     finally:
+        _principal.reset(principal_token)
         _acting_tenant.reset(token)
 
 
