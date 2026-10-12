@@ -964,7 +964,10 @@ def tool_calls(
         raise HTTPException(status_code=404, detail="the call log is switched off (JARVIS_CALL_LOG_ENABLED)")
     if cursor is not None and not cursor.isdigit():
         raise HTTPException(status_code=422, detail="cursor must be the next_cursor from a previous page")
-    page = call_log.get_call_log().query_with_head(tool=tool, client=client, since=since, limit=limit, before_seq=int(cursor) if cursor else None)
+    try:
+        page = call_log.get_call_log().query_with_head(tool=tool, client=client, since=since, limit=limit, before_seq=int(cursor) if cursor else None)
+    except call_log.CallLogError as exc:  # a snapshot that could not be taken or read is an error to retry, never a quietly shorter page
+        raise HTTPException(status_code=503, detail=f"the call log could not be read right now ({exc}); retry")
     return {**page, "client_names": "self-reported", "provenance": "server-witnessed"}
 
 
@@ -992,7 +995,7 @@ def _run_drift(body: Any, client_header: str | None) -> dict[str, Any]:
     except drift.DriftInputError as exc:
         raise LatestError(422, "invalid_request", exc.reason, exc.detail) from None
     client_name = call_log.split_client(client_header)[0] if client_header else None
-    matches = drift.match_call_log(request_["records"], request_["client"] or client_name, request_["served_digest"])
+    matches = drift.match_call_log(request_["records"], request_["client"] or client_name, request_["served_digest"], tenant=current_tenant_key())
     result["call_log"] = matches
     entry = drift.get_drift_log().record(drift.log_entry(result, request_, tenant=current_tenant_key(), client_header=client_header, matches=matches))
     result["drift_log_seq"] = entry["seq"] if entry and "seq" in entry else None

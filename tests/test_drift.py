@@ -430,6 +430,25 @@ def test_the_call_log_shows_which_logged_calls_could_have_served_the_records(jcl
     assert none["call_log"]["matches"] == [] or all("devin" not in str(m["client_name"]) for m in none["call_log"]["matches"])
 
 
+def test_the_call_log_match_never_returns_another_tenants_calls(jclient, pair):
+    """The call log is one chain for everyone. A drift check on one tenant's records must not return the seq, client, transport or result digest of calls
+    another tenant made, even when the arguments hash or the reported result digest happens to match."""
+    import time
+
+    old, new = pair
+    rid, digest = new["id"], "d" * 64
+    log = call_log.get_call_log()
+    for tenant_label in ("tenant-x", None):                                    # another tenant's call, then the operator's own
+        log.append(call_log.make_fields(transport="http-tool", tool="emr_fetch", args={"id": rid}, outcome="ok", started=time.perf_counter(),
+                                        client_header=f"agent-of-{tenant_label}/1", tenant=tenant_label, result_digest=digest))
+    mine = drift.match_call_log([rid], None, digest)                           # the operator's records: only the operator's call
+    assert [m["client_name"] for m in mine["matches"]] == ["agent-of-None"], mine
+    theirs = drift.match_call_log([rid], None, digest, tenant="tenant-x")      # (the same question asked for tenant-x)
+    assert [m["client_name"] for m in theirs["matches"]] == ["agent-of-tenant-x"], theirs
+    nobody = drift.match_call_log([rid], None, digest, tenant="tenant-y")
+    assert nobody["matches"] == []
+
+
 def test_a_record_that_changed_since_it_was_served_is_flagged(jclient, pair):
     old, new = pair
     r = check(jclient, "Claude deployed main 792e99b.", [new["id"]], served_content_sha256={new["id"]: "0" * 64})

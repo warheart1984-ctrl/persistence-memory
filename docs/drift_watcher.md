@@ -102,3 +102,5 @@ Said plainly, because a green result must not be read as more than it is:
 | `JARVIS_DRIFT_LOG_DIR` | `<dir of JARVIS_STORE_PATH>/drift-log` | |
 
 Demo (read-only, against the live records): `python scripts/drift_demo.py --key-file <file>`.
+
+The call-log match is **tenant-filtered**: only calls filed under the tenant whose records are being checked can match (the operator's calls for the operator), so a check can never return another tenant's seq, client name, transport or result digest.

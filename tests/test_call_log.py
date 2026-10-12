@@ -9,6 +9,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import math
 import multiprocessing
 import os
 import socket
@@ -808,14 +809,14 @@ def _race_appends(monkeypatch, directory: Path):
     real = call_log.CallLog.entries_desc
     threads: list[threading.Thread] = []
 
-    def racing(self):
+    def racing(self, snapshot=None):
         def writer():
             call_log.CallLog(directory).append(_fields(99))
         t = threading.Thread(target=writer)
         t.start()
         threads.append(t)
         t.join(timeout=0.4)
-        items = list(real(self))
+        items = list(real(self) if snapshot is None else real(self, snapshot))
         t = threading.Thread(target=writer)
         t.start()
         threads.append(t)
@@ -840,6 +841,325 @@ def test_an_append_while_the_page_is_read_cannot_split_it_from_its_head(tmp_path
     finish()
     assert page["entries"][0]["seq"] == page["head"]["seq"] == 5 and page["head"]["entry_hash"] == page["entries"][0]["entry_hash"]
     assert log.head()["seq"] == 7                        # both appends did happen, just after the snapshot
+
+
+@pytest.mark.skipif(not call_log._pin_by_handle(), reason="Windows reads the page under the lock by design; the Windows test below pins that")
+def test_reading_a_page_does_not_hold_the_writers_lock(tmp_path, monkeypatch):
+    """A big log is parsed AFTER the lock is released: a writer that arrives during the read finishes at once (it used to wait for the whole scan),
+    and its entry is simply not in the page, which is exactly the log as of the snapshot."""
+    log = call_log.CallLog(tmp_path / "nolock")
+    for i in range(5):
+        log.append(_fields(i))
+    real = call_log.CallLog.entries_desc
+    outcome = {}
+
+    def slow_read(self, snapshot=None):
+        t = threading.Thread(target=lambda: call_log.CallLog(tmp_path / "nolock").append(_fields(99)))
+        t.start()
+        t.join(timeout=3)
+        outcome["writer_blocked"] = t.is_alive()
+        yield from (real(self) if snapshot is None else real(self, snapshot))
+
+    monkeypatch.setattr(call_log.CallLog, "entries_desc", slow_read)
+    page = log.query_with_head(limit=50)
+    monkeypatch.setattr(call_log.CallLog, "entries_desc", real)
+    assert outcome["writer_blocked"] is False                                   # the lock was free while the page was read
+    assert page["entries"][0]["seq"] == page["head"]["seq"] == 5                # and the page still matches its head exactly
+    assert log.head()["seq"] == 6
+
+
+def test_a_snapshot_that_cannot_open_a_file_fails_instead_of_dropping_it(tmp_path, monkeypatch):
+    """Descriptor exhaustion (EMFILE) or a permission error must not look like a missing file: the page would lack that file and every later one."""
+    log = call_log.CallLog(tmp_path / "emfile")
+    for i in range(3):
+        log.append(_fields(i))
+    real_open = open
+
+    def failing_open(path, *a, **k):
+        if str(path).endswith(".jsonl"):
+            raise OSError(24, "Too many open files")
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr("builtins.open", failing_open)
+    with pytest.raises(call_log.CallLogError, match="could not snapshot"):
+        with log._locked():
+            log._snapshot()
+
+
+def test_on_windows_the_page_is_read_under_the_lock_with_no_pinned_handles_and_no_copies(tmp_path, monkeypatch):
+    """Windows cannot unlink an open file and copying every retained file could exhaust memory, so there the page is read lazily while the lock is held: a
+    writer that arrives during the read waits, nothing is open afterwards, nothing is copied, and the page still matches its head exactly."""
+    monkeypatch.setattr(call_log, "_pin_by_handle", lambda: False)
+    log = call_log.CallLog(tmp_path / "winlike")
+    for i in range(5):
+        log.append(_fields(i))
+    taken = []
+    real_snapshot = call_log.CallLog._snapshot
+    monkeypatch.setattr(call_log.CallLog, "_snapshot", lambda self: taken.append(1) or real_snapshot(self))   # must never be called on this path
+    real = call_log.CallLog.entries_desc
+    state = {}
+
+    def racing(self, snapshot=None):
+        t = threading.Thread(target=lambda: call_log.CallLog(tmp_path / "winlike").append(_fields(99)))
+        t.start()
+        state["writer"] = t
+        t.join(timeout=0.4)
+        state["writer_waited"] = t.is_alive()                  # the lock is held for the whole page: the writer cannot get in
+        yield from (real(self) if snapshot is None else real(self, snapshot))
+
+    monkeypatch.setattr(call_log.CallLog, "entries_desc", racing)
+    page = log.query_with_head(limit=50)
+    monkeypatch.setattr(call_log.CallLog, "entries_desc", real)
+    assert state["writer_waited"] is True and taken == []
+    assert page["entries"][0]["seq"] == page["head"]["seq"] == 5
+    state["writer"].join(timeout=30)       # the waiting writer gets in once the lock is released (on Windows its lock retry can take a second to notice)
+    assert not state["writer"].is_alive()
+    assert log.head()["seq"] == 6
+
+
+def test_close_tolerates_a_snapshot_entry_with_no_handle(tmp_path):
+    snap = call_log.Snapshot()
+    snap.files.append((tmp_path / "x.jsonl", 0, None))
+    snap.close()
+    assert snap.files == []
+
+
+def test_the_calls_endpoint_answers_503_retry_when_the_snapshot_cannot_be_read(jclient, monkeypatch):
+    add(jclient)
+    monkeypatch.setattr(call_log.CallLog, "query_with_head", lambda self, **k: (_ for _ in ()).throw(call_log.CallLogError("a file of the snapshot could not be read")))
+    r = jclient.get("/api/jarvis/tools/calls", headers=HDR)
+    assert r.status_code == 503 and "retry" in r.json()["detail"]
+
+
+def test_the_degraded_state_belongs_to_the_same_snapshot_as_the_page_and_head(tmp_path, monkeypatch):
+    """A writer that recovers while the page is being read appends the gap entry and clears the latch. The page and head do not contain that gap, so the
+    response must still say `degraded`: reporting a healthy log beside an incomplete page would present incomplete evidence as complete."""
+    log = call_log.CallLog(tmp_path / "degsnap")
+    for i in range(3):
+        log.append(_fields(i))
+    log._mark_degraded("simulated outage", unlogged=2)
+    assert log.degraded() is not None
+    real = call_log.CallLog.entries_desc
+
+    lazy = not call_log._pin_by_handle()     # Windows reads the page under the lock: another worker cannot recover meanwhile, it waits (and must not be run inline, it would wait for us)
+    writers = []
+
+    def recovering(self, snapshot=None):
+        if lazy:
+            t = threading.Thread(target=lambda: call_log.CallLog(tmp_path / "degsnap").append(_fields(9)))
+            t.start()
+            writers.append(t)
+        else:
+            call_log.CallLog(tmp_path / "degsnap").append(_fields(9))      # another worker: writes the gap entry first, then its own, and clears the latch
+        yield from (real(self) if snapshot is None else real(self, snapshot))
+
+    monkeypatch.setattr(call_log.CallLog, "entries_desc", recovering)
+    page = log.query_with_head(limit=50)
+    monkeypatch.setattr(call_log.CallLog, "entries_desc", real)
+    for t in writers:
+        t.join(timeout=30)
+        assert not t.is_alive()
+    assert page["degraded"] and page["degraded"]["unlogged"] == 2                       # as of the snapshot
+    assert [e["outcome"] for e in page["entries"]].count("gap") == 0 and page["head"]["seq"] == 3   # the page and the head predate the recovery
+    assert log.degraded() is None                                                       # the latch was cleared meanwhile, and the next read will say so
+
+
+def _log_with_days(tmp_path, name, days, monkeypatch):
+    monkeypatch.setenv("JARVIS_CALL_LOG_RETAIN_DAYS", "400")
+    day = [1]
+    log = call_log.CallLog(tmp_path / name, clock=lambda: datetime(2026, 1, day[0], 12, tzinfo=timezone.utc))
+    for d in range(1, days + 1):
+        day[0] = d
+        log.append(_fields(d))
+    return log, day
+
+
+@posix_user_only
+def test_a_snapshot_pins_only_the_newest_files_and_still_reads_them_all(tmp_path, monkeypatch):
+    """The log keeps ~90 daily files: one descriptor per file per request would let a handful of concurrent reads exhaust the process's descriptors."""
+    monkeypatch.setenv("JARVIS_CALL_LOG_SNAPSHOT_PINNED", "3")
+    log, _ = _log_with_days(tmp_path, "pinned", 12, monkeypatch)
+    with log._locked():
+        snap = log._snapshot()
+    assert len(snap.files) == 12 and sum(1 for _, _, fh in snap.files if fh is not None) == 3
+    assert [fh is not None for _, _, fh in snap.files] == [False] * 9 + [True] * 3       # exactly the newest three
+    assert [e["seq"] for e in log.entries_desc(snap)] == list(range(12, 0, -1))            # every entry, newest first
+    snap.close()
+
+
+@posix_user_only
+def test_an_unpinned_file_that_disappears_makes_the_read_fail_with_retry_never_a_shorter_page(tmp_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_CALL_LOG_SNAPSHOT_PINNED", "2")
+    log, _ = _log_with_days(tmp_path, "gone", 6, monkeypatch)
+    with log._locked():
+        snap = log._snapshot()
+    oldest = snap.files[0][0]
+    newest = snap.files[-1][0]
+    oldest.unlink()                                                    # retention removed an old, unpinned file after the snapshot
+    newest.unlink()                                                    # (and, for contrast, a pinned one: its handle still reads)
+    with pytest.raises(call_log.CallLogError, match="retry"):
+        list(log.entries_desc(snap))
+    snap.close()
+
+
+@posix_user_only
+def test_a_page_read_holds_at_most_the_pinned_number_of_descriptors(tmp_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_CALL_LOG_SNAPSHOT_PINNED", "2")
+    log, _ = _log_with_days(tmp_path, "fds", 15, monkeypatch)
+    real = call_log.CallLog.entries_desc
+    during = {}
+
+    def counting(self, snapshot=None):
+        during["fds"] = len(os.listdir("/proc/self/fd"))
+        yield from (real(self) if snapshot is None else real(self, snapshot))
+
+    baseline = len(os.listdir("/proc/self/fd"))
+    monkeypatch.setattr(call_log.CallLog, "entries_desc", counting)
+    log.query_with_head(limit=50)
+    monkeypatch.setattr(call_log.CallLog, "entries_desc", real)
+    assert during["fds"] - baseline <= 2 + 1                           # the 2 pinned files (+1 of slack for the interpreter), not 15
+    assert len(os.listdir("/proc/self/fd")) <= baseline + 1            # and all of them closed afterwards
+
+
+@pytest.mark.skipif(not call_log._pin_by_handle(), reason="Windows reads the page lazily under the lock, and cannot unlink a file that is open; the Windows test pins that")
+def test_concurrent_page_reads_are_bounded_and_the_rest_are_told_to_retry(tmp_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_CALL_LOG_SNAPSHOT_READERS", "1")
+    monkeypatch.setenv("JARVIS_CALL_LOG_SNAPSHOT_WAIT_SECONDS", "0.2")
+    log = call_log.CallLog(tmp_path / "slots")
+    for i in range(3):
+        log.append(_fields(i))
+    real = call_log.CallLog.entries_desc
+    inside, release = threading.Event(), threading.Event()
+
+    def slow(self, snapshot=None):
+        inside.set()
+        release.wait(timeout=5)
+        yield from (real(self) if snapshot is None else real(self, snapshot))
+
+    monkeypatch.setattr(call_log.CallLog, "entries_desc", slow)
+    first = threading.Thread(target=lambda: log.query_with_head(limit=10))
+    first.start()
+    assert inside.wait(timeout=5)
+    waiting = threading.Thread(target=lambda: pytest.raises(call_log.CallLogError, log.query_with_head, limit=10))
+    waiting.start()                                                    # a second reader, waiting for the only slot
+    time.sleep(0.05)
+    started = time.perf_counter()
+    assert log.head()["seq"] == 3                                      # the log's own lock is NOT held while a reader waits for a slot: a writer-side call is not blocked
+    assert time.perf_counter() - started < 0.1
+    waiting.join(timeout=5)
+    with pytest.raises(call_log.CallLogError, match="too many"):
+        log.query_with_head(limit=10)                                  # one reader is in flight and only one is allowed: this one is told to retry
+    release.set()
+    first.join(timeout=5)
+    monkeypatch.setattr(call_log.CallLog, "entries_desc", real)
+    assert [e["seq"] for e in log.query_with_head(limit=10)["entries"]] == [3, 2, 1]     # the slot was released: reads work again
+
+
+@pytest.mark.parametrize("raw,expected", [("nan", 2.0), ("NaN", 2.0), ("inf", 2.0), ("Infinity", 2.0), ("-inf", 2.0), ("abc", 2.0), ("", 2.0),
+                                          ("-5", 0.0), ("0", 0.0), ("0.25", 0.25), ("5", 5.0), ("1e9", 60.0)])
+def test_the_snapshot_wait_is_always_a_finite_bounded_number(monkeypatch, raw, expected):
+    """acquire(timeout=nan) can block forever and acquire(timeout=inf) raises: a bad setting must fall back, never hang or 500."""
+    monkeypatch.setenv("JARVIS_CALL_LOG_SNAPSHOT_WAIT_SECONDS", raw)
+    value = call_log.snapshot_wait_seconds()
+    assert value == expected and math.isfinite(value)
+
+
+class CountingFile(__import__("io").BytesIO):
+    """A file that counts how many bytes were read from it."""
+    read_bytes = 0
+
+    def read(self, n=-1):
+        data = super().read(n)
+        self.read_bytes += len(data)
+        return data
+
+
+@pytest.mark.parametrize("chunk", [1, 2, 3, 7, 16, 64, 4096])
+@pytest.mark.parametrize("content", [b"", b"\n", b"a", b"a\n", b"a\nb", b"a\nb\n", b"\n\na\n\n", b"line-one\nline-two\nline-three\n", b"x" * 100 + b"\n" + b"y" * 3 + b"\nz",
+                                     b"no newline at all", b"\r\nwith cr\r\n"])
+def test_reverse_lines_is_exactly_the_lines_backwards_at_any_block_size(content, chunk):
+    expected = list(reversed(content.split(b"\n"))) if content else []
+    if content.endswith(b"\n"):
+        expected = expected[1:]                                      # the empty text after a final newline is not a line
+    got = list(call_log.reverse_lines(__import__("io").BytesIO(content), len(content), chunk))
+    assert [g for g in got if g] == [e for e in expected if e]       # (empty lines are skipped by the reader anyway: compare the non-empty ones, in order)
+    assert b"".join(sorted(got)) == b"".join(sorted(e for e in expected if e))   # and nothing is lost or duplicated
+
+
+def test_reverse_lines_honours_the_size_and_ignores_what_came_after_it():
+    data = b"one\ntwo\nthree\nfour\n"
+    assert list(call_log.reverse_lines(__import__("io").BytesIO(data), len(b"one\ntwo\nthree\n"), 4)) == [b"three", b"two", b"one"]
+
+
+def test_a_page_of_one_entry_reads_one_block_not_the_whole_file():
+    """The newest daily file is unbounded: a limit=1 read, repeated by several concurrent readers, must not each hold a full decoded copy of it."""
+    lines = [json.dumps({"seq": i, "pad": "p" * 80}).encode() for i in range(1, 5001)]
+    data = b"\n".join(lines) + b"\n"                                  # ~450 KB
+    fh = CountingFile(data)
+    first = next(call_log.reverse_lines(fh, len(data), 8192))
+    assert json.loads(first)["seq"] == 5000
+    assert fh.read_bytes <= 2 * 8192 < len(data) / 20                  # one block (two at most), not 450 KB
+    fh2 = CountingFile(data)
+    taken = [json.loads(x)["seq"] for _, x in zip(range(300), call_log.reverse_lines(fh2, len(data), 8192))]
+    assert taken == list(range(5000, 4700, -1)) and fh2.read_bytes < len(data) / 4
+
+
+def test_entries_desc_stops_reading_the_file_once_the_page_is_full(tmp_path, monkeypatch):
+    log = call_log.CallLog(tmp_path / "bigfile")
+    for i in range(400):
+        log.append(_fields(i))
+    size = next(log._files()[0].parent.glob("calls-*.jsonl")).stat().st_size
+    seen = []
+    real = call_log.reverse_lines
+
+    class Spy:
+        def __init__(self, fh):
+            self.fh = fh
+        def seek(self, n):
+            return self.fh.seek(n)
+        def read(self, n=-1):
+            data = self.fh.read(n)
+            seen.append(len(data))
+            return data
+
+    monkeypatch.setattr(call_log, "reverse_lines", lambda fh, sz, chunk=None: real(Spy(fh), sz, 2048))
+    page = log.query(limit=1)
+    assert [e["seq"] for e in page["entries"]] == [400] and sum(seen) < size / 4
+
+
+def test_a_snapshot_page_ignores_what_was_appended_after_it(tmp_path):
+    log = call_log.CallLog(tmp_path / "snapbytes")
+    for i in range(3):
+        log.append(_fields(i))
+    with log._locked():
+        snap = log._snapshot()
+    for i in range(4):
+        log.append(_fields(10 + i))
+    assert [e["seq"] for e in log.entries_desc(snap)] == [3, 2, 1]
+    assert [e["seq"] for e in log.entries_desc()][0] == 7
+    snap.close()
+
+
+@pytest.mark.skipif(not call_log._pin_by_handle(), reason="Windows reads the page lazily under the lock, and cannot unlink a file that is open; the Windows test pins that")
+def test_a_snapshot_still_reads_a_file_that_retention_deleted_after_it_was_taken(tmp_path, monkeypatch):
+    """The page must not be missing a file the snapshot advertised: an append that rotates the log can unlink an older file while a page is being read."""
+    monkeypatch.setenv("JARVIS_CALL_LOG_RETAIN_DAYS", "2")
+    day = [1]
+    log = call_log.CallLog(tmp_path / "ret-snap", clock=lambda: datetime(2026, 10, day[0], 12, tzinfo=timezone.utc))
+    log.append(_fields(0))
+    day[0] = 2
+    log.append(_fields(1))
+    day[0] = 8
+    log.append(_fields(2))
+    with log._locked():
+        snap = log._snapshot()
+    assert len(snap.files) == 3
+    day[0] = 9
+    log.append(_fields(3))                                                  # rotates, and retention unlinks the day-1 and day-2 files
+    assert [p.name for p in log._files()] == ["calls-20261008.jsonl", "calls-20261009.jsonl"]
+    assert [e["seq"] for e in log.entries_desc(snap)] == [3, 2, 1]          # the snapshot still has all of its files, in full (seq 3 is day 8)
+    snap.close()
+    assert snap.files == []
 
 
 def test_the_old_two_step_read_would_have_split_the_page_from_its_head(tmp_path, monkeypatch):
