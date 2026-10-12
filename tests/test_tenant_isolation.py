@@ -74,6 +74,10 @@ GET /api/jarvis/drift/log
 GET /api/jarvis/drift/log/verify
 POST /api/jarvis/tools/emr_drift_check
 """)
+_classify(OPERATOR, "the shared inference backend (its address, credentials, replay log and spend are the deployment's): operator only until there are per-tenant quotas", """
+POST /api/jarvis/llm/generate
+GET /api/jarvis/llm/status
+""")
 _classify(OPERATOR, "nx-search reads the host filesystem: operator only", """
 POST /api/jarvis/memory/external-search
 POST /api/jarvis/memory/external/ask
@@ -164,9 +168,7 @@ DELETE /mcp/
 GET /mcp/
 POST /mcp/
 """)
-_classify(SHARED, "a process-wide resource that is not keyed by tenant (the inference backend, the RAG index): audited separately, see the tests at the end", """
-POST /api/jarvis/llm/generate
-GET /api/jarvis/llm/status
+_classify(SHARED, "a process-wide resource that is not keyed by tenant (the RAG index): audited separately, see the tests at the end", """
 POST /api/jarvis/rag/documents
 GET /api/jarvis/rag/log
 POST /api/jarvis/rag/maintenance
@@ -645,8 +647,8 @@ def test_the_rag_index_refuses_every_tenant_until_its_access_control_is_configur
 BACKEND_ADDRESS = "http://inference.internal.example:13305/api/v1"
 
 
-@pytest.mark.xfail(strict=True, reason="GAP: the inference backend's address is shown to any tenant (phase 0 should make llm/status operator-only or neutral)")
 def test_a_tenant_does_not_see_the_inference_backend_address(client, monkeypatch):
+    """(Was a strict xfail.) llm/status is operator-only; the address is not in whatever a tenant is told."""
     from app import amul_llm
 
     monkeypatch.setattr(amul_llm, "LLM_URL", BACKEND_ADDRESS)           # a real, recognisable address (the suite normally blanks it)
@@ -654,22 +656,28 @@ def test_a_tenant_does_not_see_the_inference_backend_address(client, monkeypatch
     assert r.status_code in (403, 404) or "inference.internal" not in r.text, "bob can read where the inference backend lives"
 
 
-@pytest.mark.xfail(strict=True, reason="GAP: llm/status shows the server's filesystem path of the replay log (replay_log.path) to any tenant")
 def test_a_tenant_is_not_told_the_llm_replay_log_path(client):
     r = client.get("/api/jarvis/llm/status", headers=h("bob"))
     leaked = [v for v in _values_of(r.json() if r.status_code == 200 else {}, "path") if isinstance(v, str) and v]
     assert not leaked, f"llm/status shows server paths: {leaked}"
 
 
-@pytest.mark.xfail(strict=True, reason="GAP: any tenant can spend the shared inference backend (no per-tenant quota or operator gate yet)")
-def test_a_tenant_cannot_spend_the_shared_inference_backend(client):
-    r = client.post("/api/jarvis/llm/generate", headers=h("bob"), json={"user": "hello"})
-    assert r.status_code in (403, 429)
+def test_a_tenant_cannot_spend_the_shared_inference_backend(client, monkeypatch):
+    """(Was a strict xfail.) The backend is called for nobody: a tenant's request is refused before any generation happens."""
+    from app import amul_llm
+
+    called = []
+    monkeypatch.setattr(amul_llm, "generate", lambda *a, **k: called.append(1) or {})
+    for who in ("alice", "bob"):
+        r = client.post("/api/jarvis/llm/generate", headers=h(who), json={"user": "hello"})
+        assert r.status_code == 403, (who, r.status_code, r.text[:100])
+    assert called == []
 
 
-@pytest.mark.xfail(strict=True, reason="GAP: the AMUL field status shows the server's filesystem path (data/tenants/<hash>/...) to the tenant")
 def test_a_tenant_is_not_told_the_servers_filesystem_layout(client):
+    """(Was a strict xfail.) The status still answers a tenant (its own artifact count), just without the server's directory."""
     r = client.get("/api/jarvis/memory/amul/field/status", headers=h("bob"))
+    assert r.status_code == 200 and "artifact_count" in r.json()                      # positive control: the route works for a tenant
     leaked = [v for v in _values_of(r.json(), "path") if isinstance(v, str) and v]
     assert not leaked, f"the status shows server paths: {leaked}"
 
