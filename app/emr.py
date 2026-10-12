@@ -233,8 +233,24 @@ REINFORCEMENT_RULE = (
     "certified by the Continuity Ledger and are never mutated."
 )
 
+# The reinforcement overlay is keyed like short-term memory: the operator's entries are keyed by the bare memory id (so the legacy shared sidecar and every
+# existing caller keep working), a tenant's by "<tenant>\x1f<memory id>". Nothing reads or reports another tenant's entries.
 _REINFORCEMENT: dict[str, ReinforcementState] = {}
 _DYNAMICS_LOCK = threading.RLock()
+
+
+def _dyn_key(memory_id: str, tenant: str | None = None) -> str:
+    tenant = current_tenant_key() if tenant is None else tenant
+    return f"{tenant}{_TENANT_SEP}{memory_id}" if tenant else memory_id
+
+
+def _tenant_states() -> list[ReinforcementState]:
+    """The overlay entries of the current tenant only (the operator's are the ones with no tenant prefix)."""
+    tenant = current_tenant_key()
+    if tenant:
+        prefix = f"{tenant}{_TENANT_SEP}"
+        return [s for k, s in _REINFORCEMENT.items() if k.startswith(prefix)]
+    return [s for k, s in _REINFORCEMENT.items() if _TENANT_SEP not in k]
 
 # --- Dynamics sidecar (survives restarts; lives OUTSIDE the Continuity Ledger) ---
 
@@ -259,10 +275,30 @@ def _ensure_dynamics() -> None:
             p = Path(DYNAMICS_PATH)
             if p.exists():
                 data = json.loads(p.read_text(encoding="utf-8"))
+                # "reinforcement" is the operator's overlay (and, in a file written before tenants were separated, everything that was ever recorded: the shared
+                # deployment has one tenant, the operator, so those entries ARE the operator's). "tenants" holds every other tenant's, by tenant key.
                 for mid, state in (data.get("reinforcement") or {}).items():
-                    _REINFORCEMENT[mid] = ReinforcementState(**state)
+                    _REINFORCEMENT[_dyn_key(mid, "")] = ReinforcementState(**state)
+                for tenant, entries in (data.get("tenants") or {}).items():
+                    for mid, state in entries.items():
+                        _REINFORCEMENT[_dyn_key(mid, tenant)] = ReinforcementState(**state)
         except Exception:
             pass  # sidecar is disposable dynamics, not truth
+
+
+DYNAMICS_SCHEMA = "emr-dynamics-v2"
+
+
+def _backup_legacy_sidecar(p: Path) -> None:
+    """The first time a file written before tenants were separated (schema v1) is rewritten, keep a copy of it as it was: the migration is a re-labelling
+    (its entries become the operator's), and this makes it reversible."""
+    try:
+        if p.exists() and json.loads(p.read_text(encoding="utf-8")).get("schema") == "emr-dynamics-v1":
+            backup = p.with_suffix(p.suffix + ".pre-tenant.bak")
+            if not backup.exists():
+                backup.write_bytes(p.read_bytes())
+    except Exception:
+        pass  # a backup that cannot be made must not stop the overlay from being saved
 
 
 def save_dynamics() -> bool:
@@ -272,14 +308,21 @@ def save_dynamics() -> bool:
             p = Path(DYNAMICS_PATH)
             p.parent.mkdir(parents=True, exist_ok=True)
             tmp = p.with_suffix(p.suffix + ".tmp")
+            operator_entries = {k: v.model_dump() for k, v in sorted(_REINFORCEMENT.items()) if _TENANT_SEP not in k}
+            tenant_entries: dict[str, dict] = {}
+            for k, v in sorted(_REINFORCEMENT.items()):
+                if _TENANT_SEP in k:
+                    tenant, mid = k.split(_TENANT_SEP, 1)
+                    tenant_entries.setdefault(tenant, {})[mid] = v.model_dump()
             payload = {
-                "schema": "emr-dynamics-v1",
+                "schema": DYNAMICS_SCHEMA,
                 "saved_at": datetime.now(timezone.utc).isoformat(),
                 "note": "EMR retrieval dynamics only — NOT truth; ledger is authoritative.",
-                "reinforcement": {
-                    k: v.model_dump() for k, v in sorted(_REINFORCEMENT.items())
-                },
+                # the operator's entries stay under "reinforcement", where every earlier reader looks (so a rollback of the code still reads the file)
+                "reinforcement": operator_entries,
+                "tenants": tenant_entries,
             }
+            _backup_legacy_sidecar(p)
             tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
             os.replace(tmp, p)
             return True
@@ -613,7 +656,7 @@ def reset_stm_for_tests() -> None:
 
 
 def get_reinforcement(memory_id: str) -> ReinforcementState | None:
-    return _REINFORCEMENT.get(memory_id)
+    return _REINFORCEMENT.get(_dyn_key(memory_id))
 
 
 def reinforce_ids(
@@ -640,7 +683,7 @@ def reinforce_ids(
             if mid not in known_ids:
                 unknown.append(mid)
                 continue
-            state = _REINFORCEMENT.get(mid) or ReinforcementState(memory_id=mid)
+            state = _REINFORCEMENT.get(_dyn_key(mid)) or ReinforcementState(memory_id=mid)
             if outcome.outcome_id in state.outcome_ids:
                 replayed.append(mid)
                 continue
@@ -649,7 +692,7 @@ def reinforce_ids(
             state.decay_damp = min(DAMP_CAP, state.decay_damp + DAMP_GAIN)
             state.last_reinforced_at = now_iso
             state.outcome_ids.append(outcome.outcome_id)
-            _REINFORCEMENT[mid] = state
+            _REINFORCEMENT[_dyn_key(mid)] = state
             reinforced.append(state)
         if reinforced:
             save_dynamics()
@@ -677,7 +720,7 @@ def correct_memory_ids(
             if mid not in known_ids:
                 unknown.append(mid)
                 continue
-            state = _REINFORCEMENT.get(mid) or ReinforcementState(memory_id=mid)
+            state = _REINFORCEMENT.get(_dyn_key(mid)) or ReinforcementState(memory_id=mid)
             if correction.correction_id in state.correction_ids:
                 replayed.append(mid)
                 continue
@@ -685,7 +728,7 @@ def correct_memory_ids(
             state.decay_damp = 0.0
             state.last_reinforced_at = now_iso
             state.correction_ids.append(correction.correction_id)
-            _REINFORCEMENT[mid] = state
+            _REINFORCEMENT[_dyn_key(mid)] = state
             corrected.append(state)
         if corrected:
             save_dynamics()
@@ -986,7 +1029,7 @@ def activate(
     R = resonance(rec, trajectory or [], prior_stm_ids or [])
     P = provenance_authority(rec)
     _, age_hours, D = decay_factor(rec, now=now)
-    dyn = _REINFORCEMENT.get(rec.id)
+    dyn = get_reinforcement(rec.id)
     salience = dyn.salience if dyn else 0.0
     damp = dyn.decay_damp if dyn else 0.0
     D_eff = D * (1.0 - damp)
@@ -1572,7 +1615,7 @@ def stm_context_block(session_key: str = "default") -> str:
 
 def emr_status() -> dict[str, Any]:
     _ensure_dynamics()  # report true persisted state, not pre-load zeros
-    reinforced = sorted(_REINFORCEMENT.values(), key=lambda s: -s.use_count)
+    reinforced = sorted(_tenant_states(), key=lambda s: -s.use_count)   # this tenant's entries only
     return {
         "sessions": sorted(_visible_stm_keys().values()),
         "counts": {name: len(_STM[key]) for key, name in _visible_stm_keys().items()},
@@ -1602,10 +1645,10 @@ def emr_status() -> dict[str, Any]:
         },
         "dynamics": {
             "sidecar": {
-                "path": DYNAMICS_PATH,
+                "path": None if current_tenant_key() else DYNAMICS_PATH,   # the server's filesystem layout is the operator's business, not a tenant's
                 "loaded": _dynamics_loaded,
-                "persisted_particles": len(_REINFORCEMENT),
-                "schema": "emr-dynamics-v1",
+                "persisted_particles": len(reinforced),
+                "schema": DYNAMICS_SCHEMA,
                 "note": "Retrieval dynamics only — outside the ledger; LTM stays authoritative.",
             },
             "resonance_vectors": {
@@ -1630,7 +1673,7 @@ def emr_status() -> dict[str, Any]:
                     "shared-tags",
                 ],
             },
-            "reinforced_particles": len(_REINFORCEMENT),
+            "reinforced_particles": len(reinforced),
             "caps": {
                 "salience_gain": SALIENCE_GAIN,
                 "salience_cap": SALIENCE_CAP,

@@ -843,6 +843,7 @@ def test_an_append_while_the_page_is_read_cannot_split_it_from_its_head(tmp_path
     assert log.head()["seq"] == 7                        # both appends did happen, just after the snapshot
 
 
+@pytest.mark.skipif(not call_log._pin_by_handle(), reason="Windows reads the page under the lock by design; the Windows test below pins that")
 def test_reading_a_page_does_not_hold_the_writers_lock(tmp_path, monkeypatch):
     """A big log is parsed AFTER the lock is released: a writer that arrives during the read finishes at once (it used to wait for the whole scan),
     and its entry is simply not in the page, which is exactly the log as of the snapshot."""
@@ -901,6 +902,7 @@ def test_on_windows_the_page_is_read_under_the_lock_with_no_pinned_handles_and_n
     def racing(self, snapshot=None):
         t = threading.Thread(target=lambda: call_log.CallLog(tmp_path / "winlike").append(_fields(99)))
         t.start()
+        state["writer"] = t
         t.join(timeout=0.4)
         state["writer_waited"] = t.is_alive()                  # the lock is held for the whole page: the writer cannot get in
         yield from (real(self) if snapshot is None else real(self, snapshot))
@@ -910,6 +912,8 @@ def test_on_windows_the_page_is_read_under_the_lock_with_no_pinned_handles_and_n
     monkeypatch.setattr(call_log.CallLog, "entries_desc", real)
     assert state["writer_waited"] is True and taken == []
     assert page["entries"][0]["seq"] == page["head"]["seq"] == 5
+    state["writer"].join(timeout=30)       # the waiting writer gets in once the lock is released (on Windows its lock retry can take a second to notice)
+    assert not state["writer"].is_alive()
     assert log.head()["seq"] == 6
 
 
@@ -937,13 +941,24 @@ def test_the_degraded_state_belongs_to_the_same_snapshot_as_the_page_and_head(tm
     assert log.degraded() is not None
     real = call_log.CallLog.entries_desc
 
+    lazy = not call_log._pin_by_handle()     # Windows reads the page under the lock: another worker cannot recover meanwhile, it waits (and must not be run inline, it would wait for us)
+    writers = []
+
     def recovering(self, snapshot=None):
-        call_log.CallLog(tmp_path / "degsnap").append(_fields(9))      # another worker: writes the gap entry first, then its own, and clears the latch
+        if lazy:
+            t = threading.Thread(target=lambda: call_log.CallLog(tmp_path / "degsnap").append(_fields(9)))
+            t.start()
+            writers.append(t)
+        else:
+            call_log.CallLog(tmp_path / "degsnap").append(_fields(9))      # another worker: writes the gap entry first, then its own, and clears the latch
         yield from (real(self) if snapshot is None else real(self, snapshot))
 
     monkeypatch.setattr(call_log.CallLog, "entries_desc", recovering)
     page = log.query_with_head(limit=50)
     monkeypatch.setattr(call_log.CallLog, "entries_desc", real)
+    for t in writers:
+        t.join(timeout=30)
+        assert not t.is_alive()
     assert page["degraded"] and page["degraded"]["unlogged"] == 2                       # as of the snapshot
     assert [e["outcome"] for e in page["entries"]].count("gap") == 0 and page["head"]["seq"] == 3   # the page and the head predate the recovery
     assert log.degraded() is None                                                       # the latch was cleared meanwhile, and the next read will say so
@@ -1006,6 +1021,7 @@ def test_a_page_read_holds_at_most_the_pinned_number_of_descriptors(tmp_path, mo
     assert len(os.listdir("/proc/self/fd")) <= baseline + 1            # and all of them closed afterwards
 
 
+@pytest.mark.skipif(not call_log._pin_by_handle(), reason="Windows reads the page lazily under the lock, and cannot unlink a file that is open; the Windows test pins that")
 def test_concurrent_page_reads_are_bounded_and_the_rest_are_told_to_retry(tmp_path, monkeypatch):
     monkeypatch.setenv("JARVIS_CALL_LOG_SNAPSHOT_READERS", "1")
     monkeypatch.setenv("JARVIS_CALL_LOG_SNAPSHOT_WAIT_SECONDS", "0.2")
@@ -1124,6 +1140,7 @@ def test_a_snapshot_page_ignores_what_was_appended_after_it(tmp_path):
     snap.close()
 
 
+@pytest.mark.skipif(not call_log._pin_by_handle(), reason="Windows reads the page lazily under the lock, and cannot unlink a file that is open; the Windows test pins that")
 def test_a_snapshot_still_reads_a_file_that_retention_deleted_after_it_was_taken(tmp_path, monkeypatch):
     """The page must not be missing a file the snapshot advertised: an append that rotates the log can unlink an older file while a page is being read."""
     monkeypatch.setenv("JARVIS_CALL_LOG_RETAIN_DAYS", "2")

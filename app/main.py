@@ -1005,7 +1005,7 @@ def _run_drift(body: Any, client_header: str | None) -> dict[str, Any]:
     except drift.DriftInputError as exc:
         raise LatestError(422, "invalid_request", exc.reason, exc.detail) from None
     client_name = call_log.split_client(client_header)[0] if client_header else None
-    matches = drift.match_call_log(request_["records"], request_["client"] or client_name, request_["served_digest"])
+    matches = drift.match_call_log(request_["records"], request_["client"] or client_name, request_["served_digest"], tenant=current_tenant_key())
     result["call_log"] = matches
     entry = drift.get_drift_log().record(drift.log_entry(result, request_, tenant=request_tenant(), client_header=client_header, matches=matches))
     result["drift_log_seq"] = entry["seq"] if entry and "seq" in entry else None

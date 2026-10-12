@@ -700,18 +700,24 @@ def run_check(request: dict[str, Any], store: Any) -> dict[str, Any]:
 _SERVED_TOOLS = {"emr_fetch", "fetch", "emr_latest", "emr_search_ledger", "search", "emr_search", "emr_recall"}
 
 
-def match_call_log(records: list[str], client: str | None, served_digest: str | None, limit: int = 10) -> dict[str, Any]:
-    """Which logged calls could have served these records.  A match proves a call happened with these hashes, NOT what text was shown."""
+def match_call_log(records: list[str], client: str | None, served_digest: str | None, limit: int = 10, *, tenant: str | None = None) -> dict[str, Any]:
+    """Which logged calls could have served these records.  A match proves a call happened with these hashes, NOT what text was shown.
+
+    Only calls made by the tenant whose records are being checked count: the call log is one chain for everyone, and a drift check must never return another
+    tenant's seq, client name, transport or result digest. ``tenant`` is the label the entries are filed under (the operator's is "operator")."""
     if not call_log.enabled():
         return {"available": False, "matches": [], "note": "the call log is switched off"}
     try:
         log = call_log.get_call_log()
+        wanted = tenant or "operator"
         by_args = {call_log.args_hash({"id": rid}): rid for rid in records}
         matches: list[dict[str, Any]] = []
         for e in log.entries_desc():
             if len(matches) >= limit:
                 break
             if e.get("tool") not in _SERVED_TOOLS or e.get("outcome") != "ok":
+                continue
+            if e.get("tenant") != wanted:
                 continue
             if client and client.lower() not in str(e.get("client_name") or "").lower():
                 continue
