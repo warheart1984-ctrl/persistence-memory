@@ -255,7 +255,9 @@ live before/after capture of the deploy.
 ### Built beyond the RFC's phase 0
 
 - Isolation matrix with a route registry that fails closed (#90), no known gaps left as strict xfails except the RAG audit.
-- RLS readiness check `rls_tables` (#94): a table with a `tenant_key` column and no forced RLS makes `/ready` return 503 (readiness, not startup abort).
+- RLS readiness check `rls_tables` (#94): a table with a `tenant_key` column and no forced RLS, **other than the retained legacy table `jarvis_tenant_ledgers`**, makes `/ready` return 503 (readiness, not startup abort).
+  The exception is deliberate and exact (`LEGACY_BLOB_TABLE`): the importer leaves that older JSONB rollback copy in place, it has a `tenant_key` and no RLS, the row store never reads it, and the
+  separate `legacy_data` check watches it; a look-alike table name is still flagged. A deployment that kept it therefore still passes `/ready`, so the check does not audit that table.
 - Per-tenant seal, sign and verify from the box, `jarvisctl tenants` (#95, #97): cross-tenant administration only through the migrator role on the box, never the public API. Built, **not scheduled**.
 - Drift call-log match filtered by tenant (#93); `pg_verify` fails for an unknown or empty tenant name (#98).
 - A **recall credential** (#101, `docs/recall_credential.md`): a read-only key (`EMR_RECALL_API_KEY`) limited to seven read tools. This is a third credential class beside `tenant` and `operator` in section 3.
@@ -285,9 +287,12 @@ being on every tenant-scoped row, under forced RLS, and on the per-tenant `seq`/
 
 1. **The epoch must be a Merkle root, not one hash over a list (sections 5, 7, 9).** The body defines the epoch as a hash over the serialized sorted list of
    `(tenant_key, height, block_hash, last_seq)`, but a digest built that way cannot yield the promised sibling-hash inclusion proof: verifying it would disclose the whole tenant list.
-   Define it as a canonical, domain-separated Merkle root: leaf = `H(0x00 || len-prefixed tenant_key || height || block_hash || last_seq)`, leaves sorted by `tenant_key`,
-   node = `H(0x01 || left || right)` (an odd node is promoted unchanged), epoch hash = `H(0x02 || previous_epoch_hash || n || root)`. A tenant's proof is its leaf plus the sibling hashes
-   (and its index), nothing else. Without this the tenant-scoped proof claim must be dropped.
+   Define it as a canonical, domain-separated Merkle root over **everything section 6 and section 7 say the epoch commits to**:
+   leaf = `H(0x00 || len-prefixed tenant_key || height || block_hash || last_seq || call_log_seq || call_log_head_hash)` (the tenant's call-log head, section 6; a tenant with no call log
+   uses the fixed empty value, never a missing field), leaves sorted by `tenant_key`, node = `H(0x01 || left || right)` (an odd node is promoted unchanged);
+   `events_root` = the same construction over the hashes of the lifecycle events (`tenant_restored`, `tenant_deleted`, ...) recorded since the previous epoch, ordered by event sequence, with
+   a fixed empty root when there are none; **epoch hash = `H(0x02 || previous_epoch_hash || n || tenants_root || events_root)`**. So a truncated call log, or an altered, dropped or inserted lifecycle event,
+   changes the epoch hash. A tenant's proof is its leaf plus the sibling hashes (and its index), nothing else. Without this the tenant-scoped proof claim must be dropped.
 2. **Lifecycle jobs need an explicit, audited way past the immutability triggers (section 7).** `record_history`, `evidence_objects`, `blocks`, `attestations` and `trust_statements`
    carry unconditional `BEFORE UPDATE`/`BEFORE DELETE` triggers that raise even for the table owner, so table ownership alone does not let the migrator restore-replace or delete a tenant's
    rows; the section 7 procedures would fail as written. Phase 3 must specify the mechanism and its audit. A workable shape: the triggers allow the operation only when a
