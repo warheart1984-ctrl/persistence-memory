@@ -601,3 +601,37 @@ def test_an_explicit_tenant_list_is_trimmed_and_deduplicated_before_any_tenant_i
     assert r.returncode == 0, r.stderr
     calls = [l.split("--tenant ")[1] for l in log.read_text().splitlines() if "--tenant " in l]
     assert calls == ["t_alice", "t_bob", "operator"]            # exactly these names: trimmed, in order given, once each (and the operator is not forced first here)
+
+
+def test_the_operator_only_gates_pass_inside_a_tenant_job_in_oauth_mode_but_never_for_a_tenant_token(monkeypatch):
+    """JARVIS_AUTH_MODE=oauth is the multi-tenant deployment: caller_is_operator() is False for every request there, and the box's own job must still work. The
+    exception is the job context itself, which nothing in a request can set; an OAuth tenant's principal gets nothing from it."""
+    from fastapi import HTTPException
+    from app import auth
+    from app.identity import Principal, reset_principal, set_principal
+    monkeypatch.setenv("JARVIS_AUTH_MODE", "oauth")
+    monkeypatch.setenv("JARVIS_MULTI_TENANT", "1")
+    tenant_token = set_principal(Principal(subject="alice", scopes=frozenset({"memory.read", "memory.write"}), issuer="https://idp.example"))
+    try:
+        assert not auth.caller_is_operator()
+        with pytest.raises(HTTPException) as exc:
+            auth.require_operator_read()
+        assert exc.value.status_code == 403                          # a tenant's token is refused, as before
+    finally:
+        reset_principal(tenant_token)
+    assert not auth.caller_is_operator()                              # and so is no identity at all
+    with acting_for("t_alice"):
+        assert auth.caller_is_operator()
+        auth.require_operator_read()
+    assert not auth.caller_is_operator()                              # the job context does not outlive its block
+
+
+def test_a_per_tenant_job_request_works_in_oauth_plus_strict_mode(pg, monkeypatch):
+    """The real routes the signer reads, end to end through request_as, in the deployment the multi-tenant setup actually uses."""
+    write(pg, "t_alice", 3)
+    tenant_jobs.seal(["t_alice"], force=True)
+    monkeypatch.setenv("JARVIS_AUTH_MODE", "oauth")
+    monkeypatch.setenv("JARVIS_MULTI_TENANT", "1")
+    for path in ("/api/jarvis/attestations/head", "/api/jarvis/attestations/pending", "/api/jarvis/blocks/1"):
+        status, body = tenant_jobs.request_as("t_alice", "GET", path)
+        assert status == 200, (path, status, body)

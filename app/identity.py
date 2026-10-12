@@ -43,6 +43,12 @@ _principal: contextvars.ContextVar[Principal | None] = contextvars.ContextVar(
 _acting_tenant: contextvars.ContextVar[str | None] = contextvars.ContextVar("jarvis_acting_tenant", default=None)
 
 
+def in_operator_job() -> bool:
+    """True only inside ``acting_for``: the box's own per-tenant job, started by the operator. Set by nothing else, so no request can make it true (an OAuth
+    tenant's token certainly cannot); the operator-only gates honor it even when the deployment authenticates users with OAuth."""
+    return _acting_tenant.get() is not None
+
+
 @contextlib.contextmanager
 def acting_for(tenant: str):
     """Run code as the operator administering ONE tenant's ledger (the box's per-tenant jobs: seal, sign, verify).
