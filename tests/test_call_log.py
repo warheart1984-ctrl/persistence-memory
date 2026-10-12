@@ -1021,6 +1021,7 @@ def test_a_page_read_holds_at_most_the_pinned_number_of_descriptors(tmp_path, mo
     assert len(os.listdir("/proc/self/fd")) <= baseline + 1            # and all of them closed afterwards
 
 
+@pytest.mark.skipif(not call_log._pin_by_handle(), reason="Windows reads the page lazily under the lock, and cannot unlink a file that is open; the Windows test pins that")
 def test_concurrent_page_reads_are_bounded_and_the_rest_are_told_to_retry(tmp_path, monkeypatch):
     monkeypatch.setenv("JARVIS_CALL_LOG_SNAPSHOT_READERS", "1")
     monkeypatch.setenv("JARVIS_CALL_LOG_SNAPSHOT_WAIT_SECONDS", "0.2")
@@ -1139,6 +1140,7 @@ def test_a_snapshot_page_ignores_what_was_appended_after_it(tmp_path):
     snap.close()
 
 
+@pytest.mark.skipif(not call_log._pin_by_handle(), reason="Windows reads the page lazily under the lock, and cannot unlink a file that is open; the Windows test pins that")
 def test_a_snapshot_still_reads_a_file_that_retention_deleted_after_it_was_taken(tmp_path, monkeypatch):
     """The page must not be missing a file the snapshot advertised: an append that rotates the log can unlink an older file while a page is being read."""
     monkeypatch.setenv("JARVIS_CALL_LOG_RETAIN_DAYS", "2")
