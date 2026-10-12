@@ -1,5 +1,7 @@
 # Tenant isolation matrix
 
+The design this implements, with its implementation status: [RFC-multi-tenant-ledger.md](RFC-multi-tenant-ledger.md).
+
 `tests/test_tenant_isolation.py` is the safety net for the multi-tenant work (RFC, phase 0). Two tenants, `alice` and `bob`, exist today through OAuth subjects; per-tenant API keys will add a second fixture over the same cases.
 
 ## The rule: a route must be classified
