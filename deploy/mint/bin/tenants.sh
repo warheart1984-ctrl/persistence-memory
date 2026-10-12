@@ -38,6 +38,14 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+# a flag that does not apply to the command is an error, never silently ignored (`seal --dry-run` must not seal; `sign --force` must not sign)
+case "$cmd" in
+  list)   [ "$force" -eq 0 ] && [ "$dry" -eq 0 ] && [ -z "$tenants" ] || { echo "list takes no options" >&2; exit 2; } ;;
+  seal)   [ "$dry" -eq 0 ] || { echo "seal has no --dry-run (it seals; use --force only to seal below the block minimum)" >&2; exit 2; } ;;
+  sign)   [ "$force" -eq 0 ] || { echo "sign has no --force" >&2; exit 2; } ;;
+  status|verify) [ "$force" -eq 0 ] && [ "$dry" -eq 0 ] || { echo "$cmd takes only --tenants" >&2; exit 2; } ;;
+  *) usage ;;
+esac
 [ "$cmd" = list ] || [ -n "$tenants" ] || tenants="$(list_tenants | paste -sd, -)"
 
 case "$cmd" in

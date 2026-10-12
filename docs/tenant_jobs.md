@@ -23,3 +23,8 @@ jarvisctl tenants verify [--tenants a,b]               pg_verify each tenant: hi
 
 ## Before any outside tenant is live
 Run the Windows read path of #89 on the PC, and the combined drill; the timers keep running `seal.sh` and `attest.sh sign` until someone decides to move them to `jarvisctl tenants`.
+
+## Limits and options
+
+* Each answer from a tenant's API must arrive within `JARVIS_SIGNER_TENANT_API_TIMEOUT` seconds (default 60, the HTTP transport's bound; finite and positive or the default). A tenant whose container is alive but stuck is killed and recorded as failed (`api_timeout`), and the next tenant goes on.
+* `tenants.sh` refuses a flag that does not apply to the command (`seal --dry-run`, `sign --force`, `status --dry-run`, ...) with exit 2 instead of ignoring it: `seal` always seals, `--dry-run` belongs to `sign` only.

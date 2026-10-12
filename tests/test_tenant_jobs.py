@@ -215,6 +215,7 @@ def test_serve_answers_every_line_and_survives_a_bad_one(pg):
 import os
 import subprocess
 import sys
+import time
 
 from app import attest, signer
 from tests.attest_support import make_key, requires_ssh_keygen, statement
@@ -362,6 +363,70 @@ def test_a_container_transport_that_dies_is_reported_not_hung(monkeypatch):
         transport("GET", "/api/jarvis/trust")
     assert exc.value.code == "api_unreachable"
     transport.close()
+
+
+def test_a_container_transport_that_stops_answering_times_out_and_is_killed():
+    """A container that is alive but stuck must fail THIS tenant (api_timeout) instead of holding it and every later tenant forever."""
+    stuck = [sys.executable, "-c", "import sys, time; sys.stdin.readline(); time.sleep(120)"]
+    transport = signer.ContainerTransport("t_stuck", command=stuck, timeout=0.5)
+    started = time.monotonic()
+    with pytest.raises(signer.SignerError) as exc:
+        transport("GET", "/api/jarvis/trust")
+    assert exc.value.code == "api_timeout" and "t_stuck" in str(exc.value) and time.monotonic() - started < 10
+    assert transport._proc.wait(timeout=10) is not None                 # the stuck process was killed, not left running
+    transport.close()
+
+
+def test_the_api_timeout_comes_from_the_environment_and_is_always_finite_and_positive(monkeypatch):
+    for raw, expected in (("", 60.0), ("5", 5.0), ("0", 60.0), ("-3", 60.0), ("inf", 60.0), ("nan", 60.0), ("soon", 60.0)):
+        monkeypatch.setenv("JARVIS_SIGNER_TENANT_API_TIMEOUT", raw)
+        assert signer._tenant_api_timeout() == expected, raw
+
+
+def test_a_stuck_tenant_does_not_stop_the_tenants_after_it():
+    """The timeout is what makes 'one tenant cannot break the others' true for a hang, not only for an exception."""
+    stuck = [sys.executable, "-c", "import sys, time; sys.stdin.readline(); time.sleep(120)"]
+    fine = [sys.executable, "-c", "import sys, json\nfor l in sys.stdin: print(json.dumps({'status': 200, 'body': {}}), flush=True)"]
+    answered = []
+
+    def visit(tenant):
+        t = signer.ContainerTransport(tenant, command=stuck if tenant == "t_stuck" else fine, timeout=0.5)
+        try:
+            answered.append((tenant, t("GET", "/x")[0]))
+        finally:
+            t.close()
+        return {}
+
+    report = tenant_jobs.run_for_tenants(visit, ["operator", "t_stuck", "t_after"])
+    assert report["failed"] == ["t_stuck"] and answered == [("operator", 200), ("t_after", 200)]
+
+
+def _tenants_sh(tmp_path, *args):
+    """Run tenants.sh with a fake `docker` first on PATH: arguments are validated before anything touches Docker, so a rejected combination never reaches it."""
+    fake = tmp_path / "bin"
+    fake.mkdir(exist_ok=True)
+    (fake / "docker").write_text("#!/bin/sh\nexit 1\n")
+    (fake / "docker").chmod(0o755)
+    env = {**os.environ, "PATH": f"{fake}{os.pathsep}{os.environ['PATH']}", "JARVIS_HOME": str(tmp_path / "home")}
+    return subprocess.run(["bash", str(BIN / "tenants.sh"), *args], capture_output=True, text=True, env=env, timeout=60)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="bash scripts for the box")
+@pytest.mark.parametrize("args", [("seal", "--dry-run"), ("sign", "--force"), ("status", "--dry-run"), ("status", "--force"), ("verify", "--force"),
+                                  ("verify", "--dry-run"), ("list", "--force"), ("list", "--tenants", "operator"), ("seal", "--bogus")])
+def test_a_flag_that_does_not_apply_to_the_command_is_refused_not_ignored(tmp_path, args):
+    r = _tenants_sh(tmp_path, *args)
+    assert r.returncode == 2, (r.returncode, r.stderr)
+    assert not (tmp_path / "home" / "state" / "tenants-seal.last_ok").exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="bash scripts for the box")
+@pytest.mark.parametrize("args", [("seal", "--force", "--tenants", "operator"), ("sign", "--dry-run", "--tenants", "operator"), ("status", "--tenants", "operator"),
+                                  ("verify", "--tenants", "operator")])
+def test_the_flags_that_do_apply_get_past_the_check(tmp_path, args):
+    """Positive control: these pass validation (and then fail at the fake docker, which is not exit 2)."""
+    r = _tenants_sh(tmp_path, *args)
+    assert r.returncode != 2 and "does not apply" not in r.stderr and "takes only" not in r.stderr and "has no" not in r.stderr, (r.returncode, r.stderr)
 
 
 # ======================================================================================================== the box scripts: new, and nothing else moved

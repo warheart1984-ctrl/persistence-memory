@@ -29,10 +29,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -429,19 +431,39 @@ def init_key(path: Path) -> dict[str, str]:
     return {"key_id": info.public.key_id, "public_key": info.public.text(), "path": str(path)}
 
 
+def _tenant_api_timeout() -> float:
+    """Seconds one per-tenant API answer may take (the HTTP transport's bound is 60): JARVIS_SIGNER_TENANT_API_TIMEOUT, finite and positive or the default."""
+    try:
+        value = float(os.getenv("JARVIS_SIGNER_TENANT_API_TIMEOUT", "") or 60)
+    except ValueError:
+        return 60.0
+    return value if 0 < value < float("inf") else 60.0
+
+
 class ContainerTransport:
     """An API for ONE tenant, served by ``app.tenant_jobs serve`` in a one-off migrate container (tenant-api.sh): JSON lines in, JSON lines out.
 
     The tenant is bound by the container process the operator started, never by the request, so the public API still cannot select one. The signer's
     logic is unchanged: it asks for the same paths and posts the same attestations; only the way they are reached differs.  Close it when done."""
 
-    def __init__(self, tenant: str, command: list[str] | None = None):
+    def __init__(self, tenant: str, command: list[str] | None = None, timeout: float | None = None):
         self.tenant = tenant
+        self._timeout = timeout if timeout is not None else _tenant_api_timeout()
+        self._lines: "queue.Queue[str]" = queue.Queue()
         cmd = command or [str(repo_root() / "deploy" / "mint" / "bin" / "tenant-api.sh"), tenant]
         try:
             self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
         except OSError as exc:
             raise SignerError("api_unreachable", f"cannot start the per-tenant API for {tenant!r}: {exc}", EXIT_API) from None
+        threading.Thread(target=self._pump, daemon=True).start()      # a reader thread, so that a read can be bounded: readline() itself cannot time out
+
+    def _pump(self) -> None:
+        try:
+            for line in self._proc.stdout:        # type: ignore[union-attr]
+                self._lines.put(line)
+        except (OSError, ValueError):
+            pass
+        self._lines.put("")                       # end of output: the process exited (or was killed)
 
     def __call__(self, method: str, path: str, body: "dict[str, Any] | None" = None) -> "tuple[int, Any]":
         proc = self._proc
@@ -449,7 +471,11 @@ class ContainerTransport:
             assert proc.stdin is not None and proc.stdout is not None
             proc.stdin.write(json.dumps({"method": method, "path": path, "body": body}) + "\n")
             proc.stdin.flush()
-            line = proc.stdout.readline()
+            line = self._lines.get(timeout=self._timeout)
+        except queue.Empty:
+            # a container that is alive but stuck would otherwise hold this tenant, and every tenant after it, forever
+            proc.kill()
+            raise SignerError("api_timeout", f"the per-tenant API for {self.tenant!r} did not answer within {self._timeout:g}s", EXIT_API) from None
         except (OSError, ValueError):
             line = ""
         if not line:
