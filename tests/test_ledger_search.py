@@ -259,7 +259,7 @@ def test_no_or_wrong_credentials_get_authority_denied(client, headers):
 
 def test_an_unresolved_tenant_is_refused(client):
     add(client, "deploy")
-    with patch("app.main.oauth_enabled", return_value=True), patch("app.main.current_tenant_key", return_value=None):
+    with patch("app.main.request_tenant", return_value=None):   # no identity resolved
         r = search(client, "deploy")
     assert r.status_code == 403 and r.json()["reason"] == "TENANT_UNRESOLVED" and "records" not in r.json()
 

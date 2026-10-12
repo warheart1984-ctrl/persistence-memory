@@ -30,6 +30,8 @@ import argparse
 import json
 import os
 import queue
+import re
+import secrets
 import stat
 import subprocess
 import sys
@@ -450,9 +452,15 @@ class ContainerTransport:
         self.tenant = tenant
         self._timeout = timeout if timeout is not None else _tenant_api_timeout()
         self._lines: "queue.Queue[str]" = queue.Queue()
+        self._container: str | None = None
+        env = None
+        if command is None:
+            # a name of our own for the one-off container, so a stuck one can be removed by name (killing the compose client does not stop the container)
+            self._container = f"jarvis-tenant-api-{re.sub(r'[^A-Za-z0-9_.-]', '_', tenant)[:40]}-{os.getpid()}-{secrets.token_hex(4)}"
+            env = {**os.environ, "JARVIS_TENANT_API_NAME": self._container}
         cmd = command or [str(repo_root() / "deploy" / "mint" / "bin" / "tenant-api.sh"), tenant]
         try:
-            self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
+            self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1, env=env)
         except OSError as exc:
             raise SignerError("api_unreachable", f"cannot start the per-tenant API for {tenant!r}: {exc}", EXIT_API) from None
         threading.Thread(target=self._pump, daemon=True).start()      # a reader thread, so that a read can be bounded: readline() itself cannot time out
@@ -474,7 +482,7 @@ class ContainerTransport:
             line = self._lines.get(timeout=self._timeout)
         except queue.Empty:
             # a container that is alive but stuck would otherwise hold this tenant, and every tenant after it, forever
-            proc.kill()
+            self._kill()
             raise SignerError("api_timeout", f"the per-tenant API for {self.tenant!r} did not answer within {self._timeout:g}s", EXIT_API) from None
         except (OSError, ValueError):
             line = ""
@@ -483,13 +491,22 @@ class ContainerTransport:
         answer = json.loads(line)
         return int(answer["status"]), answer["body"]
 
+    def _kill(self) -> None:
+        """End the process AND the container it started: the compose client's death does not stop a container that is stuck."""
+        self._proc.kill()
+        if self._container:
+            try:
+                subprocess.run(["docker", "rm", "-f", self._container], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60, check=False)
+            except (OSError, subprocess.SubprocessError):
+                pass
+
     def close(self) -> None:
         try:
             if self._proc.stdin:
                 self._proc.stdin.close()
             self._proc.wait(timeout=30)
         except (OSError, subprocess.TimeoutExpired):
-            self._proc.kill()
+            self._kill()
 
 
 def sign_tenants(tenants: list[str], key: KeyInfo, *, dry_run: bool, open_api: "Callable[[str], tuple[Api, Callable[[], None]]] | None" = None,

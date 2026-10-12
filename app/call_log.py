@@ -133,6 +133,14 @@ def _is_rest_write(fields: dict[str, Any]) -> bool:
     return (fields.get("method"), fields.get("route")) in LEDGER_WRITE_ROUTES
 
 
+def default_tenant_label() -> str:
+    """The tenant an entry is filed under when the request carried none. In the shared-key deployment that is the operator (the key middleware only lets the
+    operator through); in JARVIS_MULTI_TENANT mode "no identity" is never the operator: it is filed as _unauth."""
+    from app.identity import UNAUTHENTICATED_LABEL, multi_tenant_mode
+
+    return UNAUTHENTICATED_LABEL if multi_tenant_mode() else "operator"
+
+
 def read_cap_per_minute() -> int:
     """GET reads of /api/jarvis/memory/* are witnessed one by one up to this many a minute (per process); the rest are rolled into one summary."""
     try:
@@ -537,7 +545,7 @@ class CallLog:
                         if self._read_window[0] != window:
                             head = self._flush_reads_locked(head)
                             self._read_window = (window, {})
-                        tenant = str(fields.get("tenant") or "operator")
+                        tenant = str(fields.get("tenant") or default_tenant_label())
                         counts = self._read_window[1]  # the cap is per tenant, so a busy tenant cannot use up the others' reads
                         counts[tenant] = counts.get(tenant, 0) + 1
                         if counts[tenant] > read_cap_per_minute():
@@ -803,7 +811,7 @@ def make_fields(*, transport: str, tool: str, args: Any, outcome: str, started: 
         client_name, client_version = split_client(client_header)
     return {
         "transport": transport, "client_name": clean_client(client_name), "client_version": clean_client(client_version, 64),
-        "client_self_reported": True, "tenant": tenant or "operator", "tool": tool, "route": route, "method": method, "target": target,
+        "client_self_reported": True, "tenant": tenant or default_tenant_label(), "tool": tool, "route": route, "method": method, "target": target,
         "args_sha256": args_hash(args), "outcome": outcome, "error_code": error_code, "status_code": status_code,
         "result_digest": result_digest if isinstance(result_digest, str) and re.fullmatch(r"[0-9a-f]{64}", result_digest) else None,
         "duration_ms": max(0, int((time.perf_counter() - started) * 1000)),

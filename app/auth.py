@@ -19,7 +19,8 @@ from starlette.responses import JSONResponse, Response
 
 from app.public_security import is_public_deployment
 from app.refusal import json_response
-from app.identity import current_principal, current_tenant_key, reset_principal, set_principal
+from app.identity import (OPERATOR_TENANT, current_principal, current_tenant_key, is_operator, multi_tenant_mode, operator_principal, reset_principal,
+                          set_principal)
 from app.oauth import READ_SCOPE, WRITE_SCOPE, auth_mode, public_base_url, validate_access_token
 
 
@@ -240,9 +241,43 @@ def require_memory_write() -> None:
         )
 
 
+def multi_tenant_config_problems() -> list[str]:
+    """What JARVIS_MULTI_TENANT refuses to run with: anything that could turn "no identity" into an operator, or a store that is not tenant-isolated."""
+    problems: list[str] = []
+    if allow_unauthenticated():
+        problems.append("JARVIS_ALLOW_UNAUTHENTICATED is set (every caller would be the operator)")
+    if not (os.getenv("JARVIS_DATABASE_URL") or "").strip():
+        problems.append("no PostgreSQL store is configured (JARVIS_DATABASE_URL): the JSON file store has no row-level isolation")
+    elif (os.getenv("JARVIS_PG_STORE") or "rows").strip().lower() != "rows":
+        problems.append("JARVIS_PG_STORE is not 'rows': only the row store has per-tenant rows and forced row-level security")
+    if not oauth_enabled() and configured_api_key() is None:
+        problems.append("no credential is configured (set JARVIS_API_KEY for the operator, or JARVIS_AUTH_MODE=oauth)")
+    return problems
+
+
+def assert_multi_tenant_config() -> None:
+    """Called at startup: in JARVIS_MULTI_TENANT mode, refuse to serve with a configuration that could fail open."""
+    if not multi_tenant_mode():
+        return
+    problems = multi_tenant_config_problems()
+    if problems:
+        raise RuntimeError("JARVIS_MULTI_TENANT refuses to start: " + "; ".join(problems))
+
+
+def caller_is_operator() -> bool:
+    """May this request use an operator-only surface?  An OAuth tenant never may.  In JARVIS_MULTI_TENANT mode the caller must also BE the operator (an
+    authenticated operator principal): no identity is not the operator.  Outside that mode the shared-key deployment's rule holds: a request only gets here
+    after the key middleware accepted it."""
+    if oauth_enabled():
+        return False
+    if multi_tenant_mode():
+        return is_operator()
+    return True
+
+
 def require_operator_read() -> None:
     """Continuity Block reads are for the operator key only: never through an OAuth user token."""
-    if oauth_enabled():
+    if not caller_is_operator():
         raise HTTPException(status_code=403, detail="Continuity Blocks can be read with the operator key only")
 
 
@@ -252,7 +287,7 @@ def require_nx_operator() -> None:
     Until there is a real multi-tenant user and per-tenant roots, every nx route is operator-only: an OAuth user token
     (even with memory.read) is refused.
     """
-    if oauth_enabled():
+    if not caller_is_operator():
         raise HTTPException(status_code=403, detail="nx-search routes touch the host filesystem and are operator-only")
 
 
@@ -409,10 +444,41 @@ def oauth_challenge(scope: str = READ_SCOPE) -> str:
     return f'Bearer resource_metadata="{metadata}", scope="{scope}"'
 
 
+def credential_is_operator(headers, path: str) -> bool:
+    """Does this request carry the operator credential?  The same rules the gates apply, evaluated once so the identity can be bound for the whole request:
+    the tool, MCP and call-log routes take EMR_RECALL_API_KEY when it is set and the ledger key otherwise; the ledger routes take the ledger key; the
+    RAG routes have a key of their own (not the operator's); with no key configured only the explicit local-dev opt-out is the operator."""
+    if oauth_enabled() or path.startswith("/api/jarvis/rag/"):
+        return False
+    bearer = _extract_bearer(headers.get("authorization"))
+    if path.startswith(("/api/jarvis/tools/", "/mcp")):
+        recall = emr_recall_api_key()
+        if recall:
+            token = bearer or (headers.get("x-emr-recall-key") or "").strip()
+            return bool(token) and secrets.compare_digest(token, recall)
+        if is_public_deployment():
+            return False
+        presented = bearer or (headers.get("x-api-key") or "").strip()
+    else:
+        presented = bearer or (headers.get("x-api-key") or "").strip()
+    expected = configured_api_key()
+    if expected is None:
+        return allow_unauthenticated()
+    return bool(presented) and secrets.compare_digest(presented, expected)
+
+
 async def identity_middleware(request: Request, call_next):
-    """Authenticate public API/MCP calls and bind their OAuth subject to storage."""
+    """Authenticate public API/MCP calls and bind their identity to the request: an OAuth subject (a tenant), or the operator when the operator
+    credential was presented.  Everything downstream reads the principal; nothing infers "operator" from the absence of one."""
     path = request.url.path
     protected = path == "/mcp" or path.startswith(("/mcp/", "/api/jarvis/"))
+    if protected and not oauth_enabled() and credential_is_operator(request.headers, path):
+        token = set_principal(operator_principal())
+        request.scope["jarvis_tenant"] = OPERATOR_TENANT
+        try:
+            return await call_next(request)
+        finally:
+            reset_principal(token)
     if not protected or not oauth_enabled():
         return await call_next(request)
     authorization = request.headers.get("authorization") or ""

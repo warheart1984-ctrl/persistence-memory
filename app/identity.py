@@ -9,8 +9,12 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import hashlib
+import os
 import re
 from dataclasses import dataclass
+
+OPERATOR_TENANT = "operator"          # the operator's own namespace (the shared-key deployment's one tenant)
+UNAUTHENTICATED_LABEL = "_unauth"      # what a log entry says when no identity was resolved (strict mode): never "operator"
 
 
 @dataclass(frozen=True)
@@ -18,6 +22,17 @@ class Principal:
     subject: str
     scopes: frozenset[str]
     issuer: str
+    kind: str = "tenant"               # "tenant" (an OAuth subject) or "operator" (the configured ledger key): who the caller IS, not how the deployment is set up
+
+
+def operator_principal() -> Principal:
+    """The identity of a request that presented the configured operator credential (or the explicit local-dev opt-out)."""
+    return Principal(subject=OPERATOR_TENANT, scopes=frozenset({"memory.read", "memory.write"}), issuer="jarvis-operator-key", kind="operator")
+
+
+def multi_tenant_mode() -> bool:
+    """JARVIS_MULTI_TENANT: strict identity. No request may be served without a resolved principal, and "no identity" is never treated as the operator."""
+    return (os.getenv("JARVIS_MULTI_TENANT") or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 _principal: contextvars.ContextVar[Principal | None] = contextvars.ContextVar(
@@ -53,13 +68,47 @@ def current_principal() -> Principal | None:
     return _principal.get()
 
 
+@contextlib.contextmanager
+def system_scope():
+    """Run infrastructure code (the readiness check) as the operator namespace, explicitly. It concerns the database and its roles, not any tenant, and it must
+    keep working in strict mode, where a request with no identity is refused a store."""
+    token = _principal.set(operator_principal())
+    try:
+        yield
+    finally:
+        _principal.reset(token)
+
+
+def is_operator() -> bool:
+    """True only for a request that authenticated as the operator."""
+    principal = current_principal()
+    return principal is not None and principal.kind == "operator"
+
+
+def request_tenant() -> str | None:
+    """The tenant this request's data belongs to, or None when it cannot be resolved.
+
+    An OAuth subject is its opaque hash; the authenticated operator is "operator".  With no principal the legacy deployment (shared key) treats the
+    request as the operator, because the key middleware has already refused anyone who is not; in JARVIS_MULTI_TENANT mode there is no such default.
+    """
+    acting = _acting_tenant.get()
+    if acting is not None:                 # the box's per-tenant jobs (acting_for): the tenant they were started for, in strict mode too
+        return acting
+    tenant = current_tenant_key()
+    if tenant is not None:
+        return tenant
+    if is_operator():
+        return OPERATOR_TENANT
+    return None if multi_tenant_mode() else OPERATOR_TENANT
+
+
 def current_tenant_key() -> str | None:
-    """Return an opaque, filesystem-safe namespace for the current subject."""
+    """Return an opaque, filesystem-safe namespace for the current subject (None for the operator, whose namespace is the default one)."""
     acting = _acting_tenant.get()
     if acting is not None:                 # the operator, administering that tenant (see acting_for): its key as it is stored; the operator's namespace has none
-        return None if acting == "operator" else acting
+        return None if acting == OPERATOR_TENANT else acting
     principal = current_principal()
-    if principal is None:
+    if principal is None or principal.kind == "operator":
         return None
     # Keep the raw subject out of filenames and logs.  Issuer prevents collisions
     # between otherwise identical subjects from different identity providers.

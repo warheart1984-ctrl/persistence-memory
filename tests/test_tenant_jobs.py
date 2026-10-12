@@ -494,3 +494,76 @@ def test_the_tenant_list_is_taken_with_the_superuser_path_not_the_migrator_role(
     """The migrator cannot bypass row-level security and so cannot enumerate tenants: the listing is a docker-exec psql as postgres, like the backups."""
     text = (BIN / "tenants.sh").read_text(encoding="utf-8")
     assert "pg_exec psql" in text and "chain_heads" in text and "history_counters" in text
+
+
+def _fake_docker(tmp_path, body):
+    """A `docker` first on PATH that logs its arguments to docker.log and then behaves as `body` says."""
+    fake = tmp_path / "fakebin"
+    fake.mkdir(exist_ok=True)
+    (fake / "docker").write_text('#!/bin/sh\necho "$@" >> "$FAKE_DOCKER_LOG"\n' + body)
+    (fake / "docker").chmod(0o755)
+    return fake
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="bash scripts for the box")
+def test_a_stuck_container_is_removed_by_name_on_timeout_not_just_the_compose_client_killed(tmp_path, monkeypatch):
+    """Killing the compose client does not stop the container it started: the signer names the one-off container and removes it by that name."""
+    fake = _fake_docker(tmp_path, 'case "$1" in compose) read line; exec sleep 120 ;; esac\n')
+    log = tmp_path / "docker.log"
+    monkeypatch.setenv("PATH", f"{fake}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_DOCKER_LOG", str(log))
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    transport = signer.ContainerTransport("t_stuck", timeout=1.0)
+    with pytest.raises(signer.SignerError) as exc:
+        transport("GET", "/api/jarvis/trust")
+    assert exc.value.code == "api_timeout"
+    lines = log.read_text().splitlines()
+    run = next(l for l in lines if l.startswith("compose"))
+    name = re.search(r"--name (\S+)", run).group(1)
+    assert name.startswith("jarvis-tenant-api-t_stuck-") and re.fullmatch(r"[A-Za-z0-9_.-]+", name)
+    assert f"rm -f {name}" in lines                                                  # the container itself is removed, by the name it was started with
+    transport.close()
+
+
+def test_the_container_names_are_unique_and_safe_for_any_tenant_key(tmp_path, monkeypatch):
+    fake = _fake_docker(tmp_path, "exit 0\n")          # never the real docker: the default command is the box's own wrapper script
+    monkeypatch.setenv("PATH", f"{fake}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_DOCKER_LOG", str(tmp_path / "docker.log"))
+    monkeypatch.setenv("JARVIS_HOME", str(tmp_path / "home"))
+    names = set()
+    for tenant in ("operator", "t a/b;rm -rf", "x" * 200, "ü"):
+        t = signer.ContainerTransport(tenant)       # (no command: the real wrapper path, against the fake docker; only the name matters)
+        names.add(t._container)
+        assert re.fullmatch(r"[A-Za-z0-9_.-]+", t._container) and len(t._container) < 100
+        t._proc.kill()
+    assert len(names) == 4
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="bash scripts for the box")
+def test_tenant_api_sh_starts_the_one_off_container_with_the_name_it_was_given(tmp_path):
+    fake = _fake_docker(tmp_path, "exit 0\n")
+    log = tmp_path / "docker.log"
+    env = {**os.environ, "PATH": f"{fake}{os.pathsep}{os.environ['PATH']}", "FAKE_DOCKER_LOG": str(log), "JARVIS_HOME": str(tmp_path / "home")}
+    subprocess.run(["bash", str(BIN / "tenant-api.sh"), "t_alice"], env={**env, "JARVIS_TENANT_API_NAME": "jarvis-tenant-api-test"}, timeout=60, check=True)
+    subprocess.run(["bash", str(BIN / "tenant-api.sh"), "t_bob"], env=env, timeout=60, check=True)               # no name given: no --name (as before)
+    first, second = log.read_text().splitlines()
+    assert "--name jarvis-tenant-api-test" in first and "serve --tenant t_alice" in first and "--name" not in second and "serve --tenant t_bob" in second
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="bash scripts for the box")
+@pytest.mark.parametrize("args", [("sign", "--tenants", ""), ("seal", "--tenants", " , "), ("status", "--tenants", ","), ("verify", "--tenants", " ")])
+def test_an_explicitly_empty_tenant_selection_is_refused_not_widened_to_every_tenant(tmp_path, args):
+    r = _tenants_sh(tmp_path, *args)
+    assert r.returncode == 2 and "names no tenant" in r.stderr, (r.returncode, r.stderr)
+
+
+def test_the_acting_tenant_resolves_in_strict_mode_too(monkeypatch):
+    """The box's per-tenant jobs must work when JARVIS_MULTI_TENANT is on: no request identity, but the tenant the operator started the job for."""
+    from app.identity import request_tenant
+    monkeypatch.setenv("JARVIS_MULTI_TENANT", "1")
+    assert request_tenant() is None
+    with acting_for("operator"):
+        assert request_tenant() == "operator" and current_tenant_key() is None
+    with acting_for("t_alice"):
+        assert request_tenant() == "t_alice" and current_tenant_key() == "t_alice"
+    assert request_tenant() is None

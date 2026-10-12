@@ -28,16 +28,18 @@ list_tenants() {
   pg_exec psql -X -At -d jarvis -c "SELECT t FROM (SELECT tenant_key AS t FROM jarvis.chain_heads UNION SELECT tenant_key FROM jarvis.history_counters) x ORDER BY (t <> 'operator'), t"
 }
 
-force=0 dry=0 tenants=""
+force=0 dry=0 tenants="" tenants_given=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --force) force=1 ;;
     --dry-run) dry=1 ;;
-    --tenants) tenants="${2:-}"; shift ;;
+    --tenants) tenants="${2:-}"; tenants_given=1; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
 done
+# `--tenants ''` is a selection of nobody, not an omitted option: it must never fall back to "every tenant"
+if [ "$tenants_given" -eq 1 ] && [ -z "$(printf '%s' "$tenants" | tr -d ' ,')" ]; then echo "--tenants was given but names no tenant" >&2; exit 2; fi
 # a flag that does not apply to the command is an error, never silently ignored (`seal --dry-run` must not seal; `sign --force` must not sign)
 case "$cmd" in
   list)   [ "$force" -eq 0 ] && [ "$dry" -eq 0 ] && [ -z "$tenants" ] || { echo "list takes no options" >&2; exit 2; } ;;

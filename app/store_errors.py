@@ -13,3 +13,7 @@ class InvalidInputError(ValueError):
 
 class StoreVersionConflict(Exception):
     """Optimistic-lock failure: the record changed since the caller read it (HTTP 409)."""
+
+
+class TenantUnresolvedError(Exception):
+    """JARVIS_MULTI_TENANT: the request carries no identity, so there is no tenant whose ledger could be served (HTTP 401, never a default tenant)."""
