@@ -208,6 +208,21 @@ def test_strict_mode_serves_the_operator_and_refuses_everyone_else_over_http(key
         assert c.get("/api/jarvis/memory", headers=headers).status_code == 401
 
 
+def test_strict_mode_still_answers_a_rag_query_for_the_holder_of_the_rag_key_and_nobody_else(keyed, monkeypatch, tmp_path):
+    from app import amul_rag
+    key_file = tmp_path / "rag.key"
+    key_file.write_text("rag-test-key", encoding="utf-8")
+    monkeypatch.setattr(amul_rag, "RAG_API_KEY_FILE", str(key_file))
+    keyed.setenv("JARVIS_MULTI_TENANT", "1")
+    keyed.setenv("JARVIS_STORE_BOOTSTRAP", "1")
+    keyed.setenv("JARVIS_STORE_PATH", str(tmp_path / "s.json"))
+    c = TestClient(app)
+    ok = c.post("/api/jarvis/rag/query", headers={"X-Jarvis-Rag-Key": "rag-test-key"}, json={"query": "what is in the ledger"})
+    assert ok.status_code == 200, ok.text                                           # (was 401: no principal, so no store for the ledger documents)
+    for headers in ({}, {"X-Jarvis-Rag-Key": "wrong"}, {"X-API-Key": KEY}):       # the ledger key is not the RAG key; no key is no answer
+        assert c.post("/api/jarvis/rag/query", headers=headers, json={"query": "x"}).status_code == 401
+
+
 def test_the_public_routes_still_answer_in_strict_mode_with_no_credential(keyed, tmp_path):
     """/ready builds a store to check the database; strict mode refuses a store to an unidentified request, but readiness is infrastructure and must keep
     working, or the container would look unhealthy forever (found by the throwaway drill)."""

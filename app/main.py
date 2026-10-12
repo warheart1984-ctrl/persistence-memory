@@ -1696,10 +1696,14 @@ def rag_documents(body: RagDocumentsBody):
 @app.post("/api/jarvis/rag/query", dependencies=[Depends(require_rag_api_key)])
 def rag_query(body: RagQueryBody):
     try:
+        # The RAG key is a deployment secret of its own, not a tenant's credential, and this route has always answered from the operator's ledger. In strict
+        # (JARVIS_MULTI_TENANT) mode a request with no identity is refused a store, so say so explicitly: the key was checked by the route's dependency.
+        with system_scope():
+            extra = ledger_docs(get_store())
         record = answer_query(
             body.query,
             get_index(),
-            extra_docs=ledger_docs(get_store()),
+            extra_docs=extra,
         )
     except OSError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
