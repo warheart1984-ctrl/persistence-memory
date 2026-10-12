@@ -38,6 +38,7 @@ Every method+path the app serves is listed in `REGISTRY` with one class:
 Written as `xfail(strict=True)`, so the day one is fixed the test flips and has to be promoted to a plain test:
 
 * the inference backend's address is shown to any tenant (`GET /api/jarvis/llm/status`);
+* `llm/status` also shows the server's filesystem path of the replay log (`replay_log.path`);
 * any tenant can spend the shared inference backend (`POST /api/jarvis/llm/generate`);
 * the AMUL field status shows the server's filesystem path.
 

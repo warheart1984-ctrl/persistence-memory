@@ -16,6 +16,7 @@ and on the Postgres row store (forced RLS) when JARVIS_TEST_BACKEND=postgres, wh
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 from fastapi.testclient import TestClient
@@ -239,12 +240,18 @@ def world(client):
     created = anchored.json().get("created") or []                 # AnchorReport: the new artifact ids
     assert created, f"anchoring produced no artifact: {anchored.text}"
     artifact = created[0]
-    client.post("/api/jarvis/memory/emr/excite", headers=h("alice"), json={"query": SEARCH, "session_key": "default", "theta_promote": 0.0})
+    # Short-term memory is only populated when excitation does not abstain, and it abstains when two candidates score alike: so alice gets one record that a
+    # specific query singles out. (With only her near-duplicate notes the STM stayed empty and every STM isolation check compared empty with empty.)
+    working = mk(client, "alice", f"alice working note {MARK} quokkaflux telemetry notebook")
+    excited = client.post("/api/jarvis/memory/emr/excite", headers=h("alice"), json={"query": "quokkaflux telemetry notebook", "session_key": "default", "theta_promote": 0.0})
+    assert excited.status_code == 200 and excited.json().get("abstained") is False and working["id"] in excited.text, excited.text[:300]
+    context = client.get("/api/jarvis/memory/stm/context", headers=h("alice"))
+    assert context.status_code == 200 and MARK in context.text, f"alice has no short-term memory to protect: {context.text[:200]}"   # else the STM checks compare empty to empty
     client.post("/api/jarvis/memory/board", headers=h("alice"), json={"summary": f"alice board {MARK}"})
     reinforced = client.post("/api/jarvis/memory/emr/reinforce", headers=h("alice"), json={
         "memory_ids": [first["id"]], "outcome": {"signal": "positive", "source": "user", "outcome_id": f"outcome-{MARK}"}})
     assert reinforced.status_code == 200, reinforced.text                          # alice now has reinforcement state, which the status view reports
-    return {"first": first["id"], "second": second["id"], "third": third["id"], "artifact": artifact}
+    return {"first": first["id"], "second": second["id"], "third": third["id"], "working": working["id"], "artifact": artifact}
 
 
 VOLATILE = {"tenant", "result_digest", "ledger_head", "head", "ts", "created_at", "updated_at", "generated_at", "checked_at", "duration_ms"}
@@ -372,6 +379,8 @@ def id_cases(i: str, art: str | None) -> dict[str, tuple[str, str, dict | None]]
 
 
 CASE_NAMES = sorted(id_cases(GHOST, None))
+POSTGRES_ONLY = {"history"}                                     # answered 501 by the JSON store; only meaningful (and required to be a real answer) on Postgres
+ON_POSTGRES = (os.environ.get("JARVIS_TEST_BACKEND") or "").strip().lower() == "postgres"
 VALIDATES_FIRST: set[str] = set()   # a case allowed to answer 422 (none today): an id case that stops at validation has not reached the lookup it claims to test
 
 
@@ -388,6 +397,11 @@ def test_alices_id_is_indistinguishable_from_an_id_that_never_existed(client, wo
         theirs = client.request(method, path, headers=h(f"bob-one-{case}"), json=body)
         method, path, body = id_cases(GHOST, GHOST_ARTIFACT)[case]
         nobodys = client.request(method, path, headers=h(f"bob-two-{case}"), json=body)
+        if case in POSTGRES_ONLY and not ON_POSTGRES and theirs.status_code == nobodys.status_code == 501:
+            continue                                                  # the JSON store has no record history (501 for everyone); the Postgres run exercises this case for real
+        if max(theirs.status_code, nobodys.status_code) >= 500:
+            failures.append(f"{case}: a server error ({theirs.status_code} {theirs.text[:120]} | {nobodys.status_code} {nobodys.text[:120]}): the handler failed before its lookup, which proves nothing about isolation")
+            continue
         if 422 in (theirs.status_code, nobodys.status_code) and case not in VALIDATES_FIRST:
             failures.append(f"{case}: the request never got past validation ({theirs.status_code} {theirs.text[:140]}), so it proves nothing about isolation")
             continue
@@ -521,6 +535,9 @@ def test_bob_s_writes_that_are_not_addressed_by_id_change_nothing_of_alices(clie
     failures = []
     for case, (method, path, body) in sorted(MUTATION_CASES.items()):
         r = client.request(method, path, headers=h("bob"), json=body)
+        fresh = client.request(method, path, headers=h(f"carol-{case}"), json=body)          # a tenant that has never written: the same request must look the same to bob
+        if (r.status_code, _body(r, case)) != (fresh.status_code, _body(fresh, case)):
+            failures.append(f"{case}: bob's response differs from a brand-new tenant's (he is shown something of alice's, such as her artifact counts):\n   bob   {r.status_code} {str(_body(r, case))[:200]}\n   fresh {fresh.status_code} {str(_body(fresh, case))[:200]}")
         if r.status_code >= 500 or r.status_code == 422:
             failures.append(f"{case}: {r.status_code} {r.text[:120]} (a mutation case must get past validation)")
         try:
@@ -571,24 +588,49 @@ def mcp_call(client, who, name, arguments):
     return r
 
 
+def _tool_result(resp):
+    """The JSON-RPC result of an MCP tools/call, refusing anything that is not a tool result at all (a transport or validation error proves nothing)."""
+    assert resp.status_code == 200, f"{resp.status_code} {resp.text[:200]}"
+    body = resp.json()
+    assert "error" not in body and "result" in body, f"not a tool result: {resp.text[:200]}"
+    return body["result"]
+
+
 def test_mcp_tools_call_cannot_tell_alices_id_from_a_nonexistent_one(client, world):
     failures = []
     for tool in ("emr_fetch", "fetch"):
-        theirs = mcp_call(client, f"bob-one-{tool}", tool, {"id": world["first"]})
-        nobodys = mcp_call(client, f"bob-two-{tool}", tool, {"id": GHOST})
-        if theirs.status_code != nobodys.status_code or norm(theirs, world["first"]) != norm(nobodys, GHOST):
-            failures.append(f"{tool}: {theirs.text[:200]} | {nobodys.text[:200]}")
+        # positive control: through this very tool, alice CAN fetch her record, so a refusal for bob is about tenancy and not about a broken tool
+        own = _tool_result(mcp_call(client, "alice", tool, {"id": world["first"]}))
+        if own.get("isError") or MARK not in json.dumps(own) or world["first"] not in json.dumps(own):
+            failures.append(f"{tool}: alice could not fetch her own record through MCP: {json.dumps(own)[:200]}")
+        theirs_resp = mcp_call(client, f"bob-one-{tool}", tool, {"id": world["first"]})
+        nobodys_resp = mcp_call(client, f"bob-two-{tool}", tool, {"id": GHOST})
+        theirs, nobodys = _tool_result(theirs_resp), _tool_result(nobodys_resp)
+        for who, res in (("alice's id", theirs), ("a nonexistent id", nobodys)):
+            if res.get("isError") is not True or "Memory not found" not in json.dumps(res):
+                failures.append(f"{tool}: bob's call with {who} was not the expected not-found result: {json.dumps(res)[:200]}")
+        if norm(theirs_resp, world["first"]) != norm(nobodys_resp, GHOST):
+            failures.append(f"{tool}: {theirs_resp.text[:200]} | {nobodys_resp.text[:200]}")
         try:
-            assert_nothing_of_alices(theirs, world, asked=(world["first"],))
+            assert_nothing_of_alices(theirs_resp, world, asked=(world["first"],))
         except AssertionError as exc:
             failures.append(f"{tool}: {exc}")
     assert not failures, "\n".join(failures)
 
 
+def _tool_payload(result: dict) -> dict:
+    """The JSON a successful tool result carries in its first text block."""
+    assert not result.get("isError"), f"the tool failed: {json.dumps(result)[:200]}"
+    return json.loads(result["content"][0]["text"])
+
+
 def test_mcp_search_shows_bob_nothing_of_alices(client, world):
+    alice = _tool_payload(_tool_result(mcp_call(client, "alice", "emr_search_ledger", {"query": SEARCH})))
+    assert alice["records"] and MARK in json.dumps(alice)                                  # the control: through this very tool alice finds her records
     r = mcp_call(client, "bob", "emr_search_ledger", {"query": SEARCH})
+    bob = _tool_payload(_tool_result(r))                                                   # a valid, successful tool result (an error of any kind would also contain none of alice's data)
+    assert bob["records"] == [] and bob["query"] == SEARCH                                 # ... and it is the expected EMPTY result for a tenant with no records
     assert_nothing_of_alices(r, world)
-    assert MARK in mcp_call(client, "alice", "emr_search_ledger", {"query": SEARCH}).text
 
 
 # --------------------------------------------------------------------------------- shared process-wide resources: written-down gaps
@@ -600,10 +642,23 @@ def test_the_rag_index_refuses_every_tenant_until_its_access_control_is_configur
         assert_nothing_of_alices(r, world)
 
 
+BACKEND_ADDRESS = "http://inference.internal.example:13305/api/v1"
+
+
 @pytest.mark.xfail(strict=True, reason="GAP: the inference backend's address is shown to any tenant (phase 0 should make llm/status operator-only or neutral)")
-def test_a_tenant_does_not_see_the_inference_backend_address(client):
+def test_a_tenant_does_not_see_the_inference_backend_address(client, monkeypatch):
+    from app import amul_llm
+
+    monkeypatch.setattr(amul_llm, "LLM_URL", BACKEND_ADDRESS)           # a real, recognisable address (the suite normally blanks it)
     r = client.get("/api/jarvis/llm/status", headers=h("bob"))
-    assert r.status_code in (403, 404) or "url" not in json.dumps(r.json()).lower()
+    assert r.status_code in (403, 404) or "inference.internal" not in r.text, "bob can read where the inference backend lives"
+
+
+@pytest.mark.xfail(strict=True, reason="GAP: llm/status shows the server's filesystem path of the replay log (replay_log.path) to any tenant")
+def test_a_tenant_is_not_told_the_llm_replay_log_path(client):
+    r = client.get("/api/jarvis/llm/status", headers=h("bob"))
+    leaked = [v for v in _values_of(r.json() if r.status_code == 200 else {}, "path") if isinstance(v, str) and v]
+    assert not leaked, f"llm/status shows server paths: {leaked}"
 
 
 @pytest.mark.xfail(strict=True, reason="GAP: any tenant can spend the shared inference backend (no per-tenant quota or operator gate yet)")
