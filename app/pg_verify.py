@@ -1,9 +1,13 @@
-"""Verify the record-history hash chain:  python -m app.pg_verify [--tenant T | --all]
+"""Verify the record-history hash chain:  python -m app.pg_verify [--tenant T [--allow-empty] | --all]
 
 Uses JARVIS_DATABASE_MIGRATE_URL (falling back to JARVIS_DATABASE_URL) and the optional
 JARVIS_DATABASE_SCHEMA.  ``--all`` iterates every tenant and needs a role that can see all
 rows (superuser/BYPASSRLS); otherwise verify one tenant at a time.  Exit 0 = intact,
 1 = problems found, 2 = misconfiguration.  Never prints the connection string.
+
+A tenant that was named but has nothing at all in the database (no history, blocks, attestations or records) is NOT reported as an intact empty ledger: that
+is almost always a typo or a tenant that was never written, and "ok" would hide that it was never checked.  It is a problem (exit 1) unless ``--allow-empty``
+is given.  The operator's ledger may be empty (a fresh install legitimately has none), so ``operator``, named or by default, is never refused for that.
 """
 
 from __future__ import annotations
@@ -22,6 +26,20 @@ from app.pg_schema import check_schema_version, validate_schema_name
 
 # A tail of unsealed history older than this is reported (a warning, not a failure): the seal timer may have stopped.
 STALE_TAIL_HOURS = 24
+
+
+_TENANT_TABLES = ("record_history", "chain_heads", "history_counters", "blocks", "attestations", "trust_statements", "evidence_objects", "memories", "boards")
+
+
+def _tenant_known(conn: psycopg.Connection, tenant: str) -> bool:
+    """Does the tenant have ANY trace in the database?  (Several tables on purpose: a tenant whose history rows were deleted but whose chain head or blocks
+    remain is a tampered tenant, and must reach the real checks, not be waved off as unknown.)"""
+    for table in _TENANT_TABLES:
+        if not conn.execute("SELECT to_regclass(%s) IS NOT NULL", (table,)).fetchone()[0]:
+            continue
+        if conn.execute(sql.SQL("SELECT EXISTS (SELECT 1 FROM {} WHERE tenant_key = %s)").format(sql.Identifier(table)), (tenant,)).fetchone()[0]:
+            return True
+    return False
 
 
 def _block_problems(conn: psycopg.Connection, tenant: str) -> list[tuple[str, str]]:
@@ -99,9 +117,12 @@ def _block_status(conn: psycopg.Connection, tenant: str) -> dict[str, object]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m app.pg_verify")
     group = parser.add_mutually_exclusive_group()
-    group.add_argument("--tenant", default="operator", help="tenant_key to verify (default: operator)")
+    group.add_argument("--tenant", default=None, help="tenant_key to verify (default: operator)")
     group.add_argument("--all", action="store_true", help="verify every tenant (needs a RLS-bypassing role)")
+    parser.add_argument("--allow-empty", action="store_true", help="a named tenant with nothing in the database is not a problem (default: it is)")
     args = parser.parse_args(argv)
+    named = args.tenant is not None
+    allow_empty = args.allow_empty or not named          # no --tenant: the operator, whose ledger is legitimately empty on a fresh install
 
     dsn = (os.getenv("JARVIS_DATABASE_MIGRATE_URL") or os.getenv("JARVIS_DATABASE_URL") or "").strip()
     if not dsn:
@@ -122,9 +143,13 @@ def main(argv: list[str] | None = None) -> int:
             conn.execute("SET LOCAL row_security = off")
             tenants = [r[0] for r in conn.execute("SELECT DISTINCT tenant_key FROM record_history ORDER BY 1")]
         else:
-            tenants = [args.tenant]
+            tenants = [args.tenant or "operator"]
         for tenant in tenants:
             conn.execute("SELECT set_config('jarvis.tenant_key', %s, true)", (tenant,))
+            if not args.all and not allow_empty and tenant != "operator" and not _tenant_known(conn, tenant):
+                problems.append((tenant, "-", "no history, blocks, attestations or records exist for this tenant: a typo, or a tenant that was never written (nothing was verified; "
+                                              "pass --allow-empty if an empty ledger is expected)"))
+                continue
             for _hid, memory_id, problem in conn.execute(
                 "SELECT history_id, memory_id, problem FROM jarvis_verify_history(%s)", (tenant,)
             ):
