@@ -843,6 +843,7 @@ def test_an_append_while_the_page_is_read_cannot_split_it_from_its_head(tmp_path
     assert log.head()["seq"] == 7                        # both appends did happen, just after the snapshot
 
 
+@pytest.mark.skipif(not call_log._pin_by_handle(), reason="Windows reads the page under the lock by design; the Windows test below pins that")
 def test_reading_a_page_does_not_hold_the_writers_lock(tmp_path, monkeypatch):
     """A big log is parsed AFTER the lock is released: a writer that arrives during the read finishes at once (it used to wait for the whole scan),
     and its entry is simply not in the page, which is exactly the log as of the snapshot."""
