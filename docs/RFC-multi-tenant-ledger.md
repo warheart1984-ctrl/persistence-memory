@@ -299,6 +299,20 @@ being on every tenant-scoped row, under forced RLS, and on the per-tenant `seq`/
    transaction-local setting names a **recorded** lifecycle event (a `tenant_restored`/`tenant_deleted` row in the control schema, written first, by the migrator role only) and the session role is the migrator;
    every use is itself logged and enters the next epoch. Disabling triggers wholesale (`ALTER TABLE ... DISABLE TRIGGER`) is the alternative and needs the same event and logging.
 
+3. **"Hard delete" must say what happens to the global backups (section 7, open question 2).** The whole-database backup is kept unchanged and `offsite.sh` encrypts each set to one
+   deployment-wide age recipient, so destroying a tenant's own export key crypto-shreds only that tenant's *export bundles*; the tenant's rows remain in every local dump and offsite bundle taken before the
+   deletion. Before the RFC can claim erasure it needs one of: (a) an explicit retention policy (erasure is complete when the last backup set containing the tenant has aged out of retention; the
+   `tenant_deleted` event records that date, and the operator may prune earlier sets by hand), or (b) per-tenant envelope encryption of content (already named as a separate RFC in open question 1).
+   Until then a deletion is "deleted from the live database now, from backups by <date>", not an immediate hard delete.
+4. **Lifecycle operations must cover every tenant-scoped file subsystem, not only SQL tables and the call/drift logs (section 7).** A tenant that used AMUL or EMR reinforcement has state on disk: the AMUL
+   field and its checkpoints under `data/tenants/`, and the tenant's section of the EMR dynamics sidecar (#92), alongside any other per-tenant files. Export must include them in the manifest, restore must
+   put them back with the rows, and deletion must remove them, or a restore loses state and a deletion leaves tenant-derived data behind. Phase 3 starts with an inventory of these files (and a test that
+   fails when a new per-tenant file path is added without an export/delete rule), as the isolation matrix does for routes.
+5. **Not-found equivalence applies to cross-tenant identifier and existence probes only (sections 4 and 8).** Byte-for-byte equivalence with the "nonexistent id" response is the rule for attack classes 1, 2
+   and the existence oracles of class 5. It is not the rule for the rest, which must return their own correct answers: an invalid, expired or revoked credential (class 4) is 401, an authenticated tenant on
+   an operator-only surface (class 7) is 403 (as `docs/tenant_isolation.md` and the matrix already require), and resource-exhaustion controls (class 6) may return 429. The Red Team treats a correct 401/403/429
+   as a pass, and a 404-shaped answer there as the finding.
+
 ### Exit criteria (section 9)
 
 1 (Red Team), 3, 4 and 5 are open. 6 is met (matrix in CI, fail-closed on unregistered routes). **2 is only partly met** and stays open: in strict mode the app refuses to start with the
