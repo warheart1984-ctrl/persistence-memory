@@ -218,6 +218,20 @@ def test_the_offending_tables_are_named_by_the_helper_and_the_real_schema_has_no
 
 
 @pg_only
+def test_the_retained_legacy_blob_table_is_not_a_tenant_table_for_the_rls_check(pg, client):
+    """The importer leaves jarvis_tenant_ledgers (a tenant_key, no RLS) in place as a rollback copy; it must not hold /ready at 503 after a successful import.
+    Only that exact table is exempt: a look-alike with a tenant_key and no RLS is still drift."""
+    with pg.admin_conn() as conn:
+        conn.execute("CREATE TABLE jarvis_tenant_ledgers (tenant_key text PRIMARY KEY, payload jsonb NOT NULL DEFAULT '{}')")
+    assert client.get("/ready").status_code == 200
+    with pg.admin_conn() as conn:
+        conn.row_factory = __import__("psycopg").rows.dict_row
+        assert pg_store.tenant_tables_without_forced_rls(conn, pg.schema) == []
+        conn.execute("CREATE TABLE jarvis_tenant_ledgers_copy (tenant_key text PRIMARY KEY)")
+        assert pg_store.tenant_tables_without_forced_rls(conn, pg.schema) == ["jarvis_tenant_ledgers_copy"]
+
+
+@pg_only
 def test_a_schema_with_no_tenant_tables_is_not_ready(pg):
     with pg.admin_conn() as conn:
         conn.row_factory = __import__("psycopg").rows.dict_row

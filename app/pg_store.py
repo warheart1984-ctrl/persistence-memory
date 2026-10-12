@@ -1068,6 +1068,12 @@ def _require_rls_enforced(conn: psycopg.Connection) -> None:
         raise StoreUnavailableError("Ledger database role must not bypass row-level security")
 
 
+# The older JSONB store's table. The importer deliberately leaves it in place as a rollback copy and the row store never reads it, so it is not a table
+# the application serves tenants from; `legacy_data` is the check that watches it. It has a tenant_key and no row-level security, and scanning it here
+# would keep /ready at 503 forever after a successful import.
+LEGACY_BLOB_TABLE = "jarvis_tenant_ledgers"
+
+
 def tenant_tables_without_forced_rls(conn: psycopg.Connection, schema: str | None) -> list[str]:
     """Every table of the ledger schema that has a ``tenant_key`` column but not (row-level security enabled AND forced AND at least one policy).
 
@@ -1081,10 +1087,10 @@ def tenant_tables_without_forced_rls(conn: psycopg.Connection, schema: str | Non
           FROM pg_class c
           JOIN pg_namespace n ON n.oid = c.relnamespace
           JOIN pg_attribute a ON a.attrelid = c.oid AND a.attname = 'tenant_key' AND NOT a.attisdropped AND a.attnum > 0
-         WHERE n.nspname = COALESCE(%s, current_schema()) AND c.relkind IN ('r', 'p')
+         WHERE n.nspname = COALESCE(%s, current_schema()) AND c.relkind IN ('r', 'p') AND c.relname <> %s
          ORDER BY c.relname
         """,
-        (schema,),
+        (schema, LEGACY_BLOB_TABLE),
     ).fetchall()
     if not rows:
         return ["(no tenant table found in the schema)"]
