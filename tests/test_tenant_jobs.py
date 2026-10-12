@@ -567,3 +567,37 @@ def test_the_acting_tenant_resolves_in_strict_mode_too(monkeypatch):
     with acting_for("t_alice"):
         assert request_tenant() == "t_alice" and current_tenant_key() == "t_alice"
     assert request_tenant() is None
+
+
+def test_the_operator_only_gates_pass_inside_a_tenant_job_in_strict_mode_and_still_refuse_outside_it(monkeypatch):
+    """In JARVIS_MULTI_TENANT mode 'no identity' is not the operator, but the box's own job IS the operator administering a tenant: the operator-only routes
+    the signer reads (blocks, receipts, trust) must answer there, and only there."""
+    from fastapi import HTTPException
+    from app import auth
+    from app.identity import is_operator
+    monkeypatch.setenv("JARVIS_MULTI_TENANT", "1")
+    with pytest.raises(HTTPException) as exc:
+        auth.require_operator_read()
+    assert exc.value.status_code == 403
+    for tenant in ("operator", "t_alice"):
+        with acting_for(tenant):
+            assert is_operator() and auth.caller_is_operator()
+            auth.require_operator_read()
+    assert not is_operator()                                   # nothing leaks out of the block
+    with pytest.raises(HTTPException):
+        auth.require_operator_read()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="bash scripts for the box")
+def test_an_explicit_tenant_list_is_trimmed_and_deduplicated_before_any_tenant_is_checked(tmp_path):
+    """pg_verify reports a tenant with no rows as an intact empty ledger, so ' t_bob' would be 'verified' while t_bob was never checked."""
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    (fake / "docker").write_text('#!/bin/sh\necho "$@" >> "$FAKE_DOCKER_LOG"\necho "chain ok"\n')
+    (fake / "docker").chmod(0o755)
+    log = tmp_path / "docker.log"
+    env = {**os.environ, "PATH": f"{fake}{os.pathsep}{os.environ['PATH']}", "FAKE_DOCKER_LOG": str(log), "JARVIS_HOME": str(tmp_path / "home")}
+    r = subprocess.run(["bash", str(BIN / "tenants.sh"), "verify", "--tenants", " t_alice,  t_bob ,,t_alice, operator "], capture_output=True, text=True, env=env, timeout=60)
+    assert r.returncode == 0, r.stderr
+    calls = [l.split("--tenant ")[1] for l in log.read_text().splitlines() if "--tenant " in l]
+    assert calls == ["t_alice", "t_bob", "operator"]            # exactly these names: trimmed, in order given, once each (and the operator is not forced first here)

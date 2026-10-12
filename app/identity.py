@@ -50,9 +50,11 @@ def acting_for(tenant: str):
     Internal to a process that the operator started on the box: nothing in the HTTP stack ever sets it, and no request parameter, header or token can,
     so the public API still cannot be made to select a tenant. "operator" is the operator's own namespace (the default one)."""
     token = _acting_tenant.set(tenant)
+    principal_token = _principal.set(operator_principal())     # the operator's own process: the operator-only gates must pass for it, in strict mode too
     try:
         yield
     finally:
+        _principal.reset(principal_token)
         _acting_tenant.reset(token)
 
 
