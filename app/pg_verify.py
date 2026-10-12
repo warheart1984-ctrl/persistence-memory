@@ -122,6 +122,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--allow-empty", action="store_true", help="a named tenant with nothing in the database is not a problem (default: it is)")
     args = parser.parse_args(argv)
     named = args.tenant is not None
+    if named and not args.tenant.strip():
+        # `--tenant ""` (an automation variable that came through empty) must never become "the operator": that would verify the wrong ledger and report success
+        print("PROBLEM: --tenant was given but is empty; name the tenant to verify (nothing was verified)")
+        return 1
     allow_empty = args.allow_empty or not named          # no --tenant: the operator, whose ledger is legitimately empty on a fresh install
 
     dsn = (os.getenv("JARVIS_DATABASE_MIGRATE_URL") or os.getenv("JARVIS_DATABASE_URL") or "").strip()
@@ -143,7 +147,7 @@ def main(argv: list[str] | None = None) -> int:
             conn.execute("SET LOCAL row_security = off")
             tenants = [r[0] for r in conn.execute("SELECT DISTINCT tenant_key FROM record_history ORDER BY 1")]
         else:
-            tenants = [args.tenant or "operator"]
+            tenants = ["operator" if args.tenant is None else args.tenant]
         for tenant in tenants:
             conn.execute("SELECT set_config('jarvis.tenant_key', %s, true)", (tenant,))
             if not args.all and not allow_empty and tenant != "operator" and not _tenant_known(conn, tenant):

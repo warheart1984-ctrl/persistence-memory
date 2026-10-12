@@ -334,3 +334,20 @@ def test_verify_cli_does_not_wave_off_a_tenant_whose_history_was_deleted_but_who
     assert pg_verify.main(["--tenant", "alice"]) == 1
     out = capsys.readouterr().out
     assert "tenant=alice" in out and "nothing was verified" not in out         # a chain problem, not 'unknown tenant'
+
+
+@pytest.mark.parametrize("empty", ["", " ", "\t"])
+def test_verify_cli_never_turns_an_empty_tenant_into_the_operator(pg, store, monkeypatch, capsys, empty):
+    """An unset automation variable (`--tenant "$T"`) must fail, not silently verify the operator ledger and report success."""
+    from app import pg_verify
+
+    _three_entries(store)
+    monkeypatch.setenv("JARVIS_DATABASE_MIGRATE_URL", pg.admin_dsn)
+    monkeypatch.setenv("JARVIS_DATABASE_SCHEMA", pg.schema)
+    assert pg_verify.main(["--tenant", "operator"]) == 0                  # positive control: the operator itself still verifies
+    capsys.readouterr()
+    assert pg_verify.main(["--tenant", empty]) == 1
+    out = capsys.readouterr().out
+    assert "given but is empty" in out and "nothing was verified" in out and "ok: history intact" not in out
+    assert pg_verify.main(["--tenant", empty, "--allow-empty"]) == 1       # not even the opt-out makes an empty name acceptable
+    capsys.readouterr()
