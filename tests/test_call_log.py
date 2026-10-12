@@ -901,6 +901,7 @@ def test_on_windows_the_page_is_read_under_the_lock_with_no_pinned_handles_and_n
     def racing(self, snapshot=None):
         t = threading.Thread(target=lambda: call_log.CallLog(tmp_path / "winlike").append(_fields(99)))
         t.start()
+        state["writer"] = t
         t.join(timeout=0.4)
         state["writer_waited"] = t.is_alive()                  # the lock is held for the whole page: the writer cannot get in
         yield from (real(self) if snapshot is None else real(self, snapshot))
@@ -910,6 +911,8 @@ def test_on_windows_the_page_is_read_under_the_lock_with_no_pinned_handles_and_n
     monkeypatch.setattr(call_log.CallLog, "entries_desc", real)
     assert state["writer_waited"] is True and taken == []
     assert page["entries"][0]["seq"] == page["head"]["seq"] == 5
+    state["writer"].join(timeout=30)       # the waiting writer gets in once the lock is released (on Windows its lock retry can take a second to notice)
+    assert not state["writer"].is_alive()
     assert log.head()["seq"] == 6
 
 
@@ -937,13 +940,24 @@ def test_the_degraded_state_belongs_to_the_same_snapshot_as_the_page_and_head(tm
     assert log.degraded() is not None
     real = call_log.CallLog.entries_desc
 
+    lazy = not call_log._pin_by_handle()     # Windows reads the page under the lock: another worker cannot recover meanwhile, it waits (and must not be run inline, it would wait for us)
+    writers = []
+
     def recovering(self, snapshot=None):
-        call_log.CallLog(tmp_path / "degsnap").append(_fields(9))      # another worker: writes the gap entry first, then its own, and clears the latch
+        if lazy:
+            t = threading.Thread(target=lambda: call_log.CallLog(tmp_path / "degsnap").append(_fields(9)))
+            t.start()
+            writers.append(t)
+        else:
+            call_log.CallLog(tmp_path / "degsnap").append(_fields(9))      # another worker: writes the gap entry first, then its own, and clears the latch
         yield from (real(self) if snapshot is None else real(self, snapshot))
 
     monkeypatch.setattr(call_log.CallLog, "entries_desc", recovering)
     page = log.query_with_head(limit=50)
     monkeypatch.setattr(call_log.CallLog, "entries_desc", real)
+    for t in writers:
+        t.join(timeout=30)
+        assert not t.is_alive()
     assert page["degraded"] and page["degraded"]["unlogged"] == 2                       # as of the snapshot
     assert [e["outcome"] for e in page["entries"]].count("gap") == 0 and page["head"]["seq"] == 3   # the page and the head predate the recovery
     assert log.degraded() is None                                                       # the latch was cleared meanwhile, and the next read will say so
