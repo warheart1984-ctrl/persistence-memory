@@ -95,6 +95,26 @@ def test_a_request_with_the_operator_key_is_bound_to_an_operator_principal(keyed
     assert seen["tenant"] == OPERATOR_TENANT          # the call log is told who it was, not left to default
 
 
+def test_an_operator_mcp_call_is_witnessed_as_the_operator_in_strict_mode(keyed, tmp_path):
+    keyed.setenv("JARVIS_MULTI_TENANT", "1")
+    keyed.setenv("JARVIS_STORE_BOOTSTRAP", "1")
+    keyed.setenv("JARVIS_STORE_PATH", str(tmp_path / "s.json"))
+    seen = []
+    real = call_log.make_fields
+
+    def spy(**kw):
+        seen.append(kw.get("tenant"))
+        return real(**kw)
+
+    keyed.setattr(call_log, "make_fields", spy)
+    body = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "emr_latest", "arguments": {}}}
+    c = TestClient(app)                                               # (no lifespan: the startup guard is tested below)
+    if True:
+        r = c.post("/mcp", headers={"Authorization": f"Bearer {KEY}"}, json=body)
+    assert r.status_code == 200 and "result" in r.json()
+    assert seen and seen[-1] == OPERATOR_TENANT and UNAUTHENTICATED_LABEL not in seen   # (was filed _unauth: current_tenant_key() is None for the operator)
+
+
 def test_the_operator_principal_is_the_operator_and_has_no_hashed_tenant():
     p = operator_principal()
     token = set_principal(p)
