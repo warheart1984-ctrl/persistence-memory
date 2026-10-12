@@ -328,6 +328,34 @@ def test_another_tenants_report_carries_its_key_and_a_multi_tenant_run_ends_with
     assert out == ["signed blocks 1, 0 receipt(s); checkpoint 2 covers 1", "tenant t_alice: signed blocks 1, 0 receipt(s); checkpoint 2 covers 1", "all 2 tenants ok"]
 
 
+def _refused_result():
+    return {"dry_run": False, "signed_blocks": [], "signed_receipts": [], "refused_receipts": [{"id": "r1", "why": "not rederivable"}], "deferred_receipts": 0,
+            "checkpoint": None, "planned_blocks": [], "planned_receipts": [], "note": "x"}
+
+
+def test_a_tenant_that_signed_with_refused_receipts_is_a_failed_tenant_not_an_ok_one(capsys):
+    ok = {"dry_run": False, "signed_blocks": [{"height": 1, "signer_seq": 1}], "signed_receipts": [], "refused_receipts": [], "deferred_receipts": 0,
+          "checkpoint": {"signer_seq": 2, "covers": 1}, "planned_blocks": [1], "planned_receipts": []}
+    code = signer.report_tenants([{"tenant": "operator", "ok": True, "result": ok}, {"tenant": "t_alice", "ok": True, "result": _refused_result()}])
+    cap = capsys.readouterr()
+    assert code == signer.EXIT_UNHEALTHY
+    assert "FAILED tenants: t_alice (1 of 2 ok)" in cap.err and "all 2 tenants ok" not in cap.out         # tenants.sh names the tenant in its critical notification from this line
+    assert "REFUSED tenant t_alice: receipt r1" in cap.err
+
+
+def test_the_operator_alone_with_refused_receipts_prints_exactly_what_it_prints_today(capsys):
+    code = signer.report_tenants([{"tenant": "operator", "ok": True, "result": _refused_result()}])
+    cap = capsys.readouterr()
+    assert code == signer.EXIT_UNHEALTHY and cap.err == "REFUSED receipt r1: not rederivable\n"
+
+
+@pytest.mark.parametrize("value", ["", " ", ",", " , "])
+def test_an_empty_tenant_selection_is_refused_never_the_operator_by_default(monkeypatch, capsys, value):
+    monkeypatch.setattr(signer, "preflight_key", lambda path: pytest.fail("must be refused before any key or API is touched"))
+    assert signer.main(["sign", "--tenants", value]) == signer.EXIT_USAGE
+    assert "no_tenants" in capsys.readouterr().err
+
+
 def test_the_replay_check_is_told_the_tenant_but_the_operators_command_line_is_unchanged():
     assert signer._replay_args("operator") == [] and signer._replay_args("t_alice") == ["--tenant", "t_alice"]
     seen = []

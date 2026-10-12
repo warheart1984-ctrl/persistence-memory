@@ -48,6 +48,8 @@ case "$cmd" in
 esac
 [ "$cmd" = list ] || [ -n "$tenants" ] || tenants="$(list_tenants | paste -sd, -)"
 
+[ "$cmd" = list ] || [ -n "$tenants" ] || die "no tenants found (nothing to $cmd)"
+
 case "$cmd" in
   list) list_tenants ;;
   seal)

@@ -545,7 +545,10 @@ def report_tenants(outcomes: list[dict[str, Any]]) -> int:
     for o in outcomes:
         prefix = "" if o["tenant"] == OPERATOR_TENANT else f"tenant {o['tenant']}: "
         if o["ok"]:
-            code = max(code, report_sign(o["result"], prefix))
+            rc = report_sign(o["result"], prefix)
+            code = max(code, rc)
+            if rc != EXIT_OK and not (o["tenant"] == OPERATOR_TENANT and len(outcomes) == 1):
+                failed.append(o["tenant"])     # (refused receipts): a tenant that signed with errors is not "ok". The operator ALONE keeps today's exact output.
         else:
             failed.append(o["tenant"])
             code = max(code, o["exit_code"])
@@ -576,8 +579,13 @@ def main(argv: list[str] | None = None) -> int:
             print(f"key id: {info['key_id']}")
             print(f"public key (give this to the root ceremony; it is not secret): {info['public_key']}")
             return EXIT_OK
+        supplied = getattr(args, "tenants", None)
+        tenants = _tenant_list(supplied)
+        if supplied is not None and not tenants:
+            # an empty selection is not "no option": falling through would sign the operator ledger when the caller asked for specific tenants (and none were given)
+            print("no_tenants: --tenants was given but names no tenant", file=sys.stderr)
+            return EXIT_USAGE
         key = preflight_key(key_path)
-        tenants = _tenant_list(getattr(args, "tenants", None))
         if tenants:
             if args.cmd == "status":
                 return report_status(tenants, key)
