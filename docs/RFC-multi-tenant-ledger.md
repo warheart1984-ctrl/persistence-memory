@@ -264,6 +264,23 @@ live before/after capture of the deploy.
 
 Per-tenant keys and the control schema, per-tenant call-log chains and routes, per-tenant blocks routes, epochs and their verifier, the SQL-predicate guard test, the smuggling fuzz pass, per-tenant quotas and rate limits, the v10 migration, and tenant export/restore/delete with their events and drills.
 
+### Corrections to section 2 (found in review of this document)
+
+Section 2 says every table has `PRIMARY KEY (tenant_key, id)`. Checked against `app/pg_schema.py` (v9), the accurate statement is: every **tenant-scoped** table has a `tenant_key`
+column with `FORCE ROW LEVEL SECURITY` and a tenant policy, with these key shapes:
+
+| Table | Primary key |
+|---|---|
+| `memories`, `chain_heads`, `evidence_objects` | `(tenant_key, id)` |
+| `blocks` | `(tenant_key, height)` |
+| `attestations` | `(tenant_key, signer_seq)` |
+| `trust_statements` | `(tenant_key, stmt_seq)` |
+| `boards`, `history_counters` | `tenant_key` alone (one row per tenant) |
+| `record_history` | `history_id` (a **global** `bigserial`); the per-tenant gapless order is the `seq` column, kept by `history_counters`. The row carries `tenant_key` and is under forced RLS |
+
+`schema_version` has no tenant column and no RLS (it is the schema's own version). The isolation design in sections 3-5 does not depend on a single key shape; it depends on `tenant_key`
+being on every tenant-scoped row, under forced RLS, and on the per-tenant `seq`/height chains. The RLS readiness check (`rls_tables`, #94) enforces the "tenant_key column implies forced RLS with a policy" rule on every such table.
+
 ### Exit criteria (section 9)
 
 1 (Red Team), 3, 4 and 5 are open. 2 is met in code behind the flag (not enabled). 6 is met (matrix in CI, fail-closed on unregistered routes).
