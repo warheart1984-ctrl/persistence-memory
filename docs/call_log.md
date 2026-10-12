@@ -76,6 +76,7 @@ off on live), which is why its writes are in scope.
 * `GET /api/jarvis/tools/calls` returns the page **and the head from one locked snapshot** (the log's lock is held across both reads), so for an
   unfiltered request the head is always the newest entry of the first page; no append can land between them. On a later page (`cursor`) the
   head is still the log's current head.
+  A page read pins at most `JARVIS_CALL_LOG_SNAPSHOT_PINNED` (default 8) of the newest daily files and reopens older ones only if it reaches them (if one has gone, the read fails with a 503 retry, never a shorter page); at most `JARVIS_CALL_LOG_SNAPSHOT_READERS` (default 8) page reads run at once per process, and the rest are told to retry after `JARVIS_CALL_LOG_SNAPSHOT_WAIT_SECONDS` (default 2), waiting for the slot *outside* the log's lock. So the descriptors a reader can hold are bounded process-wide (64 by default) and cannot starve the log's own lock and file opens.
 * `GET /api/jarvis/tools/calls/verify` walks the chain across files and returns `ok`, `problems`, the `head` (`seq`, `entry_hash`),
   `anchor`, `degraded` and `gaps_recorded`. Edited, deleted, inserted and reordered lines all fail it.
 
