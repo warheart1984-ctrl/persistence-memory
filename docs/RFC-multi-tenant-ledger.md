@@ -313,6 +313,22 @@ being on every tenant-scoped row, under forced RLS, and on the per-tenant `seq`/
    an operator-only surface (class 7) is 403 (as `docs/tenant_isolation.md` and the matrix already require), and resource-exhaustion controls (class 6) may return 429. The Red Team treats a correct 401/403/429
    as a pass, and a 404-shaped answer there as the finding.
 
+6. **An epoch must not commit around an unsealed tail (sections 5 and 9).** The leaf commits the latest block hash and `last_seq`, but history after the last block (normal until the block threshold or age is
+   reached; `block_head()` reports `history_seq > sealed_seq`) is covered by neither, so those entries and their chain heads could be rewritten with `last_seq` unchanged and the epoch hash would not move.
+   Rule: the epoch job first seals every tenant through its `last_seq` (a forced seal, the operation `jarvisctl tenants seal --force` already performs), and refuses to commit a tenant whose `sealed_seq != last_seq`
+   rather than commit around it; the leaf commits `sealed_seq` (equal to `last_seq`). The alternative, committing a root over the unsealed rows' hashes, is acceptable only if sealing is not wanted.
+7. **The tenant status domain needs the states the procedures use (sections 3 and 7).** The control schema lists `active|suspended|deleting|deleted`, but restore begins with `status=restoring`. The domain is
+   `active | suspended | quiesced | restoring | deleting | deleted`, as a check constraint, and authentication defines each: `active` is served; `quiesced` (an export is running) serves reads and refuses
+   writes with 503 `tenant_unavailable`; `restoring`, `suspended` and `deleting` answer a **valid** key with 503 `tenant_unavailable` (that tenant only, never another's); `deleted` has all keys revoked, so it is the
+   uniform 401. Invalid, unknown, revoked or expired keys stay the single uniform 401 (no status oracle for a non-holder).
+8. **Export must be one consistent snapshot across SQL and files (section 7).** An active tenant writing during export makes the SQL snapshot and the separately copied AMUL/EMR files describe different times,
+   so a bundle can pass each component's check and still restore rows with missing or newer derived state. Rule: export first sets the tenant `quiesced` (writes refused, so nothing changes), takes the SQL data in one
+   `REPEATABLE READ` transaction, copies every file subsystem inside the same quiesce, records `last_seq` and a SHA-256 per file in the manifest, and restore refuses a bundle whose files do not match the manifest
+   or whose rows do not end at the manifest's `last_seq`. (A versioned snapshot across the database and every file subsystem is the alternative if quiescing is unacceptable.)
+9. **Rate and concurrency limits are per tenant, not only per key (section 4).** A tenant may hold several keys, so a per-key limit lets it multiply its traffic by its number of keys and still exhaust the shared
+   pool, and row/byte quotas and statement timeouts do not bound request rate or concurrency. Add a tenant-level request-rate and concurrent-request limit (and a share of the connection pool) enforced after the key
+   resolves to its tenant, with the per-key limit kept as a second, tighter control.
+
 ### Exit criteria (section 9)
 
 1 (Red Team), 3, 4 and 5 are open. 6 is met (matrix in CI, fail-closed on unregistered routes). **2 is only partly met** and stays open: in strict mode the app refuses to start with the
