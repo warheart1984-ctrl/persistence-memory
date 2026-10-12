@@ -13,7 +13,7 @@ Every method+path the app serves is listed in `REGISTRY` with one class:
 | `authenticated-neutral` | needs a credential, identical for every tenant (the tool catalog) | identical bodies for alice and bob |
 | `tenant-data` | records, evidence, board, short-term memory, graph, search | see below |
 | `mcp` | the MCP transport (same tools through `tools/call`) | same cases through `/mcp` |
-| `shared-resource` | process-wide, not keyed by tenant (inference backend, RAG index) | fail-closed where configured, **strict xfail** where not |
+| `shared-resource` | process-wide, not keyed by tenant (the RAG index; the inference backend is now operator-only) | fail-closed where configured |
 
 `test_every_served_route_is_classified_and_every_classification_is_served` fails if the app serves a route that is not in the registry, or the registry names one that is gone. **Adding a route means classifying it here, and, if it is `tenant-data`, adding it to `id_cases` or `LIST_CASES`.**
 
@@ -35,13 +35,12 @@ Every method+path the app serves is listed in `REGISTRY` with one class:
 
 ## Known gaps
 
-Written as `xfail(strict=True)`, so the day one is fixed the test flips and has to be promoted to a plain test:
+None are open as strict xfails now. (The RAG index still needs its own audit before it is enabled, below.)
 
-* the inference backend's address is shown to any tenant (`GET /api/jarvis/llm/status`);
-* `llm/status` also shows the server's filesystem path of the replay log (`replay_log.path`);
-* any tenant can spend the shared inference backend (`POST /api/jarvis/llm/generate`);
-* the AMUL field status shows the server's filesystem path.
+Fixed and promoted from strict xfails to plain tests:
 
+* **The shared inference backend is operator-only** (`GET /api/jarvis/llm/status`, `POST /api/jarvis/llm/generate`): its address, credentials, replay-log path and spend belong to the deployment. A tenant gets 403 and the backend is not called; the operator key (today's deployment) is unchanged (`tests/test_inference_operator_only.py`). Per-tenant quotas (RFC) are what would let a tenant use it later.
+* **The AMUL field status** answers a tenant (its own artifact count) without the server's directory (`path`, which holds the tenant's hash); the operator still sees it.
 
 The RAG routes are not exercised for isolation (they refuse every tenant with 503 until their access control is configured); that is asserted, and the RAG index needs its own audit before it is enabled.
 

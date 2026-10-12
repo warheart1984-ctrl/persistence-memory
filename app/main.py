@@ -1737,7 +1737,14 @@ def rag_maintenance(body: RagMaintenanceBody):
 # --- AMUL LLM (governed generation; ledger key applies via ApiKeyMiddleware) ---
 
 
-@app.get("/api/jarvis/llm/status")
+def require_operator_inference() -> None:
+    """The inference backend is ONE process-wide resource: its address and credentials, its replay log and what it costs belong to the deployment, not to a
+    tenant. Until there are per-tenant quotas (RFC), only the operator may use or inspect it; a tenant is refused (403), never given a shared allowance."""
+    if not caller_is_operator():
+        raise HTTPException(status_code=403, detail="The inference backend is operator-only")
+
+
+@app.get("/api/jarvis/llm/status", dependencies=[Depends(require_operator_inference)])
 def get_llm_status():
     return amul_llm.llm_status()
 
@@ -1779,7 +1786,7 @@ def _recalled_context(result) -> str:
     return "\n".join(lines)
 
 
-@app.post("/api/jarvis/llm/generate")
+@app.post("/api/jarvis/llm/generate", dependencies=[Depends(require_operator_inference)])
 def llm_generate(body: LlmGenerateBody):
     """One governed generation: recall -> intent -> mode -> backend -> policy check.
 
@@ -1884,7 +1891,7 @@ def amul_field_status():
         by_res[a.resolution] = by_res.get(a.resolution, 0) + 1
     return {
         "schema": "amul-artifact-v1",
-        "path": field.path,
+        **({"path": field.path} if caller_is_operator() else {}),      # the server's directory (it holds the tenant's hash) is the operator's to see
         "artifact_count": field.count,
         "by_resolution": by_res,
         "append_only": True,
