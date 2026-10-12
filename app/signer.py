@@ -43,6 +43,7 @@ from typing import Any, Callable
 from app import attest, blocks
 
 EXIT_OK, EXIT_USAGE, EXIT_CUSTODY, EXIT_UNHEALTHY, EXIT_API = 0, 2, 3, 4, 5
+OPERATOR_TENANT = "operator"
 Transport = Callable[[str, str, "dict[str, Any] | None"], "tuple[int, Any]"]
 
 
@@ -212,23 +213,28 @@ def max_receipts() -> int:
         return DEFAULT_MAX_RECEIPTS
 
 
-def default_verify_block(height: int, block_hash: str) -> None:
+def _replay_args(tenant: str) -> list[str]:
+    """``replay.sh verify`` defaults to the operator tenant; another tenant is named explicitly. For the operator the command line is exactly what it was."""
+    return [] if tenant == OPERATOR_TENANT else ["--tenant", tenant]
+
+
+def default_verify_block(height: int, block_hash: str, tenant: str = "operator") -> None:
     """The independent check before signing: replay the ledger up to this block from the RAW rows, in a one-off container (never
     the service's own SQL), and require the block to be exactly the one about to be signed."""
     script = repo_root() / "deploy" / "mint" / "bin" / "replay.sh"
     # --signatures off: the question is whether the block is what the raw rows say, not whether it is signed yet
-    r = subprocess.run([str(script), "verify", "--at-block", str(height), "--expect-block-hash", block_hash, "--signatures", "off"],
+    r = subprocess.run([str(script), "verify", *_replay_args(tenant), "--at-block", str(height), "--expect-block-hash", block_hash, "--signatures", "off"],
                        capture_output=True, text=True, timeout=600)
     if r.returncode != 0:
         tail = (r.stdout + r.stderr).strip().splitlines()[-3:]
         raise SignerError("pre_sign_verify_failed", f"the offline replay does not accept block {height}: {' | '.join(tail)}", EXIT_UNHEALTHY)
 
 
-def default_verify_receipt(receipt_id: str) -> None:
+def default_verify_receipt(receipt_id: str, tenant: str = "operator") -> None:
     """Re-derive the receipt from the RAW rows in a one-off container (``replay verify --receipt``): the stored object must be
     intact and the replay at its sealed point must give its state root, counts and block."""
     script = repo_root() / "deploy" / "mint" / "bin" / "replay.sh"
-    r = subprocess.run([str(script), "verify", "--receipt", receipt_id, "--signatures", "off"], capture_output=True, text=True, timeout=600)
+    r = subprocess.run([str(script), "verify", *_replay_args(tenant), "--receipt", receipt_id, "--signatures", "off"], capture_output=True, text=True, timeout=600)
     if r.returncode != 0:
         tail = (r.stdout + r.stderr).strip().splitlines()[-3:]
         raise SignerError("pre_sign_verify_failed", f"the offline replay does not re-derive receipt {receipt_id}: {' | '.join(tail)}", EXIT_UNHEALTHY)
@@ -423,12 +429,116 @@ def init_key(path: Path) -> dict[str, str]:
     return {"key_id": info.public.key_id, "public_key": info.public.text(), "path": str(path)}
 
 
+class ContainerTransport:
+    """An API for ONE tenant, served by ``app.tenant_jobs serve`` in a one-off migrate container (tenant-api.sh): JSON lines in, JSON lines out.
+
+    The tenant is bound by the container process the operator started, never by the request, so the public API still cannot select one. The signer's
+    logic is unchanged: it asks for the same paths and posts the same attestations; only the way they are reached differs.  Close it when done."""
+
+    def __init__(self, tenant: str, command: list[str] | None = None):
+        self.tenant = tenant
+        cmd = command or [str(repo_root() / "deploy" / "mint" / "bin" / "tenant-api.sh"), tenant]
+        try:
+            self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
+        except OSError as exc:
+            raise SignerError("api_unreachable", f"cannot start the per-tenant API for {tenant!r}: {exc}", EXIT_API) from None
+
+    def __call__(self, method: str, path: str, body: "dict[str, Any] | None" = None) -> "tuple[int, Any]":
+        proc = self._proc
+        try:
+            assert proc.stdin is not None and proc.stdout is not None
+            proc.stdin.write(json.dumps({"method": method, "path": path, "body": body}) + "\n")
+            proc.stdin.flush()
+            line = proc.stdout.readline()
+        except (OSError, ValueError):
+            line = ""
+        if not line:
+            raise SignerError("api_unreachable", f"the per-tenant API for {self.tenant!r} ended unexpectedly", EXIT_API)
+        answer = json.loads(line)
+        return int(answer["status"]), answer["body"]
+
+    def close(self) -> None:
+        try:
+            if self._proc.stdin:
+                self._proc.stdin.close()
+            self._proc.wait(timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            self._proc.kill()
+
+
+def sign_tenants(tenants: list[str], key: KeyInfo, *, dry_run: bool, open_api: "Callable[[str], tuple[Api, Callable[[], None]]] | None" = None,
+                 verify_block: "Callable[[int, str, str], None] | None" = None, verify_receipt: "Callable[[str, str], None] | None" = None) -> list[dict[str, Any]]:
+    """Sign each tenant's chain on its own.  One tenant's failure (no authorized key for it, an unhealthy log, an unreachable API, anything) is recorded
+    and the next tenant still runs; every failure is in the returned list and nothing is skipped silently.
+
+    Returns one dict per tenant: {"tenant", "ok": True, "result": run_sign's} or {"tenant", "ok": False, "code", "message", "exit_code"}."""
+    def default_open(tenant: str):
+        transport = ContainerTransport(tenant)
+        return Api("tenant:" + tenant, "", transport=transport), transport.close
+
+    open_api = open_api or default_open
+    out: list[dict[str, Any]] = []
+    for tenant in tenants:
+        closer: Callable[[], None] = lambda: None
+        try:
+            api, closer = open_api(tenant)
+            vb = (lambda h, b, _t=tenant: (verify_block or default_verify_block)(h, b, _t))
+            vr = (lambda r, _t=tenant: (verify_receipt or default_verify_receipt)(r, _t))
+            out.append({"tenant": tenant, "ok": True, "result": run_sign(api, key, dry_run=dry_run, verify_block=vb, verify_receipt=vr)})
+        except SignerError as exc:
+            out.append({"tenant": tenant, "ok": False, "code": exc.code, "message": exc.message, "exit_code": exc.exit_code})
+        except Exception as exc:  # noqa: BLE001 - one tenant must never stop the others, whatever went wrong with it
+            out.append({"tenant": tenant, "ok": False, "code": "unexpected", "message": f"{type(exc).__name__}: {str(exc)[:300]}", "exit_code": EXIT_UNHEALTHY})
+        finally:
+            try:
+                closer()
+            except Exception:  # noqa: BLE001
+                pass
+    return out
+
+
+def report_sign(result: dict[str, Any], prefix: str = "") -> int:
+    """Print what a sign pass did (the exact text the signer has always printed; ``prefix`` is only used for a tenant other than the operator)."""
+    if result["dry_run"]:
+        print(f"{prefix}dry run: would sign blocks {result['planned_blocks'] or 'none'}, {len(result['planned_receipts'])} receipt(s) and a checkpoint; "
+              f"{len(result['refused_receipts'])} receipt(s) would be refused, {result['deferred_receipts']} deferred")
+    elif result["signed_blocks"] or result["signed_receipts"]:
+        print(f"{prefix}signed blocks " + (",".join(str(b["height"]) for b in result["signed_blocks"]) or "none") + f", {len(result['signed_receipts'])} receipt(s)"
+              + f"; checkpoint {result['checkpoint']['signer_seq']} covers {result['checkpoint']['covers']}")
+    else:
+        print(f"{prefix}nothing to sign ({result.get('note', '')})")
+    for r in result["refused_receipts"]:
+        print(f"REFUSED {prefix}receipt {r['id']}: {r['why']}", file=sys.stderr)
+    return EXIT_UNHEALTHY if result["refused_receipts"] else EXIT_OK
+
+
+def report_tenants(outcomes: list[dict[str, Any]]) -> int:
+    """The per-tenant report: for the operator alone exactly the text ``sign`` prints; another tenant's lines carry its key; failures are listed and make the
+    exit code non-zero (the highest of theirs), so a failed tenant can never be mistaken for a quiet one."""
+    code, failed = EXIT_OK, []
+    for o in outcomes:
+        prefix = "" if o["tenant"] == OPERATOR_TENANT else f"tenant {o['tenant']}: "
+        if o["ok"]:
+            code = max(code, report_sign(o["result"], prefix))
+        else:
+            failed.append(o["tenant"])
+            code = max(code, o["exit_code"])
+            print(f"{prefix}{o['code']}: {o['message']}", file=sys.stderr)
+    if failed:
+        print(f"FAILED tenants: {', '.join(failed)} ({len(outcomes) - len(failed)} of {len(outcomes)} ok)", file=sys.stderr)
+    elif len(outcomes) > 1:
+        print(f"all {len(outcomes)} tenants ok")
+    return code
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python3 -m app.signer", description="Sign sealed blocks and checkpoints (host only; the private key never leaves it)")
     sub = parser.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("sign")
     s.add_argument("--dry-run", action="store_true")
-    sub.add_parser("status")
+    s.add_argument("--tenants", help="comma-separated tenant keys: sign each tenant's own chain (through the per-tenant API of the migrate container)")
+    st = sub.add_parser("status")
+    st.add_argument("--tenants", help="comma-separated tenant keys: report each tenant's state")
     sub.add_parser("init-key")
     args = parser.parse_args(argv)
 
@@ -441,6 +551,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"public key (give this to the root ceremony; it is not secret): {info['public_key']}")
             return EXIT_OK
         key = preflight_key(key_path)
+        tenants = _tenant_list(getattr(args, "tenants", None))
+        if tenants:
+            if args.cmd == "status":
+                return report_status(tenants, key)
+            return report_tenants(sign_tenants(tenants, key, dry_run=args.dry_run))
         port = os.getenv("JARVIS_APP_PORT") or "8011"
         api = Api(os.getenv("JARVIS_API_BASE") or f"http://127.0.0.1:{port}",
                   os.getenv("JARVIS_API_KEY_FILE") or str(repo_root() / "deploy" / "mint" / "secrets" / "api-key"))
@@ -451,19 +566,46 @@ def main(argv: list[str] | None = None) -> int:
     except SignerError as exc:
         print(f"{exc.code}: {exc.message}", file=sys.stderr)
         return exc.exit_code
-    if result["dry_run"]:
-        print(f"dry run: would sign blocks {result['planned_blocks'] or 'none'}, {len(result['planned_receipts'])} receipt(s) and a checkpoint; "
-              f"{len(result['refused_receipts'])} receipt(s) would be refused, {result['deferred_receipts']} deferred")
-    elif result["signed_blocks"] or result["signed_receipts"]:
-        print("signed blocks " + (",".join(str(b["height"]) for b in result["signed_blocks"]) or "none") + f", {len(result['signed_receipts'])} receipt(s)"
-              + f"; checkpoint {result['checkpoint']['signer_seq']} covers {result['checkpoint']['covers']}")
-    else:
-        print(f"nothing to sign ({result.get('note', '')})")
-    for r in result["refused_receipts"]:
-        print(f"REFUSED receipt {r['id']}: {r['why']}", file=sys.stderr)
-    if result["refused_receipts"]:
-        return EXIT_UNHEALTHY
-    return EXIT_OK
+    return report_sign(result)
+
+
+def _tenant_list(text: str | None) -> list[str]:
+    """The operator first, the rest in the order given, no blanks or duplicates (the same rule as app.tenant_jobs.parse_tenants)."""
+    seen: list[str] = []
+    for part in (text or "").split(","):
+        if part.strip() and part.strip() not in seen:
+            seen.append(part.strip())
+    return sorted(seen, key=lambda t: (t != OPERATOR_TENANT, seen.index(t)))
+
+
+def report_status(tenants: list[str], key: KeyInfo, open_api: "Callable[[str], tuple[Api, Callable[[], None]]] | None" = None) -> int:
+    code, failed, rows = EXIT_OK, [], {}
+    for tenant in tenants:
+        closer: Callable[[], None] = lambda: None
+        try:
+            if open_api:
+                api, closer = open_api(tenant)
+            else:
+                transport = ContainerTransport(tenant)
+                api, closer = Api("tenant:" + tenant, "", transport=transport), transport.close
+            rows[tenant] = status(api, key)
+        except SignerError as exc:
+            failed.append(tenant)
+            rows[tenant] = {"error": f"{exc.code}: {exc.message}"}
+            code = max(code, exc.exit_code)
+        except Exception as exc:  # noqa: BLE001
+            failed.append(tenant)
+            rows[tenant] = {"error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+            code = max(code, EXIT_UNHEALTHY)
+        finally:
+            try:
+                closer()
+            except Exception:  # noqa: BLE001
+                pass
+    print(json.dumps(rows[tenants[0]] if len(tenants) == 1 and tenants[0] == OPERATOR_TENANT else rows, indent=2))
+    if failed:
+        print(f"FAILED tenants: {', '.join(failed)} ({len(tenants) - len(failed)} of {len(tenants)} ok)", file=sys.stderr)
+    return code
 
 
 if __name__ == "__main__":
