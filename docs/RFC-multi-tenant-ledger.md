@@ -248,7 +248,7 @@ live before/after capture of the deploy.
 | G1, G2 | **Not done** (phase 1). Only OAuth yields a tenant. |
 | G3 | **Fixed** (#91): strict mode has no identity fallback and no store without a principal; the app refuses to start with the shared key's opt-out, the JSON store or a non-rows store. Off by default (flag unset). |
 | G4 | **Fixed** (#91): `Principal.kind` decides "operator"; gates check it. |
-| G5 | **Partly fixed:** every path labels the tenant from the principal and an unidentified call is filed as `_unauth`; still one global chain, not one per tenant. |
+| G5 | **Partly fixed:** every path labels the tenant from the principal; in **strict mode** (`JARVIS_MULTI_TENANT` on) a call with no identity is filed as `_unauth`. With the flag off (the live box today) `default_tenant_label()` still returns `operator`, so a rejected request that never got a principal is still filed under `operator`: that part of G5 stays open until strict mode is on. Still one global chain, not one per tenant. |
 | G6, G7 | **Not done** (phase 3). |
 | G8 | **Partly fixed:** EMR reinforcement per tenant (#92); the inference backend is operator-only (#99); server paths hidden from tenants; the AMUL field already lives in per-tenant directories; the RAG index is still unaudited. |
 
@@ -281,9 +281,26 @@ column with `FORCE ROW LEVEL SECURITY` and a tenant policy, with these key shape
 `schema_version` has no tenant column and no RLS (it is the schema's own version). The isolation design in sections 3-5 does not depend on a single key shape; it depends on `tenant_key`
 being on every tenant-scoped row, under forced RLS, and on the per-tenant `seq`/height chains. The RLS readiness check (`rls_tables`, #94) enforces the "tenant_key column implies forced RLS with a policy" rule on every such table.
 
+### Design corrections to adopt when the RFC is revised (found in review of this document)
+
+1. **The epoch must be a Merkle root, not one hash over a list (sections 5, 7, 9).** The body defines the epoch as a hash over the serialized sorted list of
+   `(tenant_key, height, block_hash, last_seq)`, but a digest built that way cannot yield the promised sibling-hash inclusion proof: verifying it would disclose the whole tenant list.
+   Define it as a canonical, domain-separated Merkle root: leaf = `H(0x00 || len-prefixed tenant_key || height || block_hash || last_seq)`, leaves sorted by `tenant_key`,
+   node = `H(0x01 || left || right)` (an odd node is promoted unchanged), epoch hash = `H(0x02 || previous_epoch_hash || n || root)`. A tenant's proof is its leaf plus the sibling hashes
+   (and its index), nothing else. Without this the tenant-scoped proof claim must be dropped.
+2. **Lifecycle jobs need an explicit, audited way past the immutability triggers (section 7).** `record_history`, `evidence_objects`, `blocks`, `attestations` and `trust_statements`
+   carry unconditional `BEFORE UPDATE`/`BEFORE DELETE` triggers that raise even for the table owner, so table ownership alone does not let the migrator restore-replace or delete a tenant's
+   rows; the section 7 procedures would fail as written. Phase 3 must specify the mechanism and its audit. A workable shape: the triggers allow the operation only when a
+   transaction-local setting names a **recorded** lifecycle event (a `tenant_restored`/`tenant_deleted` row in the control schema, written first, by the migrator role only) and the session role is the migrator;
+   every use is itself logged and enters the next epoch. Disabling triggers wholesale (`ALTER TABLE ... DISABLE TRIGGER`) is the alternative and needs the same event and logging.
+
 ### Exit criteria (section 9)
 
-1 (Red Team), 3, 4 and 5 are open. 2 is met in code behind the flag (not enabled). 6 is met (matrix in CI, fail-closed on unregistered routes).
+1 (Red Team), 3, 4 and 5 are open. 6 is met (matrix in CI, fail-closed on unregistered routes). **2 is only partly met** and stays open: in strict mode the app refuses to start with the
+unauthenticated opt-out, the JSON store, a non-rows store, or no credential at all, but it **accepts the shared key** when it is the only credential (a non-OAuth strict configuration with
+`JARVIS_API_KEY`; pinned by `test_strict_mode_starts_with_a_safe_configuration_and_the_flag_off_never_checks`), because that key is the explicit operator credential until per-tenant keys
+exist. The criterion as written ("refuses the shared key") needs per-tenant keys (phase 1), or a revision saying that only the unauthenticated shared-key opt-out is refused. It is also not
+enabled on the live box.
 
 ### Open questions answered by what was built or checked
 
