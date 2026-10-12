@@ -89,6 +89,8 @@ from app.auth import (
     require_emr_recall_api_key,
     require_mcp_write_scope,
     require_memory_write,
+    assert_multi_tenant_config,
+    caller_is_operator,
     require_operator_read,
     verify_operator_api_key,
     identity_middleware,
@@ -100,7 +102,7 @@ from app.auth import (
     validate_nx_path,
     nx_allowed_roots,
 )
-from app.identity import current_tenant_key
+from app.identity import current_tenant_key, request_tenant, system_scope
 from app import call_log, drift
 from app.call_witness import CallWitnessMiddleware
 from app.oauth import protected_resource_metadata
@@ -115,6 +117,7 @@ from app import replay as replay_contracts
 from app import attest as attest_module
 from app.evidence import EvidenceError, EvidenceObjectCreate, require_operator_write
 from app.store import StoreUnavailableError, StoreVersionConflict, get_store
+from app.store_errors import TenantUnresolvedError
 from app.store_errors import InvalidInputError
 from app.graph import (
     BfsBody,
@@ -137,6 +140,7 @@ from contextlib import asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan: track and cleanup background nx-search processes."""
     # Store for background processes
+    assert_multi_tenant_config()  # JARVIS_MULTI_TENANT: refuse to start with a configuration that could fail open
     app.state.nx_background = {"watch": None, "serve": None}
     app.state.nx_background_lock = threading.Lock()
     yield
@@ -289,6 +293,11 @@ def index():
     }
 
 
+@app.exception_handler(TenantUnresolvedError)
+async def _tenant_unresolved(request: Request, exc: TenantUnresolvedError):
+    return json_response(401, "No identity was resolved for this request", code="unauthenticated", path=request.url.path)
+
+
 @app.exception_handler(StoreUnavailableError)
 async def _store_unavailable(request: Request, exc: StoreUnavailableError):
     logging.getLogger("jarvis.store").error("ledger unavailable: %s", exc)
@@ -342,7 +351,8 @@ def ready():
     no legacy blob ledger is waiting to be imported.  Failing checks are named; details stay in the log.
     """
     try:
-        checks = get_store().readiness()
+        with system_scope():  # readiness is about the database and its roles, not a tenant: keep it working when a request with no identity is refused a store
+            checks = get_store().readiness()
     except StoreUnavailableError as exc:
         logging.getLogger("jarvis.store").error("not ready: %s", exc)
         checks = {"store": "failed"}
@@ -490,7 +500,7 @@ def list_conflicts(subject: str | None = Query(default=None)):
 
 def _run_latest(arguments: dict[str, Any], *, http: bool) -> dict[str, Any]:
     """Resolve the tenant and run the one emr_latest implementation (shared by the HTTP route and the MCP tool)."""
-    tenant = current_tenant_key() or (None if oauth_enabled() else "operator")
+    tenant = request_tenant()  # None (refused as TENANT_UNRESOLVED) when no identity resolves; the operator only when it authenticated as one
     raw_limit = arguments.get("limit")
     if http and isinstance(raw_limit, str):
         try:
@@ -515,12 +525,12 @@ def _run_latest(arguments: dict[str, Any], *, http: bool) -> dict[str, Any]:
     )
     if tenant is None:
         return latest_memories(None, tenant=None, params=params, operator=False)  # raises TENANT_UNRESOLVED
-    return latest_memories(get_store(), tenant=tenant, params=params, operator=not oauth_enabled())
+    return latest_memories(get_store(), tenant=tenant, params=params, operator=caller_is_operator())
 
 
 def _run_search(arguments: dict[str, Any], *, http: bool) -> dict[str, Any]:
     """Resolve the tenant and run the one ledger-search implementation (HTTP route, tool route and MCP tool)."""
-    tenant = current_tenant_key() or (None if oauth_enabled() else "operator")
+    tenant = request_tenant()  # None (refused as TENANT_UNRESOLVED) when no identity resolves; the operator only when it authenticated as one
     raw_limit = arguments.get("limit")
     if http and isinstance(raw_limit, str):
         try:
@@ -544,7 +554,7 @@ def _run_search(arguments: dict[str, Any], *, http: bool) -> dict[str, Any]:
     )
     if tenant is None:
         return search_ledger(None, tenant=None, params=params, operator=False)  # raises TENANT_UNRESOLVED
-    return search_ledger(get_store(), tenant=tenant, params=params, operator=not oauth_enabled())
+    return search_ledger(get_store(), tenant=tenant, params=params, operator=caller_is_operator())
 
 
 @app.get("/api/jarvis/memory/search")
@@ -947,7 +957,7 @@ def _audit_log(action: str, request: Request | None, details: dict):
 
 def require_call_log_operator() -> None:
     """The call log is operator-only: an OAuth principal (a tenant) never reads it."""
-    if oauth_enabled():
+    if not caller_is_operator():
         raise LatestError(403, "denied", AUTHORITY_DENIED, "the call log is operator-only")
 
 
@@ -981,7 +991,7 @@ def tool_calls_verify():
 
 def require_drift_operator() -> None:
     """The drift watcher reads records on the operator's behalf: an OAuth principal (a tenant) never uses it."""
-    if oauth_enabled():
+    if not caller_is_operator():
         raise LatestError(403, "denied", AUTHORITY_DENIED, "the drift watcher is operator-only")
 
 
@@ -997,7 +1007,7 @@ def _run_drift(body: Any, client_header: str | None) -> dict[str, Any]:
     client_name = call_log.split_client(client_header)[0] if client_header else None
     matches = drift.match_call_log(request_["records"], request_["client"] or client_name, request_["served_digest"], tenant=current_tenant_key())
     result["call_log"] = matches
-    entry = drift.get_drift_log().record(drift.log_entry(result, request_, tenant=current_tenant_key(), client_header=client_header, matches=matches))
+    entry = drift.get_drift_log().record(drift.log_entry(result, request_, tenant=request_tenant(), client_header=client_header, matches=matches))
     result["drift_log_seq"] = entry["seq"] if entry and "seq" in entry else None
     # a quiet outage is the thing to avoid: the verdict is still served (the ledger is not at stake), but the caller is told this check left no trace
     result["drift_log"] = "ok" if result["drift_log_seq"] is not None else "degraded"
@@ -1686,10 +1696,14 @@ def rag_documents(body: RagDocumentsBody):
 @app.post("/api/jarvis/rag/query", dependencies=[Depends(require_rag_api_key)])
 def rag_query(body: RagQueryBody):
     try:
+        # The RAG key is a deployment secret of its own, not a tenant's credential, and this route has always answered from the operator's ledger. In strict
+        # (JARVIS_MULTI_TENANT) mode a request with no identity is refused a store, so say so explicitly: the key was checked by the route's dependency.
+        with system_scope():
+            extra = ledger_docs(get_store())
         record = answer_query(
             body.query,
             get_index(),
-            extra_docs=ledger_docs(get_store()),
+            extra_docs=extra,
         )
     except OSError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -1929,7 +1943,7 @@ def _invoke_emr_tool_unguarded(name: str, arguments: dict) -> dict:
     if name == "emr_search_ledger":
         return _run_search(arguments, http=False)
     if name == "emr_drift_check":
-        if oauth_enabled():
+        if not caller_is_operator():
             raise ToolRefusal(DENIED, "the drift watcher is operator-only", AUTHORITY_DENIED)
         return _run_drift(arguments, None)
     if name == "emr_recall":

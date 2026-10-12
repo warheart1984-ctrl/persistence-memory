@@ -16,7 +16,7 @@ from fastapi.responses import JSONResponse
 
 from app import call_witness
 from app.auth import optional_verify_operator_api_key
-from app.identity import current_tenant_key
+from app.identity import request_tenant
 from mcp_server.protocol import (
     PROTOCOL_VERSION,
     EmrToolCaller,
@@ -98,7 +98,7 @@ def create_mcp_router(call_tool: EmrToolCaller) -> APIRouter:
                 call_witness.remember_client(new_session or session_id, msg.get("params"))
             out = call_witness.witnessed_dispatch(
                 msg, lambda m: dispatch_rpc(m, call_tool), session_id=session_id or new_session,
-                tenant=current_tenant_key(), user_agent=request.headers.get("user-agent"),
+                tenant=request_tenant(), user_agent=request.headers.get("user-agent"),
             )
             if out is not None:
                 responses.append(out)
