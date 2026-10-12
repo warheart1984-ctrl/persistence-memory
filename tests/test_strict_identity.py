@@ -53,12 +53,16 @@ def test_who_carries_the_operator_credential(keyed, path, headers, expected):
     assert auth.credential_is_operator(headers, path) is expected
 
 
-def test_a_configured_recall_key_decides_the_tool_routes_and_the_ledger_key_no_longer_opens_them(keyed):
+def test_a_configured_recall_key_is_a_request_identity_on_the_tool_routes_and_the_ledger_key_still_opens_them(keyed):
+    """(Was: the ledger key stopped working on the tool routes once a recall key was set.) Now both identify the request; WHAT the recall key may call is decided
+    by auth.credential_kind and pinned in tests/test_recall_credential_boundary.py."""
     keyed.setenv("EMR_RECALL_API_KEY", RECALL)
     assert auth.credential_is_operator({"authorization": f"Bearer {RECALL}"}, "/api/jarvis/tools/calls") is True
     assert auth.credential_is_operator({"x-emr-recall-key": RECALL}, "/mcp") is True
-    assert auth.credential_is_operator({"x-api-key": KEY}, "/api/jarvis/tools/calls") is False
-    assert auth.credential_is_operator({"x-api-key": KEY}, "/api/jarvis/memory") is True     # the ledger routes still take the ledger key
+    assert auth.credential_is_operator({"x-api-key": KEY}, "/api/jarvis/tools/calls") is True
+    assert auth.credential_is_operator({"x-api-key": KEY}, "/api/jarvis/memory") is True     # the ledger routes take the ledger key
+    assert auth.credential_is_operator({"authorization": f"Bearer {RECALL}"}, "/api/jarvis/memory") is False    # and never the recall key
+    assert auth.credential_is_operator({"x-api-key": "wrong"}, "/mcp") is False
 
 
 def test_with_no_key_configured_only_the_explicit_local_dev_opt_out_is_the_operator(keyed):

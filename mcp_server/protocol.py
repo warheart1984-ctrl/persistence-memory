@@ -365,6 +365,10 @@ MCP_TOOLS: list[dict[str, Any]] = [
 
 _KNOWN_TOOLS = frozenset(t["name"] for t in MCP_TOOLS)
 
+# The ONLY tools a recall-scoped credential (EMR_RECALL_API_KEY) may list or call. Everything else (writes, the drift check, anything added later) needs the
+# ledger key; adding a tool here is a deliberate decision, pinned by tests/test_recall_credential_boundary.py.
+RECALL_READ_TOOLS = frozenset({"emr_recall", "emr_latest", "emr_search_ledger", "search", "fetch", "emr_search", "emr_fetch"})
+
 
 class ToolRefusal(Exception):
     """A tool call refused for a reason with a stable machine-readable ``code``.

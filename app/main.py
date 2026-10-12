@@ -86,7 +86,8 @@ from app.auth import (
     ledger_read_protection_middleware,
     mcp_write_enabled,
     memory_write_enabled,
-    require_emr_recall_api_key,
+    require_ledger_operator_key,
+    require_tools_credential,
     require_mcp_write_scope,
     require_memory_write,
     assert_multi_tenant_config,
@@ -665,7 +666,7 @@ def _nx_client() -> NxSearchClient:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
-@app.post("/api/jarvis/memory/external-search", dependencies=[Depends(require_nx_enabled), Depends(require_nx_operator), Depends(require_emr_recall_api_key)])
+@app.post("/api/jarvis/memory/external-search", dependencies=[Depends(require_nx_enabled), Depends(require_nx_operator), Depends(require_ledger_operator_key)])
 def external_search(body: ExternalSearchRequest):
     """Search nx-search; optional promotion remains bounded and auditable."""
     if body.auto_promote:
@@ -687,7 +688,7 @@ def external_search(body: ExternalSearchRequest):
     return {"external_results": results, "promoted_memories": promoted, "promotion_count": len(promoted)}
 
 
-@app.get("/api/jarvis/memory/unified", dependencies=[Depends(require_nx_enabled), Depends(require_nx_operator), Depends(require_emr_recall_api_key)])
+@app.get("/api/jarvis/memory/unified", dependencies=[Depends(require_nx_enabled), Depends(require_nx_operator), Depends(require_ledger_operator_key)])
 def unified_search(
     query: str = Query(..., min_length=1, max_length=500),
     limit: int = Query(default=25, ge=1, le=100),
@@ -737,7 +738,7 @@ def promote_external_result(body: ExternalPromotionRequest):
 # --- nx-search extended capabilities ---
 
 
-@app.get("/api/jarvis/memory/external/stats", dependencies=[Depends(require_nx_enabled), Depends(require_nx_operator), Depends(require_emr_recall_api_key)])
+@app.get("/api/jarvis/memory/external/stats", dependencies=[Depends(require_nx_enabled), Depends(require_nx_operator), Depends(require_ledger_operator_key)])
 def external_stats():
     """Get nx-search index statistics."""
     client = _nx_client()
@@ -747,7 +748,7 @@ def external_stats():
     return stats
 
 
-@app.post("/api/jarvis/memory/external/ask", dependencies=[Depends(require_nx_enabled), Depends(require_nx_operator), Depends(require_emr_recall_api_key)])
+@app.post("/api/jarvis/memory/external/ask", dependencies=[Depends(require_nx_enabled), Depends(require_nx_operator), Depends(require_ledger_operator_key)])
 def external_ask(body: NxAskRequest):
     """Ask JARVIS a natural-language question over indexed files (read-only)."""
     client = _nx_client()
@@ -778,7 +779,7 @@ def external_forget(body: NxForgetRequest, request: Request):
     return result
 
 
-@app.post("/api/jarvis/memory/external/describe", dependencies=[Depends(require_nx_enabled), Depends(require_nx_operator), Depends(require_emr_recall_api_key)])
+@app.post("/api/jarvis/memory/external/describe", dependencies=[Depends(require_nx_enabled), Depends(require_nx_operator), Depends(require_ledger_operator_key)])
 def external_describe(body: NxDescribeRequest, request: Request):
     """Describe an image via vision (NVIDIA + HoloRT4D). Path validated against allowed roots.
 
@@ -961,7 +962,7 @@ def require_call_log_operator() -> None:
         raise LatestError(403, "denied", AUTHORITY_DENIED, "the call log is operator-only")
 
 
-@app.get("/api/jarvis/tools/calls", dependencies=[Depends(require_emr_recall_api_key), Depends(require_call_log_operator)])
+@app.get("/api/jarvis/tools/calls", dependencies=[Depends(require_ledger_operator_key), Depends(require_call_log_operator)])
 def tool_calls(
     tool: str | None = Query(default=None, max_length=64),
     client: str | None = Query(default=None, max_length=128),
@@ -981,7 +982,7 @@ def tool_calls(
     return {**page, "client_names": "self-reported", "provenance": "server-witnessed"}
 
 
-@app.get("/api/jarvis/tools/calls/verify", dependencies=[Depends(require_emr_recall_api_key), Depends(require_call_log_operator)])
+@app.get("/api/jarvis/tools/calls/verify", dependencies=[Depends(require_ledger_operator_key), Depends(require_call_log_operator)])
 def tool_calls_verify():
     """Walk the call log's hash chain across files; returns the head hash so it can be recorded elsewhere."""
     if not call_log.enabled():
@@ -1016,13 +1017,13 @@ def _run_drift(body: Any, client_header: str | None) -> dict[str, Any]:
     return result
 
 
-@app.post("/api/jarvis/drift/check", dependencies=[Depends(require_emr_recall_api_key), Depends(require_drift_operator)])
+@app.post("/api/jarvis/drift/check", dependencies=[Depends(require_ledger_operator_key), Depends(require_drift_operator)])
 def drift_check(request: Request, body: dict[str, Any] = Body(default_factory=dict)):
     """Check an agent's summary of ledger records against the records (deterministic, no model; see docs/drift_watcher.md)."""
     return _run_drift(body, request.headers.get("x-jarvis-mcp-client") or request.headers.get("user-agent"))
 
 
-@app.get("/api/jarvis/drift/log", dependencies=[Depends(require_emr_recall_api_key), Depends(require_drift_operator)])
+@app.get("/api/jarvis/drift/log", dependencies=[Depends(require_ledger_operator_key), Depends(require_drift_operator)])
 def drift_log_entries(
     client: str | None = Query(default=None, max_length=128),
     since: str | None = Query(default=None, max_length=40),
@@ -1039,14 +1040,14 @@ def drift_log_entries(
     return {**page, "head": log.head(), "provenance": "drift log (not ledger records)"}
 
 
-@app.get("/api/jarvis/drift/log/verify", dependencies=[Depends(require_emr_recall_api_key), Depends(require_drift_operator)])
+@app.get("/api/jarvis/drift/log/verify", dependencies=[Depends(require_ledger_operator_key), Depends(require_drift_operator)])
 def drift_log_verify():
     if not drift.enabled():
         raise LatestError(404, "not_found", "DRIFT_CHECK_DISABLED", "the drift watcher is switched off (JARVIS_DRIFT_CHECK_ENABLED)")
     return drift.get_drift_log().verify()
 
 
-@app.post("/api/jarvis/tools/search", dependencies=[Depends(require_emr_recall_api_key)])
+@app.post("/api/jarvis/tools/search", dependencies=[Depends(require_tools_credential)])
 def tool_search(body: EmrSearchRequest):
     """OpenAI company-knowledge search — read-only EMR recall → citation results."""
     store = get_store()
@@ -1056,7 +1057,7 @@ def tool_search(body: EmrSearchRequest):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.post("/api/jarvis/tools/fetch", dependencies=[Depends(require_emr_recall_api_key)])
+@app.post("/api/jarvis/tools/fetch", dependencies=[Depends(require_tools_credential)])
 def tool_fetch(body: EmrFetchRequest):
     """OpenAI company-knowledge fetch — full LTM record by id (read-only)."""
     store = get_store()
@@ -1068,37 +1069,37 @@ def tool_fetch(body: EmrFetchRequest):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@app.post("/api/jarvis/tools/emr_search", dependencies=[Depends(require_emr_recall_api_key)])
+@app.post("/api/jarvis/tools/emr_search", dependencies=[Depends(require_tools_credential)])
 def tool_emr_search(body: EmrSearchRequest):
     """Alias of ``search`` for hosts that namespace EMR tools."""
     return tool_search(body)
 
 
-@app.post("/api/jarvis/tools/emr_fetch", dependencies=[Depends(require_emr_recall_api_key)])
+@app.post("/api/jarvis/tools/emr_fetch", dependencies=[Depends(require_tools_credential)])
 def tool_emr_fetch(body: EmrFetchRequest):
     """Alias of ``fetch`` for hosts that namespace EMR tools."""
     return tool_fetch(body)
 
 
-@app.post("/api/jarvis/tools/emr_drift_check", dependencies=[Depends(require_emr_recall_api_key), Depends(require_drift_operator)])
+@app.post("/api/jarvis/tools/emr_drift_check", dependencies=[Depends(require_ledger_operator_key), Depends(require_drift_operator)])
 def tool_emr_drift_check(request: Request, body: dict[str, Any] | None = Body(default=None)):
     """Read-only drift check (same implementation as POST /api/jarvis/drift/check)."""
     return _run_drift(body or {}, request.headers.get("x-jarvis-mcp-client") or request.headers.get("user-agent"))
 
 
-@app.post("/api/jarvis/tools/emr_search_ledger", dependencies=[Depends(require_emr_recall_api_key)])
+@app.post("/api/jarvis/tools/emr_search_ledger", dependencies=[Depends(require_tools_credential)])
 def tool_emr_search_ledger(body: dict[str, Any] | None = Body(default=None)):
     """Read-only ranked ledger search (same implementation as GET /api/jarvis/memory/search)."""
     return _run_search(body or {}, http=False)
 
 
-@app.post("/api/jarvis/tools/emr_latest", dependencies=[Depends(require_emr_recall_api_key)])
+@app.post("/api/jarvis/tools/emr_latest", dependencies=[Depends(require_tools_credential)])
 def tool_emr_latest(body: dict[str, Any] | None = Body(default=None)):
     """Read-only newest-first discovery (same implementation as GET /api/jarvis/memory/latest)."""
     return _run_latest(body or {}, http=False)
 
 
-@app.post("/api/jarvis/tools/emr_recall", dependencies=[Depends(require_emr_recall_api_key)])
+@app.post("/api/jarvis/tools/emr_recall", dependencies=[Depends(require_tools_credential)])
 def tool_emr_recall(body: EmrRecallRequest):
     """Read-only EMR Recall Protocol — governed bundle for agent tool calling."""
     store = get_store()
@@ -1111,7 +1112,7 @@ def tool_emr_recall(body: EmrRecallRequest):
 
 @app.post(
     "/api/jarvis/tools/emr_remember",
-    dependencies=[Depends(require_emr_recall_api_key), Depends(require_mcp_write_scope)],
+    dependencies=[Depends(require_ledger_operator_key), Depends(require_mcp_write_scope)],
 )
 def tool_emr_remember(body: EmrRememberRequest):
     """Governed create via EMR — draft-only; gated by JARVIS_MCP_WRITE_ENABLED."""
@@ -1121,7 +1122,7 @@ def tool_emr_remember(body: EmrRememberRequest):
 
 @app.post(
     "/api/jarvis/tools/emr_upsert",
-    dependencies=[Depends(require_emr_recall_api_key), Depends(require_mcp_write_scope)],
+    dependencies=[Depends(require_ledger_operator_key), Depends(require_mcp_write_scope)],
 )
 def tool_emr_upsert(body: EmrUpsertRequest):
     """Governed supersede via EMR — new draft + archive prior; gated by JARVIS_MCP_WRITE_ENABLED."""
