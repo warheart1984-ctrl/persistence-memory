@@ -40,6 +40,22 @@ _principal: contextvars.ContextVar[Principal | None] = contextvars.ContextVar(
 )
 
 
+_acting_tenant: contextvars.ContextVar[str | None] = contextvars.ContextVar("jarvis_acting_tenant", default=None)
+
+
+@contextlib.contextmanager
+def acting_for(tenant: str):
+    """Run code as the operator administering ONE tenant's ledger (the box's per-tenant jobs: seal, sign, verify).
+
+    Internal to a process that the operator started on the box: nothing in the HTTP stack ever sets it, and no request parameter, header or token can,
+    so the public API still cannot be made to select a tenant. "operator" is the operator's own namespace (the default one)."""
+    token = _acting_tenant.set(tenant)
+    try:
+        yield
+    finally:
+        _acting_tenant.reset(token)
+
+
 def set_principal(principal: Principal):
     return _principal.set(principal)
 
@@ -75,6 +91,9 @@ def request_tenant() -> str | None:
     An OAuth subject is its opaque hash; the authenticated operator is "operator".  With no principal the legacy deployment (shared key) treats the
     request as the operator, because the key middleware has already refused anyone who is not; in JARVIS_MULTI_TENANT mode there is no such default.
     """
+    acting = _acting_tenant.get()
+    if acting is not None:                 # the box's per-tenant jobs (acting_for): the tenant they were started for, in strict mode too
+        return acting
     tenant = current_tenant_key()
     if tenant is not None:
         return tenant
@@ -85,6 +104,9 @@ def request_tenant() -> str | None:
 
 def current_tenant_key() -> str | None:
     """Return an opaque, filesystem-safe namespace for the current subject (None for the operator, whose namespace is the default one)."""
+    acting = _acting_tenant.get()
+    if acting is not None:                 # the operator, administering that tenant (see acting_for): its key as it is stored; the operator's namespace has none
+        return None if acting == OPERATOR_TENANT else acting
     principal = current_principal()
     if principal is None or principal.kind == "operator":
         return None
