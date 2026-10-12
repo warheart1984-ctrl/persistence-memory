@@ -15,10 +15,12 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
 from app import call_witness
-from app.auth import optional_verify_operator_api_key
+from app.auth import mcp_credential
 from app.identity import request_tenant
 from mcp_server.protocol import (
+    MCP_TOOLS,
     PROTOCOL_VERSION,
+    RECALL_READ_TOOLS,
     EmrToolCaller,
     dispatch_rpc,
     is_jsonrpc_request,
@@ -27,15 +29,31 @@ from mcp_server.protocol import (
 SESSION_HEADER = "mcp-session-id"
 
 
-def _require_mcp_auth(request: Request) -> None:
-    try:
-        optional_verify_operator_api_key(
-            request.headers.get("authorization"),
-            request.headers.get("x-emr-recall-key"),
-            request.headers.get("x-api-key"),
-        )
-    except HTTPException as exc:
-        raise exc
+def _require_mcp_auth(request: Request) -> str:
+    """Authenticate the request; returns which credential it carries (``operator``: the ledger key, or ``recall``: read tools only)."""
+    return mcp_credential(
+        request.headers.get("authorization"),
+        request.headers.get("x-emr-recall-key"),
+        request.headers.get("x-api-key"),
+    )
+
+
+def _scoped_dispatch(message: dict[str, Any], call_tool: EmrToolCaller, credential: str) -> dict[str, Any] | None:
+    """dispatch_rpc, narrowed for a recall-scoped credential: it lists, and may call, only RECALL_READ_TOOLS. Anything else is refused as a tool error."""
+    if credential != "recall":
+        return dispatch_rpc(message, call_tool)
+    method = message.get("method")
+    if method == "tools/list":
+        return {"jsonrpc": "2.0", "id": message.get("id"), "result": {"tools": [t for t in MCP_TOOLS if t["name"] in RECALL_READ_TOOLS]}}
+    if method == "tools/call":
+        params = message.get("params")
+        name = params.get("name") if isinstance(params, dict) else None
+        if name not in RECALL_READ_TOOLS:
+            return {"jsonrpc": "2.0", "id": message.get("id"), "result": {
+                "content": [{"type": "text", "text": f"tool not permitted for this credential: {name}"}],
+                "structuredContent": {"error": {"code": "AUTHORITY_DENIED", "reason": "recall-credential-read-only"}},
+                "isError": True}}
+    return dispatch_rpc(message, call_tool)
 
 
 def _parse_body(raw: bytes) -> list[dict[str, Any]]:
@@ -72,7 +90,7 @@ def create_mcp_router(call_tool: EmrToolCaller) -> APIRouter:
     async def mcp_post(request: Request) -> Response:
         _validate_accept(request)
         try:
-            _require_mcp_auth(request)
+            credential = _require_mcp_auth(request)
         except HTTPException:
             call_witness.log_unauthenticated_mcp(request.headers.get("user-agent"))
             raise
@@ -84,7 +102,7 @@ def create_mcp_router(call_tool: EmrToolCaller) -> APIRouter:
         notifications = [m for m in messages if not is_jsonrpc_request(m)]
 
         for note in notifications:
-            dispatch_rpc(note, call_tool)
+            _scoped_dispatch(note, call_tool, credential)
 
         if not requests:
             return Response(status_code=202)
@@ -97,7 +115,7 @@ def create_mcp_router(call_tool: EmrToolCaller) -> APIRouter:
             if msg.get("method") == "initialize":
                 call_witness.remember_client(new_session or session_id, msg.get("params"))
             out = call_witness.witnessed_dispatch(
-                msg, lambda m: dispatch_rpc(m, call_tool), session_id=session_id or new_session,
+                msg, lambda m: _scoped_dispatch(m, call_tool, credential), session_id=session_id or new_session,
                 tenant=request_tenant(), user_agent=request.headers.get("user-agent"),
             )
             if out is not None:
