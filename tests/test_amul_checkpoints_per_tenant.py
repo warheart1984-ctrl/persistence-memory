@@ -131,3 +131,30 @@ def test_verify_field_for_a_tenant_goes_through_its_own_chain(world):
     compact(a_field, a_recs)
     report = amul.verify_field(b_field, b_recs)
     assert report.gc_mode == "full_rehash" and report.checkpoints_checked == 0
+
+
+def test_a_tenants_legacy_chain_in_the_shared_file_is_adopted_when_it_authenticates_against_its_field(world):
+    """Upgrade path (review finding): a chain a tenant made before checkpoints were per tenant must not be abandoned; compaction would restart with no prior cold set (G2)."""
+    tmp, shared = world
+    a_field, a_recs = _fill("t_alice", 4)
+    compact(a_field, a_recs, checkpoints_path=shared)                                          # the OLD behaviour: the tenant's chain in the shared file
+    own = tmp / "tenants" / "t_alice-checkpoints.jsonl"
+    assert not own.exists()
+    report = verify_gc(a_field)                                                                  # new default: adopts, then verifies through the chain
+    assert own.exists() and own.read_bytes() == Path(shared).read_bytes()
+    assert report.mode == "checkpoint_chain" and report.integrity_ok and report.checkpoints_checked == 1
+    for r in [_rec(10), _rec(11)]:                                                               # and the chain CONTINUES from the adopted one
+        anchor_memory(r, a_field)
+    compact(a_field, a_recs + [_rec(10), _rec(11)])
+    assert gc_status(a_field)["total_checkpoints"] == 2 and verify_gc(a_field).integrity_ok
+
+
+def test_a_chain_made_for_another_field_is_never_adopted(world):
+    tmp, shared = world
+    o_field, o_recs = _fill(None, 4)
+    compact(o_field, o_recs)                                                                     # the operator's chain, in the shared file
+    t_field, t_recs = _fill("t_alice", 5)                                                        # longer than the operator's chain, so only the hashes can tell them apart
+    report = verify_gc(t_field)
+    assert report.mode == "full_rehash" and report.integrity_ok
+    assert not (tmp / "tenants" / "t_alice-checkpoints.jsonl").exists(), "the operator's chain must not be copied to a tenant"
+    assert verify_gc(o_field).mode == "checkpoint_chain"

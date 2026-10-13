@@ -68,7 +68,39 @@ def checkpoints_path_for(field: AmulField) -> str:
     A tenant's field is created with its own chain (``field.checkpoints_path``, set by app.amul.get_field from the tenant context: ``<dir>/tenants/<tenant>-checkpoints.jsonl``), so one tenant's GC
     and verify never read or write another tenant's chain (a chain is a list of line ranges and hashes of ONE field file). A field with no chain of its own (the operator's, an explicitly
     pathed one, a test's) keeps the shared default CHECKPOINTS_PATH, exactly as before, whatever its file is called or wherever it lives."""
-    return getattr(field, "checkpoints_path", None) or CHECKPOINTS_PATH
+    own = getattr(field, "checkpoints_path", None)
+    if not own:
+        return CHECKPOINTS_PATH
+    if not os.path.exists(own) and os.path.exists(CHECKPOINTS_PATH):
+        _adopt_legacy_chain(field, own)
+    return own
+
+
+def _adopt_legacy_chain(field: AmulField, own_path: str) -> bool:
+    """Upgrade path: before checkpoints were per tenant, every tenant's chain lived in the shared file. A tenant that has none of its own yet adopts the shared chain IF AND ONLY IF it
+    authenticates against THIS field (a structurally valid chain, every range's range_sha and merkle root matching this field's bytes); that is proof the chain is this tenant's. A chain made for
+    another field (the operator's, or another tenant's) never authenticates, and is left alone. Without this a tenant's next compaction would start from nothing and could re-classify an
+    already-cold artifact as hot (G2, dead-stays-dead), and verify would silently fall back to a full rehash."""
+    try:
+        cps = _load_checkpoints(CHECKPOINTS_PATH)
+        if not cps or _verify_chain_structure(cps):
+            return False
+        raw_lines = _read_raw_lines(field.path)
+        if cps[-1].range_end > len(raw_lines):
+            return False
+        for cp in cps:
+            range_sha, merkle = _range_authenticators(raw_lines, cp.range_start, cp.range_end)
+            if range_sha != cp.range_sha or merkle != cp.merkle_root:
+                return False
+        data = Path(CHECKPOINTS_PATH).read_bytes()
+        target = Path(own_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_name(target.name + ".adopting")
+        tmp.write_bytes(data)
+        os.replace(tmp, target)
+        return True
+    except (OSError, ValueError):
+        return False                                      # never let the upgrade path break a verify or a compaction: the tenant simply starts its own chain
 
 
 # Adaptive retention: cold threshold = 2x half-life of the type.
