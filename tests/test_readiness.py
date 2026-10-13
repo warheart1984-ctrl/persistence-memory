@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -260,3 +262,242 @@ def test_not_ready_while_legacy_data_is_unimported(pg, client, monkeypatch):
         conn.execute("INSERT INTO jarvis_tenant_ledgers VALUES ('operator', %s::jsonb)", (json.dumps({"memories": [{"id": "x"}]}),))
         conn.execute("GRANT SELECT ON jarvis_tenant_ledgers TO jarvis_app_test")
     _not_ready(client, legacy_data="failed")
+
+
+# ---------------------------------------------------------------------------------------------------- strict-mode STARTUP guard (JARVIS_MULTI_TENANT)
+def _strict(monkeypatch):
+    monkeypatch.setenv("JARVIS_MULTI_TENANT", "1")
+    monkeypatch.setenv("JARVIS_API_KEY", "startup-guard-key-0123456789")
+    monkeypatch.delenv("JARVIS_ALLOW_UNAUTHENTICATED", raising=False)
+    monkeypatch.delenv("JARVIS_AUTH_MODE", raising=False)
+
+
+@pg_only
+def test_the_startup_guard_passes_on_a_healthy_database_and_the_app_starts_in_strict_mode(pg, monkeypatch):
+    _strict(monkeypatch)
+    assert pg_store.assert_tenant_isolation_ready() is None
+    with TestClient(app, raise_server_exceptions=False) as c:                         # the lifespan runs the guard
+        assert c.get("/ready").status_code == 200
+
+
+@pg_only
+@pytest.mark.parametrize("weaken", [
+    "ALTER TABLE memories NO FORCE ROW LEVEL SECURITY",
+    "ALTER TABLE memories DISABLE ROW LEVEL SECURITY",
+    "DROP POLICY IF EXISTS tenant_isolation ON boards",
+    "CREATE TABLE forgotten (tenant_key text NOT NULL, id text NOT NULL)",
+])
+def test_the_startup_guard_refuses_at_once_when_a_tenant_table_is_not_protected_and_the_app_does_not_start(pg, monkeypatch, weaken):
+    _strict(monkeypatch)
+    monkeypatch.setenv("JARVIS_STARTUP_DB_WAIT_SECONDS", "30")                  # a definitive failure must not wait this out
+    with pg.admin_conn() as conn:
+        if weaken.startswith("DROP POLICY"):
+            name = conn.execute("SELECT polname FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid WHERE c.relname = 'boards'").fetchone()[0]
+            weaken = f"DROP POLICY IF EXISTS {name} ON boards"
+        conn.execute(weaken)
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="refuses to start"):
+        pg_store.assert_tenant_isolation_ready()
+    with pytest.raises(RuntimeError, match="refuses to start"):
+        with TestClient(app, raise_server_exceptions=False):
+            pass
+    assert time.monotonic() - started < 10
+
+
+@pg_only
+def test_with_the_flag_off_the_same_unprotected_database_still_starts_as_today(pg, monkeypatch):
+    monkeypatch.delenv("JARVIS_MULTI_TENANT", raising=False)
+    with pg.admin_conn() as conn:
+        conn.execute("ALTER TABLE memories NO FORCE ROW LEVEL SECURITY")
+    with TestClient(app, raise_server_exceptions=False) as c:                         # (/ready says 503; nothing changed about starting)
+        assert c.get("/ready").status_code == 503
+
+
+@pg_only
+def test_the_startup_guard_refuses_a_role_that_bypasses_row_level_security(pg, monkeypatch):
+    _strict(monkeypatch)
+    monkeypatch.setenv("JARVIS_DATABASE_URL", pg.admin_dsn)                           # the superuser DSN: RLS would not apply to it
+    pg_store.close_pools()
+    with pytest.raises(RuntimeError, match="refuses to start"):
+        pg_store.assert_tenant_isolation_ready()
+
+
+@pg_only
+def test_the_startup_guard_still_accepts_the_retained_legacy_blob_table(pg, monkeypatch):
+    _strict(monkeypatch)
+    with pg.admin_conn() as conn:
+        conn.execute("CREATE TABLE jarvis_tenant_ledgers (tenant_key text PRIMARY KEY, payload jsonb NOT NULL DEFAULT '{}')")
+    assert pg_store.assert_tenant_isolation_ready() is None
+
+
+def test_an_unreachable_database_is_retried_for_a_bounded_time_and_then_refused(monkeypatch):
+    _strict(monkeypatch)
+    monkeypatch.setenv("JARVIS_DATABASE_URL", "postgresql://u:p@127.0.0.1:9/none")
+    monkeypatch.setenv("JARVIS_PG_STORE", "rows")
+    monkeypatch.setenv("JARVIS_STARTUP_DB_WAIT_SECONDS", "2")
+    monkeypatch.setenv("JARVIS_DATABASE_POOL_TIMEOUT_MS", "300")
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="could not be reached and verified within 2s"):
+        pg_store.assert_tenant_isolation_ready()
+    assert 1.5 <= time.monotonic() - started < 20
+    pg_store.close_pools()
+
+
+def test_no_database_configured_is_refused_in_strict_mode(monkeypatch):
+    _strict(monkeypatch)
+    monkeypatch.delenv("JARVIS_DATABASE_URL", raising=False)
+    with pytest.raises(RuntimeError, match="no PostgreSQL store"):
+        pg_store.assert_tenant_isolation_ready()
+
+
+# ------------------------------------------------------------- review findings on the startup guard (policies must isolate; wrapped connection errors are transient)
+def _policy_name(conn, table):
+    return conn.execute("SELECT polname FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid WHERE c.relname = %s LIMIT 1", (table,)).fetchone()[0]
+
+
+@pg_only
+def test_a_permissive_extra_policy_or_a_replaced_policy_is_not_isolation(pg, monkeypatch):
+    """Policies are OR-ed: `USING (true)` added beside the real one, or in its place, leaves RLS 'on' and isolating nothing. The guard and /ready must both say so."""
+    _strict(monkeypatch)
+    with pg.admin_conn() as conn:
+        conn.execute("CREATE POLICY open_to_all ON boards USING (true)")
+    with pg.admin_conn() as conn:
+        conn.row_factory = __import__("psycopg").rows.dict_row
+        assert pg_store.tenant_tables_without_forced_rls(conn, pg.schema) == ["boards"]
+    with pytest.raises(RuntimeError, match="refuses to start"):
+        pg_store.assert_tenant_isolation_ready()
+    with pg.admin_conn() as conn:
+        conn.execute("DROP POLICY open_to_all ON boards")
+    assert pg_store.assert_tenant_isolation_ready() is None                               # positive control: back to the real policy
+    with pg.admin_conn() as conn:
+        name = _policy_name(conn, "memories")
+        conn.execute(f"DROP POLICY {name} ON memories")
+        conn.execute("CREATE POLICY replaced ON memories USING (true) WITH CHECK (true)")
+    with pytest.raises(RuntimeError, match="refuses to start"):
+        pg_store.assert_tenant_isolation_ready()
+
+
+@pg_only
+def test_the_isolation_probe_catches_a_policy_that_mentions_the_setting_but_is_always_true(pg, monkeypatch):
+    """The text check passes `tenant_key = current_setting(...) OR true`; only behaviour shows it: a tenant that owns nothing can read another tenant's row."""
+    from app.models import EvidenceLink, MemoryCreate
+    from app.pg_store import PostgresRowStore
+
+    _strict(monkeypatch)
+    PostgresRowStore(pg.app_dsn, "someone", schema=pg.schema).create_memory(MemoryCreate(
+        content="a row that must stay invisible to others", source_agent="t", session_id="s", type="fact", evidence=[EvidenceLink(kind="doc", ref="x", note="y")]))
+    assert pg_store.assert_tenant_isolation_ready() is None                               # positive control, with data present
+    with pg.admin_conn() as conn:
+        name = _policy_name(conn, "memories")
+        conn.execute(f"DROP POLICY {name} ON memories")
+        conn.execute("CREATE POLICY sneaky ON memories USING (tenant_key = current_setting('jarvis.tenant_key', true) OR true) "
+                     "WITH CHECK (tenant_key = current_setting('jarvis.tenant_key', true))")
+    with pg.admin_conn() as conn:
+        conn.row_factory = __import__("psycopg").rows.dict_row
+        assert pg_store.tenant_tables_without_forced_rls(conn, pg.schema) == ["memories"]    # the exact-expression check refuses it ...
+    pool, _ = pg_store._pool_for(pg.app_dsn, pg.schema)
+    with pool.connection() as conn:
+        conn.row_factory = __import__("psycopg").rows.dict_row
+        assert pg_store._isolation_probe(conn, pg.schema) == ["memories"]                    # ... and the behavioural probe independently sees the leak
+        conn.rollback()
+    with pytest.raises(RuntimeError, match="refuses to start"):
+        pg_store.assert_tenant_isolation_ready()
+
+
+@pg_only
+def test_a_dropped_connection_inside_the_schema_check_is_retried_but_a_missing_schema_is_not(pg, monkeypatch):
+    import psycopg
+
+    from app.store_errors import StoreUnavailableError
+
+    _strict(monkeypatch)
+    monkeypatch.setenv("JARVIS_STARTUP_DB_WAIT_SECONDS", "10")
+    real = pg_store.check_schema_version
+    calls = {"n": 0}
+
+    def flaky(conn):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise StoreUnavailableError("Ledger schema is missing; run the migration") from psycopg.OperationalError("server closed the connection unexpectedly")
+        return real(conn)
+
+    monkeypatch.setattr(pg_store, "check_schema_version", flaky)
+    assert pg_store.assert_tenant_isolation_ready() is None and calls["n"] == 3         # retried twice, then verified
+
+    def missing(conn):
+        raise StoreUnavailableError("Ledger schema is missing; run the migration") from psycopg.errors.UndefinedTable("relation schema_version does not exist")
+
+    monkeypatch.setattr(pg_store, "check_schema_version", missing)
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="refuses to start"):
+        pg_store.assert_tenant_isolation_ready()
+    assert time.monotonic() - started < 5                                              # a missing schema is definitive: no waiting
+
+
+@pg_only
+@pytest.mark.parametrize("policy", [
+    "CREATE POLICY wide_check ON boards FOR ALL USING (tenant_key = current_setting('jarvis.tenant_key', true)) WITH CHECK (true)",
+    "CREATE POLICY wide_insert ON boards FOR INSERT WITH CHECK (true)",
+    "CREATE POLICY wide_update ON boards FOR UPDATE USING (tenant_key = current_setting('jarvis.tenant_key', true)) WITH CHECK (true)",
+])
+def test_a_scoped_using_with_an_unrestricted_with_check_is_not_isolation(pg, monkeypatch, policy):
+    """Reads stay scoped (so the probe is blind to it) but the application role could insert or update rows under another tenant's key."""
+    _strict(monkeypatch)
+    assert pg_store.assert_tenant_isolation_ready() is None                               # positive control: the real policies pass
+    with pg.admin_conn() as conn:
+        conn.execute(policy)
+    with pg.admin_conn() as conn:
+        conn.row_factory = __import__("psycopg").rows.dict_row
+        assert pg_store.tenant_tables_without_forced_rls(conn, pg.schema) == ["boards"]
+    with pytest.raises(RuntimeError, match="refuses to start"):
+        pg_store.assert_tenant_isolation_ready()
+
+
+@pg_only
+def test_a_policy_scoped_in_both_expressions_is_still_accepted(pg, monkeypatch):
+    _strict(monkeypatch)
+    with pg.admin_conn() as conn:
+        conn.execute("CREATE POLICY extra_scoped ON boards FOR ALL USING (tenant_key = current_setting('jarvis.tenant_key', true)) "
+                     "WITH CHECK (tenant_key = current_setting('jarvis.tenant_key', true))")
+    assert pg_store.assert_tenant_isolation_ready() is None
+
+
+@pg_only
+@pytest.mark.parametrize("policy", [
+    "CREATE POLICY or_true ON boards FOR INSERT WITH CHECK (tenant_key = current_setting('jarvis.tenant_key', true) OR true)",
+    "CREATE POLICY unrelated ON boards FOR INSERT WITH CHECK (tenant_key <> '' AND current_setting('jarvis.tenant_key', true) IS NOT NULL)",
+    "CREATE POLICY or_true_update ON boards FOR UPDATE USING (tenant_key = current_setting('jarvis.tenant_key', true)) WITH CHECK (tenant_key = current_setting('jarvis.tenant_key', true) OR true)",
+    "CREATE POLICY other_column ON memories FOR INSERT WITH CHECK (id = current_setting('jarvis.tenant_key', true))",
+])
+def test_an_expression_that_only_mentions_the_setting_is_not_isolation(pg, monkeypatch, policy):
+    """The write side is invisible to the read probe, so the expression itself must be exactly the tenant equality; anything unrecognised fails closed."""
+    _strict(monkeypatch)
+    assert pg_store.assert_tenant_isolation_ready() is None
+    with pg.admin_conn() as conn:
+        conn.execute(policy)
+    with pytest.raises(RuntimeError, match="refuses to start"):
+        pg_store.assert_tenant_isolation_ready()
+
+
+@pg_only
+def test_the_isolation_probe_uses_a_fresh_random_key_so_no_tenant_name_can_collide_with_it(pg, monkeypatch):
+    """A tenant literally named like the old fixed probe key used to make its own rows look like a leak and refuse startup."""
+    from app.models import EvidenceLink, MemoryCreate
+    from app.pg_store import PostgresRowStore
+
+    _strict(monkeypatch)
+    PostgresRowStore(pg.app_dsn, "__startup_probe_no_such_tenant__", schema=pg.schema).create_memory(MemoryCreate(
+        content="a legitimate tenant with an unlucky name", source_agent="t", session_id="s", type="fact", evidence=[EvidenceLink(kind="doc", ref="x", note="y")]))
+    assert pg_store.assert_tenant_isolation_ready() is None
+    seen = []
+    real = pg_store._isolation_probe
+
+    def spy(conn, schema):
+        out = real(conn, schema)
+        seen.append(conn.execute("SELECT current_setting('jarvis.tenant_key', true) AS k").fetchone()["k"])
+        return out
+
+    monkeypatch.setattr(pg_store, "_isolation_probe", spy)
+    pg_store.assert_tenant_isolation_ready()
+    pg_store.assert_tenant_isolation_ready()
+    assert len(seen) == 2 and seen[0] != seen[1] and all(k.startswith("probe_") and len(k) == 38 for k in seen)

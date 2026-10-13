@@ -16,6 +16,7 @@ import logging
 import os
 import random
 import re
+import secrets
 import threading
 import time
 from datetime import datetime, timezone
@@ -1074,8 +1075,18 @@ def _require_rls_enforced(conn: psycopg.Connection) -> None:
 LEGACY_BLOB_TABLE = "jarvis_tenant_ledgers"
 
 
+# The ONE policy expression every tenant table uses (migrations write it; PostgreSQL deparses it this way). A policy is accepted only if each of its expressions is exactly this: a text that
+# merely MENTIONS the setting (`... OR true`, an unrelated subexpression) is not isolation, and anything unrecognised fails closed.
+_TENANT_POLICY_EXPR = "(tenant_key = current_setting('jarvis.tenant_key'::text, true))"
+
+
 def tenant_tables_without_forced_rls(conn: psycopg.Connection, schema: str | None) -> list[str]:
-    """Every table of the ledger schema that has a ``tenant_key`` column but not (row-level security enabled AND forced AND at least one policy).
+    """Every table of the ledger schema that has a ``tenant_key`` column but not (row-level security enabled AND forced AND at least one policy, every one of which is
+    exactly ``tenant_key = current_setting('jarvis.tenant_key', true)``, in BOTH its USING and its WITH CHECK expression wherever each is present: a scoped USING with an
+    unrestricted WITH CHECK still lets the application role write another tenant's rows, and a text that merely mentions the setting (``... OR true``) isolates nothing).
+
+    The last part matters: policies are combined with OR, so an added ``USING (true)`` policy, or a policy replaced by one that never mentions the setting, leaves RLS "on" and
+    isolating nothing. A policy whose predicate does not reference the tenant setting is therefore a failure of its table.
 
     The role check above proves the app role cannot bypass row-level security; this proves there is row-level security to be subject to, on every
     table that holds a tenant's rows. A table added in a migration without it (or one whose FORCE was dropped, so that its owner is exempt) is exactly
@@ -1083,18 +1094,98 @@ def tenant_tables_without_forced_rls(conn: psycopg.Connection, schema: str | Non
     rows = conn.execute(
         """
         SELECT c.relname AS name, c.relrowsecurity AS enabled, c.relforcerowsecurity AS forced,
-               (SELECT count(*) FROM pg_policy p WHERE p.polrelid = c.oid) AS policies
+               (SELECT count(*) FROM pg_policy p WHERE p.polrelid = c.oid) AS policies,
+               (SELECT count(*) FROM pg_policy p WHERE p.polrelid = c.oid
+                   AND NOT ((p.polqual IS NOT NULL OR p.polwithcheck IS NOT NULL)
+                            AND (p.polqual IS NULL OR pg_get_expr(p.polqual, p.polrelid) = %s)
+                            AND (p.polwithcheck IS NULL OR pg_get_expr(p.polwithcheck, p.polrelid) = %s))) AS policies_not_tenant_scoped
           FROM pg_class c
           JOIN pg_namespace n ON n.oid = c.relnamespace
           JOIN pg_attribute a ON a.attrelid = c.oid AND a.attname = 'tenant_key' AND NOT a.attisdropped AND a.attnum > 0
          WHERE n.nspname = COALESCE(%s, current_schema()) AND c.relkind IN ('r', 'p') AND c.relname <> %s
          ORDER BY c.relname
         """,
-        (schema, LEGACY_BLOB_TABLE),
+        (_TENANT_POLICY_EXPR, _TENANT_POLICY_EXPR, schema, LEGACY_BLOB_TABLE),
     ).fetchall()
     if not rows:
         return ["(no tenant table found in the schema)"]
-    return [r["name"] for r in rows if not (r["enabled"] and r["forced"] and r["policies"] > 0)]
+    return [r["name"] for r in rows if not (r["enabled"] and r["forced"] and r["policies"] > 0 and r["policies_not_tenant_scoped"] == 0)]
+
+
+def _tenant_tables(conn: psycopg.Connection, schema: str | None) -> list[str]:
+    return [r["name"] for r in conn.execute(
+        """
+        SELECT c.relname AS name FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+          JOIN pg_attribute a ON a.attrelid = c.oid AND a.attname = 'tenant_key' AND NOT a.attisdropped AND a.attnum > 0
+         WHERE n.nspname = COALESCE(%s, current_schema()) AND c.relkind IN ('r', 'p') AND c.relname <> %s ORDER BY c.relname
+        """, (schema, LEGACY_BLOB_TABLE)).fetchall()]
+
+
+def _isolation_probe(conn: psycopg.Connection, schema: str | None) -> list[str]:
+    """Tables that SHOW rows to a tenant that owns none: as the application role, under a tenant key nobody uses, every tenant table must be empty.
+
+    Policy text can be checked, behaviour is better: a permissive policy that mentions the setting but is OR-ed with something that is always true passes the text check and
+    fails this probe wherever the table holds any row (an empty table cannot show it; the text check is the guard there)."""
+    probe_key = "probe_" + secrets.token_hex(16)                 # random per call: no tenant (even one named by an operator) can own it
+    conn.execute("SELECT set_config('jarvis.tenant_key', %s, true)", (probe_key,))
+    leaking = []
+    for table in _tenant_tables(conn, schema):
+        n = conn.execute(sql.SQL("SELECT count(*) AS n FROM {}").format(sql.Identifier(table))).fetchone()["n"]
+        if n:
+            leaking.append(table)
+    return leaking
+
+
+def _is_transient(exc: StoreUnavailableError) -> bool:
+    """check_schema_version wraps every psycopg error as StoreUnavailableError; a lost or refused connection (OperationalError / InterfaceError) is transient, a missing table or a
+    version mismatch is not."""
+    return isinstance(exc.__cause__, (psycopg.OperationalError, psycopg.InterfaceError))
+
+
+def assert_tenant_isolation_ready() -> None:
+    """The strict-mode (JARVIS_MULTI_TENANT) STARTUP guard: refuse to start unless the database proves it can isolate tenants.
+
+    The same checks /ready runs (schema version, a role that cannot bypass row-level security, forced RLS with a policy on every tenant_key table), but fatal at startup, so a
+    deployment with a missing or non-forced RLS table never serves a request. A definitive failure (wrong schema, bypassing role, an unprotected table) refuses at once. A
+    database that cannot be reached or queried is retried for JARVIS_STARTUP_DB_WAIT_SECONDS (default 30, at most 300) and then refuses too: nothing is served that was not verified.
+    """
+    dsn = (os.getenv("JARVIS_DATABASE_URL") or "").strip()
+    schema = (os.getenv("JARVIS_DATABASE_SCHEMA") or "").strip() or None
+    if not dsn:
+        raise RuntimeError("JARVIS_MULTI_TENANT refuses to start: no PostgreSQL store is configured (JARVIS_DATABASE_URL), so tenant isolation cannot be verified")
+    wait = min(max(float(_env_int("JARVIS_STARTUP_DB_WAIT_SECONDS", 30)), 0.0), 300.0)
+    deadline = time.monotonic() + wait
+    while True:
+        try:
+            pool, _ = _pool_for(dsn, schema)
+            with pool.connection() as conn:
+                conn.row_factory = dict_row
+                conn.execute("SELECT 1").fetchone()                       # a connection problem must surface here as an error to retry, not be mistaken for a failed check below
+                check_schema_version(conn)
+                _require_rls_enforced(conn)
+                _require_tenant_tables_forced(conn, schema)
+                leaking = _isolation_probe(conn, schema)
+                conn.rollback()
+            if leaking:
+                _log.error("strict startup: tables show rows to a tenant that owns none: %s", ", ".join(leaking))
+                raise RuntimeError("JARVIS_MULTI_TENANT refuses to start: row-level security does not isolate tenants (a tenant that owns nothing can read rows)")
+            return
+        except StoreUnavailableError as exc:
+            if not _is_transient(exc):
+                raise RuntimeError(f"JARVIS_MULTI_TENANT refuses to start: {exc}") from None
+            if time.monotonic() >= deadline:
+                _log.error("strict startup: cannot verify tenant isolation (%s)", exc)
+                raise RuntimeError(f"JARVIS_MULTI_TENANT refuses to start: the database could not be reached and verified within {wait:g}s") from None
+            time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+        except RuntimeError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the database cannot be reached or queried: retry for a bounded time, then refuse
+            if time.monotonic() >= deadline:
+                _log.error("strict startup: cannot verify tenant isolation (%s: %s)", type(exc).__name__, exc)
+                raise RuntimeError(
+                    f"JARVIS_MULTI_TENANT refuses to start: the database could not be reached and verified within {wait:g}s ({type(exc).__name__})"
+                ) from None
+            time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
 
 
 def _require_tenant_tables_forced(conn: psycopg.Connection, schema: str | None) -> None:
