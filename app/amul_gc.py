@@ -70,6 +70,7 @@ def checkpoints_path_for(field: AmulField) -> str:
     and verify never read or write another tenant's chain (a chain is a list of line ranges and hashes of ONE field file). A field with no chain of its own (the operator's, an explicitly
     pathed one, a test's) keeps the shared default CHECKPOINTS_PATH, exactly as before, whatever its file is called or wherever it lives."""
     own = getattr(field, "checkpoints_path", None)
+    field.legacy_chain_ambiguous = False
     if not own:
         return CHECKPOINTS_PATH
     if not os.path.exists(own) and os.path.exists(CHECKPOINTS_PATH):
@@ -106,10 +107,12 @@ def _adopt_legacy_chain(field: AmulField, own_path: str) -> bool:
         if not _authenticates(cps, _read_raw_lines(field.path)):
             return False
         target = Path(own_path)
-        for other in sorted(target.parent.glob("*-field.jsonl")):
-            if str(other) != field.path and _authenticates(cps, _read_raw_lines(str(other))):
+        import app.amul as amul_module
+        for other in [Path(amul_module.FIELD_PATH), *sorted(target.parent.glob("*-field.jsonl"))]:    # the operator's field is a candidate owner too
+            if str(other) != field.path and other.exists() and _authenticates(cps, _read_raw_lines(str(other))):
                 logging.getLogger("jarvis.amul_gc").error(
-                    "the shared AMUL checkpoint chain authenticates against more than one tenant's field (%s and %s): not adopting it for either", Path(field.path).name, other.name)
+                    "the shared AMUL checkpoint chain authenticates against more than one field (%s and %s): not adopting it; compaction is blocked until ownership is resolved", Path(field.path).name, other.name)
+                field.legacy_chain_ambiguous = True
                 return False
         target.parent.mkdir(parents=True, exist_ok=True)
         tmp = target.with_name(target.name + ".adopting")
@@ -303,7 +306,11 @@ def compact(
     The field file itself is NEVER mutated. Classification is adaptive
     (EMR salience law); dead-stays-dead is enforced before sealing.
     """
+    explicit_path = checkpoints_path
     checkpoints_path = checkpoints_path or checkpoints_path_for(field)
+    if not explicit_path and getattr(field, "legacy_chain_ambiguous", False):
+        # Starting a replacement chain here would drop the true owner's prior cold set (G2, dead-stays-dead): refuse until ownership is resolved (e.g. the chain is copied to its owner's path by hand).
+        raise GCViolation("the shared checkpoint chain authenticates against more than one field; compaction is blocked until its owner is resolved")
     raw_lines = _read_raw_lines(field.path)
     existing = _load_checkpoints(checkpoints_path)
     covered = existing[-1].range_end if existing else 0

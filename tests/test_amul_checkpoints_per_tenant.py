@@ -14,7 +14,7 @@ import pytest
 import app.amul as amul
 import app.amul_gc as amul_gc
 from app.amul import AmulField, anchor_memory, get_field, reset_field_for_tests
-from app.amul_gc import checkpoints_path_for, compact, gc_status, verify_gc
+from app.amul_gc import GCViolation, checkpoints_path_for, compact, gc_status, verify_gc
 from app.identity import acting_for
 from app.models import MemoryRecord
 
@@ -204,3 +204,36 @@ def test_a_compaction_appending_between_validation_and_copy_cannot_slip_into_the
     monkeypatch.setattr(amul_gc, "_authenticates", authenticates_then_a_writer_appends)
     amul_gc._adopt_legacy_chain(a_field, str(tmp / "tenants" / "t_alice-checkpoints.jsonl"))
     assert (tmp / "tenants" / "t_alice-checkpoints.jsonl").read_bytes() == good               # exactly the validated snapshot, not what the file became
+
+
+def test_compaction_is_blocked_while_the_legacy_chain_is_ambiguous_but_resolving_it_unblocks(world):
+    """Review finding: declining to adopt must not let compact() start a replacement chain (it would lose the owner's prior cold set, G2)."""
+    tmp, shared = world
+    a_field, a_recs = _fill("t_alice", 3)
+    compact(a_field, a_recs, checkpoints_path=shared)
+    (tmp / "tenants" / "t_clone-field.jsonl").write_bytes(Path(a_field.path).read_bytes())
+    reset_field_for_tests()
+    with acting_for("t_alice"):
+        a2 = get_field()
+    with pytest.raises(GCViolation, match="more than one field"):
+        compact(a2, a_recs)
+    assert not (tmp / "tenants" / "t_alice-checkpoints.jsonl").exists()
+    (tmp / "tenants" / "t_alice-checkpoints.jsonl").write_bytes(Path(shared).read_bytes())   # the operator resolves ownership by hand
+    assert compact(a2, a_recs + [_rec(10)]).compacted in (True, False) and gc_status(a2)["total_checkpoints"] >= 1
+
+
+def test_a_tenant_cloned_from_the_operators_field_does_not_adopt_the_operators_chain(world):
+    tmp, shared = world
+    o_field, o_recs = _fill(None, 3)
+    compact(o_field, o_recs)                                                                     # the operator's chain in the shared file
+    (tmp / "tenants").mkdir(exist_ok=True)
+    (tmp / "tenants" / "t_clone-field.jsonl").write_bytes(Path(o_field.path).read_bytes())    # a tenant restored from the operator's field
+    reset_field_for_tests()
+    with acting_for("t_clone"):
+        c = get_field()
+    assert verify_gc(c).mode == "full_rehash"
+    assert not (tmp / "tenants" / "t_clone-checkpoints.jsonl").exists()
+    with pytest.raises(GCViolation):
+        compact(c, o_recs)
+    o2 = get_field()                                                                             # the operator itself is unaffected
+    assert verify_gc(o2).mode == "checkpoint_chain" and verify_gc(o2).integrity_ok
