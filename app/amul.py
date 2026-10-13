@@ -104,8 +104,11 @@ def _artifact_id(ledger_id: str, resolution: str, sha: str, seq: int) -> str:
 class AmulField:
     """Append-only JSONL field. Existing lines are never mutated."""
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, checkpoints_path: str | None = None):
         self.path = path
+        # The GC checkpoint chain that belongs to this field. Set only for a TENANT's field (get_field, from the tenant context); None means the shared default
+        # (amul_gc.CHECKPOINTS_PATH, JARVIS_AMUL_GC_PATH), which is what the operator's field and every explicitly pathed field use.
+        self.checkpoints_path = checkpoints_path
         self._artifacts: dict[str, Artifact] = {}
         self._order: list[str] = []
         self._loaded = False
@@ -188,13 +191,19 @@ def _tenant_field_path(tenant: str) -> str:
     return str(Path(FIELD_PATH).parent / "tenants" / f"{tenant}-field.jsonl")
 
 
+def _tenant_checkpoints_path(tenant: str) -> str:
+    return str(Path(FIELD_PATH).parent / "tenants" / f"{tenant}-checkpoints.jsonl")
+
+
 def get_field(path: str | None = None) -> AmulField:
     """Field for the explicit path, else the current OAuth tenant's, else the operator's."""
+    checkpoints = None
     if path is None:
         tenant = current_tenant_key()
         path = _tenant_field_path(tenant) if tenant else FIELD_PATH
+        checkpoints = _tenant_checkpoints_path(tenant) if tenant else None      # decided by the tenant CONTEXT, never inferred from a file name
     if path not in _fields:
-        _fields[path] = AmulField(path)
+        _fields[path] = AmulField(path, checkpoints)
     return _fields[path]
 
 

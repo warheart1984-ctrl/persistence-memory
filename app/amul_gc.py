@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -61,6 +62,72 @@ CHECKPOINT_SCHEMA = "amul-gc-checkpoint-v1"
 CHECKPOINTS_PATH = os.getenv("JARVIS_AMUL_GC_PATH") or os.path.join(
     "data", "amul-checkpoints.jsonl"
 )
+
+def checkpoints_path_for(field: AmulField) -> str:
+    """The checkpoint chain that belongs to THIS field.
+
+    A tenant's field is created with its own chain (``field.checkpoints_path``, set by app.amul.get_field from the tenant context: ``<dir>/tenants/<tenant>-checkpoints.jsonl``), so one tenant's GC
+    and verify never read or write another tenant's chain (a chain is a list of line ranges and hashes of ONE field file). A field with no chain of its own (the operator's, an explicitly
+    pathed one, a test's) keeps the shared default CHECKPOINTS_PATH, exactly as before, whatever its file is called or wherever it lives."""
+    own = getattr(field, "checkpoints_path", None)
+    field.legacy_chain_ambiguous = False
+    if not own:
+        return CHECKPOINTS_PATH
+    if not os.path.exists(own) and os.path.exists(CHECKPOINTS_PATH):
+        _adopt_legacy_chain(field, own)
+    return own
+
+
+def _parse_checkpoints(data: bytes) -> list[Checkpoint]:
+    """The same parse as _load_checkpoints, from bytes already read (a torn or partial line raises ValueError)."""
+    return [Checkpoint(**json.loads(line)) for line in data.decode("utf-8").splitlines() if line.strip()]
+
+
+def _authenticates(cps: list[Checkpoint], raw_lines: list[bytes]) -> bool:
+    """Is this a structurally valid chain whose every range matches these field bytes (range_sha and merkle root)?"""
+    if not cps or _verify_chain_structure(cps) or cps[-1].range_end > len(raw_lines):
+        return False
+    for cp in cps:
+        range_sha, merkle = _range_authenticators(raw_lines, cp.range_start, cp.range_end)
+        if range_sha != cp.range_sha or merkle != cp.merkle_root:
+            return False
+    return True
+
+
+def _adopt_legacy_chain(field: AmulField, own_path: str) -> bool:
+    """Upgrade path: before checkpoints were per tenant, every tenant's chain lived in the shared file. A tenant that has none of its own yet adopts the shared chain IF AND ONLY IF it
+    authenticates against THIS field (a structurally valid chain, every range's range_sha and merkle root matching this field's bytes), and against NO OTHER tenant's field: byte-identical
+    fields (a cloned or restored tenant) would make the chain's owner ambiguous, so then nobody adopts it (logged) and each tenant starts its own chain. A chain made for another field (the
+    operator's, or another tenant's) never authenticates and is left alone. The shared file is read ONCE: the bytes that are validated are the bytes that are copied (a concurrent compaction
+    appending in between cannot slip in unvalidated lines). Without the adoption a tenant's next compaction would start from nothing and could re-classify an already-cold artifact as hot
+    (G2, dead-stays-dead), and verify would silently fall back to a full rehash."""
+    try:
+        data = Path(CHECKPOINTS_PATH).read_bytes()
+        cps = _parse_checkpoints(data)
+        if not _authenticates(cps, _read_raw_lines(field.path)):
+            return False
+        target = Path(own_path)
+        import app.amul as amul_module
+        for other in [Path(amul_module.FIELD_PATH), *sorted(target.parent.glob("*-field.jsonl"))]:    # the operator's field is a candidate owner too
+            if str(other) != field.path and other.exists() and _authenticates(cps, _read_raw_lines(str(other))):
+                logging.getLogger("jarvis.amul_gc").error(
+                    "the shared AMUL checkpoint chain authenticates against more than one field (%s and %s): not adopting it; compaction is blocked until ownership is resolved", Path(field.path).name, other.name)
+                field.legacy_chain_ambiguous = True
+                return False
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_name(target.name + ".adopting")
+        tmp.write_bytes(data)
+        os.replace(tmp, target)
+        # The whole shared file was validated as THIS tenant's chain, so it must stop being the operator's default chain: MOVE it aside (kept as evidence). If it changed since the
+        # snapshot (a writer appended), undo the adoption instead: those lines may be the operator's own new chain, and nothing is moved.
+        if Path(CHECKPOINTS_PATH).read_bytes() != data:
+            target.unlink(missing_ok=True)
+            return False
+        os.replace(CHECKPOINTS_PATH, CHECKPOINTS_PATH + ".adopted-by-" + target.name)
+        return True
+    except (OSError, ValueError):
+        return False                                      # never let the upgrade path break a verify or a compaction: the tenant simply starts its own chain
+
 
 # Adaptive retention: cold threshold = 2x half-life of the type.
 HALF_LIFE_DAYS: dict[str, float] = {
@@ -245,7 +312,11 @@ def compact(
     The field file itself is NEVER mutated. Classification is adaptive
     (EMR salience law); dead-stays-dead is enforced before sealing.
     """
-    checkpoints_path = checkpoints_path or CHECKPOINTS_PATH
+    explicit_path = checkpoints_path
+    checkpoints_path = checkpoints_path or checkpoints_path_for(field)
+    if not explicit_path and getattr(field, "legacy_chain_ambiguous", False):
+        # Starting a replacement chain here would drop the true owner's prior cold set (G2, dead-stays-dead): refuse until ownership is resolved (e.g. the chain is copied to its owner's path by hand).
+        raise GCViolation("the shared checkpoint chain authenticates against more than one field; compaction is blocked until its owner is resolved")
     raw_lines = _read_raw_lines(field.path)
     existing = _load_checkpoints(checkpoints_path)
     covered = existing[-1].range_end if existing else 0
@@ -333,7 +404,7 @@ def verify_gc(
     range_sha/merkle comparison (G1); only the tail is parse+rehashed.
     Without: falls back to full per-artifact rehash (mode=full_rehash).
     """
-    checkpoints_path = checkpoints_path or CHECKPOINTS_PATH
+    checkpoints_path = checkpoints_path or checkpoints_path_for(field)
     report = GCVerifyReport()
     cps = _load_checkpoints(checkpoints_path)
     raw_lines = _read_raw_lines(field.path)
@@ -402,7 +473,7 @@ def reconstruct_prefix(field: AmulField, n_lines: int) -> list[Artifact]:
 def gc_status(
     field: AmulField, *, checkpoints_path: str | None = None
 ) -> dict[str, Any]:
-    checkpoints_path = checkpoints_path or CHECKPOINTS_PATH
+    checkpoints_path = checkpoints_path or checkpoints_path_for(field)
     cps = _load_checkpoints(checkpoints_path)
     covered = cps[-1].range_end if cps else 0
     return {
