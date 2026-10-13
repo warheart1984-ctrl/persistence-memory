@@ -427,3 +427,31 @@ def test_a_dropped_connection_inside_the_schema_check_is_retried_but_a_missing_s
     with pytest.raises(RuntimeError, match="refuses to start"):
         pg_store.assert_tenant_isolation_ready()
     assert time.monotonic() - started < 5                                              # a missing schema is definitive: no waiting
+
+
+@pg_only
+@pytest.mark.parametrize("policy", [
+    "CREATE POLICY wide_check ON boards FOR ALL USING (tenant_key = current_setting('jarvis.tenant_key', true)) WITH CHECK (true)",
+    "CREATE POLICY wide_insert ON boards FOR INSERT WITH CHECK (true)",
+    "CREATE POLICY wide_update ON boards FOR UPDATE USING (tenant_key = current_setting('jarvis.tenant_key', true)) WITH CHECK (true)",
+])
+def test_a_scoped_using_with_an_unrestricted_with_check_is_not_isolation(pg, monkeypatch, policy):
+    """Reads stay scoped (so the probe is blind to it) but the application role could insert or update rows under another tenant's key."""
+    _strict(monkeypatch)
+    assert pg_store.assert_tenant_isolation_ready() is None                               # positive control: the real policies pass
+    with pg.admin_conn() as conn:
+        conn.execute(policy)
+    with pg.admin_conn() as conn:
+        conn.row_factory = __import__("psycopg").rows.dict_row
+        assert pg_store.tenant_tables_without_forced_rls(conn, pg.schema) == ["boards"]
+    with pytest.raises(RuntimeError, match="refuses to start"):
+        pg_store.assert_tenant_isolation_ready()
+
+
+@pg_only
+def test_a_policy_scoped_in_both_expressions_is_still_accepted(pg, monkeypatch):
+    _strict(monkeypatch)
+    with pg.admin_conn() as conn:
+        conn.execute("CREATE POLICY extra_scoped ON boards FOR ALL USING (tenant_key = current_setting('jarvis.tenant_key', true)) "
+                     "WITH CHECK (tenant_key = current_setting('jarvis.tenant_key', true))")
+    assert pg_store.assert_tenant_isolation_ready() is None

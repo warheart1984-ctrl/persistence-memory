@@ -1076,7 +1076,8 @@ LEGACY_BLOB_TABLE = "jarvis_tenant_ledgers"
 
 def tenant_tables_without_forced_rls(conn: psycopg.Connection, schema: str | None) -> list[str]:
     """Every table of the ledger schema that has a ``tenant_key`` column but not (row-level security enabled AND forced AND at least one policy, every one of which is
-    written in terms of the per-transaction tenant setting ``jarvis.tenant_key``).
+    written in terms of the per-transaction tenant setting ``jarvis.tenant_key``, in BOTH its USING and its WITH CHECK expression wherever each is present: a scoped USING with an
+    unrestricted WITH CHECK still lets the application role write another tenant's rows).
 
     The last part matters: policies are combined with OR, so an added ``USING (true)`` policy, or a policy replaced by one that never mentions the setting, leaves RLS "on" and
     isolating nothing. A policy whose predicate does not reference the tenant setting is therefore a failure of its table.
@@ -1089,7 +1090,9 @@ def tenant_tables_without_forced_rls(conn: psycopg.Connection, schema: str | Non
         SELECT c.relname AS name, c.relrowsecurity AS enabled, c.relforcerowsecurity AS forced,
                (SELECT count(*) FROM pg_policy p WHERE p.polrelid = c.oid) AS policies,
                (SELECT count(*) FROM pg_policy p WHERE p.polrelid = c.oid
-                   AND COALESCE(pg_get_expr(p.polqual, p.polrelid), pg_get_expr(p.polwithcheck, p.polrelid), '') NOT LIKE '%%jarvis.tenant_key%%') AS policies_not_tenant_scoped
+                   AND NOT ((p.polqual IS NOT NULL OR p.polwithcheck IS NOT NULL)
+                            AND (p.polqual IS NULL OR pg_get_expr(p.polqual, p.polrelid) LIKE '%%jarvis.tenant_key%%')
+                            AND (p.polwithcheck IS NULL OR pg_get_expr(p.polwithcheck, p.polrelid) LIKE '%%jarvis.tenant_key%%'))) AS policies_not_tenant_scoped
           FROM pg_class c
           JOIN pg_namespace n ON n.oid = c.relnamespace
           JOIN pg_attribute a ON a.attrelid = c.oid AND a.attname = 'tenant_key' AND NOT a.attisdropped AND a.attnum > 0
