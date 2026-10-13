@@ -394,8 +394,13 @@ def test_the_isolation_probe_catches_a_policy_that_mentions_the_setting_but_is_a
                      "WITH CHECK (tenant_key = current_setting('jarvis.tenant_key', true))")
     with pg.admin_conn() as conn:
         conn.row_factory = __import__("psycopg").rows.dict_row
-        assert pg_store.tenant_tables_without_forced_rls(conn, pg.schema) == []          # the text check alone is fooled (that is why the probe exists)
-    with pytest.raises(RuntimeError, match="does not isolate tenants"):
+        assert pg_store.tenant_tables_without_forced_rls(conn, pg.schema) == ["memories"]    # the exact-expression check refuses it ...
+    pool, _ = pg_store._pool_for(pg.app_dsn, pg.schema)
+    with pool.connection() as conn:
+        conn.row_factory = __import__("psycopg").rows.dict_row
+        assert pg_store._isolation_probe(conn, pg.schema) == ["memories"]                    # ... and the behavioural probe independently sees the leak
+        conn.rollback()
+    with pytest.raises(RuntimeError, match="refuses to start"):
         pg_store.assert_tenant_isolation_ready()
 
 
@@ -455,3 +460,20 @@ def test_a_policy_scoped_in_both_expressions_is_still_accepted(pg, monkeypatch):
         conn.execute("CREATE POLICY extra_scoped ON boards FOR ALL USING (tenant_key = current_setting('jarvis.tenant_key', true)) "
                      "WITH CHECK (tenant_key = current_setting('jarvis.tenant_key', true))")
     assert pg_store.assert_tenant_isolation_ready() is None
+
+
+@pg_only
+@pytest.mark.parametrize("policy", [
+    "CREATE POLICY or_true ON boards FOR INSERT WITH CHECK (tenant_key = current_setting('jarvis.tenant_key', true) OR true)",
+    "CREATE POLICY unrelated ON boards FOR INSERT WITH CHECK (tenant_key <> '' AND current_setting('jarvis.tenant_key', true) IS NOT NULL)",
+    "CREATE POLICY or_true_update ON boards FOR UPDATE USING (tenant_key = current_setting('jarvis.tenant_key', true)) WITH CHECK (tenant_key = current_setting('jarvis.tenant_key', true) OR true)",
+    "CREATE POLICY other_column ON memories FOR INSERT WITH CHECK (id = current_setting('jarvis.tenant_key', true))",
+])
+def test_an_expression_that_only_mentions_the_setting_is_not_isolation(pg, monkeypatch, policy):
+    """The write side is invisible to the read probe, so the expression itself must be exactly the tenant equality; anything unrecognised fails closed."""
+    _strict(monkeypatch)
+    assert pg_store.assert_tenant_isolation_ready() is None
+    with pg.admin_conn() as conn:
+        conn.execute(policy)
+    with pytest.raises(RuntimeError, match="refuses to start"):
+        pg_store.assert_tenant_isolation_ready()

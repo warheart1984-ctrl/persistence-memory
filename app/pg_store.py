@@ -1074,10 +1074,15 @@ def _require_rls_enforced(conn: psycopg.Connection) -> None:
 LEGACY_BLOB_TABLE = "jarvis_tenant_ledgers"
 
 
+# The ONE policy expression every tenant table uses (migrations write it; PostgreSQL deparses it this way). A policy is accepted only if each of its expressions is exactly this: a text that
+# merely MENTIONS the setting (`... OR true`, an unrelated subexpression) is not isolation, and anything unrecognised fails closed.
+_TENANT_POLICY_EXPR = "(tenant_key = current_setting('jarvis.tenant_key'::text, true))"
+
+
 def tenant_tables_without_forced_rls(conn: psycopg.Connection, schema: str | None) -> list[str]:
     """Every table of the ledger schema that has a ``tenant_key`` column but not (row-level security enabled AND forced AND at least one policy, every one of which is
-    written in terms of the per-transaction tenant setting ``jarvis.tenant_key``, in BOTH its USING and its WITH CHECK expression wherever each is present: a scoped USING with an
-    unrestricted WITH CHECK still lets the application role write another tenant's rows).
+    exactly ``tenant_key = current_setting('jarvis.tenant_key', true)``, in BOTH its USING and its WITH CHECK expression wherever each is present: a scoped USING with an
+    unrestricted WITH CHECK still lets the application role write another tenant's rows, and a text that merely mentions the setting (``... OR true``) isolates nothing).
 
     The last part matters: policies are combined with OR, so an added ``USING (true)`` policy, or a policy replaced by one that never mentions the setting, leaves RLS "on" and
     isolating nothing. A policy whose predicate does not reference the tenant setting is therefore a failure of its table.
@@ -1091,15 +1096,15 @@ def tenant_tables_without_forced_rls(conn: psycopg.Connection, schema: str | Non
                (SELECT count(*) FROM pg_policy p WHERE p.polrelid = c.oid) AS policies,
                (SELECT count(*) FROM pg_policy p WHERE p.polrelid = c.oid
                    AND NOT ((p.polqual IS NOT NULL OR p.polwithcheck IS NOT NULL)
-                            AND (p.polqual IS NULL OR pg_get_expr(p.polqual, p.polrelid) LIKE '%%jarvis.tenant_key%%')
-                            AND (p.polwithcheck IS NULL OR pg_get_expr(p.polwithcheck, p.polrelid) LIKE '%%jarvis.tenant_key%%'))) AS policies_not_tenant_scoped
+                            AND (p.polqual IS NULL OR pg_get_expr(p.polqual, p.polrelid) = %s)
+                            AND (p.polwithcheck IS NULL OR pg_get_expr(p.polwithcheck, p.polrelid) = %s))) AS policies_not_tenant_scoped
           FROM pg_class c
           JOIN pg_namespace n ON n.oid = c.relnamespace
           JOIN pg_attribute a ON a.attrelid = c.oid AND a.attname = 'tenant_key' AND NOT a.attisdropped AND a.attnum > 0
          WHERE n.nspname = COALESCE(%s, current_schema()) AND c.relkind IN ('r', 'p') AND c.relname <> %s
          ORDER BY c.relname
         """,
-        (schema, LEGACY_BLOB_TABLE),
+        (_TENANT_POLICY_EXPR, _TENANT_POLICY_EXPR, schema, LEGACY_BLOB_TABLE),
     ).fetchall()
     if not rows:
         return ["(no tenant table found in the schema)"]
