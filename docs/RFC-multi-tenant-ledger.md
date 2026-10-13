@@ -239,7 +239,7 @@ Signing and key ceremonies (still shelved); per-tenant encryption of content at 
 
 Added after the RFC was written; the RFC body above is unchanged. Phase 0 is built and merged to main, **including the RLS startup guard** (#103; it was first only the readiness check, which is why this
 appendix briefly called Phase 0 partial): with `JARVIS_MULTI_TENANT` on, the app refuses to start unless the schema version, the role (no superuser, no `BYPASSRLS`) and forced RLS with an
-exactly-tenant-scoped policy on every `tenant_key` table all verify, plus a behavioural probe (`app.pg_store.assert_tenant_isolation_ready`, `docs/strict_identity.md`). The live box runs it with strict mode **off**
+exactly-tenant-scoped policy on every served `tenant_key` table (every one except the retained legacy rollback table `jarvis_tenant_ledgers`, which the row store never reads and `legacy_data` watches) all verify, plus a behavioural probe (`app.pg_store.assert_tenant_isolation_ready`, `docs/strict_identity.md`). The live box runs it with strict mode **off**
 (`JARVIS_MULTI_TENANT` and OAuth unset). Evidence: the throwaway combined drill of 2026-10-12 (key mode, strict mode, OAuth plus strict; 57 checks, 0 failed) and the
 live before/after capture of the deploy.
 
