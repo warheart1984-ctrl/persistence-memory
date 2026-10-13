@@ -62,16 +62,13 @@ CHECKPOINTS_PATH = os.getenv("JARVIS_AMUL_GC_PATH") or os.path.join(
     "data", "amul-checkpoints.jsonl"
 )
 
-def checkpoints_path_for(field_path: str) -> str:
-    """The checkpoint chain that belongs to THIS field file.
+def checkpoints_path_for(field: AmulField) -> str:
+    """The checkpoint chain that belongs to THIS field.
 
-    A tenant's field lives at ``<dir>/tenants/<tenant>-field.jsonl`` (app.amul._tenant_field_path); its checkpoints live beside it at ``<dir>/tenants/<tenant>-checkpoints.jsonl``, so one
-    tenant's GC and verify never read or write another tenant's chain (the chain is a list of line ranges and hashes of ONE field file). Any other field path (the operator's, or a test's)
-    keeps the shared default CHECKPOINTS_PATH, exactly as before."""
-    p = Path(field_path)
-    if p.parent.name == "tenants" and p.name.endswith("-field.jsonl"):
-        return str(p.with_name(p.name[: -len("-field.jsonl")] + "-checkpoints.jsonl"))
-    return CHECKPOINTS_PATH
+    A tenant's field is created with its own chain (``field.checkpoints_path``, set by app.amul.get_field from the tenant context: ``<dir>/tenants/<tenant>-checkpoints.jsonl``), so one tenant's GC
+    and verify never read or write another tenant's chain (a chain is a list of line ranges and hashes of ONE field file). A field with no chain of its own (the operator's, an explicitly
+    pathed one, a test's) keeps the shared default CHECKPOINTS_PATH, exactly as before, whatever its file is called or wherever it lives."""
+    return getattr(field, "checkpoints_path", None) or CHECKPOINTS_PATH
 
 
 # Adaptive retention: cold threshold = 2x half-life of the type.
@@ -257,7 +254,7 @@ def compact(
     The field file itself is NEVER mutated. Classification is adaptive
     (EMR salience law); dead-stays-dead is enforced before sealing.
     """
-    checkpoints_path = checkpoints_path or checkpoints_path_for(field.path)
+    checkpoints_path = checkpoints_path or checkpoints_path_for(field)
     raw_lines = _read_raw_lines(field.path)
     existing = _load_checkpoints(checkpoints_path)
     covered = existing[-1].range_end if existing else 0
@@ -345,7 +342,7 @@ def verify_gc(
     range_sha/merkle comparison (G1); only the tail is parse+rehashed.
     Without: falls back to full per-artifact rehash (mode=full_rehash).
     """
-    checkpoints_path = checkpoints_path or checkpoints_path_for(field.path)
+    checkpoints_path = checkpoints_path or checkpoints_path_for(field)
     report = GCVerifyReport()
     cps = _load_checkpoints(checkpoints_path)
     raw_lines = _read_raw_lines(field.path)
@@ -414,7 +411,7 @@ def reconstruct_prefix(field: AmulField, n_lines: int) -> list[Artifact]:
 def gc_status(
     field: AmulField, *, checkpoints_path: str | None = None
 ) -> dict[str, Any]:
-    checkpoints_path = checkpoints_path or checkpoints_path_for(field.path)
+    checkpoints_path = checkpoints_path or checkpoints_path_for(field)
     cps = _load_checkpoints(checkpoints_path)
     covered = cps[-1].range_end if cps else 0
     return {

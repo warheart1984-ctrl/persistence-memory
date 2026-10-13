@@ -13,7 +13,7 @@ import pytest
 
 import app.amul as amul
 import app.amul_gc as amul_gc
-from app.amul import anchor_memory, get_field, reset_field_for_tests
+from app.amul import AmulField, anchor_memory, get_field, reset_field_for_tests
 from app.amul_gc import checkpoints_path_for, compact, gc_status, verify_gc
 from app.identity import acting_for
 from app.models import MemoryRecord
@@ -49,14 +49,33 @@ def _fill(tenant: str | None, n: int) -> tuple:
         return build()
 
 
-def test_a_tenants_checkpoints_path_sits_beside_its_field_and_everything_else_keeps_the_shared_default(world):
+def test_a_tenants_field_carries_its_own_chain_beside_it_and_everything_else_keeps_the_shared_default(world):
     tmp, shared = world
-    assert checkpoints_path_for(amul._tenant_field_path("t_alice")) == str(tmp / "tenants" / "t_alice-checkpoints.jsonl")
-    assert checkpoints_path_for(amul._tenant_field_path("t_alice")) != checkpoints_path_for(amul._tenant_field_path("t_bob"))
-    assert checkpoints_path_for(amul.FIELD_PATH) == shared                                    # the operator: unchanged
-    assert checkpoints_path_for(str(tmp / "field.jsonl")) == shared                           # any other path (tests, tools): unchanged
-    assert checkpoints_path_for(str(tmp / "tenants" / "stray.jsonl")) == shared               # only the tenant-field naming is rewritten
-    assert checkpoints_path_for(str(tmp / "x" / "tenants" / "a-field.jsonl")) == str(tmp / "x" / "tenants" / "a-checkpoints.jsonl")
+    with acting_for("t_alice"):
+        alice = get_field()
+    with acting_for("t_bob"):
+        bob = get_field()
+    assert checkpoints_path_for(alice) == str(tmp / "tenants" / "t_alice-checkpoints.jsonl")
+    assert checkpoints_path_for(alice) != checkpoints_path_for(bob)
+    assert checkpoints_path_for(get_field()) == shared                                       # the operator (no tenant context): unchanged
+    assert checkpoints_path_for(AmulField(str(tmp / "field.jsonl"))) == shared               # an explicitly pathed field (tests, tools): unchanged
+
+
+def test_an_operator_field_that_merely_looks_like_a_tenants_keeps_the_configured_chain(world, monkeypatch):
+    """Review finding: JARVIS_AMUL_PATH=/srv/tenants/operator-field.jsonl is the OPERATOR's field. Ownership comes from the tenant context, not from a file name."""
+    tmp, shared = world
+    lookalike = tmp / "srv" / "tenants" / "operator-field.jsonl"
+    lookalike.parent.mkdir(parents=True)
+    monkeypatch.setattr(amul, "FIELD_PATH", str(lookalike))
+    reset_field_for_tests()
+    field = get_field()                                                                       # no tenant context: the operator
+    assert field.path == str(lookalike) and checkpoints_path_for(field) == shared
+    recs = [_rec(i) for i in range(3)]
+    for r in recs:
+        anchor_memory(r, field)
+    compact(field, recs)
+    assert Path(shared).exists() and not list(lookalike.parent.glob("*-checkpoints.jsonl")), "the operator's chain must stay at the configured path"
+    assert verify_gc(field).mode == "checkpoint_chain"
 
 
 def test_one_tenants_compaction_writes_beside_its_own_field_and_touches_nobody_elses(world):
