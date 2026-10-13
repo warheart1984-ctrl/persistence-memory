@@ -348,3 +348,82 @@ def test_no_database_configured_is_refused_in_strict_mode(monkeypatch):
     monkeypatch.delenv("JARVIS_DATABASE_URL", raising=False)
     with pytest.raises(RuntimeError, match="no PostgreSQL store"):
         pg_store.assert_tenant_isolation_ready()
+
+
+# ------------------------------------------------------------- review findings on the startup guard (policies must isolate; wrapped connection errors are transient)
+def _policy_name(conn, table):
+    return conn.execute("SELECT polname FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid WHERE c.relname = %s LIMIT 1", (table,)).fetchone()[0]
+
+
+@pg_only
+def test_a_permissive_extra_policy_or_a_replaced_policy_is_not_isolation(pg, monkeypatch):
+    """Policies are OR-ed: `USING (true)` added beside the real one, or in its place, leaves RLS 'on' and isolating nothing. The guard and /ready must both say so."""
+    _strict(monkeypatch)
+    with pg.admin_conn() as conn:
+        conn.execute("CREATE POLICY open_to_all ON boards USING (true)")
+    with pg.admin_conn() as conn:
+        conn.row_factory = __import__("psycopg").rows.dict_row
+        assert pg_store.tenant_tables_without_forced_rls(conn, pg.schema) == ["boards"]
+    with pytest.raises(RuntimeError, match="refuses to start"):
+        pg_store.assert_tenant_isolation_ready()
+    with pg.admin_conn() as conn:
+        conn.execute("DROP POLICY open_to_all ON boards")
+    assert pg_store.assert_tenant_isolation_ready() is None                               # positive control: back to the real policy
+    with pg.admin_conn() as conn:
+        name = _policy_name(conn, "memories")
+        conn.execute(f"DROP POLICY {name} ON memories")
+        conn.execute("CREATE POLICY replaced ON memories USING (true) WITH CHECK (true)")
+    with pytest.raises(RuntimeError, match="refuses to start"):
+        pg_store.assert_tenant_isolation_ready()
+
+
+@pg_only
+def test_the_isolation_probe_catches_a_policy_that_mentions_the_setting_but_is_always_true(pg, monkeypatch):
+    """The text check passes `tenant_key = current_setting(...) OR true`; only behaviour shows it: a tenant that owns nothing can read another tenant's row."""
+    from app.models import EvidenceLink, MemoryCreate
+    from app.pg_store import PostgresRowStore
+
+    _strict(monkeypatch)
+    PostgresRowStore(pg.app_dsn, "someone", schema=pg.schema).create_memory(MemoryCreate(
+        content="a row that must stay invisible to others", source_agent="t", session_id="s", type="fact", evidence=[EvidenceLink(kind="doc", ref="x", note="y")]))
+    assert pg_store.assert_tenant_isolation_ready() is None                               # positive control, with data present
+    with pg.admin_conn() as conn:
+        name = _policy_name(conn, "memories")
+        conn.execute(f"DROP POLICY {name} ON memories")
+        conn.execute("CREATE POLICY sneaky ON memories USING (tenant_key = current_setting('jarvis.tenant_key', true) OR true) "
+                     "WITH CHECK (tenant_key = current_setting('jarvis.tenant_key', true))")
+    with pg.admin_conn() as conn:
+        conn.row_factory = __import__("psycopg").rows.dict_row
+        assert pg_store.tenant_tables_without_forced_rls(conn, pg.schema) == []          # the text check alone is fooled (that is why the probe exists)
+    with pytest.raises(RuntimeError, match="does not isolate tenants"):
+        pg_store.assert_tenant_isolation_ready()
+
+
+@pg_only
+def test_a_dropped_connection_inside_the_schema_check_is_retried_but_a_missing_schema_is_not(pg, monkeypatch):
+    import psycopg
+
+    from app.store_errors import StoreUnavailableError
+
+    _strict(monkeypatch)
+    monkeypatch.setenv("JARVIS_STARTUP_DB_WAIT_SECONDS", "10")
+    real = pg_store.check_schema_version
+    calls = {"n": 0}
+
+    def flaky(conn):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise StoreUnavailableError("Ledger schema is missing; run the migration") from psycopg.OperationalError("server closed the connection unexpectedly")
+        return real(conn)
+
+    monkeypatch.setattr(pg_store, "check_schema_version", flaky)
+    assert pg_store.assert_tenant_isolation_ready() is None and calls["n"] == 3         # retried twice, then verified
+
+    def missing(conn):
+        raise StoreUnavailableError("Ledger schema is missing; run the migration") from psycopg.errors.UndefinedTable("relation schema_version does not exist")
+
+    monkeypatch.setattr(pg_store, "check_schema_version", missing)
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="refuses to start"):
+        pg_store.assert_tenant_isolation_ready()
+    assert time.monotonic() - started < 5                                              # a missing schema is definitive: no waiting
