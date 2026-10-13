@@ -118,6 +118,12 @@ def _adopt_legacy_chain(field: AmulField, own_path: str) -> bool:
         tmp = target.with_name(target.name + ".adopting")
         tmp.write_bytes(data)
         os.replace(tmp, target)
+        # The whole shared file was validated as THIS tenant's chain, so it must stop being the operator's default chain: MOVE it aside (kept as evidence). If it changed since the
+        # snapshot (a writer appended), undo the adoption instead: those lines may be the operator's own new chain, and nothing is moved.
+        if Path(CHECKPOINTS_PATH).read_bytes() != data:
+            target.unlink(missing_ok=True)
+            return False
+        os.replace(CHECKPOINTS_PATH, CHECKPOINTS_PATH + ".adopted-by-" + target.name)
         return True
     except (OSError, ValueError):
         return False                                      # never let the upgrade path break a verify or a compaction: the tenant simply starts its own chain

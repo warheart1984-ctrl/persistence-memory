@@ -141,7 +141,8 @@ def test_a_tenants_legacy_chain_in_the_shared_file_is_adopted_when_it_authentica
     own = tmp / "tenants" / "t_alice-checkpoints.jsonl"
     assert not own.exists()
     report = verify_gc(a_field)                                                                  # new default: adopts, then verifies through the chain
-    assert own.exists() and own.read_bytes() == Path(shared).read_bytes()
+    assert own.exists() and not Path(shared).exists()                                            # MOVED: the shared file no longer serves as the operator's chain
+    assert Path(shared + ".adopted-by-t_alice-checkpoints.jsonl").read_bytes() == own.read_bytes()   # (kept aside as evidence)
     assert report.mode == "checkpoint_chain" and report.integrity_ok and report.checkpoints_checked == 1
     for r in [_rec(10), _rec(11)]:                                                               # and the chain CONTINUES from the adopted one
         anchor_memory(r, a_field)
@@ -188,24 +189,6 @@ def test_a_torn_shared_file_is_never_adopted_and_what_is_copied_is_what_was_vali
     assert (tmp / "tenants" / "t_alice-checkpoints.jsonl").read_bytes() == good
 
 
-def test_a_compaction_appending_between_validation_and_copy_cannot_slip_into_the_adopted_chain(world, monkeypatch):
-    tmp, shared = world
-    a_field, a_recs = _fill("t_alice", 3)
-    compact(a_field, a_recs, checkpoints_path=shared)
-    good = Path(shared).read_bytes()
-    real = amul_gc._authenticates
-
-    def authenticates_then_a_writer_appends(cps, raw):
-        ok = real(cps, raw)
-        with open(shared, "ab") as fh:
-            fh.write(b'{"torn": ')                                                            # the operator's compaction lands right after the validation read
-        return ok
-
-    monkeypatch.setattr(amul_gc, "_authenticates", authenticates_then_a_writer_appends)
-    amul_gc._adopt_legacy_chain(a_field, str(tmp / "tenants" / "t_alice-checkpoints.jsonl"))
-    assert (tmp / "tenants" / "t_alice-checkpoints.jsonl").read_bytes() == good               # exactly the validated snapshot, not what the file became
-
-
 def test_compaction_is_blocked_while_the_legacy_chain_is_ambiguous_but_resolving_it_unblocks(world):
     """Review finding: declining to adopt must not let compact() start a replacement chain (it would lose the owner's prior cold set, G2)."""
     tmp, shared = world
@@ -237,3 +220,35 @@ def test_a_tenant_cloned_from_the_operators_field_does_not_adopt_the_operators_c
         compact(c, o_recs)
     o2 = get_field()                                                                             # the operator itself is unaffected
     assert verify_gc(o2).mode == "checkpoint_chain" and verify_gc(o2).integrity_ok
+
+
+def test_after_a_tenant_adopts_its_legacy_chain_the_operators_own_verify_and_compaction_are_unaffected(world):
+    """Review finding: copying left the tenant's chain at the operator's default path, so the operator then loaded a chain for another field."""
+    tmp, shared = world
+    a_field, a_recs = _fill("t_alice", 3)
+    compact(a_field, a_recs, checkpoints_path=shared)                                           # only alice ever compacted: the shared file is wholly hers
+    o_field, o_recs = _fill(None, 4)
+    assert verify_gc(a_field).mode == "checkpoint_chain"                                        # alice adopts (moves) it
+    o = verify_gc(o_field)
+    assert o.mode == "full_rehash" and o.integrity_ok and not o.integrity_failures              # the operator no longer sees alice's hashes
+    assert compact(o_field, o_recs).compacted is True and Path(shared).exists()                 # and starts a clean chain of its own
+    assert verify_gc(o_field).mode == "checkpoint_chain" and verify_gc(o_field).integrity_ok
+    assert verify_gc(a_field).mode == "checkpoint_chain" and verify_gc(a_field).integrity_ok and gc_status(a_field)["total_checkpoints"] == 1
+
+
+def test_if_the_shared_file_changed_since_the_validated_snapshot_nothing_is_adopted_or_moved(world, monkeypatch):
+    tmp, shared = world
+    a_field, a_recs = _fill("t_alice", 3)
+    compact(a_field, a_recs, checkpoints_path=shared)
+    good = Path(shared).read_bytes()
+    real = amul_gc._authenticates
+
+    def authenticates_then_a_writer_appends(cps, raw):
+        ok = real(cps, raw)
+        with open(shared, "ab") as fh:
+            fh.write(b"{}\n")
+        return ok
+
+    monkeypatch.setattr(amul_gc, "_authenticates", authenticates_then_a_writer_appends)
+    assert amul_gc._adopt_legacy_chain(a_field, str(tmp / "tenants" / "t_alice-checkpoints.jsonl")) is False
+    assert not (tmp / "tenants" / "t_alice-checkpoints.jsonl").exists() and Path(shared).read_bytes() == good + b"{}\n"
