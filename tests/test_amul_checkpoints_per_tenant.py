@@ -158,3 +158,49 @@ def test_a_chain_made_for_another_field_is_never_adopted(world):
     assert report.mode == "full_rehash" and report.integrity_ok
     assert not (tmp / "tenants" / "t_alice-checkpoints.jsonl").exists(), "the operator's chain must not be copied to a tenant"
     assert verify_gc(o_field).mode == "checkpoint_chain"
+
+
+def test_byte_identical_tenant_fields_make_the_legacy_chain_ambiguous_so_nobody_adopts_it(world):
+    """Review finding: a cloned or restored tenant has the same field bytes, so matching bytes alone cannot say whose chain it is."""
+    tmp, shared = world
+    a_field, a_recs = _fill("t_alice", 3)
+    compact(a_field, a_recs, checkpoints_path=shared)                                           # the legacy chain, made for alice
+    (tmp / "tenants" / "t_clone-field.jsonl").write_bytes(Path(a_field.path).read_bytes())      # a clone of her field
+    reset_field_for_tests()
+    with acting_for("t_alice"):
+        a2 = get_field()
+    with acting_for("t_clone"):
+        c = get_field()
+    assert verify_gc(a2).mode == "full_rehash" and verify_gc(c).mode == "full_rehash"
+    assert not (tmp / "tenants" / "t_alice-checkpoints.jsonl").exists() and not (tmp / "tenants" / "t_clone-checkpoints.jsonl").exists()
+
+
+def test_a_torn_shared_file_is_never_adopted_and_what_is_copied_is_what_was_validated(world):
+    tmp, shared = world
+    a_field, a_recs = _fill("t_alice", 3)
+    compact(a_field, a_recs, checkpoints_path=shared)
+    good = Path(shared).read_bytes()
+    Path(shared).write_bytes(good + b'{"schema": "amul-gc-checkpoint-v1", "range_sta')           # a concurrent compaction caught mid-append
+    assert verify_gc(a_field).mode == "full_rehash"
+    assert not (tmp / "tenants" / "t_alice-checkpoints.jsonl").exists()
+    Path(shared).write_bytes(good)
+    assert verify_gc(a_field).mode == "checkpoint_chain"
+    assert (tmp / "tenants" / "t_alice-checkpoints.jsonl").read_bytes() == good
+
+
+def test_a_compaction_appending_between_validation_and_copy_cannot_slip_into_the_adopted_chain(world, monkeypatch):
+    tmp, shared = world
+    a_field, a_recs = _fill("t_alice", 3)
+    compact(a_field, a_recs, checkpoints_path=shared)
+    good = Path(shared).read_bytes()
+    real = amul_gc._authenticates
+
+    def authenticates_then_a_writer_appends(cps, raw):
+        ok = real(cps, raw)
+        with open(shared, "ab") as fh:
+            fh.write(b'{"torn": ')                                                            # the operator's compaction lands right after the validation read
+        return ok
+
+    monkeypatch.setattr(amul_gc, "_authenticates", authenticates_then_a_writer_appends)
+    amul_gc._adopt_legacy_chain(a_field, str(tmp / "tenants" / "t_alice-checkpoints.jsonl"))
+    assert (tmp / "tenants" / "t_alice-checkpoints.jsonl").read_bytes() == good               # exactly the validated snapshot, not what the file became

@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -76,24 +77,40 @@ def checkpoints_path_for(field: AmulField) -> str:
     return own
 
 
+def _parse_checkpoints(data: bytes) -> list[Checkpoint]:
+    """The same parse as _load_checkpoints, from bytes already read (a torn or partial line raises ValueError)."""
+    return [Checkpoint(**json.loads(line)) for line in data.decode("utf-8").splitlines() if line.strip()]
+
+
+def _authenticates(cps: list[Checkpoint], raw_lines: list[bytes]) -> bool:
+    """Is this a structurally valid chain whose every range matches these field bytes (range_sha and merkle root)?"""
+    if not cps or _verify_chain_structure(cps) or cps[-1].range_end > len(raw_lines):
+        return False
+    for cp in cps:
+        range_sha, merkle = _range_authenticators(raw_lines, cp.range_start, cp.range_end)
+        if range_sha != cp.range_sha or merkle != cp.merkle_root:
+            return False
+    return True
+
+
 def _adopt_legacy_chain(field: AmulField, own_path: str) -> bool:
     """Upgrade path: before checkpoints were per tenant, every tenant's chain lived in the shared file. A tenant that has none of its own yet adopts the shared chain IF AND ONLY IF it
-    authenticates against THIS field (a structurally valid chain, every range's range_sha and merkle root matching this field's bytes); that is proof the chain is this tenant's. A chain made for
-    another field (the operator's, or another tenant's) never authenticates, and is left alone. Without this a tenant's next compaction would start from nothing and could re-classify an
-    already-cold artifact as hot (G2, dead-stays-dead), and verify would silently fall back to a full rehash."""
+    authenticates against THIS field (a structurally valid chain, every range's range_sha and merkle root matching this field's bytes), and against NO OTHER tenant's field: byte-identical
+    fields (a cloned or restored tenant) would make the chain's owner ambiguous, so then nobody adopts it (logged) and each tenant starts its own chain. A chain made for another field (the
+    operator's, or another tenant's) never authenticates and is left alone. The shared file is read ONCE: the bytes that are validated are the bytes that are copied (a concurrent compaction
+    appending in between cannot slip in unvalidated lines). Without the adoption a tenant's next compaction would start from nothing and could re-classify an already-cold artifact as hot
+    (G2, dead-stays-dead), and verify would silently fall back to a full rehash."""
     try:
-        cps = _load_checkpoints(CHECKPOINTS_PATH)
-        if not cps or _verify_chain_structure(cps):
-            return False
-        raw_lines = _read_raw_lines(field.path)
-        if cps[-1].range_end > len(raw_lines):
-            return False
-        for cp in cps:
-            range_sha, merkle = _range_authenticators(raw_lines, cp.range_start, cp.range_end)
-            if range_sha != cp.range_sha or merkle != cp.merkle_root:
-                return False
         data = Path(CHECKPOINTS_PATH).read_bytes()
+        cps = _parse_checkpoints(data)
+        if not _authenticates(cps, _read_raw_lines(field.path)):
+            return False
         target = Path(own_path)
+        for other in sorted(target.parent.glob("*-field.jsonl")):
+            if str(other) != field.path and _authenticates(cps, _read_raw_lines(str(other))):
+                logging.getLogger("jarvis.amul_gc").error(
+                    "the shared AMUL checkpoint chain authenticates against more than one tenant's field (%s and %s): not adopting it for either", Path(field.path).name, other.name)
+                return False
         target.parent.mkdir(parents=True, exist_ok=True)
         tmp = target.with_name(target.name + ".adopting")
         tmp.write_bytes(data)
