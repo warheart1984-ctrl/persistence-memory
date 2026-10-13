@@ -237,9 +237,9 @@ Signing and key ceremonies (still shelved); per-tenant encryption of content at 
 
 ## Implementation status (2026-10-12)
 
-Added after the RFC was written; the RFC body above is unchanged. Phase 0 is built and merged to main **except one item: the RLS startup guard**, which exists only as the readiness check below (`/ready` returns 503;
-the app can still start with a missing or non-forced RLS table, because `_require_tenant_tables_forced()` is called from `PostgresRowStore.readiness()`, not from startup). Treat Phase 0 as partial until strict-mode startup refuses
-on that check. The live box runs it with strict mode **off**
+Added after the RFC was written; the RFC body above is unchanged. Phase 0 is built and merged to main, **including the RLS startup guard** (#103; it was first only the readiness check, which is why this
+appendix briefly called Phase 0 partial): with `JARVIS_MULTI_TENANT` on, the app refuses to start unless the schema version, the role (no superuser, no `BYPASSRLS`) and forced RLS with an
+exactly-tenant-scoped policy on every served `tenant_key` table (every one except the retained legacy rollback table `jarvis_tenant_ledgers`, which the row store never reads and `legacy_data` watches) all verify, plus a behavioural probe (`app.pg_store.assert_tenant_isolation_ready`, `docs/strict_identity.md`). The live box runs it with strict mode **off**
 (`JARVIS_MULTI_TENANT` and OAuth unset). Evidence: the throwaway combined drill of 2026-10-12 (key mode, strict mode, OAuth plus strict; 57 checks, 0 failed) and the
 live before/after capture of the deploy.
 
@@ -257,7 +257,8 @@ live before/after capture of the deploy.
 ### Built beyond the RFC's phase 0
 
 - Isolation matrix with a route registry that fails closed (#90), no known gaps left as strict xfails except the RAG audit.
-- RLS readiness check `rls_tables` (#94): a table with a `tenant_key` column and no forced RLS, **other than the retained legacy table `jarvis_tenant_ledgers`**, makes `/ready` return 503 (readiness, not startup abort).
+- RLS readiness check `rls_tables` (#94): a table with a `tenant_key` column and no forced RLS, **other than the retained legacy table `jarvis_tenant_ledgers`**, makes `/ready` return 503, and with strict mode on (#103) the app also refuses to start; every policy expression must be exactly `tenant_key = current_setting('jarvis.tenant_key', true)`,
+  in both `USING` and `WITH CHECK`, and a startup probe confirms a tenant that owns nothing sees no rows.
   The exception is deliberate and exact (`LEGACY_BLOB_TABLE`): the importer leaves that older JSONB rollback copy in place, it has a `tenant_key` and no RLS, the row store never reads it, and the
   separate `legacy_data` check watches it; a look-alike table name is still flagged. A deployment that kept it therefore still passes `/ready`, so the check does not audit that table.
 - Per-tenant seal, sign and verify from the box, `jarvisctl tenants` (#95, #97): cross-tenant administration only through the migrator role on the box, never the public API. Built, **not scheduled**.
