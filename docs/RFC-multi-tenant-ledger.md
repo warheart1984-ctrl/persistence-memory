@@ -237,7 +237,9 @@ Signing and key ceremonies (still shelved); per-tenant encryption of content at 
 
 ## Implementation status (2026-10-12)
 
-Added after the RFC was written; the RFC body above is unchanged. Phase 0 is built and merged to main; the live box runs it with strict mode **off**
+Added after the RFC was written; the RFC body above is unchanged. Phase 0 is built and merged to main **except one item: the RLS startup guard**, which exists only as the readiness check below (`/ready` returns 503;
+the app can still start with a missing or non-forced RLS table, because `_require_tenant_tables_forced()` is called from `PostgresRowStore.readiness()`, not from startup). Treat Phase 0 as partial until strict-mode startup refuses
+on that check. The live box runs it with strict mode **off**
 (`JARVIS_MULTI_TENANT` and OAuth unset). Evidence: the throwaway combined drill of 2026-10-12 (key mode, strict mode, OAuth plus strict; 57 checks, 0 failed) and the
 live before/after capture of the deploy.
 
@@ -305,7 +307,9 @@ being on every tenant-scoped row, under forced RLS, and on the per-tenant `seq`/
    `tenant_deleted` event records that date, and the operator may prune earlier sets by hand), or (b) per-tenant envelope encryption of content (already named as a separate RFC in open question 1).
    Until then a deletion is "deleted from the live database now, from backups by <date>", not an immediate hard delete.
 4. **Lifecycle operations must cover every tenant-scoped file subsystem, not only SQL tables and the call/drift logs (section 7).** A tenant that used AMUL or EMR reinforcement has state on disk: the AMUL
-   field and its checkpoints under `data/tenants/`, and the tenant's section of the EMR dynamics sidecar (#92), alongside any other per-tenant files. Export must include them in the manifest, restore must
+   field under `data/tenants/`, and the tenant's section of the EMR dynamics sidecar (#92), alongside any other per-tenant files. **The AMUL checkpoints are not tenant-local:** only the field is relocated
+   per tenant (`_tenant_field_path()`); `app/amul_gc.py` keeps every tenant's checkpoints in the one shared `data/amul-checkpoints.jsonl` (`JARVIS_AMUL_GC_PATH`), and `verify_field()` calls `verify_gc(field)` without a
+   tenant path. That file is shared tenant-derived state: before lifecycle operations exist it must be partitioned per tenant, or extraction and deletion must be tenant-aware (rewriting the shared file under a lock). Export must include them in the manifest, restore must
    put them back with the rows, and deletion must remove them, or a restore loses state and a deletion leaves tenant-derived data behind. Phase 3 starts with an inventory of these files (and a test that
    fails when a new per-tenant file path is added without an export/delete rule), as the isolation matrix does for routes.
 5. **Not-found equivalence applies to cross-tenant identifier and existence probes only (sections 4 and 8).** Byte-for-byte equivalence with the "nonexistent id" response is the rule for attack classes 1, 2
@@ -322,8 +326,10 @@ being on every tenant-scoped row, under forced RLS, and on the per-tenant `seq`/
    writes with 503 `tenant_unavailable`; `restoring`, `suspended` and `deleting` answer a **valid** key with 503 `tenant_unavailable` (that tenant only, never another's); `deleted` has all keys revoked, so it is the
    uniform 401. Invalid, unknown, revoked or expired keys stay the single uniform 401 (no status oracle for a non-holder).
 8. **Export must be one consistent snapshot across SQL and files (section 7).** An active tenant writing during export makes the SQL snapshot and the separately copied AMUL/EMR files describe different times,
-   so a bundle can pass each component's check and still restore rows with missing or newer derived state. Rule: export first sets the tenant `quiesced` (writes refused, so nothing changes), takes the SQL data in one
-   `REPEATABLE READ` transaction, copies every file subsystem inside the same quiesce, records `last_seq` and a SHA-256 per file in the manifest, and restore refuses a bundle whose files do not match the manifest
+   so a bundle can pass each component's check and still restore rows with missing or newer derived state. Rule: export first sets the tenant `quiesced` **and fences and drains**: every tenant write path (request handlers, and box-side jobs that run through `identity.acting_for()` and so
+   never pass tenant-key authentication) holds a per-tenant shared advisory lock for the duration of its write, and export takes the exclusive lock, which waits for every in-flight writer and then blocks new ones; the fence is
+   held until the last file is copied (a status check at authentication alone is not a barrier: a request authenticated just before the transition could still commit). It then takes the SQL data in one
+   `REPEATABLE READ` transaction, copies every file subsystem under the same fence, records `last_seq` and a SHA-256 per file in the manifest, and restore refuses a bundle whose files do not match the manifest
    or whose rows do not end at the manifest's `last_seq`. (A versioned snapshot across the database and every file subsystem is the alternative if quiescing is unacceptable.)
 9. **Rate and concurrency limits are per tenant, not only per key (section 4).** A tenant may hold several keys, so a per-key limit lets it multiply its traffic by its number of keys and still exhaust the shared
    pool, and row/byte quotas and statement timeouts do not bound request rate or concurrency. Add a tenant-level request-rate and concurrent-request limit (and a share of the connection pool) enforced after the key
