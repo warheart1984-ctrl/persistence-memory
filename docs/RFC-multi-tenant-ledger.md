@@ -335,6 +335,14 @@ being on every tenant-scoped row, under forced RLS, and on the per-tenant `seq`/
    pool, and row/byte quotas and statement timeouts do not bound request rate or concurrency. Add a tenant-level request-rate and concurrent-request limit (and a share of the connection pool) enforced after the key
    resolves to its tenant, with the per-key limit kept as a second, tighter control.
 
+10. **Restore and delete take the same exclusive fence as export (section 7).** The fence in item 8 (per-tenant exclusive advisory lock, drained of in-flight request writers and of box-side jobs through
+    `identity.acting_for()`) is held from before validation until every SQL and file change is complete, for **restore and deletion as well**. A status change plus key revocation alone is not a barrier: a request
+    authenticated before the transition could commit during or after the replacement or deletion, mixing restored files with newer state or recreating a deleted tenant's rows or files.
+11. **The epoch commitment has one canonical byte encoding (item 1).** Every field is fixed-width or length-prefixed, so the sealing job, the verifier and a tenant's proof verifier derive the same bytes:
+    integers are unsigned 64-bit big-endian; hashes are the raw 32 bytes (never hex); `tenant_key` and any other string are a 4-byte big-endian length followed by the UTF-8 bytes; the leaf is
+    `H(0x00 || lp(tenant_key) || u64(height) || hash(block_hash) || u64(last_seq) || u64(sealed_seq) || u64(call_log_seq) || hash(call_log_head))` with a fixed all-zero value for an absent call-log head, nodes and
+    the epoch hash use the same encodings (`H(0x01 || left || right)`, `H(0x02 || hash(previous_epoch) || u64(n) || hash(tenants_root) || hash(events_root))`), and the test vectors for all of it live in the verifier's tests.
+
 ### Exit criteria (section 9)
 
 1 (Red Team), 3, 4 and 5 are open. 6 is met (matrix in CI, fail-closed on unregistered routes). **2 is only partly met** and stays open: in strict mode the app refuses to start with the
