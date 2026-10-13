@@ -477,3 +477,27 @@ def test_an_expression_that_only_mentions_the_setting_is_not_isolation(pg, monke
         conn.execute(policy)
     with pytest.raises(RuntimeError, match="refuses to start"):
         pg_store.assert_tenant_isolation_ready()
+
+
+@pg_only
+def test_the_isolation_probe_uses_a_fresh_random_key_so_no_tenant_name_can_collide_with_it(pg, monkeypatch):
+    """A tenant literally named like the old fixed probe key used to make its own rows look like a leak and refuse startup."""
+    from app.models import EvidenceLink, MemoryCreate
+    from app.pg_store import PostgresRowStore
+
+    _strict(monkeypatch)
+    PostgresRowStore(pg.app_dsn, "__startup_probe_no_such_tenant__", schema=pg.schema).create_memory(MemoryCreate(
+        content="a legitimate tenant with an unlucky name", source_agent="t", session_id="s", type="fact", evidence=[EvidenceLink(kind="doc", ref="x", note="y")]))
+    assert pg_store.assert_tenant_isolation_ready() is None
+    seen = []
+    real = pg_store._isolation_probe
+
+    def spy(conn, schema):
+        out = real(conn, schema)
+        seen.append(conn.execute("SELECT current_setting('jarvis.tenant_key', true) AS k").fetchone()["k"])
+        return out
+
+    monkeypatch.setattr(pg_store, "_isolation_probe", spy)
+    pg_store.assert_tenant_isolation_ready()
+    pg_store.assert_tenant_isolation_ready()
+    assert len(seen) == 2 and seen[0] != seen[1] and all(k.startswith("probe_") and len(k) == 38 for k in seen)

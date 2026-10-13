@@ -16,6 +16,7 @@ import logging
 import os
 import random
 import re
+import secrets
 import threading
 import time
 from datetime import datetime, timezone
@@ -1125,7 +1126,8 @@ def _isolation_probe(conn: psycopg.Connection, schema: str | None) -> list[str]:
 
     Policy text can be checked, behaviour is better: a permissive policy that mentions the setting but is OR-ed with something that is always true passes the text check and
     fails this probe wherever the table holds any row (an empty table cannot show it; the text check is the guard there)."""
-    conn.execute("SELECT set_config('jarvis.tenant_key', %s, true)", ("__startup_probe_no_such_tenant__",))
+    probe_key = "probe_" + secrets.token_hex(16)                 # random per call: no tenant (even one named by an operator) can own it
+    conn.execute("SELECT set_config('jarvis.tenant_key', %s, true)", (probe_key,))
     leaking = []
     for table in _tenant_tables(conn, schema):
         n = conn.execute(sql.SQL("SELECT count(*) AS n FROM {}").format(sql.Identifier(table))).fetchone()["n"]
