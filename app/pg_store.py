@@ -1097,6 +1097,41 @@ def tenant_tables_without_forced_rls(conn: psycopg.Connection, schema: str | Non
     return [r["name"] for r in rows if not (r["enabled"] and r["forced"] and r["policies"] > 0)]
 
 
+def assert_tenant_isolation_ready() -> None:
+    """The strict-mode (JARVIS_MULTI_TENANT) STARTUP guard: refuse to start unless the database proves it can isolate tenants.
+
+    The same checks /ready runs (schema version, a role that cannot bypass row-level security, forced RLS with a policy on every tenant_key table), but fatal at startup, so a
+    deployment with a missing or non-forced RLS table never serves a request. A definitive failure (wrong schema, bypassing role, an unprotected table) refuses at once. A
+    database that cannot be reached or queried is retried for JARVIS_STARTUP_DB_WAIT_SECONDS (default 30, at most 300) and then refuses too: nothing is served that was not verified.
+    """
+    dsn = (os.getenv("JARVIS_DATABASE_URL") or "").strip()
+    schema = (os.getenv("JARVIS_DATABASE_SCHEMA") or "").strip() or None
+    if not dsn:
+        raise RuntimeError("JARVIS_MULTI_TENANT refuses to start: no PostgreSQL store is configured (JARVIS_DATABASE_URL), so tenant isolation cannot be verified")
+    wait = min(max(float(_env_int("JARVIS_STARTUP_DB_WAIT_SECONDS", 30)), 0.0), 300.0)
+    deadline = time.monotonic() + wait
+    while True:
+        try:
+            pool, _ = _pool_for(dsn, schema)
+            with pool.connection() as conn:
+                conn.row_factory = dict_row
+                conn.execute("SELECT 1").fetchone()                       # a connection problem must surface here as an error to retry, not be mistaken for a failed check below
+                check_schema_version(conn)
+                _require_rls_enforced(conn)
+                _require_tenant_tables_forced(conn, schema)
+                conn.rollback()
+            return
+        except StoreUnavailableError as exc:
+            raise RuntimeError(f"JARVIS_MULTI_TENANT refuses to start: {exc}") from None
+        except Exception as exc:  # noqa: BLE001 - the database cannot be reached or queried: retry for a bounded time, then refuse
+            if time.monotonic() >= deadline:
+                _log.error("strict startup: cannot verify tenant isolation (%s: %s)", type(exc).__name__, exc)
+                raise RuntimeError(
+                    f"JARVIS_MULTI_TENANT refuses to start: the database could not be reached and verified within {wait:g}s ({type(exc).__name__})"
+                ) from None
+            time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+
+
 def _require_tenant_tables_forced(conn: psycopg.Connection, schema: str | None) -> None:
     """Fail closed (503) unless every tenant table has forced row-level security with a policy; the offenders are named in the log, never in the response."""
     bad = tenant_tables_without_forced_rls(conn, schema)

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -260,3 +262,89 @@ def test_not_ready_while_legacy_data_is_unimported(pg, client, monkeypatch):
         conn.execute("INSERT INTO jarvis_tenant_ledgers VALUES ('operator', %s::jsonb)", (json.dumps({"memories": [{"id": "x"}]}),))
         conn.execute("GRANT SELECT ON jarvis_tenant_ledgers TO jarvis_app_test")
     _not_ready(client, legacy_data="failed")
+
+
+# ---------------------------------------------------------------------------------------------------- strict-mode STARTUP guard (JARVIS_MULTI_TENANT)
+def _strict(monkeypatch):
+    monkeypatch.setenv("JARVIS_MULTI_TENANT", "1")
+    monkeypatch.setenv("JARVIS_API_KEY", "startup-guard-key-0123456789")
+    monkeypatch.delenv("JARVIS_ALLOW_UNAUTHENTICATED", raising=False)
+    monkeypatch.delenv("JARVIS_AUTH_MODE", raising=False)
+
+
+@pg_only
+def test_the_startup_guard_passes_on_a_healthy_database_and_the_app_starts_in_strict_mode(pg, monkeypatch):
+    _strict(monkeypatch)
+    assert pg_store.assert_tenant_isolation_ready() is None
+    with TestClient(app, raise_server_exceptions=False) as c:                         # the lifespan runs the guard
+        assert c.get("/ready").status_code == 200
+
+
+@pg_only
+@pytest.mark.parametrize("weaken", [
+    "ALTER TABLE memories NO FORCE ROW LEVEL SECURITY",
+    "ALTER TABLE memories DISABLE ROW LEVEL SECURITY",
+    "DROP POLICY IF EXISTS tenant_isolation ON boards",
+    "CREATE TABLE forgotten (tenant_key text NOT NULL, id text NOT NULL)",
+])
+def test_the_startup_guard_refuses_at_once_when_a_tenant_table_is_not_protected_and_the_app_does_not_start(pg, monkeypatch, weaken):
+    _strict(monkeypatch)
+    monkeypatch.setenv("JARVIS_STARTUP_DB_WAIT_SECONDS", "30")                  # a definitive failure must not wait this out
+    with pg.admin_conn() as conn:
+        if weaken.startswith("DROP POLICY"):
+            name = conn.execute("SELECT polname FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid WHERE c.relname = 'boards'").fetchone()[0]
+            weaken = f"DROP POLICY IF EXISTS {name} ON boards"
+        conn.execute(weaken)
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="refuses to start"):
+        pg_store.assert_tenant_isolation_ready()
+    with pytest.raises(RuntimeError, match="refuses to start"):
+        with TestClient(app, raise_server_exceptions=False):
+            pass
+    assert time.monotonic() - started < 10
+
+
+@pg_only
+def test_with_the_flag_off_the_same_unprotected_database_still_starts_as_today(pg, monkeypatch):
+    monkeypatch.delenv("JARVIS_MULTI_TENANT", raising=False)
+    with pg.admin_conn() as conn:
+        conn.execute("ALTER TABLE memories NO FORCE ROW LEVEL SECURITY")
+    with TestClient(app, raise_server_exceptions=False) as c:                         # (/ready says 503; nothing changed about starting)
+        assert c.get("/ready").status_code == 503
+
+
+@pg_only
+def test_the_startup_guard_refuses_a_role_that_bypasses_row_level_security(pg, monkeypatch):
+    _strict(monkeypatch)
+    monkeypatch.setenv("JARVIS_DATABASE_URL", pg.admin_dsn)                           # the superuser DSN: RLS would not apply to it
+    pg_store.close_pools()
+    with pytest.raises(RuntimeError, match="refuses to start"):
+        pg_store.assert_tenant_isolation_ready()
+
+
+@pg_only
+def test_the_startup_guard_still_accepts_the_retained_legacy_blob_table(pg, monkeypatch):
+    _strict(monkeypatch)
+    with pg.admin_conn() as conn:
+        conn.execute("CREATE TABLE jarvis_tenant_ledgers (tenant_key text PRIMARY KEY, payload jsonb NOT NULL DEFAULT '{}')")
+    assert pg_store.assert_tenant_isolation_ready() is None
+
+
+def test_an_unreachable_database_is_retried_for_a_bounded_time_and_then_refused(monkeypatch):
+    _strict(monkeypatch)
+    monkeypatch.setenv("JARVIS_DATABASE_URL", "postgresql://u:p@127.0.0.1:9/none")
+    monkeypatch.setenv("JARVIS_PG_STORE", "rows")
+    monkeypatch.setenv("JARVIS_STARTUP_DB_WAIT_SECONDS", "2")
+    monkeypatch.setenv("JARVIS_DATABASE_POOL_TIMEOUT_MS", "300")
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="could not be reached and verified within 2s"):
+        pg_store.assert_tenant_isolation_ready()
+    assert 1.5 <= time.monotonic() - started < 20
+    pg_store.close_pools()
+
+
+def test_no_database_configured_is_refused_in_strict_mode(monkeypatch):
+    _strict(monkeypatch)
+    monkeypatch.delenv("JARVIS_DATABASE_URL", raising=False)
+    with pytest.raises(RuntimeError, match="no PostgreSQL store"):
+        pg_store.assert_tenant_isolation_ready()
