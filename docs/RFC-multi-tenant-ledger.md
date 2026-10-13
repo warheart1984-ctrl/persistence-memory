@@ -344,6 +344,38 @@ being on every tenant-scoped row, under forced RLS, and on the per-tenant `seq`/
     `H(0x00 || lp(tenant_key) || u64(height) || hash(block_hash) || u64(last_seq) || u64(sealed_seq) || u64(call_log_seq) || hash(call_log_head))` with a fixed all-zero value for an absent call-log head, nodes and
     the epoch hash use the same encodings (`H(0x01 || left || right)`, `H(0x02 || hash(previous_epoch) || u64(n) || hash(tenants_root) || hash(events_root))`), and the test vectors for all of it live in the verifier's tests.
 
+### From an outside architectural review of the RFC (2026-10-13)
+
+The review supported the direction (per-tenant chains with an operator epoch anchor, fail-closed authentication, the Red Team gate) and asked for four things. Two were already corrected above (the
+epoch as a Merkle root, items 1, 6, 10 and 11; deletion against retained backups, item 3). The other two, and two refinements, are recorded here.
+
+12. **What row-level security does and does not protect (sections 4 and 8, attack class 9).** `jarvis.tenant_key` is a per-transaction setting that the application sets. RLS therefore protects against
+    *application mistakes* (a missing `WHERE`, a wrong id, a routing bug), not against an attacker who can execute **arbitrary SQL** as the application role: that attacker can set the setting to any tenant.
+    The guarantee the design actually offers is that no code path runs caller-influenced SQL (every value is a bound parameter, identifiers are validated), that the application role is least-privilege (not a
+    superuser, no `BYPASSRLS`, no DDL, history tables unwritable; all verified at readiness and, in strict mode, at startup), and that the setting is transaction-local, so a reused pooled connection never carries
+    a tenant over. Attack class 9 is reworded accordingly: it asserts that RLS returns nothing under an unset, empty or foreign setting *when the application issues the query*, plus tests that a connection
+    reused after a request starts with no tenant, and an injection attempt through every input must not alter the statement. If arbitrary-SQL execution by the application role is ever in scope, the
+    options are a database-verified tenant context (a `SECURITY DEFINER` function that checks a signed context before the setting takes effect) or per-tenant roles (rejected in section 3 for pooling;
+    revisit then).
+13. **Authenticate who wrote, not only whose tenant (section 3).** With several keys per tenant (per agent), `source_agent` on a record is a client-supplied label. Every memory mutation and every call-log entry
+    also records the **authenticated credential** server-side, never taken from the request; the declared agent name stays, shown as declared. A reader can then prove which credential was authorized to write
+    a record, not only which agent said it did. Details the first draft of this item left open:
+    - **A typed credential identifier, not a bare `key_id`.** The credential is `(type, id)`: `api_key` with the key's public `key_id`; `oauth` with an opaque id derived from the principal (never the raw
+      subject); `operator_key` for today's shared key (until per-tenant keys exist); **`system_job` with a stable job name** (for example `tenants-seal`, `tenants-sign`, `drift-watch`) for the trusted box-side jobs that run through `identity.acting_for()` and `app.tenant_jobs`, which never present any key, so a record they write is attributed to the job and not falsely to the shared key or to `none`; `none` with a null id for a call that authenticated nobody (a failed authentication in the `_unauth` log carries `none`,
+      never an invented identity, and no key material). OAuth writes and unauthenticated audit entries therefore stay representable.
+    - **It is inside the commitment.** A history column alone proves nothing: `jarvis_history_hash` commits only to `prev`, `op`, `version`, `before` and `after`, and blocks seal that `row_hash`, so rows
+      rewritten with a different credential would change no block and no epoch. The credential type and id join the history-hash preimage under a **new, versioned preimage format** (rows written before the change
+      keep the old format; the verifier, `jarvis_verify_history`, handles both and is told which each row uses), with migration and test vectors for both formats. The call-log entry's hash covers it the same way.
+14. **A hash commitment is not a witnessed commitment (section 5).** An epoch hash stored only on the box can be rewritten by whoever can rewrite the ledger and the box's own anchors, so it must be published
+    off the box. The existing transport does not do that per epoch: the seal timer runs hourly but the offsite timer sends only the newest backup once a day, so epochs sealed in between would sit unwitnessed
+    for hours. Require a **per-seal remote append** (the epoch line pushed to a separate machine, append-only for the box, as soon as the epoch is sealed), and optionally a third-party timestamp or transparency
+    log. Until that exists an epoch is **unwitnessed until the next offsite transfer**, and a verifier must say which it checked (a local commitment, or one witnessed off the box, by whom, and when).
+15. **More Red Team classes (section 8), each with its required outcome.** Add **11, authenticated-agent spoofing**: a valid key writing records that claim another agent, another tenant's key id, or a forged
+    credential in the body must be stored with the credential's own `(type, id)`; any forged value is ignored or rejected. Add **12, backup and restore attacks**, whose outcomes differ by attack and are not
+    interchangeable: a **stale bundle of the same tenant** may proceed only as a recorded rollback (`tenant_restored` with old and new heads); **another tenant's bundle**, a bundle whose **manifest or files were
+    altered**, and a **deleted tenant's bundle replayed** must be **rejected before any row changes** (and the attempt recorded); an **epoch or event sequence rolled back by a restore** is rejected unless a matching
+    recorded event explains it. Detection after the fact does not pass the gate for the rejected cases.
+
 ### Exit criteria (section 9)
 
 1 (Red Team), 3, 4 and 5 are open. 6 is met (matrix in CI, fail-closed on unregistered routes). **2 is only partly met** and stays open: in strict mode the app refuses to start with the
