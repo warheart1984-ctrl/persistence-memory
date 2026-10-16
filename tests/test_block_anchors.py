@@ -285,3 +285,4 @@ def test_the_dump_reader_and_the_live_reader_agree_including_blocks(tmp_path):
     finally:
         with psycopg.connect(dsn, autocommit=True) as conn:
             conn.execute("DROP SCHEMA jarvis CASCADE")
+            conn.execute("DROP SCHEMA IF EXISTS jarvis_control CASCADE")      # v10's control schema twin: left behind it would break the next run on the same server
