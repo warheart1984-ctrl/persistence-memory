@@ -935,13 +935,15 @@ REVOKE ALL ON FUNCTION __CONTROL__.touch_key_last_used(text) FROM PUBLIC;
 # Rolling V10 back removes only what V10 added (run as the migration role, inside one transaction). The control schema holds no ledger data.
 V10_ROLLBACK = """
 DROP SCHEMA IF EXISTS __CONTROL__ CASCADE;
-DELETE FROM schema_version WHERE version = 10;
+DELETE FROM __LEDGER__.schema_version WHERE version = 10;
 """
 
 def v10_rollback_sql(schema: str) -> str:
     """V10_ROLLBACK for a ledger schema, with the control schema's name QUOTED (a mixed-case or unusual name is a quoted identifier, as v10 created it)."""
-    quoted = '"' + control_schema_name(schema).replace('"', '""') + '"'
-    return V10_ROLLBACK.replace("__CONTROL__", quoted)
+    def quote(name: str) -> str:
+        return '"' + name.replace('"', '""') + '"'
+
+    return V10_ROLLBACK.replace("__CONTROL__", quote(control_schema_name(schema))).replace("__LEDGER__", quote(validate_schema_name(schema)))
 
 
 MIGRATIONS: list[tuple[int, str]] = [(1, _V1), (2, _V2), (3, _V3), (4, _V4), (5, _V5), (6, _V6), (7, _V7), (8, _V8), (9, _V9), (10, _V10)]

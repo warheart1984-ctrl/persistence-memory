@@ -525,3 +525,16 @@ def test_v10_and_its_rollback_work_for_a_mixed_case_ledger_schema(pg_server):
         with psycopg.connect(admin_dsn, autocommit=True) as conn:
             conn.execute(psycopg.sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(psycopg.sql.Identifier(schema)))
             conn.execute(psycopg.sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(psycopg.sql.Identifier(control_schema_name(schema))))
+
+
+@pg_only
+def test_v10_rollback_sql_is_self_contained_and_ignores_the_callers_search_path(pg_schema):
+    """Codex round 3 on #110: schema_version must be qualified with the ledger schema, so a caller whose search_path points elsewhere still rolls back the right ledger (or fails), never another one."""
+    assert migrate(pg_schema.admin_dsn, schema=pg_schema.schema, app_role="jarvis_app_test") == 10
+    sql = v10_rollback_sql(pg_schema.schema)
+    assert f'"{pg_schema.schema}".schema_version' in sql
+    with psycopg.connect(pg_schema.admin_dsn, options="-c search_path=public") as conn:
+        conn.execute(sql)
+    with pg_schema.admin_conn() as conn:
+        assert conn.execute("SELECT max(version) FROM schema_version").fetchone()[0] == 9
+    assert migrate(pg_schema.admin_dsn, schema=pg_schema.schema, app_role="jarvis_app_test") == 10
