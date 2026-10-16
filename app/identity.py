@@ -22,7 +22,12 @@ class Principal:
     subject: str
     scopes: frozenset[str]
     issuer: str
-    kind: str = "tenant"               # "tenant" (an OAuth subject) or "operator" (the configured ledger key): who the caller IS, not how the deployment is set up
+    kind: str = "tenant"               # "tenant" (an OAuth subject or a per-tenant API key) or "operator" (the configured ledger key): who the caller IS, not how the deployment is set up
+    # Set only for a tenant authenticated by a per-tenant API key (app.key_auth): the tenant is the key's own (t_<hex32>), not derived from a subject, and the credential is typed so a record can
+    # later say which credential wrote it. An OAuth principal leaves these empty and keeps the sha256(issuer, subject) namespace.
+    tenant_key: str | None = None
+    credential_type: str = ""          # "" (OAuth / operator), "api_key"
+    credential_id: str = ""            # the key's public key_id
 
 
 def operator_principal() -> Principal:
@@ -87,6 +92,12 @@ def system_scope():
         _principal.reset(token)
 
 
+def is_key_tenant() -> bool:
+    """True only for a request authenticated by a per-tenant API key (bound by app.auth.identity_middleware, nothing else)."""
+    principal = current_principal()
+    return principal is not None and principal.kind == "tenant" and principal.credential_type == "api_key"
+
+
 def is_operator() -> bool:
     """True only for a request that authenticated as the operator."""
     principal = current_principal()
@@ -118,6 +129,8 @@ def current_tenant_key() -> str | None:
     principal = current_principal()
     if principal is None or principal.kind == "operator":
         return None
+    if principal.tenant_key:
+        return principal.tenant_key         # a per-tenant API key: the tenant is the key's own
     # Keep the raw subject out of filenames and logs.  Issuer prevents collisions
     # between otherwise identical subjects from different identity providers.
     raw = f"{principal.issuer}\x1f{principal.subject}".encode("utf-8")

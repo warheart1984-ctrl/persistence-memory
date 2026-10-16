@@ -14,13 +14,15 @@ import secrets
 from pathlib import Path
 
 from fastapi import Header, HTTPException, Request
+from starlette.concurrency import run_in_threadpool
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse, Response
 
 from app.public_security import is_public_deployment
 from app.refusal import json_response
-from app.identity import (OPERATOR_TENANT, current_principal, current_tenant_key, in_operator_job, is_operator, multi_tenant_mode, operator_principal, reset_principal,
-                          set_principal)
+from app import key_auth
+from app.identity import (OPERATOR_TENANT, Principal, current_principal, current_tenant_key, in_operator_job, is_key_tenant, is_operator, multi_tenant_mode, operator_principal,
+                          reset_principal, set_principal)
 from app.oauth import READ_SCOPE, WRITE_SCOPE, auth_mode, public_base_url, validate_access_token
 
 
@@ -100,10 +102,10 @@ def nx_allowed_roots() -> list[Path]:
 
 def require_nx_write() -> None:
     """Require nx-write feature flag and memory write auth."""
-    if oauth_enabled():
+    if tenant_identity_in_force():
         principal = current_principal()
         if principal is None or WRITE_SCOPE not in principal.scopes:
-            raise HTTPException(status_code=403, detail="OAuth access token lacks required scope: memory.write")
+            raise HTTPException(status_code=403, detail=_scope_denied(WRITE_SCOPE))
     if not nx_write_enabled():
         raise HTTPException(
             status_code=403,
@@ -141,10 +143,10 @@ def validate_nx_path(path: str, allowed_roots: list[Path] | None = None) -> Path
 
 def require_mcp_write_scope() -> None:
     """OAuth scope half of the MCP write gate (flag handled by the write tools)."""
-    if oauth_enabled():
+    if tenant_identity_in_force():
         principal = current_principal()
         if principal is None or WRITE_SCOPE not in principal.scopes:
-            raise HTTPException(status_code=403, detail="OAuth access token lacks required scope: memory.write")
+            raise HTTPException(status_code=403, detail=_scope_denied(WRITE_SCOPE))
 
 
 def require_mcp_write() -> None:
@@ -208,8 +210,8 @@ def require_emr_recall_api_key(
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> None:
     """Require EMR_RECALL_API_KEY when set; else JARVIS_API_KEY unless JARVIS_ALLOW_UNAUTHENTICATED."""
-    if oauth_enabled():
-        # Identity middleware authenticated the OAuth token before this dependency.
+    if tenant_identity_in_force():
+        # Identity middleware authenticated the OAuth token / tenant key before this dependency.
         return
     expected = emr_recall_api_key()
     if is_public_deployment() and not expected:
@@ -249,8 +251,8 @@ def require_tools_credential(
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
 ) -> None:
     """The read tool routes: the ledger key (operator) or, when configured, the recall key (read-only scope). Records which one on the request."""
-    if oauth_enabled():
-        return                            # the identity middleware authenticated the OAuth token before this dependency
+    if tenant_identity_in_force():
+        return                            # the identity middleware authenticated the OAuth token / tenant key before this dependency
     if is_public_deployment() and not emr_recall_api_key():
         raise HTTPException(status_code=503, detail="Public deployment requires EMR_RECALL_API_KEY")
     kind = credential_kind(authorization, x_emr_recall_key, x_api_key)
@@ -267,8 +269,8 @@ def require_ledger_operator_key(
     """Call log, drift, tool writes and the nx routes: the LEDGER key, never the recall key (a recall-only caller is refused 401).
 
     With no recall key configured this is exactly what it was (the ledger key).  On a public deployment the recall key stays the operator credential."""
-    if oauth_enabled():
-        return
+    if tenant_identity_in_force():
+        return                            # (a tenant reaches the operator gates below this and is refused there, 403)
     if credential_kind(authorization, x_emr_recall_key, x_api_key) == "operator":
         return
     if is_public_deployment() and not emr_recall_api_key():
@@ -278,8 +280,8 @@ def require_ledger_operator_key(
 
 def mcp_credential(authorization: str | None, x_emr_recall_key: str | None, x_api_key: str | None) -> str:
     """The MCP endpoint's check: raises like the tool routes do, and returns which credential the request carries (``operator`` or ``recall``)."""
-    if oauth_enabled():
-        return "operator"                 # (as before: the identity middleware validated the token and bound the tenant)
+    if tenant_identity_in_force():
+        return "operator"                 # (as before: the identity middleware validated the token and bound the tenant; "operator" here only means "not recall-scoped")
     if is_public_deployment() and not emr_recall_api_key():
         raise HTTPException(status_code=503, detail="Public deployment requires EMR_RECALL_API_KEY")
     kind = credential_kind(authorization, x_emr_recall_key, x_api_key)
@@ -298,10 +300,10 @@ def require_ledger_read_api_key(
 
 
 def require_memory_write() -> None:
-    if oauth_enabled():
+    if tenant_identity_in_force():
         principal = current_principal()
         if principal is None or WRITE_SCOPE not in principal.scopes:
-            raise HTTPException(status_code=403, detail="OAuth access token lacks required scope: memory.write")
+            raise HTTPException(status_code=403, detail=_scope_denied(WRITE_SCOPE))
     if not memory_write_enabled():
         raise HTTPException(
             status_code=403,
@@ -338,6 +340,9 @@ def caller_is_operator() -> bool:
     after the key middleware accepted it."""
     if in_operator_job():          # the box's own per-tenant job (identity.acting_for), not a request: allowed in OAuth deployments too
         return True
+    principal = current_principal()
+    if principal is not None and principal.kind == "tenant":
+        return False               # a tenant is never the operator, whatever the deployment mode (a per-tenant key in a shared-key deployment included)
     if oauth_enabled():
         return False
     if multi_tenant_mode():
@@ -366,7 +371,7 @@ LEDGER_READ_PREFIX = "/api/jarvis/memory"
 
 async def ledger_read_protection_middleware(request: Request, call_next):
     """Gate GET ledger endpoints when JARVIS_PROTECT_LEDGER_READ is enabled."""
-    if oauth_enabled():
+    if tenant_identity_in_force():
         return await call_next(request)
     if request.method != "GET" or not request.url.path.startswith(LEDGER_READ_PREFIX):
         return await call_next(request)
@@ -408,7 +413,7 @@ def optional_verify_operator_api_key(
     x_api_key: str | None = None,
 ) -> None:
     """EMR_RECALL_API_KEY when set; otherwise JARVIS_API_KEY / explicit local-dev opt-out."""
-    if oauth_enabled():
+    if tenant_identity_in_force():
         # The identity middleware already validates OAuth and binds a tenant.
         # Never reinterpret a valid user token as the legacy operator secret.
         return
@@ -494,8 +499,8 @@ class ApiKeyMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next) -> Response:
         # OAuth mode owns identity for every public API/MCP request.  Do not
         # require the legacy operator key in addition to a valid user token.
-        if oauth_enabled():
-            return await call_next(request)
+        if tenant_identity_in_force():
+            return await call_next(request)          # OAuth, or a per-tenant key the identity middleware (which runs first) has already authenticated and bound
         # CORS preflights carry no credentials; let CORSMiddleware answer them.
         if request.method == "OPTIONS" or path_is_ledger_key_exempt(request.url.path):
             return await call_next(request)
@@ -520,6 +525,15 @@ OptionalApiKeyMiddleware = ApiKeyMiddleware
 
 def oauth_enabled() -> bool:
     return auth_mode() == "oauth"
+
+
+def tenant_identity_in_force() -> bool:
+    """Is this request's identity decided by a tenant principal the identity middleware bound (an OAuth token, or a per-tenant API key) rather than by the shared key?"""
+    return oauth_enabled() or is_key_tenant()
+
+
+def _scope_denied(scope: str) -> str:
+    return f"OAuth access token lacks required scope: {scope}" if oauth_enabled() else f"API key lacks required scope: {scope}"
 
 
 def oauth_challenge(scope: str = READ_SCOPE) -> str:
@@ -563,6 +577,28 @@ async def identity_middleware(request: Request, call_next):
             return await call_next(request)
         finally:
             reset_principal(token)
+    if protected and not oauth_enabled() and key_auth.key_tenants_enabled():
+        candidates = key_auth.token_candidates(request.headers)
+        if candidates:
+            # A per-tenant API key (JARVIS_KEY_TENANTS): authenticated against the control schema, bound to the key's own tenant. Every way of failing is the one 401 a wrong ledger
+            # key gets; an unreachable control schema is a 503 (never an admission); a valid key of a tenant that is not active is a 503 for that tenant only.
+            try:
+                resolved = await run_in_threadpool(key_auth.authenticate, candidates)
+            except key_auth.KeyAuthUnavailable:
+                return json_response(503, "Ledger unavailable", path=path)
+            if resolved is None:
+                return json_response(401, "Invalid or missing API key", path=path)
+            if resolved.tenant_status != "active":
+                return json_response(503, "tenant_unavailable", path=path)
+            if READ_SCOPE not in resolved.scopes:
+                return json_response(403, f"API key lacks required scope: {READ_SCOPE}", path=path)
+            token = set_principal(Principal(subject=resolved.key_id, scopes=resolved.scopes, issuer="jarvis-key", kind="tenant", tenant_key=resolved.tenant_key,
+                                            credential_type="api_key", credential_id=resolved.key_id))
+            request.scope["jarvis_tenant"] = resolved.tenant_key      # the call log reads this from the outermost layer
+            try:
+                return await call_next(request)
+            finally:
+                reset_principal(token)
     if not protected or not oauth_enabled():
         return await call_next(request)
     authorization = request.headers.get("authorization") or ""

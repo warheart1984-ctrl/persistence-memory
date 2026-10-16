@@ -1,7 +1,7 @@
 # Per-tenant API keys (RFC phase 1, slice 1)
 
-Status: **built, not in the request path, not deployed.** This slice adds the storage, the token format, the verification primitive and the migrator-role CLI. Nothing authenticates a request with a
-tenant key yet (that is the next slice, behind a flag), so merging this changes no behaviour of a running deployment except that the schema version becomes 10.
+Status: **built, not deployed.** Slice 1 adds the storage, the token format, the verification primitive and the migrator-role CLI. Slice 2 (below) authenticates requests with a tenant key behind
+`JARVIS_KEY_TENANTS`, which is off by default; with it off the only change to a running deployment is that the schema version becomes 10.
 
 ## Schema v10: the control schema
 
@@ -44,3 +44,26 @@ python -m app.tenant_keys list-tenants | list-keys [--tenant t_<hex32>]
 The token exists in exactly one place: the output of `create-key`. Prefer `--token-file` (mode 600, never overwrites an existing file) so it never appears on a terminal. Listing never shows a hash.
 
 Pinned by `tests/test_tenant_keys.py` (privileges, the constraints, round trip, uniform failure, expiry, revocation, the comparison on unknown ids, rate-limited `last_used_at`, the CLI, rollback and forward again).
+
+## Slice 2: authenticating requests (`JARVIS_KEY_TENANTS=1`)
+
+Off by default. With the flag on, a request that presents a `jlk_` token (as `Authorization: Bearer` or `X-API-Key`) on an API or MCP route is authenticated by `app/key_auth.py` through the
+control schema and bound to a **tenant principal**: `Principal(kind="tenant", tenant_key=<the key's own t_...>, credential_type="api_key", credential_id=<key_id>)`. The tenant is the key's, never a
+request parameter. The operator's ledger key keeps working exactly as before (the operator credential wins if both are presented); a request with neither is refused as before.
+
+* **A key tenant is never the operator.** In a shared-key deployment `caller_is_operator()` used to be true for anyone who got past the key middleware; it now follows the principal, so a key tenant
+  is refused every operator-only surface (blocks, attestations, call log, drift, inference backend, replay: 403), the same as an OAuth tenant. The gates that were `if oauth_enabled()` ("the identity
+  middleware decided who this is") are now `tenant_identity_in_force()`: OAuth, or a bound key tenant.
+* **Failures.** A token that does not authenticate (malformed, unknown, wrong secret, revoked, expired) is the same `401 Invalid or missing API key` a wrong ledger key gets, and the token is never echoed.
+  A control schema or pepper that cannot be used is a `503 Ledger unavailable`, never an admission. A valid key of a tenant whose status is not `active` is a `503 tenant_unavailable`, for that tenant only.
+* **Scopes** (`memory.read`, `memory.write`) are enforced: a key must be able to read; a read-only key cannot write.
+* **MCP:** a key tenant uses `/mcp` and the tool routes for its own tenant, as an OAuth tenant does; the drift check stays the operator's.
+* **Call log:** a key tenant's calls are filed under its own tenant key.
+* **Startup (flag on):** the app refuses to start without a PostgreSQL row store, without a pepper of at least 32 bytes, with the control schema missing, or with the lookup not callable by the application role.
+* **Strict mode** (`JARVIS_MULTI_TENANT=1`) and key tenants work together; unauthenticated is still refused.
+
+`tests/test_key_auth.py` pins these. `tests/test_tenant_isolation_keys.py` runs **every case of the isolation matrix again with key tenants** (alice, bob and the other names become key tenants), so the same
+properties are proven for both kinds of tenant identity, and a route added without a matrix classification fails there too. The few routes that answer a request with no credential in a shared-key deployment
+(they carry no ledger data and behave the same on the box today) are named in that file, not hidden.
+
+Not in this slice: `jarvisctl` wrappers for issuing keys, per-tenant call-log chains, and recording the credential in the history hash.

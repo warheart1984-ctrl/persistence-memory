@@ -1188,6 +1188,41 @@ def assert_tenant_isolation_ready() -> None:
             time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
 
 
+def assert_key_auth_ready() -> None:
+    """JARVIS_KEY_TENANTS startup guard: the control schema exists and the application role can call the lookup (an unknown id answers no row). Same wait-and-retry shape as the
+    isolation guard: a definitive failure (no control schema, no EXECUTE) refuses at once, an unreachable database is retried for JARVIS_STARTUP_DB_WAIT_SECONDS and then refused."""
+    from app.pg_schema import control_schema_name
+
+    dsn = (os.getenv("JARVIS_DATABASE_URL") or "").strip()
+    schema = (os.getenv("JARVIS_DATABASE_SCHEMA") or "jarvis").strip()
+    control = control_schema_name(schema)
+    wait = min(max(float(_env_int("JARVIS_STARTUP_DB_WAIT_SECONDS", 30)), 0.0), 300.0)
+    deadline = time.monotonic() + wait
+    while True:
+        try:
+            pool, _ = _pool_for(dsn, schema)
+            with pool.connection() as conn:
+                conn.execute("SELECT 1").fetchone()
+                try:
+                    with conn.transaction():
+                        rows = conn.execute(sql.SQL("SELECT 1 FROM {}.resolve_key(%s)").format(sql.Identifier(control)), ("0" * 16,)).fetchall()
+                except (psycopg.errors.UndefinedFunction, psycopg.errors.InvalidSchemaName):
+                    raise RuntimeError("JARVIS_KEY_TENANTS refuses to start: the control schema or its lookup function is missing (run the v10 migration)") from None
+                except psycopg.errors.InsufficientPrivilege:
+                    raise RuntimeError("JARVIS_KEY_TENANTS refuses to start: the application role may not call the control schema's lookup") from None
+                if rows:
+                    raise RuntimeError("JARVIS_KEY_TENANTS refuses to start: the lookup answered for an id that cannot exist")
+                conn.rollback()
+            return
+        except RuntimeError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the database cannot be reached or queried: retry for a bounded time, then refuse
+            if time.monotonic() >= deadline:
+                _log.error("key auth startup: cannot verify the control schema (%s: %s)", type(exc).__name__, exc)
+                raise RuntimeError(f"JARVIS_KEY_TENANTS refuses to start: the database could not be reached and verified within {wait:g}s ({type(exc).__name__})") from None
+            time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+
+
 def _require_tenant_tables_forced(conn: psycopg.Connection, schema: str | None) -> None:
     """Fail closed (503) unless every tenant table has forced row-level security with a policy; the offenders are named in the log, never in the response."""
     bad = tenant_tables_without_forced_rls(conn, schema)
