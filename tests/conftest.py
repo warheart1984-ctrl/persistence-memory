@@ -181,6 +181,7 @@ def pg_schema(pg_server):
     yield PgSchema(schema=name, admin_dsn=admin_dsn, app_dsn=app_dsn)
     with psycopg.connect(admin_dsn, autocommit=True) as conn:
         conn.execute(f'DROP SCHEMA "{name}" CASCADE')
+        conn.execute(f'DROP SCHEMA IF EXISTS "{name}_control" CASCADE')       # v10's control schema lives beside the ledger schema and holds privileges for the app role
 
 
 # --- Run the whole suite against the Postgres row store -------------------------------------

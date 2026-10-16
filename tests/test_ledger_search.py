@@ -18,7 +18,7 @@ from app.emr_latest import LatestError
 from app.ledger_search import SearchParams, record_tokens, search_ledger, tokens
 from app.main import app
 from app.models import EvidenceLink, MemoryCreate
-from app.pg_schema import EXPECTED_SCHEMA_VERSION, V9_ROLLBACK, migrate
+from app.pg_schema import EXPECTED_SCHEMA_VERSION, V9_ROLLBACK, V10_ROLLBACK, control_schema_name, migrate
 from app.pg_store import PostgresRowStore
 from app.store import JarvisStore
 
@@ -341,7 +341,7 @@ def test_v9_on_a_populated_ledger_changes_no_row_hash_or_root_and_rolls_back_cle
         pg_store.close_pools()
     assert before_problems == []
 
-    assert migrate(pg_schema.admin_dsn, schema=pg_schema.schema, app_role="jarvis_app_test") == EXPECTED_SCHEMA_VERSION == 9
+    assert migrate(pg_schema.admin_dsn, schema=pg_schema.schema, app_role="jarvis_app_test") == EXPECTED_SCHEMA_VERSION >= 9
     store = PostgresRowStore(pg_schema.app_dsn, "migr", schema=pg_schema.schema)
     try:
         assert store.verify_history() == []
@@ -361,6 +361,7 @@ def test_v9_on_a_populated_ledger_changes_no_row_hash_or_root_and_rolls_back_cle
         pg_store.close_pools()
 
     with psycopg.connect(pg_schema.admin_dsn, options=f"-c search_path={pg_schema.schema}") as conn:  # one transaction
+        conn.execute(V10_ROLLBACK.replace("__CONTROL__", control_schema_name(pg_schema.schema)))   # newer migrations first (v10 added a control schema)
         conn.execute(V9_ROLLBACK)
     with pg_schema.admin_conn() as conn:
         assert conn.execute("SELECT max(version) FROM schema_version").fetchone()[0] == 8
@@ -373,7 +374,7 @@ def test_v9_on_a_populated_ledger_changes_no_row_hash_or_root_and_rolls_back_cle
             assert store.verify_history() == [] and store.replay_state().state_root == before_root
         finally:
             pg_store.close_pools()
-    assert migrate(pg_schema.admin_dsn, schema=pg_schema.schema, app_role="jarvis_app_test") == 9  # and forward again
+    assert migrate(pg_schema.admin_dsn, schema=pg_schema.schema, app_role="jarvis_app_test") == EXPECTED_SCHEMA_VERSION  # and forward again
 
 
 # ------------------------------------------------------------------------------------------------ /memory/unified label
