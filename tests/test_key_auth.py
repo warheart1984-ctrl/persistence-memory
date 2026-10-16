@@ -150,7 +150,7 @@ def test_a_suspended_tenant_is_503_for_its_own_keys_only(world):
     t1, k1 = world.issue("suspend me")
     _, k2 = world.issue("untouched")
     assert c.get("/api/jarvis/memory", headers=bearer(k1)).status_code == 200
-    for status in ("suspended", "quiesced", "restoring", "deleting"):
+    for status in ("suspended", "quiesced", "restoring"):
         with world.admin() as a:
             tenant_keys.set_tenant_status(a, world.control_name, t1, status)
         r = c.get("/api/jarvis/memory", headers=bearer(k1))
@@ -159,6 +159,10 @@ def test_a_suspended_tenant_is_503_for_its_own_keys_only(world):
     with world.admin() as a:
         tenant_keys.set_tenant_status(a, world.control_name, t1, "active")
     assert c.get("/api/jarvis/memory", headers=bearer(k1)).status_code == 200
+    with world.admin() as a:
+        tenant_keys.set_tenant_status(a, world.control_name, t1, "deleting")                           # deleting revokes the keys: from then on it is the uniform 401, not a 503
+    assert c.get("/api/jarvis/memory", headers=bearer(k1)).status_code == 401
+    assert c.get("/api/jarvis/memory", headers=bearer(k2)).status_code == 200
 
 
 @pg_only
