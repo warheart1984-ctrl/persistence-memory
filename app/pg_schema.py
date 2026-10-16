@@ -893,9 +893,9 @@ CREATE TABLE __CONTROL__.api_keys (
 CREATE INDEX api_keys_tenant_idx ON __CONTROL__.api_keys (tenant_key);
 
 CREATE FUNCTION __CONTROL__.resolve_key(p_key_id text)
-RETURNS TABLE (tenant_key text, key_hash text, scopes text[], key_status text, expires_at timestamptz, tenant_status text)
+RETURNS TABLE (tenant_key text, key_hash text, scopes text[], key_status text, expired boolean, tenant_status text)
 LANGUAGE sql STABLE SECURITY DEFINER SET search_path = __CONTROL__, pg_temp AS $fn$
-    SELECT k.tenant_key, k.key_hash, k.scopes, k.status, k.expires_at, t.status
+    SELECT k.tenant_key, k.key_hash, k.scopes, k.status, (k.expires_at IS NOT NULL AND k.expires_at <= now()), t.status
       FROM api_keys k JOIN tenants t ON t.tenant_key = k.tenant_key
      WHERE k.key_id = p_key_id
 $fn$;
@@ -904,6 +904,29 @@ LANGUAGE sql SECURITY DEFINER SET search_path = __CONTROL__, pg_temp AS $fn$
     UPDATE api_keys SET last_used_at = now()
      WHERE key_id = p_key_id AND status = 'active' AND (last_used_at IS NULL OR last_used_at < now() - interval '1 minute')
 $fn$;
+-- A deleted tenant stays deleted (RFC: resurrecting a deleted tenant id must be impossible), enforced in the database so that not even a hand-written UPDATE can undo it; entering
+-- deleting/deleted revokes every key of the tenant, and no key can be issued for a tenant that is being, or has been, deleted.
+CREATE FUNCTION __CONTROL__.tenant_lifecycle_guard() RETURNS trigger LANGUAGE plpgsql SET search_path = __CONTROL__, pg_temp AS $fn$
+BEGIN
+    IF OLD.status = 'deleted' AND NEW.status <> 'deleted' THEN
+        RAISE EXCEPTION 'a deleted tenant cannot be reactivated' USING ERRCODE = 'check_violation';
+    END IF;
+    IF NEW.status IN ('deleting', 'deleted') AND OLD.status IS DISTINCT FROM NEW.status THEN
+        UPDATE api_keys SET status = 'revoked', revoked_at = now() WHERE tenant_key = NEW.tenant_key AND status = 'active';
+    END IF;
+    RETURN NEW;
+END
+$fn$;
+CREATE TRIGGER tenants_lifecycle BEFORE UPDATE ON __CONTROL__.tenants FOR EACH ROW EXECUTE FUNCTION __CONTROL__.tenant_lifecycle_guard();
+CREATE FUNCTION __CONTROL__.key_for_live_tenant_only() RETURNS trigger LANGUAGE plpgsql SET search_path = __CONTROL__, pg_temp AS $fn$
+BEGIN
+    IF (SELECT status FROM tenants WHERE tenant_key = NEW.tenant_key) IN ('deleting', 'deleted') THEN
+        RAISE EXCEPTION 'no key can be issued for a deleting or deleted tenant' USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END
+$fn$;
+CREATE TRIGGER api_keys_live_tenant BEFORE INSERT ON __CONTROL__.api_keys FOR EACH ROW EXECUTE FUNCTION __CONTROL__.key_for_live_tenant_only();
 REVOKE ALL ON FUNCTION __CONTROL__.resolve_key(text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION __CONTROL__.touch_key_last_used(text) FROM PUBLIC;
 """
@@ -925,8 +948,16 @@ def validate_schema_name(schema: str) -> str:
 
 
 def control_schema_name(schema: str) -> str:
-    """The control schema that belongs to a ledger schema (``jarvis`` -> ``jarvis_control``)."""
-    return validate_schema_name(f"{schema}_control")
+    """The control schema that belongs to a ledger schema (``jarvis`` -> ``jarvis_control``).
+
+    PostgreSQL identifiers are at most 63 characters, and a ledger schema may be up to 63: past 55 the name is shortened deterministically (a prefix, a hash of the whole name, then
+    ``_control``), so two different long schemas never share a control schema and PostgreSQL never truncates the name silently."""
+    validate_schema_name(schema)
+    if len(schema) <= 55:
+        return f"{schema}_control"
+    import hashlib
+
+    return validate_schema_name(f"{schema[:46]}_{hashlib.sha256(schema.encode()).hexdigest()[:8]}_control")
 
 
 def _grant(conn: psycopg.Connection, schema: str, role: str) -> None:

@@ -33,7 +33,7 @@ from psycopg.rows import dict_row
 from app.pg_schema import control_schema_name, validate_schema_name
 
 TOKEN_PREFIX = "jlk_"
-_TOKEN_RE = re.compile(r"^jlk_([0-9a-f]{16})_([A-Za-z0-9_-]{43})$")
+_TOKEN_RE = re.compile(r"jlk_([0-9a-f]{16})_([A-Za-z0-9_-]{43})")        # used with fullmatch: a trailing newline (which `$` would allow) is not a token
 TENANT_KEY_RE = re.compile(r"^t_[0-9a-f]{32}$")
 TENANT_STATUSES = ("active", "suspended", "quiesced", "restoring", "deleting", "deleted")
 DEFAULT_SCOPES = ("memory.read", "memory.write")
@@ -67,7 +67,7 @@ def make_token(key_id: str, secret: str) -> str:
 
 def parse_token(token: str | None) -> tuple[str, str] | None:
     """(key_id, secret), or None for anything that is not exactly a token (no partial parsing, no tolerance for whitespace or case)."""
-    m = _TOKEN_RE.match(token or "")
+    m = _TOKEN_RE.fullmatch(token or "")
     return (m.group(1), m.group(2)) if m else None
 
 
@@ -76,6 +76,8 @@ def pepper() -> bytes:
     path = (os.getenv("JARVIS_KEY_PEPPER_FILE") or "").strip()
     if path:
         try:
+            if os.stat(path).st_mode & 0o077:
+                raise KeyConfigError("JARVIS_KEY_PEPPER_FILE must not be readable by group or others (chmod 600)")
             value = open(path, encoding="utf-8").readline().strip()
         except OSError as exc:
             raise KeyConfigError(f"JARVIS_KEY_PEPPER_FILE names a file that cannot be read ({type(exc).__name__})") from None
@@ -87,8 +89,9 @@ def pepper() -> bytes:
     return raw
 
 
-def key_hash(secret: str, pepper_bytes: bytes) -> str:
-    return hmac.new(pepper_bytes, secret.encode("utf-8"), hashlib.sha256).hexdigest()
+def key_hash(key_id: str, secret: str, pepper_bytes: bytes) -> str:
+    """HMAC-SHA256 over the key id AND the secret (domain-separated): a stored hash is bound to its row's id and cannot be moved to another key."""
+    return hmac.new(pepper_bytes, b"jlk1\x00" + key_id.encode("ascii") + b"\x00" + secret.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 # --------------------------------------------------------------------------------------------------- application side: verification
@@ -100,15 +103,13 @@ def resolve(conn: psycopg.Connection, control: str, token: str | None, pepper_by
         return None
     key_id, secret = parsed
     row = conn.execute(
-        sql.SQL("SELECT tenant_key, key_hash, scopes, key_status, expires_at, tenant_status FROM {}.resolve_key(%s)").format(sql.Identifier(control)), (key_id,)).fetchone()
+        sql.SQL("SELECT tenant_key, key_hash, scopes, key_status, expired, tenant_status FROM {}.resolve_key(%s)").format(sql.Identifier(control)), (key_id,)).fetchone()
     stored = (row["key_hash"] if isinstance(row, dict) else row[1]) if row else _DUMMY_HASH
-    match = hmac.compare_digest(key_hash(secret, pepper_bytes), stored)           # always computed, found or not
+    match = hmac.compare_digest(key_hash(key_id, secret, pepper_bytes), stored)   # always computed, found or not
     if row is None or not match:
         return None
-    r = row if isinstance(row, dict) else dict(zip(("tenant_key", "key_hash", "scopes", "key_status", "expires_at", "tenant_status"), row))
-    if r["key_status"] != "active":
-        return None
-    if r["expires_at"] is not None and r["expires_at"] <= datetime.now(timezone.utc):
+    r = row if isinstance(row, dict) else dict(zip(("tenant_key", "key_hash", "scopes", "key_status", "expired", "tenant_status"), row))
+    if r["key_status"] != "active" or r["expired"]:                                 # (expiry is judged by the database's clock, one clock for every application instance)
         return None
     conn.execute(sql.SQL("SELECT {}.touch_key_last_used(%s)").format(sql.Identifier(control)), (key_id,))
     return ResolvedKey(key_id=key_id, tenant_key=r["tenant_key"], scopes=frozenset(r["scopes"]), tenant_status=r["tenant_status"])
@@ -132,7 +133,7 @@ def create_key(conn: psycopg.Connection, control: str, tenant_key: str, pepper_b
     key_id, secret = new_key()
     conn.execute(
         sql.SQL("INSERT INTO {}.api_keys (key_id, tenant_key, key_hash, scopes, label, expires_at) VALUES (%s, %s, %s, %s, %s, %s)").format(sql.Identifier(control)),
-        (key_id, tenant_key, key_hash(secret, pepper_bytes), list(scopes), label, expires_at))
+        (key_id, tenant_key, key_hash(key_id, secret, pepper_bytes), list(scopes), label, expires_at))
     return make_token(key_id, secret)
 
 
@@ -144,6 +145,9 @@ def revoke_key(conn: psycopg.Connection, control: str, key_id: str) -> bool:
 def set_tenant_status(conn: psycopg.Connection, control: str, tenant_key: str, status: str) -> bool:
     if status not in TENANT_STATUSES:
         raise ValueError(f"status must be one of {TENANT_STATUSES}")
+    current = conn.execute(sql.SQL("SELECT status FROM {}.tenants WHERE tenant_key = %s").format(sql.Identifier(control)), (tenant_key,)).fetchone()
+    if current is not None and (current["status"] if isinstance(current, dict) else current[0]) == "deleted" and status != "deleted":
+        raise ValueError("a deleted tenant cannot be reactivated")          # (the database refuses it too: tenants_lifecycle trigger)
     cur = conn.execute(
         sql.SQL("UPDATE {}.tenants SET status = %s, deleted_at = CASE WHEN %s = 'deleted' THEN now() ELSE deleted_at END WHERE tenant_key = %s").format(sql.Identifier(control)),
         (status, status, tenant_key))
