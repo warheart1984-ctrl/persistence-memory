@@ -40,22 +40,30 @@ jobs:
     # Postgres-specific tests, plus the whole HTTP-level suite (red-team tests included) run on the
     # row-level store.  The service container is throwaway; its password protects nothing real.
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        # Mirror of the official image on AWS public ECR: Docker Hub's anonymous pull limit made this job flaky.
-        image: public.ecr.aws/docker/library/postgres:16
-        env:
-          POSTGRES_PASSWORD: ci-throwaway
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 12
     env:
       JARVIS_TEST_PG_DSN: postgresql://postgres:ci-throwaway@localhost:5432/postgres
     steps:
+      - name: Start a throwaway Postgres (try each registry in turn)
+        # Not a `services:` container: that pulls from ONE registry and the job dies before any test runs when that registry's anonymous quota is spent
+        # (Docker Hub's, and the AWS public ECR mirror's, both ran out on the same day). Here the registries are tried in turn, with a short back-off.
+        run: |
+          set -u
+          image=""
+          for candidate in public.ecr.aws/docker/library/postgres:16 mirror.gcr.io/library/postgres:16 postgres:16; do
+            for attempt in 1 2 3; do
+              if docker pull "$candidate"; then image="$candidate"; break 2; fi
+              sleep $((attempt * 5))
+            done
+          done
+          if [ -z "$image" ]; then echo "no registry would give us the Postgres image" >&2; exit 1; fi
+          echo "using $image"
+          docker run -d --name ci-postgres -e POSTGRES_PASSWORD=ci-throwaway -p 5432:5432 "$image"
+          for i in $(seq 1 60); do
+            if docker exec ci-postgres pg_isready -U postgres -h 127.0.0.1; then exit 0; fi
+            sleep 2
+          done
+          docker logs ci-postgres
+          exit 1
       - uses: actions/checkout@v4
       - name: Set up Python
         uses: actions/setup-python@v5
