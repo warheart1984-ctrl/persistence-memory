@@ -9,7 +9,7 @@ A second schema beside the ledger schema, `<schema>_control` (`jarvis_control` o
 
 * `tenants(tenant_key, label, status, created_at, deleted_at)`. `tenant_key` must be `t_` followed by 32 random hex characters (a CHECK), so it can never be `operator`, empty, or an OAuth
   hash. `status` is `active | suspended | quiesced | restoring | deleting | deleted`.
-* `api_keys(key_id, tenant_key, key_hash, scopes, status, label, created_at, expires_at, last_used_at, revoked_at)`. `key_hash` is `HMAC-SHA256(pepper, secret)`.
+* `api_keys(key_id, tenant_key, key_hash, scopes, status, label, created_at, expires_at, last_used_at, revoked_at)`. `key_hash` is `HMAC-SHA256(pepper, key_id, secret)`.
 
 It is a separate schema on purpose: these tables are where the server learns *which* tenant a credential belongs to, so they cannot be under tenant row-level security, and the guard that audits the
 ledger schema ("every table with a `tenant_key` column has forced RLS", at readiness and at strict startup) rightly does not apply to them.
