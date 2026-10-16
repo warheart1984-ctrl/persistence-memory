@@ -865,7 +865,56 @@ DROP FUNCTION IF EXISTS jarvis_search_tokens(text, text, text[]);
 DELETE FROM schema_version WHERE version = 9;
 """
 
-MIGRATIONS: list[tuple[int, str]] = [(1, _V1), (2, _V2), (3, _V3), (4, _V4), (5, _V5), (6, _V6), (7, _V7), (8, _V8), (9, _V9)]
+_V10 = r"""
+-- Per-tenant API keys (RFC phase 1): a CONTROL schema, beside the ledger schema (``<schema>_control``), not under tenant row-level security: it is where the server learns
+-- WHICH tenant a credential belongs to, so it cannot itself be tenant-scoped. The application role gets NO table privilege here: it can only call the two SECURITY DEFINER
+-- functions below (look a key up by its public id; note that it was used). Creating tenants and keys, revoking and status changes are the migrator role's (jarvisctl), never the public API's.
+-- It is a separate schema also so that the "every table with a tenant_key column has forced RLS" guard (readiness and strict startup), which audits the ledger schema, rightly does not apply.
+CREATE SCHEMA __CONTROL__;
+CREATE TABLE __CONTROL__.tenants (
+    tenant_key text PRIMARY KEY CHECK (tenant_key ~ '^t_[0-9a-f]{32}$'),      -- random, never derived from a name; 'operator' and the OAuth hash namespace cannot collide with it
+    label text NOT NULL DEFAULT '' CHECK (length(label) <= 200),
+    status text NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'suspended', 'quiesced', 'restoring', 'deleting', 'deleted')),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    deleted_at timestamptz
+);
+CREATE TABLE __CONTROL__.api_keys (
+    key_id text PRIMARY KEY CHECK (key_id ~ '^[0-9a-f]{16}$'),               -- public, not secret: the lookup handle inside the token jlk_<key_id>_<secret>
+    tenant_key text NOT NULL REFERENCES __CONTROL__.tenants (tenant_key),
+    key_hash text NOT NULL CHECK (key_hash ~ '^[0-9a-f]{64}$'),              -- HMAC-SHA256(pepper, secret); the pepper lives in a file, never in the database
+    scopes text[] NOT NULL DEFAULT ARRAY['memory.read', 'memory.write'],
+    status text NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'revoked')),
+    label text NOT NULL DEFAULT '' CHECK (length(label) <= 200),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    expires_at timestamptz,
+    last_used_at timestamptz,
+    revoked_at timestamptz
+);
+CREATE INDEX api_keys_tenant_idx ON __CONTROL__.api_keys (tenant_key);
+
+CREATE FUNCTION __CONTROL__.resolve_key(p_key_id text)
+RETURNS TABLE (tenant_key text, key_hash text, scopes text[], key_status text, expires_at timestamptz, tenant_status text)
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = __CONTROL__, pg_temp AS $fn$
+    SELECT k.tenant_key, k.key_hash, k.scopes, k.status, k.expires_at, t.status
+      FROM api_keys k JOIN tenants t ON t.tenant_key = k.tenant_key
+     WHERE k.key_id = p_key_id
+$fn$;
+CREATE FUNCTION __CONTROL__.touch_key_last_used(p_key_id text) RETURNS void
+LANGUAGE sql SECURITY DEFINER SET search_path = __CONTROL__, pg_temp AS $fn$
+    UPDATE api_keys SET last_used_at = now()
+     WHERE key_id = p_key_id AND status = 'active' AND (last_used_at IS NULL OR last_used_at < now() - interval '1 minute')
+$fn$;
+REVOKE ALL ON FUNCTION __CONTROL__.resolve_key(text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION __CONTROL__.touch_key_last_used(text) FROM PUBLIC;
+"""
+
+# Rolling V10 back removes only what V10 added (run as the migration role, inside one transaction). The control schema holds no ledger data.
+V10_ROLLBACK = """
+DROP SCHEMA IF EXISTS __CONTROL__ CASCADE;
+DELETE FROM schema_version WHERE version = 10;
+"""
+
+MIGRATIONS: list[tuple[int, str]] = [(1, _V1), (2, _V2), (3, _V3), (4, _V4), (5, _V5), (6, _V6), (7, _V7), (8, _V8), (9, _V9), (10, _V10)]
 EXPECTED_SCHEMA_VERSION = MIGRATIONS[-1][0]
 
 
@@ -873,6 +922,11 @@ def validate_schema_name(schema: str) -> str:
     if not _SCHEMA_RE.match(schema):
         raise ValueError(f"invalid schema name: {schema!r}")
     return schema
+
+
+def control_schema_name(schema: str) -> str:
+    """The control schema that belongs to a ledger schema (``jarvis`` -> ``jarvis_control``)."""
+    return validate_schema_name(f"{schema}_control")
 
 
 def _grant(conn: psycopg.Connection, schema: str, role: str) -> None:
@@ -904,6 +958,14 @@ def _grant(conn: psycopg.Connection, schema: str, role: str) -> None:
             conn.execute(sql.SQL("GRANT SELECT ON {} TO {}").format(sql.Identifier(table), r))
         conn.execute(sql.SQL("GRANT EXECUTE ON FUNCTION jarvis_store_attestation(text, text, text, text, bigint, text, text, text, text) TO {}").format(r))
         conn.execute(sql.SQL("GRANT EXECUTE ON FUNCTION jarvis_store_trust_statement(text, text, text, text, bigint, text, bigint, text, text, text) TO {}").format(r))
+    control = control_schema_name(schema)
+    if conn.execute("SELECT to_regnamespace(%s) IS NOT NULL", (control,)).fetchone()[0]:
+        # v10+: the control schema (tenants, API keys) is invisible to the application except through two SECURITY DEFINER functions
+        c = sql.Identifier(control)
+        conn.execute(sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(c, r))
+        conn.execute(sql.SQL("REVOKE ALL ON ALL TABLES IN SCHEMA {} FROM {}").format(c, r))
+        conn.execute(sql.SQL("GRANT EXECUTE ON FUNCTION {}.resolve_key(text) TO {}").format(c, r))
+        conn.execute(sql.SQL("GRANT EXECUTE ON FUNCTION {}.touch_key_last_used(text) TO {}").format(c, r))
     if not exists("chain_heads") and exists("record_history"):
         # v2 only (transitional): the invoker-rights trigger inserts as the app role
         conn.execute(sql.SQL("GRANT SELECT, INSERT ON record_history TO {}").format(r))
@@ -939,9 +1001,10 @@ def migrate(
             raise StoreUnavailableError(
                 f"database schema version {current} is newer than this code ({EXPECTED_SCHEMA_VERSION})"
             )
+        control = control_schema_name(schema or conn.execute("SELECT current_schema()").fetchone()[0])
         for version, ddl in MIGRATIONS:
             if version > current and (up_to is None or version <= up_to):
-                conn.execute(ddl)
+                conn.execute(ddl.replace("__CONTROL__", sql.Identifier(control).as_string(conn)))
                 conn.execute("INSERT INTO schema_version (version) VALUES (%s)", (version,))
                 current = version
         if app_role is not None:
