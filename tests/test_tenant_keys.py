@@ -50,15 +50,16 @@ def test_a_token_has_one_exact_shape_and_nothing_else_parses():
     token = tenant_keys.make_token(key_id, secret)
     assert re.fullmatch(r"jlk_[0-9a-f]{16}_[A-Za-z0-9_-]{43}", token)
     assert tenant_keys.parse_token(token) == (key_id, secret)
-    for bad in (None, "", token + " ", " " + token, token.upper(), token[:-1], token + "x", "jlk_" + "g" * 16 + "_" + secret, f"jlk_{key_id}", secret, f"Bearer {token}", token.replace("jlk_", "jlx_")):
+    for bad in (None, "", token + " ", " " + token, token + "\n", token + "\r\n", "\n" + token, token.upper(), token[:-1], token + "x", "jlk_" + "g" * 16 + "_" + secret, f"jlk_{key_id}", secret, f"Bearer {token}", token.replace("jlk_", "jlx_")):
         assert tenant_keys.parse_token(bad) is None, bad
     assert len({tenant_keys.new_key()[1] for _ in range(50)}) == 50
 
 
 def test_the_hash_depends_on_the_pepper_and_the_secret_and_is_not_the_secret():
-    h = tenant_keys.key_hash("s", PEPPER)
+    h = tenant_keys.key_hash("0123456789abcdef", "s", PEPPER)
     assert re.fullmatch(r"[0-9a-f]{64}", h) and h != "s"
-    assert h != tenant_keys.key_hash("s", PEPPER + b"x") and h != tenant_keys.key_hash("t", PEPPER)
+    assert h != tenant_keys.key_hash("0123456789abcdef", "s", PEPPER + b"x") and h != tenant_keys.key_hash("0123456789abcdef", "t", PEPPER)
+    assert h != tenant_keys.key_hash("fedcba9876543210", "s", PEPPER)                    # bound to the key id as well
 
 
 def test_the_pepper_is_required_and_strong_and_may_come_from_a_file(tmp_path, monkeypatch):
@@ -71,7 +72,11 @@ def test_the_pepper_is_required_and_strong_and_may_come_from_a_file(tmp_path, mo
         tenant_keys.pepper()
     f = tmp_path / "pepper"
     f.write_text("p" * 40 + "\nsecond line ignored\n")
+    f.chmod(0o644)
     monkeypatch.setenv("JARVIS_KEY_PEPPER_FILE", str(f))
+    with pytest.raises(tenant_keys.KeyConfigError, match="must not be readable"):
+        tenant_keys.pepper()                                                            # a world-readable pepper file is refused
+    f.chmod(0o600)
     assert tenant_keys.pepper() == b"p" * 40
     monkeypatch.setenv("JARVIS_KEY_PEPPER_FILE", str(tmp_path / "missing"))
     with pytest.raises(tenant_keys.KeyConfigError) as exc:
@@ -135,7 +140,7 @@ def test_a_key_round_trips_and_the_database_never_holds_the_secret(pg):
     with _admin(pg) as c:
         rows = c.execute(psycopg.sql.SQL("SELECT * FROM {}.api_keys").format(psycopg.sql.Identifier(pg.control))).fetchall()
         assert len(rows) == 1 and rows[0]["key_id"] == key_id and rows[0]["tenant_key"] == tenant and rows[0]["scopes"] == ["memory.read"]
-        assert rows[0]["key_hash"] == tenant_keys.key_hash(secret, PEPPER)
+        assert rows[0]["key_hash"] == tenant_keys.key_hash(key_id, secret, PEPPER)
         assert secret not in repr(rows) and token not in repr(rows)
     with _app(pg) as c:
         got = tenant_keys.resolve(c, pg.control, token, PEPPER)
@@ -194,9 +199,11 @@ def test_an_unknown_key_id_still_costs_a_comparison_so_it_is_not_a_cheap_oracle(
 def test_a_valid_key_of_a_non_active_tenant_resolves_with_its_status_for_the_caller_to_decide(pg):
     tenant, token = _issue(pg)
     with _admin(pg) as a, _app(pg) as c:
-        for status in ("suspended", "restoring", "deleting"):
+        for status in ("suspended", "restoring", "quiesced"):
             assert tenant_keys.set_tenant_status(a, pg.control, tenant, status) is True
             assert tenant_keys.resolve(c, pg.control, token, PEPPER).tenant_status == status
+        assert tenant_keys.set_tenant_status(a, pg.control, tenant, "deleting") is True
+        assert tenant_keys.resolve(c, pg.control, token, PEPPER) is None                      # deleting revokes the tenant's keys: the caller sees the uniform failure
         assert tenant_keys.set_tenant_status(a, pg.control, tenant, "deleted") is True
         assert a.execute(psycopg.sql.SQL("SELECT deleted_at IS NOT NULL AS d FROM {}.tenants").format(psycopg.sql.Identifier(pg.control))).fetchone()["d"] is True
         assert tenant_keys.set_tenant_status(a, pg.control, "t_" + "9" * 32, "active") is False
@@ -272,3 +279,133 @@ def test_v10_rolls_back_cleanly_and_forward_again_and_changes_no_ledger_data(pg_
     assert migrate(pg_schema.admin_dsn, schema=pg_schema.schema, app_role="jarvis_app_test") == 10      # and forward again
     with pg_schema.admin_conn() as conn:
         assert conn.execute("SELECT to_regnamespace(%s) IS NOT NULL", (control,)).fetchone()[0]
+
+
+# ----------------------------------------------------------------------------------------------------- review findings (verification of #107)
+@pg_only
+def test_a_deleted_tenant_can_never_be_reactivated_by_the_cli_or_by_hand_and_its_keys_stay_dead(pg):
+    tenant, token = _issue(pg)
+    second = None
+    with _admin(pg) as a:
+        second = tenant_keys.create_key(a, pg.control, tenant, PEPPER)
+        assert tenant_keys.set_tenant_status(a, pg.control, tenant, "deleting") is True
+        keys = tenant_keys.list_keys(a, pg.control, tenant)
+        assert keys and all(k["status"] == "revoked" and k["revoked_at"] is not None for k in keys)       # entering deleting revokes every key
+        assert tenant_keys.set_tenant_status(a, pg.control, tenant, "deleted") is True
+        for status in ("active", "suspended", "restoring", "quiesced", "deleting"):
+            with pytest.raises(ValueError, match="cannot be reactivated"):
+                tenant_keys.set_tenant_status(a, pg.control, tenant, status)
+            with pytest.raises(psycopg.errors.CheckViolation):                                          # and the database refuses a hand-written UPDATE too
+                a.execute(psycopg.sql.SQL("UPDATE {}.tenants SET status = %s WHERE tenant_key = %s").format(psycopg.sql.Identifier(pg.control)), (status, tenant))
+        assert tenant_keys.set_tenant_status(a, pg.control, tenant, "deleted") is True                   # idempotent
+        with pytest.raises(psycopg.errors.CheckViolation):
+            tenant_keys.create_key(a, pg.control, tenant, PEPPER)                                         # no new key for a deleted tenant
+    with _app(pg) as c:
+        assert tenant_keys.resolve(c, pg.control, token, PEPPER) is None and tenant_keys.resolve(c, pg.control, second, PEPPER) is None
+
+
+@pg_only
+def test_suspending_and_restoring_a_tenant_does_not_revoke_its_keys(pg):
+    tenant, token = _issue(pg)
+    with _admin(pg) as a, _app(pg) as c:
+        for status in ("suspended", "restoring", "quiesced", "active"):
+            tenant_keys.set_tenant_status(a, pg.control, tenant, status)
+        assert tenant_keys.resolve(c, pg.control, token, PEPPER).tenant_status == "active"              # the key lives on through every non-deleting state
+        assert tenant_keys.set_tenant_status(a, pg.control, tenant, "deleting") is True
+        assert tenant_keys.resolve(c, pg.control, token, PEPPER) is None
+
+
+@pg_only
+def test_a_stored_hash_is_bound_to_its_key_id_so_it_cannot_be_moved_to_another_key(pg):
+    t1, a_token = _issue(pg)
+    with _admin(pg) as a:
+        t2 = tenant_keys.create_tenant(a, pg.control, "other")
+        b_token = tenant_keys.create_key(a, pg.control, t2, PEPPER)
+    a_id, a_secret = tenant_keys.parse_token(a_token)
+    b_id = tenant_keys.parse_token(b_token)[0]
+    with _admin(pg) as a:
+        a.execute(psycopg.sql.SQL("UPDATE {}.api_keys SET key_hash = (SELECT key_hash FROM {}.api_keys WHERE key_id = %s) WHERE key_id = %s").format(
+            psycopg.sql.Identifier(pg.control), psycopg.sql.Identifier(pg.control)), (a_id, b_id))
+    with _app(pg) as c:
+        assert tenant_keys.resolve(c, pg.control, tenant_keys.make_token(b_id, a_secret), PEPPER) is None   # A's secret under B's id does not authenticate
+        assert tenant_keys.resolve(c, pg.control, a_token, PEPPER).tenant_key == t1
+
+
+@pg_only
+def test_expiry_is_judged_by_the_databases_clock(pg):
+    """The function returns whether the key has expired by now(); the application's clock is not consulted."""
+    _, token = _issue(pg, expires_at=datetime.now(timezone.utc) + timedelta(days=1))
+    with _app(pg) as c:
+        assert tenant_keys.resolve(c, pg.control, token, PEPPER) is not None
+        row = c.execute(psycopg.sql.SQL("SELECT expired FROM {}.resolve_key(%s)").format(psycopg.sql.Identifier(pg.control)), (tenant_keys.parse_token(token)[0],)).fetchone()
+        assert row["expired"] is False
+    with _admin(pg) as a:
+        a.execute(psycopg.sql.SQL("UPDATE {}.api_keys SET expires_at = now() - interval '1 second'").format(psycopg.sql.Identifier(pg.control)))
+    with _app(pg) as c:
+        assert tenant_keys.resolve(c, pg.control, token, PEPPER) is None
+
+
+def test_the_control_schema_name_fits_postgres_for_every_ledger_schema_name_and_never_collides():
+    from app.pg_schema import control_schema_name as name
+
+    assert name("jarvis") == "jarvis_control"                                           # unchanged for ordinary names
+    seen = set()
+    for n in range(1, 64):
+        base = "a" * n
+        c = name(base)
+        assert len(c) <= 63 and c.endswith("_control"), n
+        seen.add(c)
+    assert len(seen) == 63
+    assert name("x" * 60 + "aaa") != name("x" * 60 + "bbb") and name("x" * 63) == name("x" * 63)   # long names are shortened deterministically, with a hash of the whole name
+
+
+@pytest.mark.postgres
+def test_v10_works_on_a_ledger_schema_with_a_63_character_name(pg_server):
+    admin_dsn, _ = pg_server
+    schema = ("L" + "x" * 62)
+    assert len(schema) == 63
+    with psycopg.connect(admin_dsn, autocommit=True) as conn:
+        conn.execute(psycopg.sql.SQL("CREATE SCHEMA {}").format(psycopg.sql.Identifier(schema)))
+    try:
+        assert migrate(admin_dsn, schema=schema, app_role="jarvis_app_test") == 10
+        with psycopg.connect(admin_dsn, autocommit=True) as conn:
+            assert conn.execute("SELECT to_regnamespace(%s) IS NOT NULL", (psycopg.sql.Identifier(control_schema_name(schema)).as_string(conn),)).fetchone()[0]
+    finally:
+        with psycopg.connect(admin_dsn, autocommit=True) as conn:
+            conn.execute(psycopg.sql.SQL("DROP SCHEMA {} CASCADE").format(psycopg.sql.Identifier(schema)))
+            conn.execute(psycopg.sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(psycopg.sql.Identifier(control_schema_name(schema))))
+
+
+_LEDGER_TABLES = ("memories", "boards", "record_history", "history_counters", "chain_heads", "evidence_objects", "blocks", "attestations", "trust_statements")
+
+
+@pytest.mark.postgres
+def test_v10_rollback_and_forward_again_with_real_ledger_data_changes_no_ledger_row(pg_schema):
+    """The earlier rollback test used an empty database. Here the operator and a key tenant have written; every ledger table must be byte-identical after rollback + forward."""
+    from app.models import EvidenceLink, MemoryCreate
+    from app.pg_store import PostgresRowStore
+
+    assert migrate(pg_schema.admin_dsn, schema=pg_schema.schema, app_role="jarvis_app_test") == 10
+    control = control_schema_name(pg_schema.schema)
+    with psycopg.connect(pg_schema.admin_dsn, autocommit=True, row_factory=dict_row) as a:
+        tenant = tenant_keys.create_tenant(a, control, "writer")
+        tenant_keys.create_key(a, control, tenant, PEPPER)
+    for who in ("operator", tenant):
+        store = PostgresRowStore(pg_schema.app_dsn, who, schema=pg_schema.schema)
+        for i in range(3):
+            store.create_memory(MemoryCreate(content=f"{who} record {i}", source_agent="t", session_id="s", type="fact", evidence=[EvidenceLink(kind="doc", ref="x", note="y")]))
+    pg_store.close_pools()
+
+    def checksums():
+        with pg_schema.admin_conn() as conn:
+            return {t: conn.execute(psycopg.sql.SQL("SELECT md5(coalesce(string_agg(x::text, ',' ORDER BY x::text), '')) FROM {} x").format(psycopg.sql.Identifier(t))).fetchone()[0] for t in _LEDGER_TABLES}
+
+    before = checksums()
+    assert all(before.values())
+    with psycopg.connect(pg_schema.admin_dsn, options=f"-c search_path={pg_schema.schema}") as conn:
+        conn.execute(V10_ROLLBACK.replace("__CONTROL__", control))
+    assert checksums() == before
+    assert migrate(pg_schema.admin_dsn, schema=pg_schema.schema, app_role="jarvis_app_test") == 10
+    assert checksums() == before
+    with pg_schema.admin_conn() as conn:
+        assert conn.execute("SELECT count(*) FROM memories WHERE tenant_key = %s", (tenant,)).fetchone()[0] == 3     # the key tenant's rows survived (unreachable without v10, intact)

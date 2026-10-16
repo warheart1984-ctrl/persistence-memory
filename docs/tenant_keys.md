@@ -18,14 +18,19 @@ ledger schema ("every table with a `tenant_key` column has forced RLS", at readi
 `resolve_key(key_id)` returns the stored hash, scopes, statuses and expiry for one id, and `touch_key_last_used(key_id)` notes a use (at most once a minute per key). Creating tenants and keys,
 revoking, and changing a tenant's status are the migrator's, through `python -m app.tenant_keys` on the box. The public API cannot create, change or list a key or a tenant.
 
+**Lifecycle is enforced in the database, not only in the CLI.** A trigger on `tenants` refuses any transition out of `deleted` (a deleted tenant id can never be resurrected, even by a hand-written UPDATE),
+and entering `deleting` or `deleted` revokes every key of the tenant; a second trigger refuses to issue a key for a tenant that is being, or has been, deleted. Suspending, quiescing and restoring a tenant do not
+revoke its keys. The ledger schema may be up to 63 characters: past 55 the control schema name is shortened deterministically (a prefix, a hash of the whole name, then `_control`) so it never exceeds PostgreSQL's limit
+and two different long schemas never share one.
+
 Rollback: `V10_ROLLBACK` (with `__CONTROL__` replaced by the control schema's name) drops the control schema and the version row. It holds no ledger data, so no ledger data changes either way. As with v8 and v9, a v9
 application refuses a v10 database and the reverse; rehearse on a throwaway stack before the live migration.
 
 ## Token and verification
 
 `jlk_<key_id>_<secret>`: `key_id` is 16 hex characters, **public** (it is the lookup handle, so verification is one indexed read and an unknown id reveals nothing); `secret` is 256 bits from the OS CSPRNG
-(43 URL-safe characters). The database never holds the token or the secret, only `HMAC-SHA256(pepper, secret)`. The pepper is at least 32 bytes and comes from `JARVIS_KEY_PEPPER_FILE` (first line) or
-`JARVIS_KEY_PEPPER`; there is no default, and it is never in the database, so a stolen database alone cannot verify a guess.
+(43 URL-safe characters). The database never holds the token or the secret, only `HMAC-SHA256(pepper, "jlk1" 0x00 key_id 0x00 secret)`: the hash covers the key id as well as the secret, so a stored hash cannot be moved to another key's row. The pepper is at least 32 bytes and comes from `JARVIS_KEY_PEPPER_FILE` (first line) or
+`JARVIS_KEY_PEPPER`; there is no default (a pepper file that is readable by group or others is refused), and it is never in the database, so a stolen database alone cannot verify a guess.
 
 `tenant_keys.resolve(conn, control, token, pepper)` returns a `ResolvedKey` (key id, tenant key, scopes, the tenant's status) or `None`. **Every failure is the same `None`**: malformed, unknown id, wrong
 secret, wrong pepper, revoked, expired. The HMAC comparison is made even when the id is unknown or the token is malformed, so an unknown id costs the same as a wrong secret. A valid key of a tenant that is
