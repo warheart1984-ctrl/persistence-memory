@@ -23,7 +23,7 @@ and entering `deleting` or `deleted` revokes every key of the tenant; a second t
 revoke its keys. The ledger schema may be up to 63 characters: past 55 the control schema name is shortened deterministically (a prefix, a hash of the whole name, then `_control`) so it never exceeds PostgreSQL's limit
 and two different long schemas never share one.
 
-Rollback: `V10_ROLLBACK` (with `__CONTROL__` replaced by the control schema's name) drops the control schema and the version row. It holds no ledger data, so no ledger data changes either way. As with v8 and v9, a v9
+Rollback: `pg_schema.v10_rollback_sql(schema)` (`V10_ROLLBACK` with the control schema's name, quoted as v10 created it) drops the control schema and the version row. It holds no ledger data, so no ledger data changes either way. As with v8 and v9, a v9
 application refuses a v10 database and the reverse; rehearse on a throwaway stack before the live migration.
 
 ## Token and verification

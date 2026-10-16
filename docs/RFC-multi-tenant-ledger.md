@@ -376,6 +376,35 @@ epoch as a Merkle root, items 1, 6, 10 and 11; deletion against retained backups
     altered**, and a **deleted tenant's bundle replayed** must be **rejected before any row changes** (and the attempt recorded); an **epoch or event sequence rolled back by a restore** is rejected unless a matching
     recorded event explains it. Detection after the fact does not pass the gate for the rejected cases.
 
+### From two open-source gateway studies (2026-10-16)
+
+Studies of `Shcherbin96/mcp-gateway` (tenant-scoped approvals and an append-only audit, with isolation by hand-written query filters) and `abwaters/mcp-zero` (user and group policy, fail-closed masking, payload-free audit; no tenant
+concept at all) confirmed the direction and added three requirements. Both are repository claims plus their own test runs, not something verified on this system.
+
+16. **Every process-level cache and limiter is keyed by the full security scope (sections 4 and 8).** mcp-zero's fix was to key pooled transports and token caches by the authenticated subject. Audit of this
+    codebase (2026-10-16): the embedding caches (`app/amul_rag.py` `_EMBED_CACHE`, `app/emr_embed.py`) map content to a vector and are only read for records the caller was already given, so they do not cross tenants;
+    neither has a size bound. The rule going forward: a new cache that can return anything derived from stored data must include the tenant key in its key, and a Red Team test must show two tenants storing the
+    same text do not see each other's cache effect.
+17. **Rate limiting is per credential, not per address (section 3).** `McpRateLimiter` (`app/public_security.py`) keys on the client address, only on public deployments and only on `/mcp`, is process-local, and never evicts a
+    bucket. Behind a proxy that hides the client address, tenants share one bucket. Phase 1: key by the authenticated principal (tenant key plus credential id) when there is one, fall back to the address when there
+    is not, and evict idle buckets. An availability gap, not an isolation one.
+    From `skunkworks-powerweave/mcp-multitenant-gateway` (third study, 2026-10-16): its limiter is keyed by the bearer key prefix and runs *before* verification, so brute-force guessing of one key is throttled too,
+    and **it refuses to start with more than one worker unless a shared limiter backend is declared**, so a process-local limit cannot silently multiply per replica. Adopt both: throttle by the public `key_id`
+    before the HMAC check, and make the process-local limiter a startup refusal when more than one worker or replica is configured without a shared backend.
+18. **Decision transitions are conditional and carry the tenant (section 4).** mcp-gateway decides an approval with `WHERE id = $1 AND status = 'pending' AND tenant_id = $2`, so a decision is idempotent and a guessed id
+    from another tenant matches nothing. Our human-decision and draft/verified paths already run under forced row-level security; add an explicit test that a foreign tenant's decision on a guessed id changes nothing
+    and a repeated decision is a no-op.
+
+19. **A forged tenant field never widens scope (section 8, attack class 11).** The third study's whole isolation rule is that the authenticated tenant overrides any client-supplied `tenant_id`. We go further: no
+    route or tool takes a tenant from the request at all (the tenant is `Principal.tenant_key`, from the key row or the OAuth identity). Nothing yet *pins* that. Add to the matrix, for every case and for both
+    OAuth and key tenants, a variant that sends `tenant_id`, `_tenant_id` and `tenant_key` naming another tenant in the body, the query string and a header; the response must be byte-identical to the request without
+    them (ignored, or rejected the same way for everybody), and a route that starts reading such a field fails the test.
+20. **Candidate, not scheduled: idempotency keys on writes.** A retried `remember` (a timeout, a client retry) can store a duplicate draft. An optional caller-supplied idempotency key, scoped to the tenant and
+    credential, would make a retry return the first result. This is a feature, not an isolation fix; record it, decide later.
+
+Also noted from mcp-gateway: its role lookup joined on the agent id without asserting the tenant, relying on globally unique ids and the issuer. Our key resolution takes the tenant from the control-schema row of
+the presented key and never from a request value, which is the stronger rule both studies recommend.
+
 ### Exit criteria (section 9)
 
 1 (Red Team), 3, 4 and 5 are open. 6 is met (matrix in CI, fail-closed on unregistered routes). **2 is only partly met** and stays open: in strict mode the app refuses to start with the

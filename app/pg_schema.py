@@ -920,7 +920,8 @@ $fn$;
 CREATE TRIGGER tenants_lifecycle BEFORE UPDATE ON __CONTROL__.tenants FOR EACH ROW EXECUTE FUNCTION __CONTROL__.tenant_lifecycle_guard();
 CREATE FUNCTION __CONTROL__.key_for_live_tenant_only() RETURNS trigger LANGUAGE plpgsql SET search_path = __CONTROL__, pg_temp AS $fn$
 BEGIN
-    IF (SELECT status FROM tenants WHERE tenant_key = NEW.tenant_key) IN ('deleting', 'deleted') THEN
+    -- FOR SHARE: a concurrent transition to deleting/deleted waits for this insert to commit (and then revokes the new key); one that got there first is seen here. No window in between.
+    IF (SELECT status FROM tenants WHERE tenant_key = NEW.tenant_key FOR SHARE) IN ('deleting', 'deleted') THEN
         RAISE EXCEPTION 'no key can be issued for a deleting or deleted tenant' USING ERRCODE = 'check_violation';
     END IF;
     RETURN NEW;
@@ -934,8 +935,16 @@ REVOKE ALL ON FUNCTION __CONTROL__.touch_key_last_used(text) FROM PUBLIC;
 # Rolling V10 back removes only what V10 added (run as the migration role, inside one transaction). The control schema holds no ledger data.
 V10_ROLLBACK = """
 DROP SCHEMA IF EXISTS __CONTROL__ CASCADE;
-DELETE FROM schema_version WHERE version = 10;
+DELETE FROM __LEDGER__.schema_version WHERE version = 10;
 """
+
+def v10_rollback_sql(schema: str) -> str:
+    """V10_ROLLBACK for a ledger schema, with the control schema's name QUOTED (a mixed-case or unusual name is a quoted identifier, as v10 created it)."""
+    def quote(name: str) -> str:
+        return '"' + name.replace('"', '""') + '"'
+
+    return V10_ROLLBACK.replace("__CONTROL__", quote(control_schema_name(schema))).replace("__LEDGER__", quote(validate_schema_name(schema)))
+
 
 MIGRATIONS: list[tuple[int, str]] = [(1, _V1), (2, _V2), (3, _V3), (4, _V4), (5, _V5), (6, _V6), (7, _V7), (8, _V8), (9, _V9), (10, _V10)]
 EXPECTED_SCHEMA_VERSION = MIGRATIONS[-1][0]

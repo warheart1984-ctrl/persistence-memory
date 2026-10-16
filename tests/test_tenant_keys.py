@@ -15,7 +15,7 @@ import pytest
 from psycopg.rows import dict_row
 
 from app import pg_store, tenant_keys
-from app.pg_schema import V10_ROLLBACK, control_schema_name, migrate
+from app.pg_schema import control_schema_name, migrate, v10_rollback_sql
 
 pg_only = pytest.mark.postgres
 PEPPER = b"unit-test-pepper-0123456789-0123456789"
@@ -272,7 +272,7 @@ def test_v10_rolls_back_cleanly_and_forward_again_and_changes_no_ledger_data(pg_
     control = control_schema_name(pg_schema.schema)
     assert migrate(pg_schema.admin_dsn, schema=pg_schema.schema, app_role="jarvis_app_test") == 10
     with psycopg.connect(pg_schema.admin_dsn, options=f"-c search_path={pg_schema.schema}") as conn:
-        conn.execute(V10_ROLLBACK.replace("__CONTROL__", control))
+        conn.execute(v10_rollback_sql(pg_schema.schema))
     with pg_schema.admin_conn() as conn:
         assert conn.execute("SELECT max(version) FROM schema_version").fetchone()[0] == 9
         assert conn.execute("SELECT to_regnamespace(%s) IS NULL", (control,)).fetchone()[0]
@@ -403,9 +403,138 @@ def test_v10_rollback_and_forward_again_with_real_ledger_data_changes_no_ledger_
     before = checksums()
     assert all(before.values())
     with psycopg.connect(pg_schema.admin_dsn, options=f"-c search_path={pg_schema.schema}") as conn:
-        conn.execute(V10_ROLLBACK.replace("__CONTROL__", control))
+        conn.execute(v10_rollback_sql(pg_schema.schema))
     assert checksums() == before
     assert migrate(pg_schema.admin_dsn, schema=pg_schema.schema, app_role="jarvis_app_test") == 10
     assert checksums() == before
     with pg_schema.admin_conn() as conn:
         assert conn.execute("SELECT count(*) FROM memories WHERE tenant_key = %s", (tenant,)).fetchone()[0] == 3     # the key tenant's rows survived (unreachable without v10, intact)
+
+
+# ----------------------------------------------------------------------------------------------------- review findings (Codex, round 2 on #107)
+@pg_only
+def test_issuing_a_key_and_deleting_the_tenant_cannot_race_either_way_round(pg):
+    """The trigger reads the tenant's status FOR SHARE: a concurrent transition to deleting waits for an uncommitted insert (and then revokes that key), and an insert waits for an uncommitted
+    transition (and then sees it). Neither order can leave an active key on a deleting tenant."""
+    import threading
+
+    ident = psycopg.sql.Identifier(pg.control)
+    tenant, _ = _issue(pg)
+    open_conns = []
+
+    def conn(autocommit=False):
+        c = psycopg.connect(pg.admin_dsn, autocommit=autocommit, row_factory=dict_row, options="-c lock_timeout=20000")
+        open_conns.append(c)
+        return c
+
+    try:
+        # order 1: the transition holds the row; the insert must wait, then be refused
+        deleting = conn()
+        deleting.execute(psycopg.sql.SQL("UPDATE {}.tenants SET status = 'deleting' WHERE tenant_key = %s").format(ident), (tenant,))      # uncommitted
+        outcome = {}
+
+        def insert_while_deleting():
+            c = conn(autocommit=True)
+            try:
+                tenant_keys.create_key(c, pg.control, tenant, PEPPER)
+                outcome["insert"] = "issued"
+            except psycopg.errors.CheckViolation:
+                outcome["insert"] = "refused"
+
+        t = threading.Thread(target=insert_while_deleting)
+        t.start()
+        t.join(timeout=1.0)
+        still_waiting = t.is_alive()
+        deleting.commit()
+        t.join(timeout=25)
+        assert still_waiting, "the insert should be waiting for the uncommitted transition"
+        assert outcome["insert"] == "refused"
+        # order 2: the insert holds the share lock; the transition must wait, then revoke the new key
+        tenant2, _ = _issue(pg)
+        inserting = conn()
+        new_token = tenant_keys.create_key(inserting, pg.control, tenant2, PEPPER)                                                           # uncommitted
+
+        def delete_while_inserting():
+            tenant_keys.set_tenant_status(conn(autocommit=True), pg.control, tenant2, "deleting")
+
+        t2 = threading.Thread(target=delete_while_inserting)
+        t2.start()
+        t2.join(timeout=1.0)
+        still_waiting = t2.is_alive()
+        inserting.commit()
+        t2.join(timeout=25)
+        assert still_waiting, "the transition should be waiting for the uncommitted insert"
+        with _app(pg) as c:
+            assert tenant_keys.resolve(c, pg.control, new_token, PEPPER) is None                                                         # the key that raced in was revoked
+    finally:
+        for c in open_conns:                                                                                                              # never leave a transaction open: it would block the fixture's teardown
+            try:
+                c.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+            c.close()
+
+
+@pg_only
+def test_an_explicit_zero_day_expiry_expires_now_and_a_negative_one_is_refused(pg, monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("JARVIS_DATABASE_MIGRATE_URL", pg.admin_dsn)
+    monkeypatch.setenv("JARVIS_DATABASE_SCHEMA", pg.schema)
+    monkeypatch.setenv("JARVIS_KEY_PEPPER", PEPPER.decode())
+    assert tenant_keys.main(["create-tenant"]) == 0
+    tenant = capsys.readouterr().out.strip()
+    f = tmp_path / "t0"
+    assert tenant_keys.main(["create-key", "--tenant", tenant, "--expires-days", "0", "--token-file", str(f)]) == 0
+    with _app(pg) as c, _admin(pg) as a:
+        assert tenant_keys.list_keys(a, pg.control, tenant)[0]["expires_at"] is not None          # 0 is an expiry (now), not "never"
+        assert tenant_keys.resolve(c, pg.control, f.read_text().strip(), PEPPER) is None
+    assert tenant_keys.main(["create-key", "--tenant", tenant, "--expires-days", "-1", "--token-file", str(tmp_path / "t1")]) == 1
+    assert tenant_keys.main(["create-key", "--tenant", tenant, "--token-file", str(tmp_path / "t2")]) == 0
+    with _admin(pg) as a:
+        assert any(k["expires_at"] is None for k in tenant_keys.list_keys(a, pg.control, tenant))   # omitting it still means no expiry
+
+
+@pg_only
+def test_setting_deleted_again_keeps_the_first_deletion_timestamp(pg):
+    tenant, _ = _issue(pg)
+    with _admin(pg) as a:
+        tenant_keys.set_tenant_status(a, pg.control, tenant, "deleted")
+        first = tenant_keys.list_tenants(a, pg.control)[0]["deleted_at"]
+        assert first is not None
+        tenant_keys.set_tenant_status(a, pg.control, tenant, "deleted")
+        assert tenant_keys.list_tenants(a, pg.control)[0]["deleted_at"] == first
+
+
+@pytest.mark.postgres
+def test_v10_and_its_rollback_work_for_a_mixed_case_ledger_schema(pg_server):
+    """validate_schema_name allows uppercase; v10 creates the control schema as a quoted identifier, so the rollback must quote it too."""
+    admin_dsn, _ = pg_server
+    schema = "Ledger_MixedCase"
+    with psycopg.connect(admin_dsn, autocommit=True) as conn:
+        conn.execute(psycopg.sql.SQL("CREATE SCHEMA {}").format(psycopg.sql.Identifier(schema)))
+    try:
+        assert migrate(admin_dsn, schema=schema, app_role="jarvis_app_test") == 10
+        with psycopg.connect(admin_dsn, autocommit=True) as conn:
+            assert conn.execute("SELECT count(*) FROM pg_namespace WHERE nspname = 'Ledger_MixedCase_control'").fetchone()[0] == 1
+        with psycopg.connect(admin_dsn) as conn:                                                      # (one transaction; the mixed-case schema is a quoted identifier)
+            conn.execute(psycopg.sql.SQL("SET LOCAL search_path TO {}").format(psycopg.sql.Identifier(schema)))
+            conn.execute(v10_rollback_sql(schema))
+        with psycopg.connect(admin_dsn, autocommit=True) as conn:
+            assert conn.execute("SELECT count(*) FROM pg_namespace WHERE nspname = 'Ledger_MixedCase_control'").fetchone()[0] == 0
+            assert conn.execute(psycopg.sql.SQL("SELECT max(version) FROM {}.schema_version").format(psycopg.sql.Identifier(schema))).fetchone()[0] == 9
+    finally:
+        with psycopg.connect(admin_dsn, autocommit=True) as conn:
+            conn.execute(psycopg.sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(psycopg.sql.Identifier(schema)))
+            conn.execute(psycopg.sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(psycopg.sql.Identifier(control_schema_name(schema))))
+
+
+@pg_only
+def test_v10_rollback_sql_is_self_contained_and_ignores_the_callers_search_path(pg_schema):
+    """Codex round 3 on #110: schema_version must be qualified with the ledger schema, so a caller whose search_path points elsewhere still rolls back the right ledger (or fails), never another one."""
+    assert migrate(pg_schema.admin_dsn, schema=pg_schema.schema, app_role="jarvis_app_test") == 10
+    sql = v10_rollback_sql(pg_schema.schema)
+    assert f'"{pg_schema.schema}".schema_version' in sql
+    with psycopg.connect(pg_schema.admin_dsn, options="-c search_path=public") as conn:
+        conn.execute(sql)
+    with pg_schema.admin_conn() as conn:
+        assert conn.execute("SELECT max(version) FROM schema_version").fetchone()[0] == 9
+    assert migrate(pg_schema.admin_dsn, schema=pg_schema.schema, app_role="jarvis_app_test") == 10

@@ -163,6 +163,7 @@ def test_a_restored_copy_replays_to_the_identical_state(pg, store):
         finally:
             pg_store.close_pools()
             conn.execute('DROP SCHEMA "restored" CASCADE')
+            conn.execute('DROP SCHEMA IF EXISTS "restored_control" CASCADE')      # v10's control schema twin: left behind it would break the next run on the same server
 
 
 def test_deleted_records_are_not_in_the_state_and_are_counted(pg, store):

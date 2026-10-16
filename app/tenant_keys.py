@@ -149,7 +149,7 @@ def set_tenant_status(conn: psycopg.Connection, control: str, tenant_key: str, s
     if current is not None and (current["status"] if isinstance(current, dict) else current[0]) == "deleted" and status != "deleted":
         raise ValueError("a deleted tenant cannot be reactivated")          # (the database refuses it too: tenants_lifecycle trigger)
     cur = conn.execute(
-        sql.SQL("UPDATE {}.tenants SET status = %s, deleted_at = CASE WHEN %s = 'deleted' THEN now() ELSE deleted_at END WHERE tenant_key = %s").format(sql.Identifier(control)),
+        sql.SQL("UPDATE {}.tenants SET status = %s, deleted_at = CASE WHEN %s = 'deleted' THEN coalesce(deleted_at, now()) ELSE deleted_at END WHERE tenant_key = %s").format(sql.Identifier(control)),
         (status, status, tenant_key))
     return cur.rowcount == 1
 
@@ -204,7 +204,9 @@ def main(argv: list[str] | None = None) -> int:
                 print(create_tenant(conn, control, args.label))
             elif args.cmd == "create-key":
                 scopes = tuple(s.strip() for s in args.scopes.split(",") if s.strip())
-                expires = datetime.now(timezone.utc) + timedelta(days=args.expires_days) if args.expires_days else None
+                if args.expires_days is not None and args.expires_days < 0:
+                    raise ValueError("--expires-days cannot be negative")
+                expires = datetime.now(timezone.utc) + timedelta(days=args.expires_days) if args.expires_days is not None else None      # 0 means "expires now", not "never"
                 token = create_key(conn, control, args.tenant, pepper(), label=args.label, scopes=scopes, expires_at=expires)
                 if args.token_file:
                     fd = os.open(args.token_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
