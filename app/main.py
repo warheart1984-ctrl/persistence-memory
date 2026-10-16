@@ -104,7 +104,7 @@ from app.auth import (
     nx_allowed_roots,
 )
 from app.identity import current_tenant_key, multi_tenant_mode, request_tenant, system_scope
-from app import call_log, drift, pg_store
+from app import call_log, drift, key_auth, pg_store
 from app.call_witness import CallWitnessMiddleware
 from app.oauth import protected_resource_metadata
 from app.public_security import cors_origins, public_security_middleware
@@ -142,6 +142,9 @@ async def lifespan(app: FastAPI):
     """Application lifespan: track and cleanup background nx-search processes."""
     # Store for background processes
     assert_multi_tenant_config()  # JARVIS_MULTI_TENANT: refuse to start with a configuration that could fail open
+    if key_auth.key_tenants_enabled():
+        key_auth.assert_config()  # JARVIS_KEY_TENANTS: needs the row store and a strong pepper
+        pg_store.assert_key_auth_ready()  # ... and the control schema, reachable by the application role through the two lookup functions
     if multi_tenant_mode():
         pg_store.assert_tenant_isolation_ready()  # ... and with a database that cannot be shown to isolate tenants (schema, role, forced RLS on every tenant table)
     app.state.nx_background = {"watch": None, "serve": None}
