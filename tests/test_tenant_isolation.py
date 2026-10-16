@@ -221,8 +221,18 @@ def client(monkeypatch):
         yield c
 
 
+class OAuthBearers:
+    """How the matrix says who is calling: an OAuth bearer whose subject is the name. tests/test_tenant_isolation_keys.py swaps this for per-tenant API keys and re-runs every case."""
+
+    def header(self, who: str) -> dict[str, str]:
+        return {"Authorization": f"Bearer {who}"}
+
+
+AUTH = OAuthBearers()
+
+
 def h(who: str) -> dict[str, str]:
-    return {"Authorization": f"Bearer {who}"}
+    return AUTH.header(who)
 
 
 def mk(client, who, content, **extra):
@@ -321,10 +331,19 @@ def test_operator_only_routes_deny_every_tenant(client):
     assert not failures, "operator-only routes answered a tenant:\n" + "\n".join(failures)
 
 
+# Named exceptions for a deployment whose primary credential is the shared key rather than OAuth (tests/test_tenant_isolation_keys.py sets them): routes that answer a request with no
+# credential but carry no ledger data (a 405 for GET /mcp, ending an MCP session, the tool catalog, the RAG routes failing closed with 503 when no RAG key is configured). Empty for OAuth, where
+# the identity middleware refuses every /mcp and /api/jarvis request that has no token.
+NO_CREDENTIAL_OK: dict[tuple[str, str], int] = {}
+PUBLIC_NEEDS_THE_SHARED_KEY: set[tuple[str, str]] = set()      # public pages that the shared-key middleware still gates (the Swagger OAuth redirect page)
+
+
 def test_a_request_with_no_credential_is_refused_everywhere_that_is_not_public(client):
     failures = []
     for method, path in NON_PUBLIC_ROWS:
         r = client.request(method, _concrete(path), json=_body_for(method))
+        if NO_CREDENTIAL_OK.get((method, path)) == r.status_code and MARK not in r.text:
+            continue
         if r.status_code not in (401, 403) or MARK in r.text:
             failures.append(f"{method} {path}: {r.status_code} {r.text[:120]}")
     assert not failures, "answered with no credential:\n" + "\n".join(failures)
@@ -335,6 +354,8 @@ def test_public_routes_carry_nothing_of_a_tenants(client, world):
     for method, path in PUBLIC_ROWS:
         for headers in ({}, h("bob"), h("alice")):
             r = client.request(method, path, headers=headers)
+            if (method, path) in PUBLIC_NEEDS_THE_SHARED_KEY and r.status_code == 401 and MARK not in r.text:
+                continue
             if r.status_code != 200 or MARK in r.text or "mem-" in r.text:
                 failures.append(f"{method} {path}: {r.status_code}")
     assert not failures, "\n".join(failures)
