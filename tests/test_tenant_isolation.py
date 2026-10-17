@@ -754,13 +754,36 @@ FORGED_FIELDS = ("tenant_id", "_tenant_id", "tenant_key", "tenant", "jarvis.tena
 FORGED_HEADERS = ("X-Tenant-Id", "X-Tenant-Key", "X-Jarvis-Tenant", "X-Jarvis-Tenant-Key")
 
 
-def _forged(client, who, method, path, body, victims):
-    """Send the request as `who`, with every tenant-naming field the server might conceivably read, set to `victims`, in the body, the query string and the headers."""
+TRANSPORTS = ("body", "query", "headers")
+OPERATOR_MARK = "operator-owned-marker-kestrel-91d2"
+
+
+def _forged(client, who, method, path, body, victims, transport):
+    """Send the request as `who` with every tenant-naming field set to the victim, through ONE transport only. Separate requests per transport mean a body that a strict route rejects (422 for any
+    unknown field) cannot hide a query string or a header that the route would honour."""
     value = victims[0]
-    headers = {**h(who), **{k: value for k in FORGED_HEADERS}}
-    params = {k: value for k in FORGED_FIELDS}
-    payload = {**body, **{k: value for k in FORGED_FIELDS}} if isinstance(body, dict) else body
+    headers, params, payload = h(who), {}, body
+    if transport == "headers":
+        headers = {**headers, **{k: value for k in FORGED_HEADERS}}
+    elif transport == "query":
+        params = {k: value for k in FORGED_FIELDS}
+    elif isinstance(body, dict):
+        payload = {**body, **{k: value for k in FORGED_FIELDS}}
     return client.request(method, path, headers=headers, params=params, json=payload)
+
+
+def _seed_operator_state():
+    """Recognizable operator-owned data, so that a forged `operator` selector that DID switch the namespace would show it (an empty operator namespace looks like a nonexistent decoy)."""
+    from app.identity import operator_principal, reset_principal, set_principal
+    from app.models import EvidenceLink, MemoryCreate
+    from app.store import get_store
+
+    token = set_principal(operator_principal())
+    try:
+        get_store().create_memory(MemoryCreate(content=f"operator private note {OPERATOR_MARK} {SEARCH}", source_agent="op", session_id="s", type="fact",
+                                               evidence=[EvidenceLink(kind="doc", ref="x", note="y")]))
+    finally:
+        reset_principal(token)
 
 
 def test_a_forged_tenant_field_never_widens_scope(client, world):
@@ -768,32 +791,36 @@ def test_a_forged_tenant_field_never_widens_scope(client, world):
     string and four headers) and the response must be exactly what he gets naming a tenant that does not exist: naming alice buys him nothing, and nothing of alice's changes."""
     victims = getattr(AUTH, "aliases", lambda who: [who])("alice")
     decoys = ["nobody-" + v for v in victims]
+    _seed_operator_state()
     cases = {**{f"list:{k}": v for k, v in LIST_CASES.items()}, **{f"mutation:{k}": v for k, v in MUTATION_CASES.items()},
              **{f"id:{k}": v for k, v in id_cases(world["first"], world["artifact"]).items()}}
     before = _alice_state(client, world)
     failures = []
     checked = 0
     for victim, decoy in zip(victims, decoys):
-        for case, (method, path, body) in sorted(cases.items()):
-            if case.removeprefix("id:") in POSTGRES_ONLY and not ON_POSTGRES:
-                continue
-            tag = re.sub(r"\W", "", f"{case}{victim}")[:40]          # two brand-new tenants with identical (empty) state, so the only difference is the name each one forges
-            named = _forged(client, f"fa-{tag}", method, path, body, [victim])
-            blind = _forged(client, f"fb-{tag}", method, path, body, [decoy])
-            checked += 1
-            def same(resp, name):          # `name` is the victim alias; the decoy is "nobody-" + it; a 422 echoes the caller's own forged value (his input, not a leak)
-                text = norm(resp, world["first"], world["second"], world["third"], world["working"], world["artifact"])[1].replace("nobody-" + name, "<NAME>").replace(name, "<NAME>")
-                text = re.sub(r"mem-[0-9a-f]{12}", "<ID>", text)          # a write that succeeds mints ids and clocks of its own, wherever the response nests them
-                return resp.status_code, re.sub(r"\d{4}-\d\d-\d\dT[\d:.]+\+00:00", "<TS>", text)
+        for transport in TRANSPORTS:
+            for case, (method, path, body) in sorted(cases.items()):
+                if case.removeprefix("id:") in POSTGRES_ONLY and not ON_POSTGRES:
+                    continue
+                tag = re.sub(r"\W", "", f"{case}{victim}{transport}")[:40]          # two brand-new tenants with identical (empty) state, so the only difference is the name each one forges
+                named = _forged(client, f"fa-{tag}", method, path, body, [victim], transport)
+                blind = _forged(client, f"fb-{tag}", method, path, body, [decoy], transport)
+                checked += 1
 
-            if same(named, victim) != same(blind, victim):
-                a, b = same(named, victim), same(blind, victim)
-                at = next((k for k, (x, y) in enumerate(zip(a[1], b[1])) if x != y), 0)
-                failures.append(f"{case} naming {victim!r}: {a[0]} != {b[0]} (naming nobody); first difference: ...{a[1][max(0, at - 80):at + 80]!r} vs ...{b[1][max(0, at - 80):at + 80]!r}")
-            if MARK in named.text:
-                failures.append(f"{case} naming {victim!r}: alice's text appeared")
-            if _alice_state(client, world) != before:
-                failures.append(f"{case} naming {victim!r}: changed alice's state")
-                before = _alice_state(client, world)
-    assert checked >= 2 * 25, f"the forged-field sweep covered only {checked} requests"
+                def same(resp, name):          # `name` is the victim alias; the decoy is "nobody-" + it; a 422 echoes the caller's own forged value (his input, not a leak)
+                    text = norm(resp, world["first"], world["second"], world["third"], world["working"], world["artifact"])[1].replace("nobody-" + name, "<NAME>").replace(name, "<NAME>")
+                    text = re.sub(r"mem-[0-9a-f]{12}", "<ID>", text)          # a write that succeeds mints ids and clocks of its own, wherever the response nests them
+                    return resp.status_code, re.sub(r"\d{4}-\d\d-\d\dT[\d:.]+\+00:00", "<TS>", text)
+
+                if same(named, victim) != same(blind, victim):
+                    a, b = same(named, victim), same(blind, victim)
+                    at = next((k for k, (x, y) in enumerate(zip(a[1], b[1])) if x != y), 0)
+                    failures.append(f"{transport}:{case} naming {victim!r}: {a[0]} != {b[0]} (naming nobody); first difference: ...{a[1][max(0, at - 80):at + 80]!r} vs ...{b[1][max(0, at - 80):at + 80]!r}")
+                for mark in (MARK, OPERATOR_MARK):
+                    if mark in named.text:
+                        failures.append(f"{transport}:{case} naming {victim!r}: {'alice' if mark == MARK else 'the operator'}'s text appeared")
+                if _alice_state(client, world) != before:
+                    failures.append(f"{transport}:{case} naming {victim!r}: changed alice's state")
+                    before = _alice_state(client, world)
+    assert checked >= 3 * 2 * 25, f"the forged-field sweep covered only {checked} requests"
     assert not failures, "\n".join(failures)
