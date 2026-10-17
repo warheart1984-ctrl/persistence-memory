@@ -28,14 +28,19 @@ class KeyTenants:
     """h(who) -> that name's own API key, minted on first use (a fresh tenant each, so `carol-who-never-wrote` really is a tenant with nothing)."""
 
     def __init__(self, admin_dsn: str, control: str):
-        self.admin_dsn, self.control, self.tokens = admin_dsn, control, {}
+        self.admin_dsn, self.control, self.tokens, self.tenants = admin_dsn, control, {}, {}
 
     def header(self, who: str) -> dict[str, str]:
         if who not in self.tokens:
             with psycopg.connect(self.admin_dsn, autocommit=True, row_factory=dict_row) as c:
                 tenant = tenant_keys.create_tenant(c, self.control, who)
+                self.tenants[who] = tenant
                 self.tokens[who] = tenant_keys.create_key(c, self.control, tenant, PEPPER.encode(), label=who)
         return {"Authorization": f"Bearer {self.tokens[who]}"}
+
+    def aliases(self, who: str) -> list[str]:
+        self.header(who)
+        return [self.tenants[who], who, "operator"]
 
 
 @pytest.fixture
