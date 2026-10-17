@@ -51,27 +51,47 @@ class McpRateLimiter:
             window.append(now)
             return True
 
-    def blocked(self, subject: str, limit: int) -> bool:
-        """Is `subject` already at `limit` in the current window? (Does not count this call.)"""
+    def reserve(self, subject: str, limit: int) -> float | None:
+        """Atomically count one in-flight attempt against `subject` unless it is already at `limit`. The caller `release`s it if the attempt turns out not to be a failure. Counting BEFORE the
+        expensive work means a burst of concurrent attempts cannot all pass a check made against an empty bucket. Buckets at their limit are never evicted to make room (that would reset
+        the throttle); when the table is full of such buckets a new subject is refused instead. Returns the reservation (its timestamp) for `release`, or None when refused."""
         now = time.monotonic()
         with self._lock:
-            window = self._requests.get(subject)
-            if window is None:
-                return False
+            self._protect_at = limit
+            if len(self._requests) >= self.MAX_BUCKETS and subject not in self._requests:
+                self._evict(now)
+                if len(self._requests) >= self.MAX_BUCKETS:
+                    return None
+            window = self._requests[subject]
             while window and now - window[0] >= self._window:
                 window.popleft()
-            return len(window) >= limit
+            if len(window) >= limit:
+                return None
+            window.append(now)
+            return now
+
+    def release(self, subject: str, reservation: float) -> None:
+        """Remove THIS reservation, not the newest one: overlapping attempts finish in any order, and a finished success must not erase another attempt's failed guess."""
+        with self._lock:
+            window = self._requests.get(subject)
+            if window:
+                try:
+                    window.remove(reservation)
+                except ValueError:
+                    pass                                                   # already aged out of the window
 
     def _evict(self, now: float) -> None:
         for key in [k for k, w in self._requests.items() if not w or now - w[-1] >= self._window]:
             del self._requests[key]
-        if len(self._requests) >= self.MAX_BUCKETS:             # every bucket is live: drop the oldest-touched half rather than refuse to track anyone new
-            for key, _ in sorted(self._requests.items(), key=lambda kv: kv[1][-1])[: self.MAX_BUCKETS // 2]:
+        if len(self._requests) >= self.MAX_BUCKETS:             # every bucket is live: drop the oldest-touched half, but never one that is at its limit (a throttle must survive a flood of other subjects)
+            keep_at = getattr(self, "_protect_at", None)
+            droppable = [(k, w) for k, w in self._requests.items() if keep_at is None or len(w) < keep_at]
+            for key, _ in sorted(droppable, key=lambda kv: kv[1][-1])[: self.MAX_BUCKETS // 2]:
                 del self._requests[key]
 
 
 mcp_rate_limiter = McpRateLimiter()
-key_failure_limiter = McpRateLimiter()          # failed tenant-key attempts, keyed (client address, key id); see key_auth.attempts_blocked
+key_failure_limiter = McpRateLimiter()          # failed tenant-key attempts, keyed (client address, key id); see key_auth.reserve_attempt
 
 
 def rate_limit_subject(request: Request) -> str:

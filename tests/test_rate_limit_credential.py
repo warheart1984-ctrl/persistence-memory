@@ -95,3 +95,67 @@ def test_more_than_one_worker_is_a_startup_refusal_unless_a_shared_limiter_is_de
         public_security.assert_config()
     monkeypatch.setenv("JARVIS_RATE_LIMIT_SHARED_BACKEND", "edge-waf")
     assert config_problems() == []
+
+
+def test_a_burst_of_concurrent_attempts_cannot_all_pass_a_check_made_against_an_empty_bucket():
+    """Codex on #112: the attempt is counted BEFORE the expensive verification, atomically, so at most `limit` of a concurrent burst are admitted."""
+    import threading
+
+    lim = McpRateLimiter()
+    admitted, gate = [], threading.Barrier(40)
+
+    def attempt():
+        gate.wait()
+        admitted.append(lim.reserve("keyfail:1.2.3.4:abc", 5) is not None)
+
+    threads = [threading.Thread(target=attempt) for _ in range(40)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert sum(admitted) == 5
+
+
+def test_a_released_reservation_is_not_counted_as_a_failure():
+    lim = McpRateLimiter()
+    for _ in range(50):
+        lim.release("s", lim.reserve("s", 3))                                                   # a successful credential, or an outage: never a wrong guess
+    assert [lim.reserve("s", 3) is not None for _ in range(4)] == [True, True, True, False]
+
+
+def test_a_throttled_bucket_survives_a_flood_of_other_subjects_and_new_ones_are_refused_when_full():
+    """Codex on #112: 10,000 distinct key ids must not evict the throttled target and reset its count."""
+    lim = McpRateLimiter()
+    lim.MAX_BUCKETS = 100
+    for _ in range(3):
+        assert lim.reserve("target", 3) is not None
+    assert lim.reserve("target", 3) is None                                # at its limit
+    for i in range(1000):
+        lim.reserve(f"junk-{i}", 3)                                        # the flood; each junk id has a single failed guess
+    assert lim.reserve("target", 3) is None, "the flood evicted the throttled bucket"
+    # and when every bucket is at its limit, a brand-new subject is refused rather than evicting one
+    full = McpRateLimiter()
+    full.MAX_BUCKETS = 5
+    for i in range(5):
+        for _ in range(3):
+            full.reserve(f"b{i}", 3)
+    assert full.reserve("new", 3) is None
+    assert full.reserve("b0", 3) is None
+
+
+def test_releasing_a_success_removes_its_own_reservation_not_a_newer_failures():
+    """Codex on #112 (round 2): attempts overlap and finish in any order. An old valid request finishing after a newer invalid one must leave the invalid one counted, at ITS time."""
+    import app.public_security as ps
+
+    clock = [100.0]
+    real = ps.time.monotonic
+    ps.time.monotonic = lambda: clock[0]
+    try:
+        lim = McpRateLimiter(window=60)
+        old_valid = lim.reserve("s", 2)
+        clock[0] = 150.0
+        newer_invalid = lim.reserve("s", 2)                                 # stays counted: it was a wrong guess
+        lim.release("s", old_valid)                                         # the older, valid one finishes last
+        assert list(lim._requests["s"]) == [newer_invalid]
+        clock[0] = 170.0                                                    # 70s after the old one, 20s after the failure: the failure must still count
+        assert lim.reserve("s", 2) is not None and lim.reserve("s", 2) is None
+    finally:
+        ps.time.monotonic = real
