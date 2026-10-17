@@ -51,30 +51,34 @@ class McpRateLimiter:
             window.append(now)
             return True
 
-    def reserve(self, subject: str, limit: int) -> bool:
+    def reserve(self, subject: str, limit: int) -> float | None:
         """Atomically count one in-flight attempt against `subject` unless it is already at `limit`. The caller `release`s it if the attempt turns out not to be a failure. Counting BEFORE the
         expensive work means a burst of concurrent attempts cannot all pass a check made against an empty bucket. Buckets at their limit are never evicted to make room (that would reset
-        the throttle); when the table is full of such buckets a new subject is refused instead."""
+        the throttle); when the table is full of such buckets a new subject is refused instead. Returns the reservation (its timestamp) for `release`, or None when refused."""
         now = time.monotonic()
         with self._lock:
             self._protect_at = limit
             if len(self._requests) >= self.MAX_BUCKETS and subject not in self._requests:
                 self._evict(now)
                 if len(self._requests) >= self.MAX_BUCKETS:
-                    return False
+                    return None
             window = self._requests[subject]
             while window and now - window[0] >= self._window:
                 window.popleft()
             if len(window) >= limit:
-                return False
+                return None
             window.append(now)
-            return True
+            return now
 
-    def release(self, subject: str) -> None:
+    def release(self, subject: str, reservation: float) -> None:
+        """Remove THIS reservation, not the newest one: overlapping attempts finish in any order, and a finished success must not erase another attempt's failed guess."""
         with self._lock:
             window = self._requests.get(subject)
             if window:
-                window.pop()
+                try:
+                    window.remove(reservation)
+                except ValueError:
+                    pass                                                   # already aged out of the window
 
     def _evict(self, now: float) -> None:
         for key in [k for k, w in self._requests.items() if not w or now - w[-1] >= self._window]:

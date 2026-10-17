@@ -58,7 +58,7 @@ def _failure_subjects(candidates: Iterable[str], client: str) -> list[str]:
     return out or [f"keyfail:{client}:-"]
 
 
-def reserve_attempt(candidates: Iterable[str], client: str) -> list[str] | None:
+def reserve_attempt(candidates: Iterable[str], client: str) -> list[tuple[str, float]] | None:
     """Count this attempt against every (client address, key id) it names BEFORE any HMAC or database work, atomically. None means the address has already used its failures for one of
     those key ids this minute (a 429, nothing computed). Otherwise the returned subjects must be `release_attempt`ed if the attempt turns out not to be a failed guess (success, or a
     database outage), and are left counted when it fails. Counting up front means a burst of concurrent guesses cannot all be admitted by a check made against an empty bucket. Keyed by address
@@ -66,21 +66,22 @@ def reserve_attempt(candidates: Iterable[str], client: str) -> list[str] | None:
     from app.public_security import key_failure_limiter
 
     limit = failure_limit()
-    taken: list[str] = []
+    taken: list[tuple[str, float]] = []
     for subject in _failure_subjects(candidates, client):
-        if key_failure_limiter.reserve(subject, limit):
-            taken.append(subject)
+        reservation = key_failure_limiter.reserve(subject, limit)
+        if reservation is not None:
+            taken.append((subject, reservation))
         else:
             release_attempt(taken)
             return None
     return taken
 
 
-def release_attempt(subjects: Iterable[str]) -> None:
+def release_attempt(reservations: Iterable[tuple[str, float]]) -> None:
     from app.public_security import key_failure_limiter
 
-    for subject in subjects:
-        key_failure_limiter.release(subject)
+    for subject, reservation in reservations:
+        key_failure_limiter.release(subject, reservation)
 
 
 class KeyAuthUnavailable(RuntimeError):
