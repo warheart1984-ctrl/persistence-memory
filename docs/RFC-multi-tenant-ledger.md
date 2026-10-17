@@ -391,6 +391,10 @@ concept at all) confirmed the direction and added three requirements. Both are r
     From `skunkworks-powerweave/mcp-multitenant-gateway` (third study, 2026-10-16): its limiter is keyed by the bearer key prefix and runs *before* verification, so brute-force guessing of one key is throttled too,
     and **it refuses to start with more than one worker unless a shared limiter backend is declared**, so a process-local limit cannot silently multiply per replica. Adopt both: throttle by the public `key_id`
     before the HMAC check, and make the process-local limiter a startup refusal when more than one worker or replica is configured without a shared backend.
+    **Built (branch `feat/rate-limit-per-credential`):** `/mcp` requests are charged to the authenticated credential (a key tenant's key id, an OAuth subject, or the operator), the client address only when nobody
+    authenticated; idle buckets are evicted and the table is capped; failed tenant-key attempts are counted per (client address, key id) and, past `JARVIS_KEY_FAIL_LIMIT_PER_MINUTE` (20), refused with 429 before any HMAC
+    or database work (per address as well as key id, so a stranger naming your key id cannot lock you out of it); more than one worker (`WEB_CONCURRENCY`, `UVICORN_WORKERS`, `GUNICORN_WORKERS`) refuses to start unless
+    `JARVIS_RATE_LIMIT_SHARED_BACKEND` names the shared limiter that enforces the real limit. Still process-local and public-mode-only for the `/mcp` limit; a shared limiter is not built.
 18. **Decision transitions are conditional and carry the tenant (section 4).** mcp-gateway decides an approval with `WHERE id = $1 AND status = 'pending' AND tenant_id = $2`, so a decision is idempotent and a guessed id
     from another tenant matches nothing. Our human-decision and draft/verified paths already run under forced row-level security; add an explicit test that a foreign tenant's decision on a guessed id changes nothing
     and a repeated decision is a no-op.
@@ -401,6 +405,14 @@ concept at all) confirmed the direction and added three requirements. Both are r
     them (ignored, or rejected the same way for everybody), and a route that starts reading such a field fails the test.
 20. **Candidate, not scheduled: idempotency keys on writes.** A retried `remember` (a timeout, a client retry) can store a duplicate draft. An optional caller-supplied idempotency key, scoped to the tenant and
     credential, would make a retry return the first result. This is a feature, not an isolation fix; record it, decide later.
+
+21. **Admit only on success; never on "not denied" (from an independent verification of the mcp-zero study, 2026-10-16).** That gateway blocked a call only on an explicit deny, so a hook that crashed before
+    or after the policy ran let the call through; it built a masked payload and then sent the original upstream while the audit said "masked"; and a plugin hook that ran before policy could replace the
+    identity. For us: (a) every gate in `identity_middleware` and the key branch admits only on a positive result, and any exception is a refusal (500 or 503), never a call to the handler; (b) whatever is
+    recorded as the redacted form of a request is what the code path uses where redaction is claimed (call log, replay log); (c) the tenant is bound once, by the identity layer, and nothing downstream (tool
+    code, a future plugin seam) may rewrite the principal. Add Red Team tests: an injected failure in each gate (control schema, pepper, limiter, call log) must produce a refusal and no handler call; a
+    handler must be unable to change `current_principal()` for the rest of the request.
+    Also from it: anonymous operation must stay impossible in production: strict mode already refuses to start without a credential; keep that a startup refusal, not a default.
 
 Also noted from mcp-gateway: its role lookup joined on the agent id without asserting the tenant, relying on globally unique ids and the issuer. Our key resolution takes the tenant from the control-schema row of
 the presented key and never from a request value, which is the stronger rule both studies recommend.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import threading
 import time
 from collections import defaultdict, deque
 
@@ -27,24 +28,88 @@ def trusted_hosts() -> set[str]:
 
 
 class McpRateLimiter:
-    """Process-local backstop; the edge/WAF remains the primary limiter."""
+    """Process-local fixed-window limiter (the edge/WAF remains the primary limiter). Buckets idle for a whole window are evicted, so a stream of distinct subjects cannot grow the table forever."""
 
-    def __init__(self) -> None:
+    MAX_BUCKETS = 10_000
+
+    def __init__(self, window: float = 60.0) -> None:
         self._requests: dict[str, deque[float]] = defaultdict(deque)
+        self._window = window
+        self._lock = threading.Lock()
 
-    def allow(self, client: str) -> bool:
-        limit = int(os.getenv("JARVIS_MCP_RATE_LIMIT_PER_MINUTE", "60"))
+    def allow(self, subject: str, limit: int | None = None) -> bool:
+        limit = int(os.getenv("JARVIS_MCP_RATE_LIMIT_PER_MINUTE", "60")) if limit is None else limit
         now = time.monotonic()
-        window = self._requests[client]
-        while window and now - window[0] >= 60:
-            window.popleft()
-        if len(window) >= limit:
-            return False
-        window.append(now)
-        return True
+        with self._lock:
+            if len(self._requests) >= self.MAX_BUCKETS and subject not in self._requests:
+                self._evict(now)
+            window = self._requests[subject]
+            while window and now - window[0] >= self._window:
+                window.popleft()
+            if len(window) >= limit:
+                return False
+            window.append(now)
+            return True
+
+    def blocked(self, subject: str, limit: int) -> bool:
+        """Is `subject` already at `limit` in the current window? (Does not count this call.)"""
+        now = time.monotonic()
+        with self._lock:
+            window = self._requests.get(subject)
+            if window is None:
+                return False
+            while window and now - window[0] >= self._window:
+                window.popleft()
+            return len(window) >= limit
+
+    def _evict(self, now: float) -> None:
+        for key in [k for k, w in self._requests.items() if not w or now - w[-1] >= self._window]:
+            del self._requests[key]
+        if len(self._requests) >= self.MAX_BUCKETS:             # every bucket is live: drop the oldest-touched half rather than refuse to track anyone new
+            for key, _ in sorted(self._requests.items(), key=lambda kv: kv[1][-1])[: self.MAX_BUCKETS // 2]:
+                del self._requests[key]
 
 
 mcp_rate_limiter = McpRateLimiter()
+key_failure_limiter = McpRateLimiter()          # failed tenant-key attempts, keyed (client address, key id); see key_auth.attempts_blocked
+
+
+def rate_limit_subject(request: Request) -> str:
+    """Who a request is charged to: its authenticated credential when the identity layer has bound one (a tenant key or OAuth subject is a tenant of its own; the operator is one subject),
+    else the client address. Tenants behind one proxy address therefore no longer share a bucket. This runs inside the identity middleware, so a failed authentication never reaches it
+    (see key_auth.failure_limiter for those)."""
+    from app.identity import current_principal
+
+    principal = current_principal()
+    if principal is not None:
+        if principal.kind == "operator":
+            return "operator"
+        who = principal.credential_id or principal.tenant_key or principal.subject
+        return f"tenant:{principal.issuer}:{who}"
+    return "ip:" + (request.client.host if request.client else "unknown")
+
+
+def worker_count() -> int:
+    for name in ("WEB_CONCURRENCY", "UVICORN_WORKERS", "GUNICORN_WORKERS"):
+        raw = (os.getenv(name) or "").strip()
+        if raw.isdigit():
+            return int(raw)
+    return 1
+
+
+def config_problems() -> list[str]:
+    """The limiters are per process. With more than one worker each tenant's quota silently multiplies by the worker count, so that is a startup refusal unless a shared backend is declared
+    (JARVIS_RATE_LIMIT_SHARED_BACKEND names one; the limiters here do not implement it, so declaring it states that the edge enforces the real limit)."""
+    if worker_count() > 1 and not (os.getenv("JARVIS_RATE_LIMIT_SHARED_BACKEND") or "").strip():
+        return [f"{worker_count()} workers are configured but the rate limiters are per process (each tenant's quota would multiply by the worker count): run one worker, "
+                "or set JARVIS_RATE_LIMIT_SHARED_BACKEND to name the shared limiter that enforces the real limit"]
+    return []
+
+
+def assert_config() -> None:
+    problems = config_problems()
+    if problems:
+        raise RuntimeError("rate limiting refuses to start: " + "; ".join(problems))
 
 
 async def public_security_middleware(request: Request, call_next):
@@ -54,8 +119,7 @@ async def public_security_middleware(request: Request, call_next):
         if not allowed_hosts or request_host not in allowed_hosts:
             return JSONResponse(status_code=421, content={"detail": "Untrusted Host header"})
         if request.url.path.startswith("/mcp"):
-            client = request.client.host if request.client else "unknown"
-            if not mcp_rate_limiter.allow(client):
+            if not mcp_rate_limiter.allow(rate_limit_subject(request)):
                 return JSONResponse(status_code=429, content={"detail": "MCP rate limit exceeded"})
 
     response = await call_next(request)

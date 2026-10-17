@@ -67,6 +67,10 @@ request parameter. The operator's ledger key keeps working exactly as before (th
 * **Startup (flag on):** the app refuses to start without a PostgreSQL row store, without a pepper of at least 32 bytes, with the control schema missing, or with the lookup not callable by the application role.
 * **Strict mode** (`JARVIS_MULTI_TENANT=1`) and key tenants work together; unauthenticated is still refused.
 
+* **Guessing is throttled.** Failed attempts are counted per (client address, key id); past `JARVIS_KEY_FAIL_LIMIT_PER_MINUTE` (default 20) the request is a `429` with `Retry-After: 60` before any HMAC or database work.
+  Counting by address as well as key id means someone who sends junk naming your key id cannot lock you out of your own key. The `/mcp` rate limit (public deployments) is charged to the credential, not the address.
+  The limiters are per process: more than one worker refuses to start unless `JARVIS_RATE_LIMIT_SHARED_BACKEND` is set (see `tests/test_rate_limit_credential.py`).
+
 `tests/test_key_auth.py` pins these. `tests/test_tenant_isolation_keys.py` runs **every case of the isolation matrix again with key tenants** (alice, bob and the other names become key tenants), so the same
 properties are proven for both kinds of tenant identity, and a route added without a matrix classification fails there too. The few routes that answer a request with no credential in a shared-key deployment
 (they carry no ledger data and behave the same on the box today) are named in that file, not hidden.

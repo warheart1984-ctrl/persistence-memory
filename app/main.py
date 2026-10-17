@@ -107,7 +107,7 @@ from app.identity import current_tenant_key, multi_tenant_mode, request_tenant, 
 from app import call_log, drift, key_auth, pg_store
 from app.call_witness import CallWitnessMiddleware
 from app.oauth import protected_resource_metadata
-from app.public_security import cors_origins, public_security_middleware
+from app.public_security import assert_config as assert_rate_limit_config, cors_origins, public_security_middleware
 from app.refusal import DENIED, LEDGER_UNAVAILABLE, VERSION_CONFLICT, json_response, retry_after_seconds
 from app.emr_latest import AUTHORITY_DENIED, LatestError, LatestParams, latest_memories, parse_limit
 from app.ledger_search import SearchParams, search_ledger
@@ -142,6 +142,7 @@ async def lifespan(app: FastAPI):
     """Application lifespan: track and cleanup background nx-search processes."""
     # Store for background processes
     assert_multi_tenant_config()  # JARVIS_MULTI_TENANT: refuse to start with a configuration that could fail open
+    assert_rate_limit_config()  # per-process limiters: more than one worker multiplies every quota, so refuse unless a shared limiter is declared
     if key_auth.key_tenants_enabled():
         key_auth.assert_config()  # JARVIS_KEY_TENANTS: needs the row store and a strong pepper
         pg_store.assert_key_auth_ready()  # ... and the control schema, reachable by the application role through the two lookup functions

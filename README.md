@@ -11,6 +11,8 @@ reachable from the network; the PC and the agents reach it through an SSH tunnel
 restore are in [`deploy/mint/README.md`](deploy/mint/README.md). **This table describes the deployed build**, which is `main` as of 2026-10-11 (`5a8d756`, schema v9);
 anything merged after that day is not deployed until the next deploy.
 
+**Schema v10 is in the code, not yet on the box.** `main` is at schema **v10** (the per-tenant API-key control schema, merged 2026-10-16; see [`docs/tenant_keys.md`](docs/tenant_keys.md)). The deployed ledger is still v9: a deploy of `main` runs the v10 migration, which changes no ledger row, and is rehearsed on a throwaway stack first. Per-tenant keys are off by default (`JARVIS_KEY_TENANTS`). The way back is `pg_schema.v10_rollback_sql`.
+
 | Capability | Status |
 |---|---|
 | **Postgres row store**: one row per record, forced row-level security, two roles (the app cannot change history), hash-chained `record_history` | **live** (`docs/POSTGRES.md`) |
