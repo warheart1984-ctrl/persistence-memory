@@ -95,3 +95,48 @@ def test_more_than_one_worker_is_a_startup_refusal_unless_a_shared_limiter_is_de
         public_security.assert_config()
     monkeypatch.setenv("JARVIS_RATE_LIMIT_SHARED_BACKEND", "edge-waf")
     assert config_problems() == []
+
+
+def test_a_burst_of_concurrent_attempts_cannot_all_pass_a_check_made_against_an_empty_bucket():
+    """Codex on #112: the attempt is counted BEFORE the expensive verification, atomically, so at most `limit` of a concurrent burst are admitted."""
+    import threading
+
+    lim = McpRateLimiter()
+    admitted, gate = [], threading.Barrier(40)
+
+    def attempt():
+        gate.wait()
+        admitted.append(lim.reserve("keyfail:1.2.3.4:abc", 5))
+
+    threads = [threading.Thread(target=attempt) for _ in range(40)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert sum(admitted) == 5
+
+
+def test_a_released_reservation_is_not_counted_as_a_failure():
+    lim = McpRateLimiter()
+    for _ in range(50):
+        assert lim.reserve("s", 3)
+        lim.release("s")                                                   # a successful credential, or an outage: never a wrong guess
+    assert [lim.reserve("s", 3) for _ in range(4)] == [True, True, True, False]
+
+
+def test_a_throttled_bucket_survives_a_flood_of_other_subjects_and_new_ones_are_refused_when_full():
+    """Codex on #112: 10,000 distinct key ids must not evict the throttled target and reset its count."""
+    lim = McpRateLimiter()
+    lim.MAX_BUCKETS = 100
+    for _ in range(3):
+        assert lim.reserve("target", 3)
+    assert not lim.reserve("target", 3)                                    # at its limit
+    for i in range(1000):
+        lim.reserve(f"junk-{i}", 3)                                        # the flood; each junk id has a single failed guess
+    assert not lim.reserve("target", 3), "the flood evicted the throttled bucket"
+    # and when every bucket is at its limit, a brand-new subject is refused rather than evicting one
+    full = McpRateLimiter()
+    full.MAX_BUCKETS = 5
+    for i in range(5):
+        for _ in range(3):
+            full.reserve(f"b{i}", 3)
+    assert not full.reserve("new", 3)
+    assert not full.reserve("b0", 3)

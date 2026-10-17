@@ -58,20 +58,29 @@ def _failure_subjects(candidates: Iterable[str], client: str) -> list[str]:
     return out or [f"keyfail:{client}:-"]
 
 
-def attempts_blocked(candidates: Iterable[str], client: str) -> bool:
-    """True when this address has already failed `failure_limit()` times against one of these key ids this minute: the request is refused with 429 BEFORE any HMAC is computed or the
-    database consulted, so guessing one key's secret is throttled. Keyed by address as well as key id, so a stranger who sends junk naming your key id cannot lock you out of your own key."""
+def reserve_attempt(candidates: Iterable[str], client: str) -> list[str] | None:
+    """Count this attempt against every (client address, key id) it names BEFORE any HMAC or database work, atomically. None means the address has already used its failures for one of
+    those key ids this minute (a 429, nothing computed). Otherwise the returned subjects must be `release_attempt`ed if the attempt turns out not to be a failed guess (success, or a
+    database outage), and are left counted when it fails. Counting up front means a burst of concurrent guesses cannot all be admitted by a check made against an empty bucket. Keyed by address
+    as well as key id, so a stranger who sends junk naming your key id cannot lock you out of your own key."""
     from app.public_security import key_failure_limiter
 
     limit = failure_limit()
-    return any(key_failure_limiter.blocked(subject, limit) for subject in _failure_subjects(candidates, client))
+    taken: list[str] = []
+    for subject in _failure_subjects(candidates, client):
+        if key_failure_limiter.reserve(subject, limit):
+            taken.append(subject)
+        else:
+            release_attempt(taken)
+            return None
+    return taken
 
 
-def record_failure(candidates: Iterable[str], client: str) -> None:
+def release_attempt(subjects: Iterable[str]) -> None:
     from app.public_security import key_failure_limiter
 
-    for subject in _failure_subjects(candidates, client):
-        key_failure_limiter.allow(subject, limit=10**9)      # count it; the decision to refuse is made by attempts_blocked
+    for subject in subjects:
+        key_failure_limiter.release(subject)
 
 
 class KeyAuthUnavailable(RuntimeError):
