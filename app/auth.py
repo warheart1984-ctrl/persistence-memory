@@ -582,11 +582,15 @@ async def identity_middleware(request: Request, call_next):
         if candidates:
             # A per-tenant API key (JARVIS_KEY_TENANTS): authenticated against the control schema, bound to the key's own tenant. Every way of failing is the one 401 a wrong ledger
             # key gets; an unreachable control schema is a 503 (never an admission); a valid key of a tenant that is not active is a 503 for that tenant only.
+            client_addr = request.client.host if request.client else "unknown"
+            if key_auth.attempts_blocked(candidates, client_addr):
+                return json_response(429, "Too many failed attempts", headers={"Retry-After": "60"}, path=path)
             try:
                 resolved = await run_in_threadpool(key_auth.authenticate, candidates)
             except key_auth.KeyAuthUnavailable:
                 return json_response(503, "Ledger unavailable", path=path)
             if resolved is None:
+                key_auth.record_failure(candidates, client_addr)
                 return json_response(401, "Invalid or missing API key", path=path)
             if resolved.tenant_status != "active":
                 return json_response(503, "tenant_unavailable", path=path)

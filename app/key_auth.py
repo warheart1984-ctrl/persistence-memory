@@ -41,6 +41,39 @@ def token_candidates(headers) -> list[str]:
     return out
 
 
+def failure_limit() -> int:
+    """Failed key attempts per minute, per (client address, key id), before the key is not even checked (JARVIS_KEY_FAIL_LIMIT_PER_MINUTE)."""
+    try:
+        return max(1, int(os.getenv("JARVIS_KEY_FAIL_LIMIT_PER_MINUTE", "20")))
+    except ValueError:
+        return 20
+
+
+def _failure_subjects(candidates: Iterable[str], client: str) -> list[str]:
+    out = []
+    for token in candidates:
+        parsed = tenant_keys.parse_token(token)
+        # a malformed token has no key id to guess against: it is charged to the address alone
+        out.append(f"keyfail:{client}:{parsed[0] if parsed else '-'}")
+    return out or [f"keyfail:{client}:-"]
+
+
+def attempts_blocked(candidates: Iterable[str], client: str) -> bool:
+    """True when this address has already failed `failure_limit()` times against one of these key ids this minute: the request is refused with 429 BEFORE any HMAC is computed or the
+    database consulted, so guessing one key's secret is throttled. Keyed by address as well as key id, so a stranger who sends junk naming your key id cannot lock you out of your own key."""
+    from app.public_security import key_failure_limiter
+
+    limit = failure_limit()
+    return any(key_failure_limiter.blocked(subject, limit) for subject in _failure_subjects(candidates, client))
+
+
+def record_failure(candidates: Iterable[str], client: str) -> None:
+    from app.public_security import key_failure_limiter
+
+    for subject in _failure_subjects(candidates, client):
+        key_failure_limiter.allow(subject, limit=10**9)      # count it; the decision to refuse is made by attempts_blocked
+
+
 class KeyAuthUnavailable(RuntimeError):
     """The control schema could not be consulted (database down, misconfigured pepper): the request is refused with 503, never admitted."""
 
