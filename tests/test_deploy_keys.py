@@ -26,7 +26,7 @@ def box(tmp_path):
     fake.mkdir()
     log = tmp_path / "docker.log"
     # a docker that records every argument (one line per call) and what the container would see in the environment, and answers like the CLI does
-    (fake / "docker").write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$FAKE_DOCKER_LOG"\ncase "$*" in *create-key*) echo "key 0123456789abcdef issued; token written to /keys/x.token" ;; *list-tenants*) echo "t_x  active  a" ;; esac\nexit 0\n')
+    (fake / "docker").write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$FAKE_DOCKER_LOG"\ncase "$*" in *create-key*) echo "key 0123456789abcdef issued; token written to /keys/x.token" ;; *list-tenants*) echo "t_x  active  a" ;; esac\nexit ${FAKE_DOCKER_RC:-0}\n')
     (fake / "docker").chmod(0o755)
     env = dict(os.environ, PATH=f"{fake}:{os.environ['PATH']}", JARVIS_HOME=str(tmp_path / "home"), FAKE_DOCKER_LOG=str(log), HOME=str(tmp_path))
 
@@ -162,7 +162,8 @@ def test_jarvisctl_dispatches_keys_and_lists_it_in_help(box):
 @pytest.mark.parametrize("line,expected", [("JARVIS_KEY_TENANTS=1", "ON"), ("JARVIS_KEY_TENANTS=TRUE", "ON"), ("JARVIS_KEY_TENANTS=Yes", "ON"), ("JARVIS_KEY_TENANTS=on", "ON"),
                                            ("JARVIS_KEY_TENANTS= 1 ", "ON"), ('JARVIS_KEY_TENANTS="true"', "ON"), ("JARVIS_KEY_TENANTS='ON'", "ON"),
                                            ("JARVIS_KEY_TENANTS=0", "off"), ("JARVIS_KEY_TENANTS=false", "off"), ("JARVIS_KEY_TENANTS=", "off"), ("JARVIS_KEY_TENANTS=maybe", "off"),
-                                           ("# JARVIS_KEY_TENANTS=1", "off"), ("XJARVIS_KEY_TENANTS=1", "off")])
+                                           ("JARVIS_KEY_TENANTS=1 # enable tenant keys", "ON"), ('JARVIS_KEY_TENANTS="true" # enable', "ON"), ("JARVIS_KEY_TENANTS=0 # was 1", "off"), ("JARVIS_KEY_TENANTS=1#not-a-comment", "off"),
+                                           ("JARVIS_KEY_TENANTS='on'  # x # y", "ON"), ("# JARVIS_KEY_TENANTS=1", "off"), ("XJARVIS_KEY_TENANTS=1", "off")])
 def test_status_reads_the_flag_the_way_the_application_does(box, line, expected):
     """Codex on #115: key_tenants_enabled() strips and lowercases, so status must not report 'off' for a value the app accepts (nor 'ON' for one it rejects)."""
     (box.secrets / "app.env").write_text("JARVIS_API_KEY=x\n" + line + "\n")
@@ -175,3 +176,15 @@ def test_status_uses_the_last_assignment_like_compose(box):
     assert "key authentication: off" in box.run("status").stdout
     (box.secrets / "app.env").write_text("JARVIS_KEY_TENANTS=0\nJARVIS_KEY_TENANTS=true\n")
     assert "key authentication: ON" in box.run("status").stdout
+
+
+def test_status_does_not_turn_a_failed_query_into_an_empty_deployment(box):
+    """Codex on #115: an unavailable control plane must not read as 'tenants: 0 / keys: 0'."""
+    with_pepper(box)
+    box.env_["FAKE_DOCKER_RC"] = "1"
+    r = box.run("status")
+    assert r.returncode == 1 and "tenants: unavailable" in r.stdout and "keys:    unavailable" in r.stdout
+    assert "tenants: 0" not in r.stdout and "keys:    0" not in r.stdout
+    box.env_["FAKE_DOCKER_RC"] = "0"
+    r = box.run("status")
+    assert r.returncode == 0 and "tenants: 1" in r.stdout

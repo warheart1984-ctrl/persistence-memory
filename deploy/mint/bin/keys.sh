@@ -110,12 +110,16 @@ case "$cmd" in
   status)
     [ $# -eq 0 ] || bad "status takes no options"
     if [ -f "$PEPPER_FILE" ]; then echo "pepper: present ($(stat -c %a "$PEPPER_FILE"))"; else echo "pepper: absent (jarvisctl keys pepper-init)"; fi
-    # as the app reads it: the LAST assignment wins (compose env_file), surrounding quotes and blanks are dropped, and key_tenants_enabled() lowercases (1/true/yes/on)
-    flag="$(grep -E '^[[:space:]]*JARVIS_KEY_TENANTS[[:space:]]*=' "$SECRETS_DIR/app.env" 2>/dev/null | tail -1 | sed -E 's/^[^=]*=//; s/^[[:space:]]+//; s/[[:space:]]+$//; s/^"(.*)"$/\1/; s/^'"'"'(.*)'"'"'$/\1/; s/^[[:space:]]+//; s/[[:space:]]+$//' | tr '[:upper:]' '[:lower:]' || true)"
+    # as the app reads it: the LAST assignment wins (compose env_file); a quoted value is what is inside the quotes (anything after the closing quote is a comment); an unquoted value ends
+    # at a space-prefixed "#" (compose inline comment); key_tenants_enabled() lowercases (1/true/yes/on)
+    flag="$(grep -E '^[[:space:]]*JARVIS_KEY_TENANTS[[:space:]]*=' "$SECRETS_DIR/app.env" 2>/dev/null | tail -1 | sed -E 's/^[^=]*=//; s/^[[:space:]]+//; /^"/{s/^"([^"]*)".*$/\1/;b done}; /^'"'"'/{s/^'"'"'([^'"'"']*)'"'"'.*$/\1/;b done}; s/[[:space:]]+#.*$//; :done; s/^[[:space:]]+//; s/[[:space:]]+$//' | tr '[:upper:]' '[:lower:]' || true)"
     case "$flag" in 1|true|yes|on) echo "key authentication: ON in secrets/app.env" ;; *) echo "key authentication: off (JARVIS_KEY_TENANTS not enabled in secrets/app.env)" ;; esac
     if [ -f "$PEPPER_FILE" ]; then
-      echo "tenants: $(tk list-tenants 2>/dev/null | grep -c '^t_' || true)"
-      echo "keys:    $(tk list-keys 2>/dev/null | grep -c '^[0-9a-f]\{16\}' || true)"
+      # a failed query is reported as unavailable (and fails the command), never as an empty deployment
+      rc=0
+      if t="$(tk list-tenants 2>/dev/null)"; then echo "tenants: $(printf '%s\n' "$t" | grep -c '^t_' || true)"; else echo "tenants: unavailable (the control schema could not be queried)"; rc=1; fi
+      if k="$(tk list-keys 2>/dev/null)"; then echo "keys:    $(printf '%s\n' "$k" | grep -c '^[0-9a-f]\{16\}' || true)"; else echo "keys:    unavailable (the control schema could not be queried)"; rc=1; fi
+      exit "$rc"
     fi
     ;;
   *) usage ;;
