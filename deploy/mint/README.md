@@ -13,14 +13,14 @@ Windows PC ──ssh -L──►  127.0.0.1:8011  ─►  app (non-root, read-on
    backups (hourly, verified) ──► ~/jarvis-ledger/backups ──► age-encrypted daily ──► Windows PC (G:)
 ```
 
-## Where things stand (updated 2026-10-11; the box was last deployed 2026-10-11)
+## Where things stand (updated 2026-10-18; the box was last deployed 2026-10-18)
 
 * **Running:** the stack on `127.0.0.1:8011`, on Linux Mint 22.3 (4 CPUs, 15 GiB RAM, Wi-Fi only, disk not
   encrypted). Docker 29.1.3, compose 2.40.3 and age 1.1.1 come from Ubuntu's own archive.
 * **Data:** 59 records imported from the PC's `jarvis-store.json` with `pg_import` on 2026-10-05 (manifest in
   `~/jarvis-ledger/state/import-manifest.json`), plus one record migrated from the old service
-  (`mem-da3ddefda22a`, copied from `mem-79f9aa7e7e44`). Since then agents have written their own records through the API: **62 live records at
-  history seq 137 on 2026-10-11** (`jarvisctl replay state`, i.e. `GET /api/jarvis/replay/state`, reports the live count and is the source of truth).
+  (`mem-da3ddefda22a`, copied from `mem-79f9aa7e7e44`). Since then agents have written their own records through the API: **66 live records at
+  history seq 143 on 2026-10-18** (`jarvisctl replay state`, i.e. `GET /api/jarvis/replay/state`, reports the live count and is the source of truth).
 * **The old service on 8001 is retired:** `persistence-memory.service` is stopped and disabled. Its data
   (`~/.local/share/persistence-memory/`) and `~/.config/persistence-memory/memory.env` are untouched, and
   `~/persistence-memory` is pinned at `d5157ba`. To bring it back:
@@ -35,7 +35,7 @@ Windows PC ──ssh -L──►  127.0.0.1:8011  ─►  app (non-root, read-on
 * **Deployed on 2026-10-08 and 2026-10-10:** schema **v7** (the signature tables) on 2026-10-08; schema **v8** and **v9** on 2026-10-10 (`emr_latest`'s
   supersedes index and the ledger-search index; `main` at `792e99b`), with `emr_latest`, `emr_search_ledger`, the nx-search bridge and the removal of
   the digital twin line. The rollback for 2026-10-10 is the named backup restored under the `pre-v8v9` images; there is no down-migration for V8.
-* **Schema v10 (merged 2026-10-16, not deployed):** the control schema `<schema>_control` (tenants and per-tenant API keys; `docs/tenant_keys.md`). It touches no ledger row and no hash; a v9 application refuses a v10 database and the reverse. The box stays at v9 until a deploy of `main`, which needs the migration rehearsed on a throwaway restore first (the 2026-10-16 drill did this: `~/jarvis-ledger/drills/2026-10-16-keys/`). Down-migration: `app.pg_schema.v10_rollback_sql(schema)` as the migration role (drops the control schema and the version row; no ledger data changes).
+* **Deployed on 2026-10-18:** schema **v10** (`main` at `3638995`): the control schema `<schema>_control` (tenants and per-tenant API keys; `docs/tenant_keys.md`), the key-authentication code (off: `JARVIS_KEY_TENANTS` unset, no pepper, no tenants or keys), the per-credential rate limit and failed-key throttle. The migration touches no ledger row and no hash; a v9 application refuses a v10 database and the reverse. Rehearsed first on a restore of a real backup (`~/jarvis-ledger/drills/2026-10-17-v10-main`, 52/52). Rollback: tags `jarvis-ledger-app:pre-v10` / `jarvis-ledger-db:pre-v10` and either `app.pg_schema.v10_rollback_sql(schema)` as the migration role (drops the control schema and the version row; no ledger data changes) or the backup taken with the app stopped just before (`jarvis-20261018T161754Z`, kept in `~/jarvis-ledger/keep-pre-v10`).
 * **Deployed on 2026-10-11:** no schema change (still **v9**). The server-side **call log** (`docs/call_log.md`; on, `JARVIS_CALL_LOG_ENABLED=1`, in the appdata
   volume and so in the backups) and the **drift watcher** (`docs/drift_watcher.md`; on, `JARVIS_DRIFT_CHECK_ENABLED=1`, operator-only, results go to its own
   log, never to the ledger); `main` at `5a8d756`, an app-only swap. The rollback is the `pre-drift` image tags (remove the flag line, recreate the app only).
@@ -226,8 +226,8 @@ Backup first (`jarvisctl backup`, then `jarvisctl drill`), then pull and `jarvis
 schema version exactly, so **v5 code refuses a v6 database and v6 code refuses a v5 one: rolling back means checking out the old
 code and restoring the backup taken before the upgrade** (writes made after it are lost). After such a rollback the newer
 backup sets and anchors no longer fit the restored database (their blocks "vanished"), so move the newer `jarvis-*` sets and the
-newer `anchors/anchors-*.txt` files aside before the next backup, or it will quarantine its dump. The box is at **v9** now; `main` is at **v10**, not yet deployed (v6 on 2026-10-06, v7 on
-2026-10-08, v8 and v9 on 2026-10-10). V8 has no down-migration, so the way back across it is the named backup restored under the `pre-v8v9` images. V9 alone
+newer `anchors/anchors-*.txt` files aside before the next backup, or it will quarantine its dump. The box is at **v10** now (v6 on 2026-10-06, v7 on
+2026-10-08, v8 and v9 on 2026-10-10, v10 on 2026-10-18). V8 has no down-migration, so the way back across it is the named backup restored under the `pre-v8v9` images. V9 alone
 does have one: run `app.pg_schema.V9_ROLLBACK` as the migration role in one transaction and deploy the V8 code (`docs/ledger_search.md`), which keeps every write made since.
 
 ### Signatures (schema v7)

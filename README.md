@@ -4,14 +4,14 @@ A governed, evidence-first memory ledger for AI agents, backed by PostgreSQL. It
 provenance, and proves it was not quietly changed. It does **not** decide what is true (`docs/CONTINUITY_LEDGER_SOC.md`).
 Continuity lives in ledger records, not in chat transcripts; the service itself is replaceable.
 
-## What is live on 8011 (last deployed 2026-10-11)
+## What is live on 8011 (last deployed 2026-10-18)
 
-One ledger runs in Docker on a private Linux box at **`127.0.0.1:8011`** (PostgreSQL row store, schema **v9**). Nothing is
+One ledger runs in Docker on a private Linux box at **`127.0.0.1:8011`** (PostgreSQL row store, schema **v10**). Nothing is
 reachable from the network; the PC and the agents reach it through an SSH tunnel. Deployment, operations and the rehearsed
-restore are in [`deploy/mint/README.md`](deploy/mint/README.md). **This table describes the deployed build**, which is `main` as of 2026-10-11 (`5a8d756`, schema v9);
-anything merged after that day is not deployed until the next deploy.
+restore are in [`deploy/mint/README.md`](deploy/mint/README.md). **This table describes the deployed build**, which is `main` as of 2026-10-18 (`3638995`, schema v10);
+anything merged after that day is not deployed until the next deploy. Deploys since 2026-10-11: multi-tenant phase 0 (2026-10-12), the scoped recall credential (2026-10-13), and schema v10 with per-tenant API keys (2026-10-18).
 
-**Schema v10 is in the code, not yet on the box.** `main` is at schema **v10** (the per-tenant API-key control schema, merged 2026-10-16; see [`docs/tenant_keys.md`](docs/tenant_keys.md)). The deployed ledger is still v9: a deploy of `main` runs the v10 migration, which changes no ledger row, and is rehearsed on a throwaway stack first. Per-tenant keys are off by default (`JARVIS_KEY_TENANTS`). The way back is `pg_schema.v10_rollback_sql`.
+**Schema v10 is live (deployed 2026-10-18), with per-tenant API keys switched off.** The v10 migration added the control schema (`<schema>_control`, see [`docs/tenant_keys.md`](docs/tenant_keys.md)) and changed no ledger row or hash. No tenant and no key exists on the box, `JARVIS_KEY_TENANTS`, `JARVIS_MULTI_TENANT` and OAuth are unset, and a `jlk_` token is an ordinary wrong key (401). Turning keys on needs a pepper file and an explicit decision. The way back is `pg_schema.v10_rollback_sql` (keeps every write) or the pre-deploy backup.
 
 | Capability | Status |
 |---|---|
@@ -21,7 +21,7 @@ anything merged after that day is not deployed until the next deploy.
 | **Continuity Blocks**: sealed, Merkle-rooted, hash-chained ranges of the history; every block hash is also kept outside the database in the backup anchors | **live**, **unsigned** (`docs/CONTINUITY_BLOCKS.md`) |
 | **Replay Contracts, `RC.Ledger.v1`**: rebuild the ledger's state and ordered events as of any seq or sealed block, with a state root; receipts at sealed points (Evidence Objects); offline verifier `python -m app.replay verify`; `jarvisctl replay`; a restore-drill step | **live** since 2026-10-06: the `/api/jarvis/replay/*` routes, receipts at sealed points, the offline verifier, `jarvisctl replay` and the restore-drill step run on the box (`docs/REPLAY_CONTRACTS.md`). A receipt is an unsigned claim until it is re-derived |
 | Domain Replay Contracts (`RC.AIKI`, `ARIS`, `SX`, `Lineage`, `Mandala`) | **on hold**: declared only (no schema, owner or algorithm exists) |
-| **Signatures**: attestations of blocks, receipts and checkpoints by a key a root key authorized, a trust log, the host signer, the PC witness/cosign tool, signature levels L0/L1/L2 in replay verification, `JARVIS_SIGNATURES=off\|warn\|require` (schema v7, `docs/SIGNATURES.md`, `docs/SIGNING_RUNBOOK.md`) | **deployed since 2026-10-08 (schema v7 tables), shelved**: no key has been made and no key ceremony done, the sign timer is off, nothing is signed; `JARVIS_SIGNATURES=warn` with an empty trust roots file, so a replay reports blocks as unsigned and never as verified (the live database is schema v9) |
+| **Signatures**: attestations of blocks, receipts and checkpoints by a key a root key authorized, a trust log, the host signer, the PC witness/cosign tool, signature levels L0/L1/L2 in replay verification, `JARVIS_SIGNATURES=off\|warn\|require` (schema v7, `docs/SIGNATURES.md`, `docs/SIGNING_RUNBOOK.md`) | **deployed since 2026-10-08 (schema v7 tables), shelved**: no key has been made and no key ceremony done, the sign timer is off, nothing is signed; `JARVIS_SIGNATURES=warn` with an empty trust roots file, so a replay reports blocks as unsigned and never as verified (the live database is schema v10) |
 | CES registry, unified provenance chain, ESFR promotion | **not built** (`docs/CCS_CHARTER.md`) |
 
 Also enforced by tests: continuity across sessions, replay of a retrieve with why / where / when / session, conflicts surfaced
@@ -104,7 +104,7 @@ database URL or that opt-in the service answers 503 rather than creating a ledge
   A block sealed after the last backup is not anchored yet; a receipt taken earlier also exposes a later rewrite.
 * **Domain Replay Contracts (on hold) and CES schemas are not built.** Earlier docs claimed stubs under `schemas/rc/` and `schemas/ces/`;
   they never existed (corrected). Only `RC.Ledger.v1` has files (`schemas/rc/`). Receipts are unsigned claims until re-derived.
-* **Signing is shelved.** The live ledger is schema v9 (deployed 2026-10-10), with `JARVIS_SIGNATURES=warn` and no trust roots: no key is authorized, nothing is signed, and a replay reports blocks as unsigned, never as verified.
+* **Signing is shelved.** The live ledger is schema v10 (v9 deployed 2026-10-10, v10 on 2026-10-18), with `JARVIS_SIGNATURES=warn` and no trust roots: no key is authorized, nothing is signed, and a replay reports blocks as unsigned, never as verified.
 * **Soft Clause V rules only warn** (emotion, transient state, transcripts) until the operator flips `JARVIS_CLAUSE_V_SOFT`.
 * **One box.** Wi-Fi only, disk not encrypted, an hour's worth of data at risk between backups, no automatic security updates
   (`deploy/mint/README.md`, "Honest limits").
