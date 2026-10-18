@@ -22,6 +22,7 @@ jarvisctl <command>
   seal [--force|--status]  seal new history into Continuity Blocks now (or show the unsealed tail)
   attest status|sign|init-key|install-roots|verify   signatures: the host-side signer, the trust roots, verification
   tenants list|seal|sign|status|verify   per-tenant versions of seal / attest sign / verify (new; the timers still run the operator-only ones)
+  keys pepper-init|pepper-install-app|tenant-create|key-create|key-revoke|tenant-status|tenants|keys|status   per-tenant API keys (RFC phase 1): issue, revoke, list; tokens go to a mode-600 file, never the screen
   replay state|receipt|receipts|check|verify   Replay Contracts: replay the ledger at a point, receipts at sealed points, re-derive them
   backup               take a backup set now
   prune [--dry-run]    apply the retention policy
@@ -62,6 +63,7 @@ case "$cmd" in
   seal)     exec "$here/seal.sh" "$@" ;;
   attest)   exec "$here/attest.sh" "$@" ;;
   tenants)  exec "$here/tenants.sh" "$@" ;;
+  keys)     exec "$here/keys.sh" "$@" ;;
   replay)   exec "$here/replay.sh" "$@" ;;
   backup)   exec "$here/backup.sh" "$@" ;;
   prune)    exec "$here/prune.sh" "$@" ;;

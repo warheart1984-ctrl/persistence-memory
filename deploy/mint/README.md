@@ -230,6 +230,12 @@ newer `anchors/anchors-*.txt` files aside before the next backup, or it will qua
 2026-10-08, v8 and v9 on 2026-10-10, v10 on 2026-10-18). V8 has no down-migration, so the way back across it is the named backup restored under the `pre-v8v9` images. V9 alone
 does have one: run `app.pg_schema.V9_ROLLBACK` as the migration role in one transaction and deploy the V8 code (`docs/ledger_search.md`), which keeps every write made since.
 
+### Per-tenant API keys (`jarvisctl keys`)
+
+`jarvisctl keys pepper-init|pepper-install-app|tenant-create|key-create|key-revoke|tenant-status|tenants|keys|status` issues and manages per-tenant API keys (schema v10; `docs/tenant_keys.md`). Tokens are written to a
+mode-600 file under `secrets/issued-keys/` and never printed; the pepper (`secrets/key-pepper`) is created once and never overwritten or shown. Key authentication stays off until `JARVIS_KEY_TENANTS=1` is set
+for the app (see `docs/tenant_keys.md`); issuing a key does not enable it.
+
 ### Signatures (schema v7)
 
 Backup sets carry `<set>.signatures.json` (the attestations, trust statements and blocks, for the PC witness) and the anchors carry
