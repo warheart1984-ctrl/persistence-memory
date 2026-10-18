@@ -1,0 +1,159 @@
+"""jarvisctl keys: the box-side wrapper for per-tenant API keys (RFC phase 1). What it validates before Docker is touched, that the pepper and the tokens are never printed or put on a
+command line, that a pepper or a token file is never overwritten, and that issuing a key does not switch key authentication on."""
+
+from __future__ import annotations
+
+import os
+import shutil
+import stat
+import subprocess
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+MINT = ROOT / "deploy" / "mint"
+TENANT = "t_" + "ab" * 16
+KEY_ID = "0123456789abcdef"
+
+
+@pytest.fixture
+def box(tmp_path):
+    d = tmp_path / "mint"
+    shutil.copytree(MINT, d, ignore=shutil.ignore_patterns(".env", "secrets"))
+    (d / "secrets").mkdir()
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    log = tmp_path / "docker.log"
+    # a docker that records every argument (one line per call) and what the container would see in the environment, and answers like the CLI does
+    (fake / "docker").write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$FAKE_DOCKER_LOG"\ncase "$*" in *create-key*) echo "key 0123456789abcdef issued; token written to /keys/x.token" ;; *list-tenants*) echo "t_x  active  a" ;; esac\nexit 0\n')
+    (fake / "docker").chmod(0o755)
+    env = dict(os.environ, PATH=f"{fake}:{os.environ['PATH']}", JARVIS_HOME=str(tmp_path / "home"), FAKE_DOCKER_LOG=str(log), HOME=str(tmp_path))
+
+    class Box:
+        dir, secrets, env_, log_ = d, d / "secrets", env, log
+
+        def run(self, *args):
+            return subprocess.run([str(d / "bin" / "keys.sh"), *args], env=env, capture_output=True, text=True, timeout=60)
+
+        def docker_calls(self):
+            return log.read_text().splitlines() if log.exists() else []
+
+    return Box()
+
+
+def with_pepper(box):
+    r = box.run("pepper-init")
+    assert r.returncode == 0, r.stderr
+    return (box.secrets / "key-pepper").read_text().strip()
+
+
+BAD = [
+    ("tenant-create",), ("tenant-create", "--label"), ("tenant-create", "--label", "x", "--tenant", TENANT),
+    ("key-create", "--tenant", TENANT), ("key-create", "--tenant", "operator", "--out", "a"), ("key-create", "--tenant", TENANT.upper(), "--out", "a"),
+    ("key-create", "--tenant", "t_" + "ab" * 15, "--out", "a"), ("key-create", "--tenant", TENANT, "--out", "../x"), ("key-create", "--tenant", TENANT, "--out", "a/b"),
+    ("key-create", "--tenant", TENANT, "--out", ".."), ("key-create", "--tenant", TENANT, "--out", "a b"),
+    ("key-create", "--tenant", TENANT, "--out", "a", "--scopes", "admin"), ("key-create", "--tenant", TENANT, "--out", "a", "--scopes", "memory.read,"),
+    ("key-create", "--tenant", TENANT, "--out", "a", "--expires-days", "-1"), ("key-create", "--tenant", TENANT, "--out", "a", "--expires-days", "soon"),
+    ("key-create", "--tenant", TENANT, "--out", "a", "--status", "active"), ("key-create", "--tenant", TENANT, "--out", "a", "--label", "x" * 81),
+    ("key-create", "--tenant", TENANT, "--out", "a", "--label", "two\nlines"),
+    ("key-revoke",), ("key-revoke", "jlk_" + KEY_ID + "_" + "A" * 43), ("key-revoke", KEY_ID.upper()), ("key-revoke", KEY_ID, "extra"),
+    ("tenant-status", "--tenant", TENANT), ("tenant-status", "--tenant", TENANT, "--status", "gone"), ("tenant-status", "--tenant", "x", "--status", "active"),
+    ("tenants", "--all"), ("keys", "--tenant", "nope"), ("status", "x"), ("pepper-init", "--out", "x"), ("nonsense",), ("keys", "--bogus"),
+]
+
+
+@pytest.mark.parametrize("args", BAD, ids=lambda a: " ".join(a)[:70].replace("\n", "\\n"))
+def test_a_bad_argument_is_refused_before_docker_is_touched(box, args):
+    with_pepper(box)
+    r = box.run(*args)
+    assert r.returncode == 2, (r.returncode, r.stderr)
+    assert box.docker_calls() == []
+
+
+def test_pepper_init_writes_a_strong_mode_600_secret_and_prints_none_of_it(box):
+    r = box.run("pepper-init")
+    assert r.returncode == 0
+    p = box.secrets / "key-pepper"
+    value = p.read_text().strip()
+    assert stat.S_IMODE(p.stat().st_mode) == 0o600 and len(value) >= 32
+    assert value not in r.stdout + r.stderr
+    assert not list(box.secrets.glob("key-pepper.tmp*"))
+
+
+def test_the_pepper_is_never_overwritten(box):
+    first = with_pepper(box)
+    r = box.run("pepper-init")
+    assert r.returncode == 1 and "already exists" in r.stderr
+    assert (box.secrets / "key-pepper").read_text().strip() == first
+
+
+@pytest.mark.parametrize("args", [("tenant-create", "--label", "alice"), ("tenants",), ("keys",), ("key-revoke", KEY_ID),
+                                  ("key-create", "--tenant", TENANT, "--out", "alice")])
+def test_nothing_runs_without_a_pepper(box, args):
+    r = box.run(*args)
+    assert r.returncode == 1 and "pepper-init" in r.stderr
+    assert box.docker_calls() == []
+
+
+def test_the_pepper_must_be_mode_600(box):
+    with_pepper(box)
+    (box.secrets / "key-pepper").chmod(0o640)
+    r = box.run("tenants")
+    assert r.returncode == 1 and "600" in r.stderr and box.docker_calls() == []
+
+
+def test_key_create_hands_the_cli_a_token_file_and_a_read_only_pepper_mount_and_never_the_values(box):
+    pepper = with_pepper(box)
+    r = box.run("key-create", "--tenant", TENANT, "--out", "alice", "--label", "alice's agent", "--scopes", "memory.read", "--expires-days", "30")
+    assert r.returncode == 0, r.stderr
+    (call,) = box.docker_calls()
+    for needle in ("create-key", f"--tenant {TENANT}", "--token-file /keys/alice.token", "--scopes memory.read", "--expires-days 30", "migrate python -m app.tenant_keys",
+                   "-e JARVIS_KEY_PEPPER_FILE=/run/key-pepper", f"{box.secrets}/key-pepper:/run/key-pepper:ro", f"--user {os.getuid()}:{os.getgid()}"):
+        assert needle in call, needle
+    assert pepper not in call and pepper not in r.stdout + r.stderr
+    assert "jlk_" not in call + r.stdout + r.stderr
+    assert (box.secrets / "issued-keys").is_dir() and stat.S_IMODE((box.secrets / "issued-keys").stat().st_mode) == 0o700
+
+
+def test_an_existing_token_file_is_never_overwritten_and_the_cli_is_not_even_called(box):
+    with_pepper(box)
+    keys = box.secrets / "issued-keys"
+    keys.mkdir()
+    (keys / "alice.token").write_text("precious\n")
+    r = box.run("key-create", "--tenant", TENANT, "--out", "alice")
+    assert r.returncode == 1 and "never overwritten" in r.stderr
+    assert (keys / "alice.token").read_text() == "precious\n" and box.docker_calls() == []
+
+
+def test_the_other_commands_pass_exactly_their_arguments(box):
+    with_pepper(box)
+    assert box.run("tenant-create", "--label", "alice").returncode == 0
+    assert box.run("key-revoke", KEY_ID).returncode == 0
+    assert box.run("tenant-status", "--tenant", TENANT, "--status", "suspended").returncode == 0
+    assert box.run("tenants").returncode == 0
+    assert box.run("keys", "--tenant", TENANT).returncode == 0
+    calls = box.docker_calls()
+    assert [c.split("app.tenant_keys ", 1)[1] for c in calls] == ["create-tenant --label alice", f"revoke-key {KEY_ID}", f"set-status --tenant {TENANT} --status suspended",
+                                                                   "list-tenants", f"list-keys --tenant {TENANT}"]
+
+
+def test_status_reports_whether_key_authentication_is_on_and_issuing_a_key_does_not_turn_it_on(box):
+    r = box.run("status")
+    assert r.returncode == 0 and "pepper: absent" in r.stdout and "key authentication: off" in r.stdout
+    with_pepper(box)
+    (box.secrets / "app.env").write_text("JARVIS_API_KEY=secret-value-that-must-not-be-echoed\n")
+    box.run("key-create", "--tenant", TENANT, "--out", "alice")
+    assert "JARVIS_KEY_TENANTS" not in (box.secrets / "app.env").read_text()
+    r = box.run("status")
+    assert "key authentication: off" in r.stdout and "secret-value" not in r.stdout + r.stderr
+    (box.secrets / "app.env").write_text("JARVIS_KEY_TENANTS=1\n")
+    assert "key authentication: ON" in box.run("status").stdout
+
+
+def test_jarvisctl_dispatches_keys_and_lists_it_in_help(box):
+    ctl = str(box.dir / "bin" / "jarvisctl")
+    help_text = subprocess.run([ctl, "help"], env=box.env_, capture_output=True, text=True).stdout
+    assert "keys pepper-init|tenant-create|key-create" in help_text
+    r = subprocess.run([ctl, "keys", "nonsense"], env=box.env_, capture_output=True, text=True)
+    assert r.returncode == 2 and "keys.sh" in r.stderr

@@ -46,6 +46,24 @@ python -m app.tenant_keys set-status --tenant t_<hex32> --status suspended
 python -m app.tenant_keys list-tenants | list-keys [--tenant t_<hex32>]
 ```
 
+### On the box: `jarvisctl keys`
+
+`jarvisctl keys ...` wraps the commands above for the box. It runs the same CLI in the migrate container as the migrator role, as the host user, with the pepper mounted read-only (never passed as a value), and
+**never prints a token**: `key-create` requires `--out NAME` and writes `secrets/issued-keys/NAME.token` (mode 600, directory 700; an existing file is never overwritten). Every argument is validated before Docker is touched.
+
+```
+jarvisctl keys pepper-init                       # once: secrets/key-pepper, random, mode 600, never overwritten, value not shown. Back it up with the secrets: keys verify only with it.
+jarvisctl keys tenant-create --label alice       # prints the new t_... id
+jarvisctl keys key-create --tenant t_... --out alice-agent [--label L] [--scopes memory.read,memory.write] [--expires-days N]
+jarvisctl keys key-revoke KEY_ID                 # the 16 hex characters after jlk_
+jarvisctl keys tenant-status --tenant t_... --status suspended
+jarvisctl keys tenants | keys [--tenant t_...] | status
+```
+
+Issuing a key does **not** turn key authentication on. To enable it: `jarvisctl keys pepper-init`, make the pepper readable by the app's uid (10001) and mount it into the app container, set
+`JARVIS_KEY_TENANTS=1` and `JARVIS_KEY_PEPPER_FILE` in `secrets/app.env`, recreate the app only, and probe a key before announcing it (the 2026-10-17 drill is the template). Until then a `jlk_` token is an
+ordinary wrong key (401). `tests/test_deploy_keys.py` pins the wrapper.
+
 The token exists in exactly one place: the output of `create-key`. Prefer `--token-file` (mode 600, never overwrites an existing file) so it never appears on a terminal. Listing never shows a hash.
 
 Pinned by `tests/test_tenant_keys.py` (privileges, the constraints, round trip, uniform failure, expiry, revocation, the comparison on unknown ids, rate-limited `last_used_at`, the CLI, rollback and forward again).
@@ -75,4 +93,4 @@ request parameter. The operator's ledger key keeps working exactly as before (th
 properties are proven for both kinds of tenant identity, and a route added without a matrix classification fails there too. The few routes that answer a request with no credential in a shared-key deployment
 (they carry no ledger data and behave the same on the box today) are named in that file, not hidden.
 
-Not in this slice: `jarvisctl` wrappers for issuing keys, per-tenant call-log chains, and recording the credential in the history hash.
+Not in this slice: per-tenant call-log chains, and recording the credential in the history hash.
