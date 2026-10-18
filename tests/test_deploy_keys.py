@@ -157,3 +157,21 @@ def test_jarvisctl_dispatches_keys_and_lists_it_in_help(box):
     assert "keys pepper-init|tenant-create|key-create" in help_text
     r = subprocess.run([ctl, "keys", "nonsense"], env=box.env_, capture_output=True, text=True)
     assert r.returncode == 2 and "keys.sh" in r.stderr
+
+
+@pytest.mark.parametrize("line,expected", [("JARVIS_KEY_TENANTS=1", "ON"), ("JARVIS_KEY_TENANTS=TRUE", "ON"), ("JARVIS_KEY_TENANTS=Yes", "ON"), ("JARVIS_KEY_TENANTS=on", "ON"),
+                                           ("JARVIS_KEY_TENANTS= 1 ", "ON"), ('JARVIS_KEY_TENANTS="true"', "ON"), ("JARVIS_KEY_TENANTS='ON'", "ON"),
+                                           ("JARVIS_KEY_TENANTS=0", "off"), ("JARVIS_KEY_TENANTS=false", "off"), ("JARVIS_KEY_TENANTS=", "off"), ("JARVIS_KEY_TENANTS=maybe", "off"),
+                                           ("# JARVIS_KEY_TENANTS=1", "off"), ("XJARVIS_KEY_TENANTS=1", "off")])
+def test_status_reads_the_flag_the_way_the_application_does(box, line, expected):
+    """Codex on #115: key_tenants_enabled() strips and lowercases, so status must not report 'off' for a value the app accepts (nor 'ON' for one it rejects)."""
+    (box.secrets / "app.env").write_text("JARVIS_API_KEY=x\n" + line + "\n")
+    out = box.run("status").stdout
+    assert f"key authentication: {expected}" in out, out
+
+
+def test_status_uses_the_last_assignment_like_compose(box):
+    (box.secrets / "app.env").write_text("JARVIS_KEY_TENANTS=1\nJARVIS_KEY_TENANTS=0\n")
+    assert "key authentication: off" in box.run("status").stdout
+    (box.secrets / "app.env").write_text("JARVIS_KEY_TENANTS=0\nJARVIS_KEY_TENANTS=true\n")
+    assert "key authentication: ON" in box.run("status").stdout

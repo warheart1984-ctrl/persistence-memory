@@ -110,7 +110,9 @@ case "$cmd" in
   status)
     [ $# -eq 0 ] || bad "status takes no options"
     if [ -f "$PEPPER_FILE" ]; then echo "pepper: present ($(stat -c %a "$PEPPER_FILE"))"; else echo "pepper: absent (jarvisctl keys pepper-init)"; fi
-    if [ -f "$SECRETS_DIR/app.env" ] && grep -qE '^JARVIS_KEY_TENANTS=(1|true|yes|on)$' "$SECRETS_DIR/app.env"; then echo "key authentication: ON in secrets/app.env"; else echo "key authentication: off (JARVIS_KEY_TENANTS not set in secrets/app.env)"; fi
+    # as the app reads it: the LAST assignment wins (compose env_file), surrounding quotes and blanks are dropped, and key_tenants_enabled() lowercases (1/true/yes/on)
+    flag="$(grep -E '^[[:space:]]*JARVIS_KEY_TENANTS[[:space:]]*=' "$SECRETS_DIR/app.env" 2>/dev/null | tail -1 | sed -E 's/^[^=]*=//; s/^[[:space:]]+//; s/[[:space:]]+$//; s/^"(.*)"$/\1/; s/^'"'"'(.*)'"'"'$/\1/; s/^[[:space:]]+//; s/[[:space:]]+$//' | tr '[:upper:]' '[:lower:]' || true)"
+    case "$flag" in 1|true|yes|on) echo "key authentication: ON in secrets/app.env" ;; *) echo "key authentication: off (JARVIS_KEY_TENANTS not enabled in secrets/app.env)" ;; esac
     if [ -f "$PEPPER_FILE" ]; then
       echo "tenants: $(tk list-tenants 2>/dev/null | grep -c '^t_' || true)"
       echo "keys:    $(tk list-keys 2>/dev/null | grep -c '^[0-9a-f]\{16\}' || true)"
