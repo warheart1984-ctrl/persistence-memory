@@ -1,6 +1,6 @@
 # Per-tenant API keys (RFC phase 1, slice 1)
 
-Status: **built, not deployed.** Slice 1 adds the storage, the token format, the verification primitive and the migrator-role CLI. Slice 2 (below) authenticates requests with a tenant key behind
+Status: **schema v10 is deployed (2026-10-18) with key authentication switched off**: the control schema exists on the live box, no tenant or key has been created, and `JARVIS_KEY_TENANTS` is unset. Slice 1 adds the storage, the token format, the verification primitive and the migrator-role CLI. Slice 2 (below) authenticates requests with a tenant key behind
 `JARVIS_KEY_TENANTS`, which is off by default; with it off the only change to a running deployment is that the schema version becomes 10.
 
 ## Schema v10: the control schema

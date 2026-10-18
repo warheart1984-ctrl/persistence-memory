@@ -78,7 +78,7 @@ pool is shed with an immediate 503 rather than queued behind a slow database.
 * `GET /health` - **liveness**: the process is up. Never touches the ledger, reports no counts or paths.
 * `GET /ready` - **readiness**: 200 only if all of these hold, checked live on every call (never cached);
   otherwise 503 with `Retry-After` and the failing check names (no details):
-  `database` (`SELECT 1` as the application role), `schema_version` (matches the code exactly) (the code is at schema 10; a database at 9 is refused until migrated), `role`
+  `database` (`SELECT 1` as the application role), `schema_version` (matches the code exactly) (the code is at schema 10; a database at another version is refused until migrated; the live box is at 10), `role`
   (not superuser, no `BYPASSRLS`), `rls_tables` (every table of the schema with a `tenant_key` column has row-level security enabled, **forced**, and at least one policy; the role check proves the app role cannot bypass RLS, this proves there is RLS to be subject to, so a migration that adds a tenant table without it, or drops its FORCE, makes `/ready` 503; the offending tables are named in the log only; the one exception is the retained legacy blob table `jarvis_tenant_ledgers`, which the importer leaves as a rollback copy and the row store never reads: `legacy_data` watches it), `history_write_denied` (the role is *proven* unable to write
   `record_history`, `chain_heads` or `history_counters`: the catalog shows no write privilege and attempted
   INSERT/UPDATE/DELETE are refused, inside rolled-back savepoints; `TRUNCATE` is checked in the catalog
