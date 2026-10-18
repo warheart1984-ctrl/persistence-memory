@@ -10,7 +10,8 @@
 #   keys.sh tenant-status --tenant t_<hex> --status active|suspended|quiesced|restoring|deleting|deleted
 #   keys.sh tenants                              list tenants
 #   keys.sh keys [--tenant t_<hex>]              list keys (never a hash)
-#   keys.sh status                               pepper present? is JARVIS_KEY_TENANTS set in the app env? how many tenants and keys
+#   keys.sh pepper-install-app                   make the app's own copy of the pepper (secrets/key-pepper.app, owned by the app's uid 10001, mode 400); the operator's copy stays yours
+#   keys.sh status                               pepper present? app copy present and identical? is JARVIS_KEY_TENANTS set in the app env? how many tenants and keys
 #
 # Issuing a key does NOT turn key authentication on: the app only honours keys with JARVIS_KEY_TENANTS=1 and a pepper mounted for it (docs/tenant_keys.md). Every argument is
 # validated before Docker is touched; a rejected combination exits 2. The pepper and the tokens are never printed, logged or put on a command line.
@@ -19,12 +20,13 @@ export LOG_NAME=keys
 # shellcheck source=lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-usage() { sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+usage() { sed -n '2,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 bad() { echo "$*" >&2; exit 2; }
 [ $# -ge 1 ] || usage
 cmd="$1"; shift
 
 PEPPER_FILE="$SECRETS_DIR/key-pepper"
+APP_PEPPER_FILE="$SECRETS_DIR/key-pepper.app"      # what the APP mounts: its own copy, owned by uid 10001. This CLI always uses the operator copy above, which never changes owner.
 KEYS_DIR="$SECRETS_DIR/issued-keys"
 TENANT_RE='^t_[0-9a-f]{32}$'
 KEYID_RE='^[0-9a-f]{16}$'
@@ -54,7 +56,7 @@ tk() {
     -v "$PEPPER_FILE:/run/key-pepper:ro" -v "$KEYS_DIR:/keys" -e JARVIS_KEY_PEPPER_FILE=/run/key-pepper \
     migrate python -m app.tenant_keys "$@"
 }
-need_pepper() { [ -f "$PEPPER_FILE" ] || die "no pepper yet: run  jarvisctl keys pepper-init  first"; [ "$(stat -c %a "$PEPPER_FILE")" = 600 ] || die "$PEPPER_FILE must be mode 600"; mkdir -p "$KEYS_DIR"; chmod 700 "$KEYS_DIR"; }
+need_pepper() { [ -f "$PEPPER_FILE" ] || die "no pepper yet: run  jarvisctl keys pepper-init  first"; [ "$(stat -c %a "$PEPPER_FILE")" = 600 ] || die "$PEPPER_FILE must be mode 600"; [ "$(stat -c %u "$PEPPER_FILE")" = "$(id -u)" ] || die "$PEPPER_FILE must belong to you (the app gets its own copy: jarvisctl keys pepper-install-app); never chown it"; [ -r "$PEPPER_FILE" ] || die "$PEPPER_FILE is not readable by you"; mkdir -p "$KEYS_DIR"; chmod 700 "$KEYS_DIR"; }
 
 case "$cmd" in
   pepper-init)
@@ -65,6 +67,16 @@ case "$cmd" in
     rm -f "$PEPPER_FILE.tmp.$$"
     chmod 600 "$PEPPER_FILE"
     log INFO "pepper written to $PEPPER_FILE (mode 600, $(head -c -1 "$PEPPER_FILE" | wc -c) characters; the value is not shown). Back it up with the secrets: keys issued under it verify only with it."
+    ;;
+  pepper-install-app)
+    parse_opts "$@"; [ -z "$tenant$label$scopes$expires$out$status" ] || bad "pepper-install-app takes no options"
+    need_pepper
+    [ ! -e "$APP_PEPPER_FILE" ] || die "$APP_PEPPER_FILE already exists: it is never overwritten (delete it yourself to replace it; keys verify only under the pepper they were issued with)"
+    # a root container (the default) can read your file and chown the copy; the copy is the only thing that changes owner. Nothing about the value is passed on a command line.
+    docker run --rm --user 0 --read-only --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add FOWNER --network none --entrypoint sh \
+      -v "$SECRETS_DIR:/s" "$APP_IMAGE" -c 'set -e; umask 077; cp /s/key-pepper /s/key-pepper.app; chown 10001:10001 /s/key-pepper.app; chmod 400 /s/key-pepper.app' \
+      || die "could not create the app's copy of the pepper"
+    log INFO "app copy written to $APP_PEPPER_FILE (owner 10001, mode 400; the value is not shown). Mount THIS file into the app as JARVIS_KEY_PEPPER_FILE; never the operator copy."
     ;;
   tenant-create)
     parse_opts "$@"; [ -z "$tenant$scopes$expires$out$status" ] || bad "tenant-create takes only --label"
@@ -110,6 +122,10 @@ case "$cmd" in
   status)
     [ $# -eq 0 ] || bad "status takes no options"
     if [ -f "$PEPPER_FILE" ]; then echo "pepper: present ($(stat -c %a "$PEPPER_FILE"))"; else echo "pepper: absent (jarvisctl keys pepper-init)"; fi
+    if [ -f "$APP_PEPPER_FILE" ]; then
+      if [ -f "$PEPPER_FILE" ] && [ "$(docker run --rm --user 0 --read-only --cap-drop ALL --cap-add DAC_OVERRIDE --network none --entrypoint sh -v "$SECRETS_DIR:/s:ro" "$APP_IMAGE" -c 'cmp -s /s/key-pepper /s/key-pepper.app && echo same || echo different' 2>/dev/null)" = same ]; then echo "app pepper copy: present, identical to the operator copy"
+      else echo "app pepper copy: present, but NOT confirmed identical to the operator copy (keys would not verify in the app)"; fi
+    else echo "app pepper copy: absent (jarvisctl keys pepper-install-app)"; fi
     # as the app reads it: the LAST assignment wins (compose env_file); a quoted value is what is inside the quotes (anything after the closing quote is a comment); an unquoted value ends
     # at a space-prefixed "#" (compose inline comment); key_tenants_enabled() lowercases (1/true/yes/on)
     flag="$(grep -E '^[[:space:]]*JARVIS_KEY_TENANTS[[:space:]]*=' "$SECRETS_DIR/app.env" 2>/dev/null | tail -1 | sed -E 's/^[^=]*=//; s/^[[:space:]]+//; /^"/{s/^"([^"]*)".*$/\1/;b done}; /^'"'"'/{s/^'"'"'([^'"'"']*)'"'"'.*$/\1/;b done}; s/[[:space:]]+#.*$//; :done; s/^[[:space:]]+//; s/[[:space:]]+$//' | tr '[:upper:]' '[:lower:]' || true)"

@@ -26,7 +26,7 @@ def box(tmp_path):
     fake.mkdir()
     log = tmp_path / "docker.log"
     # a docker that records every argument (one line per call) and what the container would see in the environment, and answers like the CLI does
-    (fake / "docker").write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$FAKE_DOCKER_LOG"\ncase "$*" in *create-key*) echo "key 0123456789abcdef issued; token written to /keys/x.token" ;; *list-tenants*) echo "t_x  active  a" ;; esac\nexit ${FAKE_DOCKER_RC:-0}\n')
+    (fake / "docker").write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$FAKE_DOCKER_LOG"\ncase "$*" in *create-key*) echo "key 0123456789abcdef issued; token written to /keys/x.token" ;; *list-tenants*) echo "t_x  active  a" ;; *"cmp -s"*) echo same ;; esac\nexit ${FAKE_DOCKER_RC:-0}\n')
     (fake / "docker").chmod(0o755)
     env = dict(os.environ, PATH=f"{fake}:{os.environ['PATH']}", JARVIS_HOME=str(tmp_path / "home"), FAKE_DOCKER_LOG=str(log), HOME=str(tmp_path))
 
@@ -154,7 +154,7 @@ def test_status_reports_whether_key_authentication_is_on_and_issuing_a_key_does_
 def test_jarvisctl_dispatches_keys_and_lists_it_in_help(box):
     ctl = str(box.dir / "bin" / "jarvisctl")
     help_text = subprocess.run([ctl, "help"], env=box.env_, capture_output=True, text=True).stdout
-    assert "keys pepper-init|tenant-create|key-create" in help_text
+    assert "keys pepper-init|pepper-install-app|tenant-create|key-create" in help_text
     r = subprocess.run([ctl, "keys", "nonsense"], env=box.env_, capture_output=True, text=True)
     assert r.returncode == 2 and "keys.sh" in r.stderr
 
@@ -188,3 +188,36 @@ def test_status_does_not_turn_a_failed_query_into_an_empty_deployment(box):
     box.env_["FAKE_DOCKER_RC"] = "0"
     r = box.run("status")
     assert r.returncode == 0 and "tenants: 1" in r.stdout
+
+
+def test_pepper_install_app_makes_a_separate_app_owned_copy_and_never_touches_the_operator_copy(box):
+    """Codex (P1) on #115: the app needs the pepper owned by uid 10001, and the operator CLI must keep reading ITS copy as the host user (key-revoke must work once keys are on)."""
+    pepper = with_pepper(box)
+    r = box.run("pepper-install-app")
+    assert r.returncode == 0, r.stderr
+    (call,) = box.docker_calls()
+    for needle in ("run --rm --user 0", "--network none", "--read-only", f"-v {box.secrets}:/s", "chown 10001:10001 /s/key-pepper.app", "chmod 400 /s/key-pepper.app", "cp /s/key-pepper /s/key-pepper.app"):
+        assert needle in call, needle
+    assert pepper not in call + r.stdout + r.stderr
+    assert (box.secrets / "key-pepper").read_text().strip() == pepper and stat.S_IMODE((box.secrets / "key-pepper").stat().st_mode) == 0o600
+    # and the management commands still run as the host user against the operator copy, never the app copy
+    box.run("key-revoke", KEY_ID)
+    revoke = box.docker_calls()[-1]
+    assert f"--user {os.getuid()}:{os.getgid()}" in revoke and f"{box.secrets}/key-pepper:/run/key-pepper:ro" in revoke and "key-pepper.app" not in revoke
+
+
+def test_the_app_copy_is_never_overwritten_and_needs_the_operator_pepper_first(box):
+    r = box.run("pepper-install-app")
+    assert r.returncode == 1 and "pepper-init" in r.stderr and box.docker_calls() == []
+    with_pepper(box)
+    (box.secrets / "key-pepper.app").write_text("existing\n")
+    r = box.run("pepper-install-app")
+    assert r.returncode == 1 and "already exists" in r.stderr and box.docker_calls() == []
+    assert (box.secrets / "key-pepper.app").read_text() == "existing\n"
+
+
+def test_status_reports_the_app_copy(box):
+    with_pepper(box)
+    assert "app pepper copy: absent" in box.run("status").stdout
+    (box.secrets / "key-pepper.app").write_text("x\n")
+    assert "app pepper copy: present, identical" in box.run("status").stdout          # the fake docker answers `same`
