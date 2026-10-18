@@ -31,7 +31,7 @@ def test_domain_replay_contracts_are_on_hold():
 
 def test_signatures_are_deployed_but_shelved():
     sig = row(README, "| **Signatures**")
-    for needle in ("shelved", "no key", "sign timer is off", "nothing is signed", "schema v9", "JARVIS_SIGNATURES=warn", "never as verified"):
+    for needle in ("shelved", "no key", "sign timer is off", "nothing is signed", "schema v10", "JARVIS_SIGNATURES=warn", "never as verified"):
         assert needle in sig, needle
     assert "**live**" not in sig and "not deployed" not in sig and "schema v6" not in sig
 
@@ -45,9 +45,9 @@ def test_no_stale_claim_that_replay_is_missing_from_the_box():
 
 
 def test_the_mint_readme_lists_what_is_deployed_and_what_is_not():
-    assert "Where things stand (updated 2026-10-11; the box was last deployed 2026-10-11)" in MINT
+    assert "Where things stand (updated 2026-10-18; the box was last deployed 2026-10-18)" in MINT
     assert "**Deployed on 2026-10-06:**" in MINT and "Replay Contracts (`RC.Ledger.v1`" in MINT
     assert "**Deployed on 2026-10-08 and 2026-10-10:**" in MINT and "schema **v8** and **v9**" in MINT
     assert "**Shelved, though the code is deployed:** signatures" in MINT and "the sign timer is off" in MINT
     assert "The sign timer is **off**" in MINT
-    assert "**Deployed on 2026-10-11:**" in MINT and "JARVIS_CALL_LOG_ENABLED=1" in MINT and "JARVIS_DRIFT_CHECK_ENABLED=1" in MINT and "pre-drift" in MINT
+    assert "**Deployed on 2026-10-18:**" in MINT and "schema **v10**" in MINT and "**Deployed on 2026-10-11:**" in MINT and "JARVIS_CALL_LOG_ENABLED=1" in MINT and "JARVIS_DRIFT_CHECK_ENABLED=1" in MINT and "pre-drift" in MINT

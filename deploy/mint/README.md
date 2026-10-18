@@ -13,14 +13,14 @@ Windows PC ──ssh -L──►  127.0.0.1:8011  ─►  app (non-root, read-on
    backups (hourly, verified) ──► ~/jarvis-ledger/backups ──► age-encrypted daily ──► Windows PC (G:)
 ```
 
-## Where things stand (updated 2026-10-11; the box was last deployed 2026-10-11)
+## Where things stand (updated 2026-10-18; the box was last deployed 2026-10-18)
 
 * **Running:** the stack on `127.0.0.1:8011`, on Linux Mint 22.3 (4 CPUs, 15 GiB RAM, Wi-Fi only, disk not
   encrypted). Docker 29.1.3, compose 2.40.3 and age 1.1.1 come from Ubuntu's own archive.
 * **Data:** 59 records imported from the PC's `jarvis-store.json` with `pg_import` on 2026-10-05 (manifest in
   `~/jarvis-ledger/state/import-manifest.json`), plus one record migrated from the old service
-  (`mem-da3ddefda22a`, copied from `mem-79f9aa7e7e44`). Since then agents have written their own records through the API: **62 live records at
-  history seq 137 on 2026-10-11** (`jarvisctl replay state`, i.e. `GET /api/jarvis/replay/state`, reports the live count and is the source of truth).
+  (`mem-da3ddefda22a`, copied from `mem-79f9aa7e7e44`). Since then agents have written their own records through the API: **66 live records at
+  history seq 143 on 2026-10-18** (`jarvisctl replay state`, i.e. `GET /api/jarvis/replay/state`, reports the live count and is the source of truth).
 * **The old service on 8001 is retired:** `persistence-memory.service` is stopped and disabled. Its data
   (`~/.local/share/persistence-memory/`) and `~/.config/persistence-memory/memory.env` are untouched, and
   `~/persistence-memory` is pinned at `d5157ba`. To bring it back:
