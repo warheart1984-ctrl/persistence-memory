@@ -85,9 +85,10 @@ services:
       JARVIS_HOST: 0.0.0.0
       JARVIS_DATABASE_SCHEMA: jarvis
       JARVIS_PG_STORE: rows
-      # Private host: agents write through the REST API. MCP write tools stay off until you decide otherwise.
+      # Private host: agents write through the REST API. MCP write tools (emr_remember / emr_upsert: draft-only, user_requested, ledger key only; the recall key is refused)
+      # stay off until you set JARVIS_MCP_WRITE_ENABLED=true in deploy/mint/.env and recreate the app. The default is OFF, so a missing or empty value never opens writes.
       JARVIS_MEMORY_WRITE_ENABLED: "true"
-      JARVIS_MCP_WRITE_ENABLED: "false"
+      JARVIS_MCP_WRITE_ENABLED: ${JARVIS_MCP_WRITE_ENABLED:-false}
       JARVIS_CORS_ORIGINS: "http://127.0.0.1:${JARVIS_APP_PORT:-8011},http://localhost:${JARVIS_APP_PORT:-8011}"
       # Everything the app writes outside Postgres goes to the appdata volume (the image root is read-only).
       # The PUBLIC root keys the service verifies signatures against (read-only; empty until the key ceremony). No private key is ever
