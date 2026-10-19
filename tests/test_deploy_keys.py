@@ -221,3 +221,12 @@ def test_status_reports_the_app_copy(box):
     assert "app pepper copy: absent" in box.run("status").stdout
     (box.secrets / "key-pepper.app").write_text("x\n")
     assert "app pepper copy: present, identical" in box.run("status").stdout          # the fake docker answers `same`
+
+
+def test_the_mcp_write_flag_comes_from_the_env_file_and_defaults_to_off():
+    """The compose file used to hard-code JARVIS_MCP_WRITE_ENABLED to "false" (compose environment beats secrets/app.env), so it could not be turned on without editing a tracked file on the box.
+    It is now ${JARVIS_MCP_WRITE_ENABLED:-false}: set in deploy/mint/.env, and an unset or empty value is OFF."""
+    compose = (MINT / "docker-compose.yml").read_text()
+    lines = [l.strip() for l in compose.splitlines() if l.strip().startswith("JARVIS_MCP_WRITE_ENABLED")]
+    assert lines == ["JARVIS_MCP_WRITE_ENABLED: ${JARVIS_MCP_WRITE_ENABLED:-false}"]
+    assert "JARVIS_MCP_WRITE_ENABLED=false" in (MINT / ".env.example").read_text()
