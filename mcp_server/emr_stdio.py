@@ -24,6 +24,7 @@ from mcp_server.protocol import (
     EMR_UPSERT_TOOL,
     MCP_TOOLS,
     RECALL_READ_TOOLS,
+    WRITER_TOOLS,
     dispatch_rpc,
 )
 
@@ -61,8 +62,8 @@ def api_key(tool: str | None = None) -> str:
     """The ledger API key, or "" when none is configured.
 
     Order: EMR_RECALL_API_KEY, JARVIS_API_KEY, then the first line of the file named by JARVIS_API_KEY_FILE.
-    For a tool OUTSIDE the recall-readable set (the writes, the drift check) the ledger credential comes first when there is one: the recall key is read-only
-    and the server refuses it there.
+    For a tool OUTSIDE the recall-readable set the key is chosen by least privilege: emr_remember / emr_upsert use EMR_WRITER_API_KEY when set (then the ledger key),
+    the drift check needs the ledger key; the recall key is read-only and the server refuses it for any write.
     A file that is NAMED but missing, unreadable or empty is an error, whatever else is set: the operator pointed
     at a credential that is not there, so nothing is sent (no request, no key, no empty key). A blank
     JARVIS_API_KEY_FILE counts as not named.
@@ -75,10 +76,15 @@ def api_key(tool: str | None = None) -> str:
         except KeyFileError as exc:
             raise RuntimeError(f"JARVIS_API_KEY_FILE names {path!r}, which {exc}. Nothing was sent.") from None
     recall = (os.environ.get("EMR_RECALL_API_KEY") or "").strip()
+    writer = (os.environ.get("EMR_WRITER_API_KEY") or "").strip()
     ledger = (os.environ.get("JARVIS_API_KEY") or "").strip() or from_file
-    if tool is not None and tool not in RECALL_READ_TOOLS and ledger:
+    # Least privilege first: a tool a scoped key may call gets the scoped key (the writer key for emr_remember / emr_upsert, the recall key for the reads); the ledger key only
+    # where nothing narrower will do (or nothing narrower is configured). A tool outside WRITER_TOOLS (the drift check) needs the ledger key.
+    if tool is not None and tool not in WRITER_TOOLS and ledger:
         return ledger
-    return recall or ledger
+    if tool is not None and tool not in RECALL_READ_TOOLS and tool in WRITER_TOOLS:
+        return writer or ledger or recall
+    return recall or writer or ledger
 
 
 # --- who is calling (self-reported; the ledger's call log records it as such) ------------------------------------------------

@@ -21,6 +21,7 @@ from mcp_server.protocol import (
     MCP_TOOLS,
     PROTOCOL_VERSION,
     RECALL_READ_TOOLS,
+    WRITER_TOOLS,
     EmrToolCaller,
     dispatch_rpc,
     is_jsonrpc_request,
@@ -35,23 +36,29 @@ def _require_mcp_auth(request: Request) -> str:
         request.headers.get("authorization"),
         request.headers.get("x-emr-recall-key"),
         request.headers.get("x-api-key"),
+        request.headers.get("x-emr-writer-key"),
     )
 
 
+_SCOPES = {"recall": (RECALL_READ_TOOLS, "recall-credential-read-only"), "writer": (WRITER_TOOLS, "writer-credential-scope")}
+
+
 def _scoped_dispatch(message: dict[str, Any], call_tool: EmrToolCaller, credential: str) -> dict[str, Any] | None:
-    """dispatch_rpc, narrowed for a recall-scoped credential: it lists, and may call, only RECALL_READ_TOOLS. Anything else is refused as a tool error."""
-    if credential != "recall":
+    """dispatch_rpc, narrowed for a scoped credential: ``recall`` lists, and may call, only RECALL_READ_TOOLS; ``writer`` only WRITER_TOOLS. Anything else is refused as a tool error."""
+    scope = _SCOPES.get(credential)
+    if scope is None:
         return dispatch_rpc(message, call_tool)
+    allowed, reason = scope
     method = message.get("method")
     if method == "tools/list":
-        return {"jsonrpc": "2.0", "id": message.get("id"), "result": {"tools": [t for t in MCP_TOOLS if t["name"] in RECALL_READ_TOOLS]}}
+        return {"jsonrpc": "2.0", "id": message.get("id"), "result": {"tools": [t for t in MCP_TOOLS if t["name"] in allowed]}}
     if method == "tools/call":
         params = message.get("params")
         name = params.get("name") if isinstance(params, dict) else None
-        if name not in RECALL_READ_TOOLS:
+        if name not in allowed:
             return {"jsonrpc": "2.0", "id": message.get("id"), "result": {
                 "content": [{"type": "text", "text": f"tool not permitted for this credential: {name}"}],
-                "structuredContent": {"error": {"code": "AUTHORITY_DENIED", "reason": "recall-credential-read-only"}},
+                "structuredContent": {"error": {"code": "AUTHORITY_DENIED", "reason": reason}},
                 "isError": True}}
     return dispatch_rpc(message, call_tool)
 

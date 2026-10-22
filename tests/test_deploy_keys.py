@@ -154,7 +154,7 @@ def test_status_reports_whether_key_authentication_is_on_and_issuing_a_key_does_
 def test_jarvisctl_dispatches_keys_and_lists_it_in_help(box):
     ctl = str(box.dir / "bin" / "jarvisctl")
     help_text = subprocess.run([ctl, "help"], env=box.env_, capture_output=True, text=True).stdout
-    assert "keys pepper-init|pepper-install-app|tenant-create|key-create" in help_text
+    assert "keys pepper-init|pepper-install-app|writer-key-init|tenant-create|key-create" in help_text
     r = subprocess.run([ctl, "keys", "nonsense"], env=box.env_, capture_output=True, text=True)
     assert r.returncode == 2 and "keys.sh" in r.stderr
 
@@ -230,3 +230,38 @@ def test_the_mcp_write_flag_comes_from_the_env_file_and_defaults_to_off():
     lines = [l.strip() for l in compose.splitlines() if l.strip().startswith("JARVIS_MCP_WRITE_ENABLED")]
     assert lines == ["JARVIS_MCP_WRITE_ENABLED: ${JARVIS_MCP_WRITE_ENABLED:-false}"]
     assert "JARVIS_MCP_WRITE_ENABLED=false" in (MINT / ".env.example").read_text()
+
+
+def test_writer_key_init_makes_a_strong_mode_600_key_adds_one_env_line_and_prints_nothing(box):
+    (box.secrets / "app.env").write_text("JARVIS_API_KEY=ledger-secret-value\n")
+    (box.secrets / "app.env").chmod(0o600)
+    r = box.run("writer-key-init")
+    assert r.returncode == 0, r.stderr
+    key = (box.secrets / "writer.key").read_text().strip()
+    assert len(key) >= 32 and stat.S_IMODE((box.secrets / "writer.key").stat().st_mode) == 0o600
+    env = (box.secrets / "app.env").read_text()
+    assert env.count("EMR_WRITER_API_KEY=") == 1 and f"EMR_WRITER_API_KEY={key}\n" in env and "JARVIS_API_KEY=ledger-secret-value" in env
+    assert stat.S_IMODE((box.secrets / "app.env").stat().st_mode) == 0o600
+    assert key not in r.stdout + r.stderr and "ledger-secret-value" not in r.stdout + r.stderr
+    assert box.docker_calls() == [] and not list(box.secrets.glob("writer.key.tmp*"))
+
+
+def test_writer_key_init_never_overwrites_and_never_adds_a_second_line(box):
+    r = box.run("writer-key-init")
+    assert r.returncode == 1 and "jarvisctl secrets" in r.stderr
+    (box.secrets / "app.env").write_text("JARVIS_API_KEY=x\n")
+    assert box.run("writer-key-init").returncode == 0
+    first_key, first_env = (box.secrets / "writer.key").read_text(), (box.secrets / "app.env").read_text()
+    again = box.run("writer-key-init")
+    assert again.returncode == 1 and "never overwritten" in again.stderr
+    assert (box.secrets / "writer.key").read_text() == first_key and (box.secrets / "app.env").read_text() == first_env
+    (box.secrets / "writer.key").unlink()
+    again = box.run("writer-key-init")
+    assert again.returncode == 1 and "already sets EMR_WRITER_API_KEY" in again.stderr
+    assert (box.secrets / "app.env").read_text() == first_env and not (box.secrets / "writer.key").exists()
+
+
+def test_writer_key_init_takes_no_options(box):
+    (box.secrets / "app.env").write_text("JARVIS_API_KEY=x\n")
+    assert box.run("writer-key-init", "--force").returncode == 2
+    assert not (box.secrets / "writer.key").exists()

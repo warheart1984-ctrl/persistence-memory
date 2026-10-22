@@ -414,6 +414,9 @@ concept at all) confirmed the direction and added three requirements. Both are r
     handler must be unable to change `current_principal()` for the rest of the request.
     Also from it: anonymous operation must stay impossible in production: strict mode already refuses to start without a credential; keep that a startup refusal, not a default.
 
+22. **A scoped writer credential (built, 2026-10).** `EMR_WRITER_API_KEY` lets a second machine recall and write governed *drafts* without holding the ledger key (read tools + `emr_remember` / `emr_upsert`, nothing
+    else; `docs/writer_credential.md`). It narrows what a lost laptop exposes. It does not by itself say *which* credential wrote a record: that is item 13 (the typed credential in the history hash), still unbuilt.
+
 Also noted from mcp-gateway: its role lookup joined on the agent id without asserting the tenant, relying on globally unique ids and the issuer. Our key resolution takes the tenant from the control-schema row of
 the presented key and never from a request value, which is the stronger rule both studies recommend.
 

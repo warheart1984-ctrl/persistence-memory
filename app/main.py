@@ -86,8 +86,10 @@ from app.auth import (
     ledger_read_protection_middleware,
     mcp_write_enabled,
     memory_write_enabled,
+    assert_writer_key_config,
     require_ledger_operator_key,
     require_tools_credential,
+    require_tools_write_credential,
     require_mcp_write_scope,
     require_memory_write,
     assert_multi_tenant_config,
@@ -142,6 +144,7 @@ async def lifespan(app: FastAPI):
     """Application lifespan: track and cleanup background nx-search processes."""
     # Store for background processes
     assert_multi_tenant_config()  # JARVIS_MULTI_TENANT: refuse to start with a configuration that could fail open
+    assert_writer_key_config()  # EMR_WRITER_API_KEY: refuse a weak writer key, one equal to another credential, or one on a public deployment
     assert_rate_limit_config()  # per-process limiters: more than one worker multiplies every quota, so refuse unless a shared limiter is declared
     if key_auth.key_tenants_enabled():
         key_auth.assert_config()  # JARVIS_KEY_TENANTS: needs the row store and a strong pepper
@@ -1118,7 +1121,7 @@ def tool_emr_recall(body: EmrRecallRequest):
 
 @app.post(
     "/api/jarvis/tools/emr_remember",
-    dependencies=[Depends(require_ledger_operator_key), Depends(require_mcp_write_scope)],
+    dependencies=[Depends(require_tools_write_credential), Depends(require_mcp_write_scope)],
 )
 def tool_emr_remember(body: EmrRememberRequest):
     """Governed create via EMR — draft-only; gated by JARVIS_MCP_WRITE_ENABLED."""
@@ -1128,7 +1131,7 @@ def tool_emr_remember(body: EmrRememberRequest):
 
 @app.post(
     "/api/jarvis/tools/emr_upsert",
-    dependencies=[Depends(require_ledger_operator_key), Depends(require_mcp_write_scope)],
+    dependencies=[Depends(require_tools_write_credential), Depends(require_mcp_write_scope)],
 )
 def tool_emr_upsert(body: EmrUpsertRequest):
     """Governed supersede via EMR — new draft + archive prior; gated by JARVIS_MCP_WRITE_ENABLED."""
