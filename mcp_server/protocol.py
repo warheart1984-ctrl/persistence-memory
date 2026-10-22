@@ -369,6 +369,10 @@ _KNOWN_TOOLS = frozenset(t["name"] for t in MCP_TOOLS)
 # ledger key; adding a tool here is a deliberate decision, pinned by tests/test_recall_credential_boundary.py.
 RECALL_READ_TOOLS = frozenset({"emr_recall", "emr_latest", "emr_search_ledger", "search", "fetch", "emr_search", "emr_fetch"})
 
+# The ONLY tools a writer-scoped credential (EMR_WRITER_API_KEY) may list or call: the read tools plus the two governed DRAFT writes. The drift check and anything added later need the
+# ledger key; adding a tool here is a deliberate decision, pinned by tests/test_writer_credential_boundary.py. (The writes still need JARVIS_MCP_WRITE_ENABLED and user_requested.)
+WRITER_TOOLS = RECALL_READ_TOOLS | frozenset({"emr_remember", "emr_upsert"})
+
 
 class ToolRefusal(Exception):
     """A tool call refused for a reason with a stable machine-readable ``code``.

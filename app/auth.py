@@ -31,6 +31,37 @@ def emr_recall_api_key() -> str | None:
     return key or None
 
 
+def emr_writer_api_key() -> str | None:
+    """EMR_WRITER_API_KEY: a scoped credential that may call the seven read tools AND emr_remember / emr_upsert, and nothing else (docs/writer_credential.md)."""
+    key = (os.getenv("EMR_WRITER_API_KEY") or "").strip()
+    return key or None
+
+
+MIN_WRITER_KEY_CHARS = 32
+
+
+def writer_key_problems() -> list[str]:
+    """What EMR_WRITER_API_KEY refuses to start with: too short, or the same string as another credential (a writer key that IS the ledger key would be the operator key)."""
+    writer = emr_writer_api_key()
+    if not writer:
+        return []
+    problems = []
+    if len(writer) < MIN_WRITER_KEY_CHARS:
+        problems.append(f"EMR_WRITER_API_KEY is shorter than {MIN_WRITER_KEY_CHARS} characters")
+    if is_public_deployment():
+        problems.append("EMR_WRITER_API_KEY is not supported on a public deployment (the recall key is the one credential there)")
+    for name, other in (("JARVIS_API_KEY", configured_api_key()), ("EMR_RECALL_API_KEY", emr_recall_api_key())):
+        if other and secrets.compare_digest(writer, other):
+            problems.append(f"EMR_WRITER_API_KEY must not equal {name}")
+    return problems
+
+
+def assert_writer_key_config() -> None:
+    problems = writer_key_problems()
+    if problems:
+        raise RuntimeError("EMR_WRITER_API_KEY refuses to start: " + "; ".join(problems))
+
+
 def memory_write_enabled() -> bool:
     """Gate for REST ledger CRUD / EMR reinforce / board mutations."""
     default = "false" if is_public_deployment() else "true"
@@ -222,25 +253,32 @@ def require_emr_recall_api_key(
     verify_operator_api_key(authorization, x_emr_recall_key)
 
 
-def credential_kind(authorization: str | None, x_emr_recall_key: str | None, x_api_key: str | None) -> str | None:
-    """Which credential does a tool or MCP request carry?  ``operator`` (the ledger key), ``recall`` (EMR_RECALL_API_KEY: read tools only), or None.
+def credential_kind(authorization: str | None, x_emr_recall_key: str | None, x_api_key: str | None, x_emr_writer_key: str | None = None) -> str | None:
+    """Which credential does a tool or MCP request carry?  ``operator`` (the ledger key), ``writer`` (EMR_WRITER_API_KEY: the read tools plus emr_remember / emr_upsert),
+    ``recall`` (EMR_RECALL_API_KEY: read tools only), or None.
 
-    The recall key is a *scoped* credential: it never opens call log, drift, writes, administration or any REST ledger route (see docs/recall_credential.md).
-    The ledger key keeps working on the tool routes when a recall key is configured, so installing one breaks no existing client.  On a PUBLIC deployment the
-    old rule stays: the recall key is the one operator credential there (the ledger key is not accepted on the tool routes)."""
+    The recall and writer keys are *scoped* credentials: neither opens call log, drift, administration or any REST ledger route (docs/recall_credential.md,
+    docs/writer_credential.md). The ledger key keeps working on the tool routes when they are configured, so installing one breaks no existing client, and it wins when
+    several are presented. The writer key is accepted as a Bearer or in X-EMR-Writer-Key, never in X-API-Key. On a PUBLIC deployment the old rule stays: the recall key is
+    the one operator credential there (the ledger key and the writer key are not accepted on the tool routes)."""
     recall = emr_recall_api_key()
+    writer = emr_writer_api_key()
     ledger = configured_api_key()
     bearer = _extract_bearer(authorization)
     recall_token = bearer or (x_emr_recall_key or "").strip()
     recall_match = bool(recall and recall_token and secrets.compare_digest(recall_token, recall))
+    writer_token = bearer or (x_emr_writer_key or "").strip()
+    writer_match = bool(writer and writer_token and secrets.compare_digest(writer_token, writer))
     if is_public_deployment():
         return "operator" if recall_match else None            # the old rule: on a public deployment the recall key is the operator credential
     if ledger is None:
-        if recall:
-            return "recall" if recall_match else None          # still read-only with no ledger key configured: operator-only operations fail closed (nobody is the operator)
+        if recall or writer:
+            return "writer" if writer_match else ("recall" if recall_match else None)     # still scoped with no ledger key configured: operator-only operations fail closed (nobody is the operator)
         return "operator" if allow_unauthenticated() else None
     if any(t and secrets.compare_digest(t, ledger) for t in (bearer, (x_api_key or "").strip())):   # (either one: see presented_ledger_candidates)
         return "operator"                                      # (the ledger key wins when both are presented)
+    if writer_match:
+        return "writer"
     return "recall" if recall_match else None
 
 
@@ -249,42 +287,63 @@ def require_tools_credential(
     authorization: str | None = Header(default=None),
     x_emr_recall_key: str | None = Header(default=None, alias="X-EMR-Recall-Key"),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_emr_writer_key: str | None = Header(default=None, alias="X-EMR-Writer-Key"),
 ) -> None:
-    """The read tool routes: the ledger key (operator) or, when configured, the recall key (read-only scope). Records which one on the request."""
+    """The read tool routes: the ledger key (operator) or, when configured, the writer key (reads + the two draft writes) or the recall key (read-only scope). Records which one on the request."""
     if tenant_identity_in_force():
         return                            # the identity middleware authenticated the OAuth token / tenant key before this dependency
     if is_public_deployment() and not emr_recall_api_key():
         raise HTTPException(status_code=503, detail="Public deployment requires EMR_RECALL_API_KEY")
-    kind = credential_kind(authorization, x_emr_recall_key, x_api_key)
+    kind = credential_kind(authorization, x_emr_recall_key, x_api_key, x_emr_writer_key)
     if kind is None:
         raise HTTPException(status_code=401, detail="Invalid or missing operator API key" if emr_recall_api_key() else "Invalid or missing API key")
     request.scope["jarvis_credential"] = kind
 
 
-def require_ledger_operator_key(
+def require_tools_write_credential(
+    request: Request,
     authorization: str | None = Header(default=None),
     x_emr_recall_key: str | None = Header(default=None, alias="X-EMR-Recall-Key"),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_emr_writer_key: str | None = Header(default=None, alias="X-EMR-Writer-Key"),
 ) -> None:
-    """Call log, drift, tool writes and the nx routes: the LEDGER key, never the recall key (a recall-only caller is refused 401).
-
-    With no recall key configured this is exactly what it was (the ledger key).  On a public deployment the recall key stays the operator credential."""
+    """emr_remember / emr_upsert over REST: the LEDGER key or the WRITER key; the recall key is refused (401)."""
     if tenant_identity_in_force():
         return                            # (a tenant reaches the operator gates below this and is refused there, 403)
-    if credential_kind(authorization, x_emr_recall_key, x_api_key) == "operator":
+    kind = credential_kind(authorization, x_emr_recall_key, x_api_key, x_emr_writer_key)
+    if kind in ("operator", "writer"):
+        request.scope["jarvis_credential"] = kind
         return
     if is_public_deployment() and not emr_recall_api_key():
         raise HTTPException(status_code=503, detail="Public deployment requires EMR_RECALL_API_KEY")
     raise HTTPException(status_code=401, detail="Invalid or missing operator API key" if emr_recall_api_key() else "Invalid or missing API key")
 
 
-def mcp_credential(authorization: str | None, x_emr_recall_key: str | None, x_api_key: str | None) -> str:
-    """The MCP endpoint's check: raises like the tool routes do, and returns which credential the request carries (``operator`` or ``recall``)."""
+def require_ledger_operator_key(
+    authorization: str | None = Header(default=None),
+    x_emr_recall_key: str | None = Header(default=None, alias="X-EMR-Recall-Key"),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_emr_writer_key: str | None = Header(default=None, alias="X-EMR-Writer-Key"),
+) -> None:
+    """Call log, drift, tool writes and the nx routes: the LEDGER key, never the recall key (a recall-only caller is refused 401).
+
+    With no recall key configured this is exactly what it was (the ledger key).  On a public deployment the recall key stays the operator credential."""
+    if tenant_identity_in_force():
+        return                            # (a tenant reaches the operator gates below this and is refused there, 403)
+    if credential_kind(authorization, x_emr_recall_key, x_api_key, x_emr_writer_key) == "operator":
+        return
+    if is_public_deployment() and not emr_recall_api_key():
+        raise HTTPException(status_code=503, detail="Public deployment requires EMR_RECALL_API_KEY")
+    raise HTTPException(status_code=401, detail="Invalid or missing operator API key" if emr_recall_api_key() else "Invalid or missing API key")
+
+
+def mcp_credential(authorization: str | None, x_emr_recall_key: str | None, x_api_key: str | None, x_emr_writer_key: str | None = None) -> str:
+    """The MCP endpoint's check: raises like the tool routes do, and returns which credential the request carries (``operator``, ``writer`` or ``recall``)."""
     if tenant_identity_in_force():
         return "operator"                 # (as before: the identity middleware validated the token and bound the tenant; "operator" here only means "not recall-scoped")
     if is_public_deployment() and not emr_recall_api_key():
         raise HTTPException(status_code=503, detail="Public deployment requires EMR_RECALL_API_KEY")
-    kind = credential_kind(authorization, x_emr_recall_key, x_api_key)
+    kind = credential_kind(authorization, x_emr_recall_key, x_api_key, x_emr_writer_key)
     if kind is None:
         raise HTTPException(status_code=401, detail="Invalid or missing operator API key" if emr_recall_api_key() else "Invalid or missing API key")
     return kind
@@ -382,7 +441,8 @@ async def ledger_read_protection_middleware(request: Request, call_next):
         # deployment the recall key stays the operator credential, as before.
         if is_public_deployment() and not emr_recall_api_key():
             raise HTTPException(status_code=503, detail="Public deployment requires EMR_RECALL_API_KEY")
-        if credential_kind(request.headers.get("authorization"), request.headers.get("x-emr-recall-key"), request.headers.get("x-api-key")) != "operator":
+        if credential_kind(request.headers.get("authorization"), request.headers.get("x-emr-recall-key"), request.headers.get("x-api-key"),
+                           request.headers.get("x-emr-writer-key")) != "operator":
             raise HTTPException(status_code=401, detail="Invalid or missing operator API key")
     except HTTPException as exc:
         return json_response(exc.status_code, exc.detail, headers=getattr(exc, "headers", None), path=request.url.path)
@@ -559,6 +619,11 @@ def credential_is_operator(headers, path: str) -> bool:
                 return False
         elif is_public_deployment():
             return False
+        writer = emr_writer_api_key()
+        if writer and not is_public_deployment():
+            wtoken = bearer or (headers.get("x-emr-writer-key") or "").strip()
+            if wtoken and secrets.compare_digest(wtoken, writer):
+                return True                  # likewise the writer key: it reaches the operator's ledger through the tool routes; credential_kind decides which tools
     expected = configured_api_key()
     if expected is None:
         return allow_unauthenticated()

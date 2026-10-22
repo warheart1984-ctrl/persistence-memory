@@ -21,3 +21,5 @@ The boundary is pinned by `tests/test_recall_credential_boundary.py`: every rout
 tools and the MCP transport; the set of tools it may list or call is written out in the test, so adding one is a decision, and a route added later is closed to it by default.
 
 Generate a recall key with `python3 -c "import secrets; print(secrets.token_urlsafe(32))"`, put it in `secrets/app.env` as `EMR_RECALL_API_KEY=...`, and give it to the client from a protected file or secret store; never paste it into a profile, a chat or a commit.
+
+A wider scoped credential exists for clients that also need to write draft memories without the ledger key: see [the writer credential](writer_credential.md).

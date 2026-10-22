@@ -232,9 +232,14 @@ does have one: run `app.pg_schema.V9_ROLLBACK` as the migration role in one tran
 
 ### Per-tenant API keys (`jarvisctl keys`)
 
-`jarvisctl keys pepper-init|pepper-install-app|tenant-create|key-create|key-revoke|tenant-status|tenants|keys|status` issues and manages per-tenant API keys (schema v10; `docs/tenant_keys.md`). Tokens are written to a
+`jarvisctl keys pepper-init|pepper-install-app|writer-key-init|tenant-create|key-create|key-revoke|tenant-status|tenants|keys|status` issues and manages per-tenant API keys (schema v10; `docs/tenant_keys.md`). Tokens are written to a
 mode-600 file under `secrets/issued-keys/` and never printed; the pepper (`secrets/key-pepper`) is created once and never overwritten or shown. Key authentication stays off until `JARVIS_KEY_TENANTS=1` is set
 for the app (see `docs/tenant_keys.md`); issuing a key does not enable it.
+
+### The writer credential (`EMR_WRITER_API_KEY`)
+
+`jarvisctl keys writer-key-init` creates a scoped key that can use the read tools plus `emr_remember` / `emr_upsert` and nothing else (`docs/writer_credential.md`): the key to give a second machine instead of the ledger
+key. It is installed by recreating the app; it does not change `JARVIS_MCP_WRITE_ENABLED`, which stays the deployment's own switch.
 
 ### Signatures (schema v7)
 
